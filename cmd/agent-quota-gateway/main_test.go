@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
@@ -110,15 +111,15 @@ func TestIntegration_fullStack(t *testing.T) {
 		}
 		store.Put(key, snap)
 	}
-	proxyHandler, err := proxy.New(upSrv.URL, observer)
+	proxyHandler, err := proxy.New(upSrv.URL, observer, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/health", healthHandler())
-	mux.HandleFunc("/_gateway/quota", quotaHandler(store))
-	mux.Handle("/", backend.Middleware(registry, proxyHandler))
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, nil))
+	mux.Handle("/", backend.Middleware(registry, nil, proxyHandler))
 
 	handler := logging.Middleware(mux)
 	gw := httptest.NewServer(handler)
@@ -244,6 +245,159 @@ func TestIntegration_fullStack(t *testing.T) {
 		if strings.Contains(logs, banned) {
 			t.Errorf("stderr leaked %q\nlogs: %s", banned, logs)
 		}
+	}
+}
+
+// TestIntegration_autoFailover drives the full wired stack: an `auto`
+// request routed to a backend whose upstream 429s comes back to the
+// client as a 503 (switchable), the sticky pointer advances, and the
+// client's retry lands on the healthy backend and succeeds — all without
+// the gateway buffering the request body. It also confirms the auto quota
+// view follows the switch.
+func TestIntegration_autoFailover(t *testing.T) {
+	// Upstream 429s the first backend's credential (with a future reset)
+	// and serves 200 for the second.
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("x-api-key") {
+		case "cred-a":
+			w.Header().Set("anthropic-ratelimit-unified-status", "rejected")
+			w.Header().Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()))
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error"}}`))
+		default:
+			w.Header().Set("anthropic-ratelimit-unified-status", "allowed")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	})
+	upSrv := httptest.NewServer(upstream)
+	t.Cleanup(upSrv.Close)
+
+	// Two backends; sorted nicks => ["acct-a","acct-b"], start at index 0.
+	t.Setenv("AQG_BACKEND_ACCT_A", "cred-a")
+	t.Setenv("AQG_BACKEND_ACCT_B", "cred-b")
+	registry, err := backend.Load()
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	autoCtl := auto.NewController(registry, 0, nil, io.Discard)
+
+	store := quota.NewStore()
+	observer := func(resp *http.Response) {
+		snap := quota.Extract(resp)
+		if !snap.HasData() {
+			return
+		}
+		key := defaultBackendKey
+		if resp.Request != nil {
+			if b, ok := backend.FromContext(resp.Request.Context()); ok {
+				key = b.Nick
+			}
+		}
+		store.Put(key, snap)
+	}
+	proxyHandler, err := proxy.New(upSrv.URL, observer, autoCtl.ModifyResponse)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, autoCtl))
+	mux.Handle("/", backend.Middleware(registry, autoCtl, proxyHandler))
+	gw := httptest.NewServer(logging.Middleware(mux))
+	t.Cleanup(gw.Close)
+
+	autoPost := func() *http.Response {
+		req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/messages", strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer auto")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		return resp
+	}
+
+	// 1. First auto request hits acct-a → upstream 429 → client sees 503.
+	resp1 := autoPost()
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("first auto request status=%d, want 503 (switchable)", resp1.StatusCode)
+	}
+	if ra := resp1.Header.Get("Retry-After"); ra == "" {
+		t.Errorf("503 missing Retry-After")
+	}
+	if got := autoCtl.Current(); got != "acct-b" {
+		t.Fatalf("after 429, currentAuto=%q, want acct-b", got)
+	}
+
+	// 2. The client's retry lands on acct-b and succeeds.
+	resp2 := autoPost()
+	body, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("retry status=%d, want 200 on the switched backend", resp2.StatusCode)
+	}
+	if !strings.Contains(string(body), `"ok":true`) {
+		t.Errorf("retry body=%q, want upstream success payload", body)
+	}
+
+	// 3. The auto quota view follows the switch.
+	qResp, err := http.Get(gw.URL + "/_gateway/quota?backend=auto")
+	if err != nil {
+		t.Fatalf("quota get: %v", err)
+	}
+	defer qResp.Body.Close()
+	var view map[string]any
+	if err := json.NewDecoder(qResp.Body).Decode(&view); err != nil {
+		t.Fatalf("decode quota: %v", err)
+	}
+	if view["active_backend"] != "acct-b" {
+		t.Errorf("active_backend=%v, want acct-b", view["active_backend"])
+	}
+}
+
+// TestQuotaHandler_autoViewAddsActiveBackend proves the quota endpoint's
+// `auto` path returns the active sticky backend's snapshot with an
+// active_backend field naming it — so a consumer asking `auto` needs zero
+// knowledge of pool membership.
+func TestQuotaHandler_autoViewAddsActiveBackend(t *testing.T) {
+	t.Setenv("AQG_BACKEND_ACCT_ONE", "cred-one")
+	registry, err := backend.Load()
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	autoCtl := auto.NewController(registry, 0, nil, io.Discard) // start at acct-one
+
+	store := quota.NewStore()
+	util := 0.42
+	store.Put("acct-one", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util})
+
+	srv := httptest.NewServer(quotaHandler(store, autoCtl))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/quota?backend=auto")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["active_backend"] != "acct-one" {
+		t.Errorf("active_backend=%v, want acct-one", got["active_backend"])
+	}
+	if got["backend"] != "acct-one" {
+		t.Errorf("backend=%v, want acct-one (snapshot promoted into the view)", got["backend"])
+	}
+	if got["unified_status"] != "allowed" {
+		t.Errorf("unified_status=%v, want allowed", got["unified_status"])
+	}
+	if got["unified_5h_utilization"] != 0.42 {
+		t.Errorf("unified_5h_utilization=%v, want 0.42", got["unified_5h_utilization"])
 	}
 }
 

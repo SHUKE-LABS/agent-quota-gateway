@@ -36,7 +36,9 @@ single gateway without any client ever seeing a credential.
 - Selector-based routing. The inbound `ANTHROPIC_AUTH_TOKEN` is a local
   backend selector, never forwarded upstream. Unknown or missing
   selectors fail closed with `403` — there is no silent fallback to
-  another account.
+  another account. The reserved selector `auto` lets the gateway pick a
+  pooled backend itself (global-sticky with reactive `429` failover — see
+  [The `auto` selector](#the-auto-selector)).
 - Quota snapshots are captured passively from upstream rate-limit
   headers and exposed at `GET /_gateway/quota`, keyed per backend. No
   synthetic probe requests — freshness depends on real client traffic.
@@ -44,8 +46,10 @@ single gateway without any client ever seeing a credential.
 Out of scope:
 
 - Non-Anthropic providers
-- `auto` / quota- or concurrency-aware scheduling across backends
-  (a selector always names one explicit backend)
+- Quota-watermark or concurrency-aware load spreading across backends.
+  The `auto` selector switches **only** on a real `429` (to maximize
+  prompt-cache retention); it never pre-empts on a utilization threshold
+  and never spreads concurrent requests across accounts.
 - TLS termination (front it with a reverse proxy or `stunnel` if
   you need it)
 - Request/response body modification, caching, retries
@@ -120,9 +124,97 @@ You should see streaming SSE events back. The `-N` flag is required so
 selector returns `403 {"error":"unknown backend selector"}` without any
 upstream round-trip.
 
+## The `auto` selector
+
+Instead of naming a backend, a client can send the reserved selector
+`auto` and let the gateway choose:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
+ANTHROPIC_AUTH_TOKEN=auto \
+claude
+```
+
+The consumer never needs to know pool membership — it sends `auto` and
+the gateway routes to one pooled backend, switching accounts on its
+behalf when one runs out. The model is **global-sticky, reactive, and
+zero-probe**:
+
+- **Sticky.** Every `auto` request reuses the same backend
+  (`currentAuto`) so Anthropic's per-account prompt cache keeps paying
+  off. The gateway does not compare or balance across backends.
+- **Reactive switch, no watermark.** A backend is ridden until it
+  actually returns a `429`. There is no utilization threshold — a backend
+  at 95% can still finish a small task, and switching only on a real
+  rejection means fewer switches and better cache retention.
+- **Zero probe.** The starting backend is chosen at random on startup and
+  its quota fills in from the first real response; `GET
+  /_gateway/quota?backend=auto` is empty until traffic flows. No backend
+  is ever contacted just to measure it. This is also why resets stay
+  naturally staggered: because each account's rolling 5-hour window is
+  anchored to its own real first use (never a synthetic probe), the
+  windows drift apart, so there is almost always one account freeing up
+  before the others.
+
+### What the client sees on a switch
+
+On a `429` from the current backend the gateway does **not** forward the
+`429`. Anthropic's `429` is a pre-stream rejection, so the gateway handles
+it on the response side — no request body is buffered; the *client*
+replays its own body:
+
+- **A backend is still available →** the response is rewritten to `503`
+  with `Retry-After: 1`. The gateway has already advanced `currentAuto`
+  to another backend, so the client's retry resolves to it and succeeds,
+  rebuilding the cache once on the new account. `503` is a transient
+  "retry" signal, deliberately distinct from a `429` ("you are
+  rate-limited") — Claude Code and any non-trivial client retry it.
+- **Every backend is exhausted →** there is nothing to switch to, so the
+  gateway forwards an honest `429` with `Retry-After` set to the precise
+  wait until the soonest backend resets (read from the upstream
+  `anthropic-ratelimit-unified-reset` header, not estimated).
+  `currentAuto` is pre-pointed at that soonest backend so the client's
+  post-wait retry lands on it. A backend's exhausted mark clears
+  automatically once its reset time passes.
+
+  The header `reset` is a conservative upper bound: the rolling 5-hour
+  window actually frees capacity gradually as old usage ages out, so a
+  backend may recover sooner than its advertised reset. The gateway
+  treats the reset as authoritative and does not bank on early partial
+  recovery.
+
+Each switch is logged server-side as one line — `auto: claude-a ->
+claude-b (claude-a hit 429)` — naming nicks only, never credentials or
+the rejected selector value.
+
+### Reading auto's quota
+
+`GET /_gateway/quota?backend=auto` returns the active backend's snapshot
+plus an `active_backend` field naming the nick it resolved to:
+
+```bash
+curl http://127.0.0.1:8080/_gateway/quota?backend=auto
+```
+
+```json
+{
+  "backend": "claude-b",
+  "active_backend": "claude-b",
+  "unified_status": "allowed",
+  "unified_5h_utilization": 0.05,
+  "as_of": "2026-06-14T13:42:11.038Z"
+}
+```
+
+Because `active_backend` changes alongside the snapshot, a sudden
+utilization jump (e.g. 99% → 5%) on a switch is self-explained: the
+gateway moved to a fresher account. The consumer needs no knowledge of
+pool membership — it asks `auto` and the response self-describes.
+
 ## Layout
 
 - `cmd/agent-quota-gateway/` — service entrypoint and integration tests
+- `internal/auto/` — the `auto` selector's global-sticky controller
 - `internal/backend/` — backend registry, selector resolution middleware
 - `internal/config/` — env loading and validation
 - `internal/proxy/` — reverse-proxy handler and tests
@@ -236,8 +328,11 @@ curl http://127.0.0.1:8080/_gateway/quota?backend=claude-a
 for that nick has been seen, the body is just `{"backend": "unknown",
 "as_of": "..."}`. Use the presence of a `unified_*` field (e.g.
 `unified_5h_utilization`) to decide whether quota data is actually
-available. (The endpoint takes no selector itself — it is a local
-read-only view, gated by the loopback boundary like `/_gateway/health`.)
+available. The one reserved value is `?backend=auto`, which resolves to
+the current sticky backend and adds an `active_backend` field (see [The
+`auto` selector](#the-auto-selector)). (The endpoint takes no credential
+selector itself — it is a local read-only view, gated by the loopback
+boundary like `/_gateway/health`.)
 
 ### Freshness model
 

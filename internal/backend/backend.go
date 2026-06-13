@@ -16,12 +16,38 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 // EnvPrefix marks an environment variable as a backend declaration:
 // AQG_BACKEND_<NICK>=<credential>. The part after the prefix is
 // normalized into the selector clients use (see normalizeNick).
 const EnvPrefix = "AQG_BACKEND_"
+
+// AutoSelector is the reserved selector that asks the gateway to pick a
+// pooled backend itself (global-sticky with reactive 429 failover). It
+// is not a configurable nick: a backend that normalizes to "auto" is
+// rejected at load so the reserved word stays unambiguous.
+const AutoSelector = "auto"
+
+// AutoResolver is the gateway's auto-selector strategy, kept as an
+// interface here so the resolver middleware can call it without the
+// backend package importing the auto package (which itself depends on
+// this one). The concrete implementation lives in internal/auto.
+type AutoResolver interface {
+	// ResolveAuto returns the sticky backend to serve an `auto` request.
+	// When exhausted is true the whole pool is rate-limited and the
+	// caller must emit 429 with the given Retry-After (the wait until the
+	// soonest backend resets); b is then the soonest-resetting backend
+	// the client's post-wait retry will land on.
+	ResolveAuto() (b Backend, retryAfter time.Duration, exhausted bool)
+}
+
+// IsAutoSelector reports whether a selector names the reserved auto
+// selector, matched with the same normalization as a nick.
+func IsAutoSelector(selector string) bool {
+	return normalizeSelector(selector) == AutoSelector
+}
 
 // Backend is one resolved upstream identity. Credential is the real
 // secret the proxy stamps outbound; Nick is the stable key the selector
@@ -68,6 +94,9 @@ func loadFrom(environ []string) (*Registry, error) {
 		nick := normalizeNick(rawNick)
 		if nick == "" {
 			return nil, fmt.Errorf("backend: %s has an empty nick", key)
+		}
+		if nick == AutoSelector {
+			return nil, fmt.Errorf("backend: %s maps to the reserved nick %q; %q is the auto selector and cannot be a backend", key, AutoSelector, AutoSelector)
 		}
 		if val == "" {
 			return nil, fmt.Errorf("backend: %s has an empty credential", key)
@@ -135,4 +164,24 @@ func WithBackend(ctx context.Context, b Backend) context.Context {
 func FromContext(ctx context.Context) (Backend, bool) {
 	b, ok := ctx.Value(ctxKey{}).(Backend)
 	return b, ok
+}
+
+// autoKey is unexported so no other package can collide with our
+// auto-flag context value.
+type autoKey struct{}
+
+// MarkAuto returns a copy of ctx flagged as an auto-routed request. The
+// auto controller's response hook reads this to decide whether an
+// upstream 429 should trigger failover (auto) or pass through honestly
+// (an explicit selector has no failover target).
+func MarkAuto(ctx context.Context) context.Context {
+	return context.WithValue(ctx, autoKey{}, true)
+}
+
+// IsAutoRequest reports whether ctx was flagged by MarkAuto — i.e. the
+// request resolved through the `auto` selector rather than an explicit
+// backend nick.
+func IsAutoRequest(ctx context.Context) bool {
+	v, _ := ctx.Value(autoKey{}).(bool)
+	return v
 }
