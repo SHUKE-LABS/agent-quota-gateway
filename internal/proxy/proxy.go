@@ -1,10 +1,12 @@
 // Package proxy implements the Anthropic Messages reverse proxy.
 //
-// The proxy is intentionally thin: it routes the V1 surface
-// (/v1/messages and /v1/messages/count_tokens) through Go's standard
-// httputil.ReverseProxy, sets the upstream auth header from config, and
-// disables response buffering so server-sent events stream as they
-// arrive. Nothing about request or response bodies is inspected.
+// The proxy is intentionally thin: it forwards every POST through Go's
+// standard httputil.ReverseProxy, sets the upstream auth header from
+// config, and disables response buffering so server-sent events stream
+// as they arrive. Nothing about request or response bodies is
+// inspected. Paths are not whitelisted — any path reaches the upstream,
+// which is the authority on what it serves. The loopback-only bind
+// (enforced at config load) is the security boundary, not a route table.
 //
 // An optional response observer hook lets the caller inspect each
 // upstream *http.Response (headers only, post-roundtrip) without
@@ -20,17 +22,10 @@ import (
 	"time"
 )
 
-// allowedPaths is the closed route table for V1. Requests outside this
-// set receive 404 — we refuse to be an open relay for arbitrary upstream
-// paths, both to keep the surface auditable and to avoid leaking the
-// API key through routes the operator did not intend to expose.
-var allowedPaths = map[string]bool{
-	"/v1/messages":              true,
-	"/v1/messages/count_tokens": true,
-}
-
-// allowedMethods is the HTTP method set V1 accepts on the routed paths.
-// Anthropic's Messages surface is POST-only.
+// allowedMethods is the HTTP method set the proxy forwards. Anthropic's
+// API surface is POST-only; a GET reaching the upstream with the API key
+// attached is unnecessary exposure, so non-POST requests are rejected
+// here with 405 before any upstream round-trip.
 var allowedMethods = map[string]bool{
 	http.MethodPost: true,
 }
@@ -106,10 +101,6 @@ func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error
 		if !allowedMethods[r.Method] {
 			w.Header().Set("Allow", http.MethodPost)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !allowedPaths[r.URL.Path] {
-			http.NotFound(w, r)
 			return
 		}
 		rp.ServeHTTP(w, r)
