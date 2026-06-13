@@ -221,3 +221,43 @@ func TestIntegration_fullStack(t *testing.T) {
 		}
 	}
 }
+
+// TestHealthHandler_methodGuard pins the GET-only contract on
+// /_gateway/health. The README documents the endpoint as GET, but the
+// handler used to accept any verb and return 200 — same shape as the
+// GET response, which let a client that learned POST-on-health then
+// trip on quota's 405. healthHandler and quotaHandler must agree, so
+// this test fires POST/PUT/DELETE/OPTIONS and asserts 405 + Allow: GET
+// (matching quotaHandler's policy).
+func TestHealthHandler_methodGuard(t *testing.T) {
+	srv := httptest.NewServer(healthHandler())
+	defer srv.Close()
+
+	// Sanity: GET still works.
+	getResp, err := http.Get(srv.URL + "/_gateway/health")
+	if err != nil {
+		t.Fatalf("health GET: %v", err)
+	}
+	getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("health GET status = %d, want 200", getResp.StatusCode)
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions} {
+		req, err := http.NewRequest(method, srv.URL+"/_gateway/health", nil)
+		if err != nil {
+			t.Fatalf("NewRequest %s: %v", method, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s status = %d, want 405", method, resp.StatusCode)
+		}
+		if allow := resp.Header.Get("Allow"); allow != http.MethodGet {
+			t.Errorf("%s Allow header = %q, want %q", method, allow, http.MethodGet)
+		}
+		resp.Body.Close()
+	}
+}

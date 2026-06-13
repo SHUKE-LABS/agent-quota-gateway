@@ -134,8 +134,15 @@ func run() error {
 // does not expose the version, uptime, or upstream reachability. Any
 // additional readiness signal would belong on a separate endpoint so
 // callers can tell "process is alive" from "upstream is reachable".
+// Method is GET only; non-GET requests receive 405 — matching
+// quotaHandler's policy so the two /_gateway/* endpoints agree.
 func healthHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
