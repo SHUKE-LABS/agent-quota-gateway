@@ -91,3 +91,60 @@ func TestMiddleware_emitsRequiredFields(t *testing.T) {
 		}
 	}
 }
+
+// TestMiddleware_generatesRequestIDWhenAbsent verifies that the
+// logger fabricates a non-empty request ID when the inbound request
+// has no X-Request-Id header. Two consecutive requests must get
+// different IDs — otherwise log correlation is meaningless.
+func TestMiddleware_generatesRequestIDWhenAbsent(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	oldStderr := os.Stderr
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		_, _ = buf.ReadFrom(r)
+		close(done)
+	}()
+
+	handler := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	ids := make(map[string]bool, 3)
+	for i := 0; i < 3; i++ {
+		resp, err := http.Post(srv.URL+"/v1/messages", "application/json", nil)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	w.Close()
+	<-done
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 log lines, got %d: %q", len(lines), buf.String())
+	}
+	for _, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("not JSON: %v\n%s", err, line)
+		}
+		id, _ := entry["request_id"].(string)
+		if id == "" || id == "-" {
+			t.Errorf("request_id missing or sentinel: %v", entry["request_id"])
+		}
+		if ids[id] {
+			t.Errorf("duplicate request_id %q across requests", id)
+		}
+		ids[id] = true
+	}
+}

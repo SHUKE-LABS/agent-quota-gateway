@@ -9,6 +9,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -77,10 +78,29 @@ func (c Config) validate() error {
 	if _, err := url.Parse(c.AnthropicBaseURL); err != nil {
 		return fmt.Errorf("ANTHROPIC_BASE_URL is invalid: %w", err)
 	}
-	if c.ListenAddr == "" {
-		return errors.New("LISTEN_ADDR must not be empty")
+	if err := validateListenAddr(c.ListenAddr); err != nil {
+		return err
 	}
 	return nil
+}
+
+// validateListenAddr enforces the loopback-only constraint for V1:
+// the host part of LISTEN_ADDR must be a literal loopback address
+// (127.0.0.1, ::1) or the loopback name "localhost". We accept the
+// name because it is the conventional shortcut and resolves to a
+// loopback IP, but we reject 0.0.0.0 and any routable address —
+// exposing the proxy off-loopback would put the API key on the wire.
+func validateListenAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("LISTEN_ADDR is invalid: %w", err)
+	}
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return nil
+	default:
+		return fmt.Errorf("LISTEN_ADDR must be loopback (127.0.0.1, ::1, or localhost); got %q", host)
+	}
 }
 
 func getEnv(key, fallback string) string {

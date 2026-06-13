@@ -41,6 +41,51 @@ func TestLoad_overrides(t *testing.T) {
 	}
 }
 
+func TestLoad_loopbackVariants(t *testing.T) {
+	cases := []string{
+		"127.0.0.1:8080",
+		"[::1]:8080",
+		"localhost:8080",
+	}
+	for _, addr := range cases {
+		t.Run(addr, func(t *testing.T) {
+			t.Setenv(EnvAnthropicBaseURL, "")
+			t.Setenv(EnvAnthropicAPIKey, "k")
+			t.Setenv(EnvListenAddr, addr)
+			if _, err := Load(); err != nil {
+				t.Errorf("Load() addr=%q: unexpected error %v", addr, err)
+			}
+		})
+	}
+}
+
+func TestLoad_rejectsNonLoopback(t *testing.T) {
+	cases := []string{
+		"0.0.0.0:8080",
+		"192.168.1.1:8080",
+		"example.com:8080",
+	}
+	for _, addr := range cases {
+		t.Run(addr, func(t *testing.T) {
+			t.Setenv(EnvAnthropicBaseURL, "")
+			t.Setenv(EnvAnthropicAPIKey, "k")
+			t.Setenv(EnvListenAddr, addr)
+			if _, err := Load(); err == nil {
+				t.Errorf("Load() addr=%q: expected loopback rejection", addr)
+			}
+		})
+	}
+}
+
+func TestLoad_rejectsMalformedAddr(t *testing.T) {
+	t.Setenv(EnvAnthropicBaseURL, "")
+	t.Setenv(EnvAnthropicAPIKey, "k")
+	t.Setenv(EnvListenAddr, "no-port")
+	if _, err := Load(); err == nil {
+		t.Error("Load() expected error for malformed LISTEN_ADDR")
+	}
+}
+
 func TestLoad_missingKey(t *testing.T) {
 	t.Setenv(EnvAnthropicAPIKey, "")
 	t.Setenv(EnvAnthropicBaseURL, "")
