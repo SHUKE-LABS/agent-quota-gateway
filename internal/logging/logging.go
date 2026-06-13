@@ -7,6 +7,8 @@
 package logging
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -54,10 +56,20 @@ func (s *statusRecorder) WriteHeader(code int) {
 }
 
 // requestID returns the inbound X-Request-Id header if present, otherwise
-// a deterministic "-" so log consumers always see the same field shape.
+// a fresh 16-hex-char random ID. The random form is generated once per
+// request so uninstrumented traffic can still be correlated across the
+// log stream; the sentinel form ("-") would have collapsed unrelated
+// requests into a single bucket, which defeats the field's purpose.
 func requestID(r *http.Request) string {
 	if id := r.Header.Get("X-Request-Id"); id != "" {
 		return id
 	}
-	return "-"
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure is exceptional; fall back to a time-based
+		// label rather than the "-"" sentinel so log shape stays
+		// stable for downstream consumers.
+		return time.Now().UTC().Format("20060102T150405.000000000")
+	}
+	return hex.EncodeToString(b[:])
 }

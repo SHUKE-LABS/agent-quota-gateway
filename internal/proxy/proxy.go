@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -45,19 +46,19 @@ func New(baseURL, apiKey string) (http.Handler, error) {
 
 	rp := httputil.NewSingleHostReverseProxy(upstream)
 
-	// Director runs once per request, after the standard ReverseProxy
-	// has copied the inbound URL. We re-derive scheme/host/path from the
+	// Replace the default director entirely. NewSingleHostReverseProxy's
+	// default director parses the upstream URL on every request and then
+	// joins paths in a way that makes the dataflow hard to audit. We do
+	// the same job inline — re-derive scheme/host/path from the
 	// configured upstream so a malicious inbound Host header cannot
 	// redirect traffic, and stamp the auth header from the gateway's
 	// own config so client-supplied x-api-key is replaced.
-	origDirector := rp.Director
+	basePath := strings.TrimRight(upstream.Path, "/")
 	rp.Director = func(r *http.Request) {
-		origDirector(r)
-		r.Host = upstream.Host
 		r.URL.Scheme = upstream.Scheme
 		r.URL.Host = upstream.Host
-		// Preserve the inbound path; the standard director already
-		// joined the upstream path with the inbound path.
+		r.Host = upstream.Host
+		r.URL.Path = joinPath(basePath, r.URL.Path)
 		r.Header.Set("x-api-key", apiKey)
 	}
 
@@ -100,3 +101,23 @@ var errInvalidBaseURL = &configError{msg: "ANTHROPIC_BASE_URL must include schem
 type configError struct{ msg string }
 
 func (e *configError) Error() string { return e.msg }
+
+// joinPath concatenates a base path with a request path, ensuring
+// exactly one slash between them and a leading slash on the result.
+// For the Anthropic V1 surface, basePath is always empty (the upstream
+// lives at the root), but the function preserves correct behavior if
+// future versions point at a subpath.
+func joinPath(basePath, requestPath string) string {
+	base := strings.TrimRight(basePath, "/")
+	req := strings.TrimLeft(requestPath, "/")
+	switch {
+	case base == "" && req == "":
+		return "/"
+	case base == "":
+		return "/" + req
+	case req == "":
+		return base
+	default:
+		return base + "/" + req
+	}
+}
