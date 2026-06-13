@@ -1,0 +1,14 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Env / local state
+.env
+.env.*
+
+# Build outputs
+bin/
+dist/
+coverage.out
+
