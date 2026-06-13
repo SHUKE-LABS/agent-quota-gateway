@@ -24,14 +24,21 @@ credential directly.
 - One log line per request (method, path, status, duration, request
   ID). Request bodies, response bodies, and credential headers are
   never logged.
+- Quota snapshots are captured passively from upstream rate-limit
+  headers and exposed at `GET /_gateway/quota`. No synthetic probe
+  requests — freshness depends on real client traffic.
 
 Out of scope for V1:
 
-- Quota tracking, rate limiting, cost snapshots
 - Non-Anthropic providers
 - TLS termination (front it with a reverse proxy or `stunnel` if
   you need it)
-- Request/response modification, caching, retries
+- Request/response body modification, caching, retries
+- Quota history, time-series, or per-request metering — only the
+  latest snapshot per backend is kept
+- Rate limiting or request blocking based on quota state
+- Authentication on `/_gateway/quota` — loopback is the trust
+  boundary
 - Docker image or other packaging — `go build` is the deliverable
 
 ## Quickstart
@@ -82,13 +89,66 @@ You should see streaming SSE events back. The `-N` flag is required so
 - `cmd/agent-quota-gateway/` — service entrypoint
 - `internal/config/` — env loading and validation
 - `internal/proxy/` — reverse-proxy handler and tests
+- `internal/quota/` — rate-limit header extraction and snapshot store
 - `internal/logging/` — middleware and tests
 - `test/` — reserved for end-to-end coverage
 
+## Quota snapshots
+
+The gateway watches the `anthropic-ratelimit-*` and
+`anthropic-organization-id` response headers on every forwarded
+request and keeps the latest snapshot per backend key in an
+in-process cache. Reads go through a small loopback endpoint:
+
+```bash
+curl http://127.0.0.1:8080/_gateway/quota?backend=mybackend
+```
+
+Response shape (all rate-limit fields are optional — they are
+omitted when the upstream response did not carry the corresponding
+header):
+
+```json
+{
+  "backend": "mybackend",
+  "requests_limit": 1000,
+  "requests_remaining": 997,
+  "requests_reset": "2026-06-13T13:45:00Z",
+  "tokens_limit": 80000,
+  "tokens_remaining": 79412,
+  "tokens_reset": "2026-06-13T13:45:30Z",
+  "org_id": "org_abc123",
+  "as_of": "2026-06-13T13:42:11.038Z"
+}
+```
+
+`as_of` is the gateway-side time the snapshot was recorded; the
+`*_reset` fields are absolute upstream timestamps.
+
+### Backend keying
+
+Clients identify the backend a request is bound for by setting the
+`X-Mux-Backend-Nick` header on the inbound request. The proxy
+forwards it to Anthropic untouched, and the observer files the
+response snapshot under that key. When the header is absent or
+empty, the snapshot is filed under `default` and `GET
+/_gateway/quota` (no query) returns it.
+
+`GET /_gateway/quota?backend=unknown` always returns 200; if no
+traffic for that key has been seen, the body is just `{"backend":
+"unknown", "as_of": "..."}`. Use the presence of `tokens_limit` /
+`requests_limit` to decide whether quota data is actually available.
+
+### Freshness model
+
+Snapshots only update when real traffic flows. The gateway never
+issues synthetic probe requests — if no client has hit the backend
+recently, the snapshot is stale by exactly that gap. Consumers that
+need fresh data should issue (or wait for) a real request.
+
 ## Why a thin proxy
 
-V1 is deliberately a pass-through. The proxy exists to be the trust
-boundary — it owns the API key, and its logs are safe to share with
-any local tool. Future versions will add quota capture and rate
-windows on top of this same boundary; this README will be updated
-when those land.
+The proxy is the trust boundary — it owns the API key, and its
+logs are safe to share with any local tool. Quota observation
+piggy-backs on the same boundary: rate-limit headers come down on
+every response, so we capture them with zero extra upstream load.

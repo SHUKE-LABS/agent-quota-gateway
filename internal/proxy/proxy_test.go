@@ -24,7 +24,7 @@ func newGateway(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *http
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 
-	gw, err := proxy.New(upstream.URL, "test-api-key")
+	gw, err := proxy.New(upstream.URL, "test-api-key", nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
@@ -253,5 +253,92 @@ func TestProxy_disallowedMethodReturns405(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", resp.StatusCode)
+	}
+}
+
+// TestProxy_observerFiresWithResponse confirms the ModifyResponse hook
+// runs once per upstream round-trip and receives a response whose
+// Header set and Request still reflect what the upstream sent and what
+// the client originally asked for. This is the integration point quota
+// capture relies on; if it ever stops firing, the snapshot cache goes
+// silently stale.
+func TestProxy_observerFiresWithResponse(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("anthropic-ratelimit-tokens-remaining", "42")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	upSrv := httptest.NewServer(upstream)
+	t.Cleanup(upSrv.Close)
+
+	var seenHeader, seenBackend string
+	var calls atomic.Int32
+	observer := func(resp *http.Response) {
+		calls.Add(1)
+		seenHeader = resp.Header.Get("anthropic-ratelimit-tokens-remaining")
+		if resp.Request != nil {
+			seenBackend = resp.Request.Header.Get("X-Mux-Backend-Nick")
+		}
+	}
+
+	gw, err := proxy.New(upSrv.URL, "test-api-key", observer)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	gwSrv := httptest.NewServer(gw)
+	t.Cleanup(gwSrv.Close)
+
+	req, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/messages", strings.NewReader("{}"))
+	req.Header.Set("X-Mux-Backend-Nick", "mybackend")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("observer call count = %d, want 1", got)
+	}
+	if seenHeader != "42" {
+		t.Errorf("observer saw anthropic-ratelimit-tokens-remaining = %q, want 42", seenHeader)
+	}
+	if seenBackend != "mybackend" {
+		t.Errorf("observer saw X-Mux-Backend-Nick = %q, want mybackend (custom headers must survive to ModifyResponse)", seenBackend)
+	}
+}
+
+// TestProxy_observerNotCalledForRejectedRequests proves the hook does
+// not fire for requests the proxy rejects before they reach the
+// upstream. Wrong method or wrong path → no observer call, since there
+// is no upstream response to inspect.
+func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("upstream must not be hit; got %s %s", r.Method, r.URL.Path)
+	})
+	upSrv := httptest.NewServer(upstream)
+	t.Cleanup(upSrv.Close)
+
+	var calls atomic.Int32
+	gw, err := proxy.New(upSrv.URL, "test-api-key", func(*http.Response) { calls.Add(1) })
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	gwSrv := httptest.NewServer(gw)
+	t.Cleanup(gwSrv.Close)
+
+	resp, err := http.Post(gwSrv.URL+"/v1/unknown", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(gwSrv.URL + "/v1/messages")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := calls.Load(); got != 0 {
+		t.Errorf("observer call count = %d, want 0 (rejected requests must not invoke observer)", got)
 	}
 }

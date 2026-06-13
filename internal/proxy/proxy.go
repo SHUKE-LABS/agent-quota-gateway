@@ -5,6 +5,11 @@
 // httputil.ReverseProxy, sets the upstream auth header from config, and
 // disables response buffering so server-sent events stream as they
 // arrive. Nothing about request or response bodies is inspected.
+//
+// An optional response observer hook lets the caller inspect each
+// upstream *http.Response (headers only, post-roundtrip) without
+// touching the body or interfering with streaming. The proxy itself
+// stays header-agnostic; quota capture lives in package quota.
 package proxy
 
 import (
@@ -20,7 +25,7 @@ import (
 // paths, both to keep the surface auditable and to avoid leaking the
 // API key through routes the operator did not intend to expose.
 var allowedPaths = map[string]bool{
-	"/v1/messages":             true,
+	"/v1/messages":              true,
 	"/v1/messages/count_tokens": true,
 }
 
@@ -30,12 +35,20 @@ var allowedMethods = map[string]bool{
 	http.MethodPost: true,
 }
 
+// ResponseObserver is invoked once per successful upstream round-trip,
+// after the response status and headers are known and before the proxy
+// writes the response back to the client. The body must not be read;
+// doing so would race with the proxy's own copy loop and break
+// streaming. nil is a valid value and disables the hook.
+type ResponseObserver func(*http.Response)
+
 // New builds the proxy http.Handler.
 //
 // baseURL must be a fully qualified upstream URL (e.g.
 // "https://api.anthropic.com"). apiKey is forwarded as the x-api-key
-// header on every request.
-func New(baseURL, apiKey string) (http.Handler, error) {
+// header on every request. observer, if non-nil, is invoked once per
+// upstream response for header-only inspection (see ResponseObserver).
+func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error) {
 	upstream, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -60,6 +73,19 @@ func New(baseURL, apiKey string) (http.Handler, error) {
 		r.Host = upstream.Host
 		r.URL.Path = joinPath(basePath, r.URL.Path)
 		r.Header.Set("x-api-key", apiKey)
+	}
+
+	// ModifyResponse runs after headers are received but before the
+	// body copy starts. Touching the body here would race with the
+	// proxy's own streaming copy, so we hand the response (headers,
+	// status, and resp.Request) to the observer and return nil.
+	// Returning an error here would surface as a 502; the observer is
+	// best-effort and must not break the request.
+	if observer != nil {
+		rp.ModifyResponse = func(resp *http.Response) error {
+			observer(resp)
+			return nil
+		}
 	}
 
 	// A negative FlushInterval means "flush immediately after each
