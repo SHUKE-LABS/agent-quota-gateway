@@ -297,7 +297,7 @@ func rewriteTo503(resp *http.Response) {
 	body := []byte(`{"error":"backend switching; retry"}`)
 
 	resp.StatusCode = http.StatusServiceUnavailable
-	resp.Status = http.StatusText(http.StatusServiceUnavailable)
+	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 
