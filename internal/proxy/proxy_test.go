@@ -36,7 +36,7 @@ func newGateway(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *http
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 
-	gw, err := proxy.New(upstream.URL, nil)
+	gw, err := proxy.New(upstream.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestProxy_observerFiresWithResponse(t *testing.T) {
 		}
 	}
 
-	gw, err := proxy.New(upSrv.URL, observer)
+	gw, err := proxy.New(upSrv.URL, observer, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 	t.Cleanup(upSrv.Close)
 
 	var calls atomic.Int32
-	gw, err := proxy.New(upSrv.URL, func(*http.Response) { calls.Add(1) })
+	gw, err := proxy.New(upSrv.URL, func(*http.Response) { calls.Add(1) }, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
@@ -386,7 +386,7 @@ func newGatewayWithKey(t *testing.T, key string, handler http.HandlerFunc) *http
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 
-	gw, err := proxy.New(upstream.URL, nil)
+	gw, err := proxy.New(upstream.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}

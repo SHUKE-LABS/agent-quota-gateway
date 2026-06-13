@@ -39,6 +39,16 @@ var allowedMethods = map[string]bool{
 // streaming. nil is a valid value and disables the hook.
 type ResponseObserver func(*http.Response)
 
+// ResponseModifier runs in ModifyResponse after the observer and may
+// mutate the response (status, headers, body) before the proxy streams
+// it to the client — the supported httputil.ReverseProxy mechanism for
+// rewriting a response. It is the auto selector's failover hook: an
+// upstream 429 on an auto-routed request becomes a 503 (switchable) or a
+// Retry-After 429 (pool dry). A returned error surfaces as a 502, so
+// implementations should return nil for the pass-through case. nil
+// disables the hook.
+type ResponseModifier func(*http.Response) error
+
 // New builds the proxy http.Handler.
 //
 // baseURL must be a fully qualified upstream URL (e.g.
@@ -50,8 +60,9 @@ type ResponseObserver func(*http.Response)
 // "Authorization: Bearer <token>" with the oauth-2025-04-20 beta flag,
 // while any other key is sent as the x-api-key header. observer, if
 // non-nil, is invoked once per upstream response for header-only
-// inspection (see ResponseObserver).
-func New(baseURL string, observer ResponseObserver) (http.Handler, error) {
+// inspection (see ResponseObserver). modifier, if non-nil, runs after the
+// observer and may rewrite the response (see ResponseModifier).
+func New(baseURL string, observer ResponseObserver, modifier ResponseModifier) (http.Handler, error) {
 	upstream, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -98,15 +109,22 @@ func New(baseURL string, observer ResponseObserver) (http.Handler, error) {
 		}
 	}
 
-	// ModifyResponse runs after headers are received but before the
-	// body copy starts. Touching the body here would race with the
-	// proxy's own streaming copy, so we hand the response (headers,
-	// status, and resp.Request) to the observer and return nil.
-	// Returning an error here would surface as a 502; the observer is
-	// best-effort and must not break the request.
-	if observer != nil {
+	// ModifyResponse runs after headers are received but before the body
+	// copy starts. The observer inspects headers only (its body-read
+	// caveat still holds — reading the streaming body here would race the
+	// copy loop). The modifier runs next and is the one hook allowed to
+	// rewrite the response, which ModifyResponse-time mutation supports
+	// because the proxy streams whatever response object survives this
+	// callback. The observer is best-effort (returns nothing); only the
+	// modifier can surface an error, which becomes a 502.
+	if observer != nil || modifier != nil {
 		rp.ModifyResponse = func(resp *http.Response) error {
-			observer(resp)
+			if observer != nil {
+				observer(resp)
+			}
+			if modifier != nil {
+				return modifier(resp)
+			}
 			return nil
 		}
 	}

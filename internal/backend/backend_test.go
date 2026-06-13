@@ -86,6 +86,38 @@ func TestLoadFrom_noBackendsRejected(t *testing.T) {
 	}
 }
 
+func TestLoadFrom_reservedAutoNickRejected(t *testing.T) {
+	// "auto" is the reserved selector; a backend that normalizes to it
+	// must be rejected so the word stays unambiguous.
+	for _, kv := range []string{"AQG_BACKEND_AUTO=cred", "AQG_BACKEND_auto=cred", "AQG_BACKEND_Auto=cred"} {
+		if _, err := loadFrom([]string{kv}); err == nil {
+			t.Errorf("loadFrom(%q): expected reserved-nick error", kv)
+		}
+	}
+}
+
+func TestIsAutoSelector(t *testing.T) {
+	for _, sel := range []string{"auto", "AUTO", "  Auto  "} {
+		if !IsAutoSelector(sel) {
+			t.Errorf("IsAutoSelector(%q)=false, want true", sel)
+		}
+	}
+	for _, sel := range []string{"", "autox", "claude-a"} {
+		if IsAutoSelector(sel) {
+			t.Errorf("IsAutoSelector(%q)=true, want false", sel)
+		}
+	}
+}
+
+func TestAutoFlag_roundTrip(t *testing.T) {
+	if IsAutoRequest(context.Background()) {
+		t.Error("bare context reported as auto-routed")
+	}
+	if !IsAutoRequest(MarkAuto(context.Background())) {
+		t.Error("MarkAuto context not reported as auto-routed")
+	}
+}
+
 func TestContext_roundTrip(t *testing.T) {
 	b := Backend{Nick: "claude-a", Credential: "cred-a"}
 	ctx := WithBackend(context.Background(), b)

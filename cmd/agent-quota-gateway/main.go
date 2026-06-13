@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
@@ -43,6 +44,12 @@ func run() error {
 		return fmt.Errorf("backend: %w", err)
 	}
 
+	// autoCtl is the `auto` selector's global-sticky controller. The
+	// random start index (start < 0) anchors each restart at a different
+	// backend with no probe traffic; its quota snapshot fills in from the
+	// first real response.
+	autoCtl := auto.NewController(registry, -1, nil, nil)
+
 	store := quota.NewStore()
 
 	// observer is invoked once per upstream response, before the proxy
@@ -70,7 +77,11 @@ func run() error {
 		store.Put(key, snap)
 	}
 
-	proxyHandler, err := proxy.New(cfg.AnthropicBaseURL, observer)
+	// The auto controller's ModifyResponse hook runs after the observer:
+	// it fails over (429 -> 503) or forwards an honest 429 only for
+	// auto-routed requests, leaving every explicit-selector response
+	// untouched.
+	proxyHandler, err := proxy.New(cfg.AnthropicBaseURL, observer, autoCtl.ModifyResponse)
 	if err != nil {
 		return fmt.Errorf("proxy: %w", err)
 	}
@@ -82,8 +93,8 @@ func run() error {
 	// endpoints are mounted directly and take no selector.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/health", healthHandler())
-	mux.HandleFunc("/_gateway/quota", quotaHandler(store))
-	mux.Handle("/", backend.Middleware(registry, proxyHandler))
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, autoCtl))
+	mux.Handle("/", backend.Middleware(registry, autoCtl, proxyHandler))
 
 	handler := logging.Middleware(mux)
 
@@ -151,17 +162,30 @@ func healthHandler() http.HandlerFunc {
 	}
 }
 
+// autoQuotaView is the /_gateway/quota?backend=auto response: the active
+// sticky backend's snapshot with an added active_backend field naming the
+// nick. The embedded Snapshot promotes its fields into the same JSON
+// object, so a consumer that asks `auto` gets the snapshot it would have
+// gotten by naming the backend directly, plus the name itself — it needs
+// zero knowledge of pool membership, and the 99%->5% jump on a switch is
+// self-explained because active_backend changes alongside it.
+type autoQuotaView struct {
+	quota.Snapshot
+	ActiveBackend string `json:"active_backend"`
+}
+
 // quotaHandler returns the JSON snapshot for the requested backend.
 //
 // Method is GET only — POSTing here would suggest the endpoint mutates
 // state, which it does not. The backend nick comes from the `?backend=`
 // query param and defaults to defaultBackendKey, so a plain `curl
-// /_gateway/quota` reads the default snapshot back. Unknown
-// keys return 200 with an empty snapshot (just backend + as_of) — the
-// distinction the caller cares about ("did I get quota data?") is
+// /_gateway/quota` reads the default snapshot back. The reserved value
+// `auto` resolves to the current sticky backend and adds active_backend.
+// Unknown keys return 200 with an empty snapshot (just backend + as_of) —
+// the distinction the caller cares about ("did I get quota data?") is
 // answered by which fields are present in the JSON body, not by the
 // status code.
-func quotaHandler(store *quota.Store) http.HandlerFunc {
+func quotaHandler(store *quota.Store, autoCtl *auto.Controller) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -172,8 +196,15 @@ func quotaHandler(store *quota.Store) http.HandlerFunc {
 		if key == "" {
 			key = defaultBackendKey
 		}
-		snap := store.Get(key)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(snap)
+		if autoCtl != nil && backend.IsAutoSelector(key) {
+			nick := autoCtl.Current()
+			_ = json.NewEncoder(w).Encode(autoQuotaView{
+				Snapshot:      store.Get(nick),
+				ActiveBackend: nick,
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(store.Get(key))
 	}
 }
