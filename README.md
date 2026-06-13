@@ -86,12 +86,49 @@ You should see streaming SSE events back. The `-N` flag is required so
 
 ## Layout
 
-- `cmd/agent-quota-gateway/` — service entrypoint
+- `cmd/agent-quota-gateway/` — service entrypoint and integration tests
 - `internal/config/` — env loading and validation
 - `internal/proxy/` — reverse-proxy handler and tests
 - `internal/quota/` — rate-limit header extraction and snapshot store
 - `internal/logging/` — middleware and tests
-- `test/` — reserved for end-to-end coverage
+
+### Health
+
+A loopback-only liveness probe is exposed at `GET /_gateway/health`.
+It returns `200` with body `{"status":"ok"}` and a `Content-Type` of
+`application/json`. The response is intentionally minimal — no version,
+no uptime, no upstream reachability check — because the trust model
+treats any local process as legitimate. Use it from a supervisor or
+`curl` to confirm the process is alive; pair it with `GET
+/_gateway/quota` if you also want to know whether traffic has flowed.
+
+## Security model
+
+The trust boundary is the loopback interface. Everything that can reach
+`127.0.0.1:8080` is considered authorised, so the gateway is safe to
+run alongside a single user account without authentication. The
+guarantees that follow from that:
+
+- The gateway owns the API key. Clients never see it — they may set
+  any placeholder in `ANTHROPIC_API_KEY` and the proxy replaces it
+  with the configured value on every outbound request.
+- Request and response bodies are not logged, persisted, or inspected.
+  The logging middleware records only `method`, `path`, `status`,
+  `duration`, and a request ID.
+- The client-supplied `x-api-key` is replaced with the configured key
+  before the upstream call; all other headers forwarded to the
+  upstream are otherwise untouched. No credential-sensitive field is
+  written to stderr.
+- Quota snapshots are stored only in process memory. There is no on-
+  disk state and no telemetry egress; stopping the gateway erases the
+  cache.
+- The proxy does not issue probe traffic. Every snapshot is the side
+  effect of a real request a client made, so there is no covert
+  channel that would let an operator learn anything an authorised
+  client could not learn themselves.
+- The listen address is loopback-only. `config.validate` rejects
+  `0.0.0.0`, public IPs, and unresolvable names so a misconfigured
+  deployment fails closed at startup.
 
 ## Quota snapshots
 
@@ -146,9 +183,29 @@ issues synthetic probe requests — if no client has hit the backend
 recently, the snapshot is stale by exactly that gap. Consumers that
 need fresh data should issue (or wait for) a real request.
 
+### Consumer contract
+
+The JSON shape returned by `/_gateway/quota` is the producer-side
+contract consumed by [`shukebeta/my-ai-team#588`](https://github.com/shukebeta/my-ai-team/issues/588).
+The gateway publishes whatever fields the upstream response carried
+and omits the rest; consumers are expected to adapt to the shape
+they observe rather than rely on a frozen schema. This means:
+
+- Field presence is signal, not noise. A `tokens_limit` field that
+  exists today may be absent tomorrow if Anthropic stops sending it.
+  Treat missing fields as "not advertised on the last response" rather
+  than "zero".
+- The endpoint returns `200` for known and unknown backend keys; the
+  caller decides whether the snapshot is meaningful by inspecting the
+  body.
+- The gateway does not ship compatibility shims. If the consumer needs
+  a renamed field, a converted unit, or a derived value, that
+  translation lives in the consumer.
+
 ## Why a thin proxy
 
 The proxy is the trust boundary — it owns the API key, and its
 logs are safe to share with any local tool. Quota observation
 piggy-backs on the same boundary: rate-limit headers come down on
 every response, so we capture them with zero extra upstream load.
+See [Security model](#security-model) for the full list of guarantees.

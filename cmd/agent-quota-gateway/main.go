@@ -79,6 +79,7 @@ func run() error {
 	// endpoint is mounted on a gateway-specific prefix so it cannot
 	// collide with anything the upstream Messages surface defines.
 	mux := http.NewServeMux()
+	mux.HandleFunc("/_gateway/health", healthHandler())
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store))
 	mux.Handle("/", proxyHandler)
 
@@ -125,6 +126,20 @@ func run() error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	return nil
+}
+
+// healthHandler returns a fixed {"status":"ok"} body. It is a loopback-
+// only liveness probe — the loopback trust model means it carries no
+// sensitive state, so the response shape is deliberately minimal and
+// does not expose the version, uptime, or upstream reachability. Any
+// additional readiness signal would belong on a separate endpoint so
+// callers can tell "process is alive" from "upstream is reachable".
+func healthHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}
 }
 
 // quotaHandler returns the JSON snapshot for the requested backend.
