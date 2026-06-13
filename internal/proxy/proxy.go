@@ -53,9 +53,6 @@ func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error
 	if err != nil {
 		return nil, err
 	}
-	if upstream.Scheme == "" || upstream.Host == "" {
-		return nil, errInvalidBaseURL
-	}
 
 	rp := httputil.NewSingleHostReverseProxy(upstream)
 
@@ -118,15 +115,6 @@ func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error
 		rp.ServeHTTP(w, r)
 	}), nil
 }
-
-// errInvalidBaseURL is returned when the configured upstream URL has no
-// scheme or host. We surface this at startup so misconfiguration is loud,
-// not silent.
-var errInvalidBaseURL = &configError{msg: "ANTHROPIC_BASE_URL must include scheme and host"}
-
-type configError struct{ msg string }
-
-func (e *configError) Error() string { return e.msg }
 
 // joinPath concatenates a base path with a request path, ensuring
 // exactly one slash between them and a leading slash on the result.

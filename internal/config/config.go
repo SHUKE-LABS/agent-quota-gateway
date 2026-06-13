@@ -69,14 +69,19 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// validate enforces the V1 contract: non-empty API key, parseable upstream
-// URL, and a loopback listen address. Future versions may relax these.
+// validate enforces the V1 contract: non-empty API key, an upstream URL
+// with a scheme and host, and a loopback listen address. Future versions
+// may relax these.
 func (c Config) validate() error {
 	if strings.TrimSpace(c.AnthropicAPIKey) == "" {
 		return errors.New("ANTHROPIC_API_KEY is required")
 	}
-	if _, err := url.Parse(c.AnthropicBaseURL); err != nil {
+	upstream, err := url.Parse(c.AnthropicBaseURL)
+	if err != nil {
 		return fmt.Errorf("ANTHROPIC_BASE_URL is invalid: %w", err)
+	}
+	if upstream.Scheme == "" || upstream.Host == "" {
+		return fmt.Errorf("ANTHROPIC_BASE_URL=%q: scheme and host are required", c.AnthropicBaseURL)
 	}
 	if err := validateListenAddr(c.ListenAddr); err != nil {
 		return err

@@ -95,3 +95,33 @@ func TestLoad_missingKey(t *testing.T) {
 		t.Fatal("Load() expected error when ANTHROPIC_API_KEY is empty")
 	}
 }
+
+func TestLoad_rejectsMalformedBaseURL(t *testing.T) {
+	cases := []string{
+		"foo",         // no scheme, no host
+		"http://",     // empty host
+		"not-a-url",   // no scheme, no host
+		"://broken",   // missing scheme and host
+	}
+	for _, raw := range cases {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv(EnvAnthropicBaseURL, raw)
+			t.Setenv(EnvAnthropicAPIKey, "k")
+			t.Setenv(EnvListenAddr, "127.0.0.1:8080")
+			cfg, err := Load()
+			if err == nil {
+				t.Fatalf("Load() baseURL=%q: expected error, got cfg=%+v", raw, cfg)
+			}
+		})
+	}
+}
+
+func TestLoad_acceptsValidBaseURL(t *testing.T) {
+	t.Setenv(EnvAnthropicBaseURL, "https://api.anthropic.com")
+	t.Setenv(EnvAnthropicAPIKey, "k")
+	t.Setenv(EnvListenAddr, "127.0.0.1:8080")
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+}
