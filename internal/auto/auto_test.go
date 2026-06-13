@@ -15,6 +15,8 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 )
 
+const testDefaultBaseURL = "https://api.anthropic.com"
+
 // fixedClock is a manually-advanced clock so reset-window logic is
 // deterministic and free of real sleeps.
 type fixedClock struct {
@@ -34,26 +36,26 @@ func (c *fixedClock) advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-// testRegistry builds a Registry over the named backends via the public
-// env path (loadFrom is unexported in package backend). Credentials are
-// "cred-<nick>" so a leak test can grep for "cred".
+// testRegistry builds a Registry with all nicks in a single "auto" pool
+// via the public env path (loadFrom is unexported in package backend).
+// Credentials are "cred-<nick>" so a leak test can grep for "cred".
 func testRegistry(t *testing.T, nicks ...string) *backend.Registry {
 	t.Helper()
 	for _, n := range nicks {
-		t.Setenv(backend.EnvPrefix+strings.ToUpper(n), "cred-"+n)
+		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
 	}
-	reg, err := backend.Load()
+	reg, err := backend.Load(testDefaultBaseURL)
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
 	return reg
 }
 
-// auto429 builds an upstream 429 response for backend nick b, flagged
-// auto-routed, carrying a unified-reset header resetIn from the clock's
-// current time (resetIn <= 0 omits the header).
-func auto429(b backend.Backend, clock *fixedClock, resetIn time.Duration) *http.Response {
-	ctx := backend.MarkAuto(backend.WithBackend(context.Background(), b))
+// resp429 builds an upstream 429 response for backend b, carrying a
+// unified-reset header resetIn from the clock's current time (resetIn <= 0
+// omits the header).
+func resp429(b backend.Backend, clock *fixedClock, resetIn time.Duration) *http.Response {
+	ctx := backend.WithBackend(context.Background(), b)
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
 	h := http.Header{}
 	h.Set("anthropic-ratelimit-unified-status", "rejected")
@@ -70,7 +72,16 @@ func auto429(b backend.Backend, clock *fixedClock, resetIn time.Duration) *http.
 
 func newController(t *testing.T, start int, clock *fixedClock, logOut io.Writer, nicks ...string) *Controller {
 	t.Helper()
-	return NewController(testRegistry(t, nicks...), start, clock.now, logOut)
+	return NewController(testRegistry(t, nicks...), "auto", start, clock.now, logOut)
+}
+
+func (c *Controller) resolve(t *testing.T, nick string) backend.Backend {
+	t.Helper()
+	b, ok := c.reg.ResolveIn(c.pool, nick)
+	if !ok {
+		t.Fatalf("ResolveIn(%q,%q) not found", c.pool, nick)
+	}
+	return b
 }
 
 func TestResolveAuto_stickyWhileHealthy(t *testing.T) {
@@ -96,8 +107,7 @@ func TestModifyResponse_429RewritesTo503AndAdvances(t *testing.T) {
 	var logBuf bytes.Buffer
 	c := newController(t, 0, clock, &logBuf, "a", "b", "c")
 
-	a, _ := c.reg.Resolve("a")
-	resp := auto429(a, clock, time.Hour)
+	resp := resp429(c.resolve(t, "a"), clock, time.Hour)
 	resp.Header.Set("anthropic-ratelimit-unified-5h-utilization", "1.0")
 
 	if err := c.ModifyResponse(resp); err != nil {
@@ -126,7 +136,7 @@ func TestModifyResponse_429RewritesTo503AndAdvances(t *testing.T) {
 	if got := c.Current(); got != "b" {
 		t.Errorf("Current()=%q, want b (advanced off the 429'd backend)", got)
 	}
-	if log := logBuf.String(); !strings.Contains(log, "auto: a -> b (a hit 429)") {
+	if log := logBuf.String(); !strings.Contains(log, "auto[auto]: a -> b (a hit 429)") {
 		t.Errorf("switch not logged as expected; got %q", log)
 	}
 }
@@ -134,25 +144,9 @@ func TestModifyResponse_429RewritesTo503AndAdvances(t *testing.T) {
 func TestModifyResponse_passThroughCases(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "a", "b")
-	a, _ := c.reg.Resolve("a")
 
-	t.Run("non-auto 429 is not rewritten", func(t *testing.T) {
-		ctx := backend.WithBackend(context.Background(), a) // no MarkAuto
-		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
-		resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Request: req, Body: io.NopCloser(strings.NewReader("x"))}
-		if err := c.ModifyResponse(resp); err != nil {
-			t.Fatalf("ModifyResponse: %v", err)
-		}
-		if resp.StatusCode != http.StatusTooManyRequests {
-			t.Errorf("explicit-selector 429 was rewritten to %d; want untouched 429", resp.StatusCode)
-		}
-		if c.Current() != "a" {
-			t.Errorf("currentAuto moved on a non-auto request")
-		}
-	})
-
-	t.Run("auto non-429 is untouched", func(t *testing.T) {
-		ctx := backend.MarkAuto(backend.WithBackend(context.Background(), a))
+	t.Run("non-429 is untouched", func(t *testing.T) {
+		ctx := backend.WithBackend(context.Background(), c.resolve(t, "a"))
 		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
 		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Request: req, Body: io.NopCloser(strings.NewReader("ok"))}
 		if err := c.ModifyResponse(resp); err != nil {
@@ -160,6 +154,20 @@ func TestModifyResponse_passThroughCases(t *testing.T) {
 		}
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("status=%d, want 200 untouched", resp.StatusCode)
+		}
+		if c.Current() != "a" {
+			t.Errorf("currentAuto moved on a non-429 response")
+		}
+	})
+
+	t.Run("429 with no resolved backend is untouched", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil) // no WithBackend
+		resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Request: req, Body: io.NopCloser(strings.NewReader("x"))}
+		if err := c.ModifyResponse(resp); err != nil {
+			t.Fatalf("ModifyResponse: %v", err)
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Errorf("status=%d, want untouched 429 when no backend is on context", resp.StatusCode)
 		}
 	})
 }
@@ -169,11 +177,8 @@ func TestModifyResponse_allExhaustedForwards429WithRetryAfter(t *testing.T) {
 	var logBuf bytes.Buffer
 	c := newController(t, 0, clock, &logBuf, "a", "b")
 
-	a, _ := c.reg.Resolve("a")
-	b, _ := c.reg.Resolve("b")
-
 	// a 429s with a far reset; switch to b succeeds (503).
-	if err := c.ModifyResponse(auto429(a, clock, 300*time.Second)); err != nil {
+	if err := c.ModifyResponse(resp429(c.resolve(t, "a"), clock, 300*time.Second)); err != nil {
 		t.Fatalf("ModifyResponse a: %v", err)
 	}
 	if c.Current() != "b" {
@@ -181,7 +186,7 @@ func TestModifyResponse_allExhaustedForwards429WithRetryAfter(t *testing.T) {
 	}
 
 	// b 429s with the sooner reset; pool is now dry → honest 429.
-	resp := auto429(b, clock, 120*time.Second)
+	resp := resp429(c.resolve(t, "b"), clock, 120*time.Second)
 	if err := c.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse b: %v", err)
 	}
@@ -214,10 +219,9 @@ func TestModifyResponse_allExhaustedForwards429WithRetryAfter(t *testing.T) {
 func TestResolveAuto_reEligibleAfterReset(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "solo")
-	solo, _ := c.reg.Resolve("solo")
 
 	// The only backend 429s → pool dry.
-	resp := auto429(solo, clock, 100*time.Second)
+	resp := resp429(c.resolve(t, "solo"), clock, 100*time.Second)
 	if err := c.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
@@ -239,15 +243,14 @@ func TestResolveAuto_reEligibleAfterReset(t *testing.T) {
 	}
 }
 
-// TestModifyResponse_missingResetHeaderParksConservatively proves a 429
-// with no usable reset still parks the backend (failover proceeds) rather
-// than looping back onto the dead backend.
+// TestModifyResponse_missingResetHeaderParks proves a 429 with no usable
+// reset still parks the backend (failover proceeds) rather than looping
+// back onto the dead backend.
 func TestModifyResponse_missingResetHeaderParks(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "solo")
-	solo, _ := c.reg.Resolve("solo")
 
-	resp := auto429(solo, clock, 0) // no reset header
+	resp := resp429(c.resolve(t, "solo"), clock, 0) // no reset header
 	if err := c.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
@@ -270,9 +273,8 @@ func TestController_neverLogsCredentials(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	var logBuf bytes.Buffer
 	c := newController(t, 0, clock, &logBuf, "a", "b")
-	a, _ := c.reg.Resolve("a")
 
-	_ = c.ModifyResponse(auto429(a, clock, time.Hour))
+	_ = c.ModifyResponse(resp429(c.resolve(t, "a"), clock, time.Hour))
 	if strings.Contains(logBuf.String(), "cred") {
 		t.Errorf("switch log leaked a credential: %q", logBuf.String())
 	}
@@ -292,7 +294,7 @@ func TestController_concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			b, _, _ := c.ResolveAuto()
-			_ = c.ModifyResponse(auto429(b, clock, 30*time.Second))
+			_ = c.ModifyResponse(resp429(b, clock, 30*time.Second))
 			_ = c.Current()
 		}()
 	}
@@ -307,9 +309,61 @@ func TestNewController_randomStartIsValid(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	valid := map[string]bool{"a": true, "b": true, "c": true}
 	for i := 0; i < 20; i++ {
-		c := NewController(testRegistry(t, "a", "b", "c"), -1, clock.now, io.Discard)
+		c := NewController(testRegistry(t, "a", "b", "c"), "auto", -1, clock.now, io.Discard)
 		if got := c.Current(); !valid[got] {
 			t.Fatalf("random start produced invalid nick %q", got)
 		}
+	}
+}
+
+// TestPools_routesPerPool proves the Pools wrapper isolates controllers
+// per pool: routing returns a member of the named pool, an unknown pool
+// fails closed, a 429 fails over within its own pool, and the other pool
+// is untouched.
+func TestPools_routesPerPool(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_A", "cred-a")
+	t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_B", "cred-b")
+	t.Setenv(backend.EnvPrefix+"API_BACKEND_K", "cred-k")
+	reg, err := backend.Load(testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := NewPools(reg, clock.now, io.Discard)
+
+	// Unknown pool fails closed.
+	if _, _, ok, _ := pools.Route("nope"); ok {
+		t.Error("Route(nope) ok=true, want false")
+	}
+
+	// A known pool returns one of its own members.
+	autoB, _, ok, _ := pools.Route("auto")
+	if !ok {
+		t.Fatal("Route(auto) ok=false, want true")
+	}
+	if autoB.Pool != "auto" {
+		t.Errorf("Route(auto) returned pool %q, want auto", autoB.Pool)
+	}
+
+	// A 429 on the api pool's member must not disturb the auto pool.
+	apiB, _, _, _ := pools.Route("api")
+	if apiB.Pool != "api" {
+		t.Fatalf("Route(api) returned pool %q, want api", apiB.Pool)
+	}
+	resp := resp429(apiB, clock, time.Hour)
+	if err := pools.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+	// api is a single-member pool → dry → honest 429.
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("api 429 status=%d, want 429 (single-member pool dry)", resp.StatusCode)
+	}
+	// The auto pool is still healthy and resolvable.
+	if _, _, _, exhausted := pools.Route("auto"); exhausted {
+		t.Error("auto pool reported exhausted after an api-pool 429")
+	}
+	cur, ok := pools.Current("auto")
+	if !ok || cur.Pool != "auto" {
+		t.Errorf("Current(auto) = (%+v,%v), want an auto-pool member", cur, ok)
 	}
 }

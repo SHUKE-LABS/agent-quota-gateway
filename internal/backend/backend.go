@@ -1,85 +1,120 @@
-// Package backend holds the gateway's registry of named upstream
-// credentials and the request-scoped resolution of an inbound selector
-// to one of them.
+// Package backend holds the gateway's registry of named upstream pools
+// and the request-scoped resolution of an inbound selector to a backend
+// within one of them.
 //
 // The gateway owns every upstream credential. A client never sends a
-// real token: it sends a *selector* (via ANTHROPIC_AUTH_TOKEN, which
-// Claude Code puts on the Authorization header), and the gateway swaps
-// in the selected backend's credential before forwarding. Backends are
-// declared purely through the process environment — there is no
-// credential file, so the gateway keeps its "no on-disk state" posture.
+// real token: it sends a *pool name* (via ANTHROPIC_AUTH_TOKEN, which
+// Claude Code puts on the Authorization header), and the gateway picks a
+// backend from that pool and swaps in its credential before forwarding.
+//
+// Everything is a pool. There is no non-pool mode and no implicit
+// default pool: every backend is declared inside a named pool through
+// the process environment. A pool groups *interchangeable* backends —
+// same protocol, same quota semantics — so the auto-rotation that fronts
+// every pool can fail over between its members without changing the
+// observable model or quota behaviour. Backends are declared purely
+// through environment variables; there is no credential file, so the
+// gateway keeps its "no on-disk state" posture.
 package backend
 
 import (
-	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
-	"time"
 )
 
-// EnvPrefix marks an environment variable as a backend declaration:
-// AQG_BACKEND_<NICK>=<credential>. The part after the prefix is
-// normalized into the selector clients use (see normalizeNick).
-const EnvPrefix = "AQG_BACKEND_"
+// EnvPrefix marks an environment variable as belonging to the pool
+// configuration namespace. Two shapes are recognised under it:
+//
+//	AQG_POOL_<POOL>_BASE_URL=<upstream>            // the pool's default upstream
+//	AQG_POOL_<POOL>_BACKEND_<NICK>=<cred>[|<url>]  // one member of the pool
+//
+// <POOL> and <NICK> are normalized (see normalizeName): lowercased, with
+// underscores folded to hyphens, so AQG_POOL_Z_AI_BACKEND_KEY_A is
+// addressed as pool "z-ai", member "key-a".
+const EnvPrefix = "AQG_POOL_"
 
-// AutoSelector is the reserved selector that asks the gateway to pick a
-// pooled backend itself (global-sticky with reactive 429 failover). It
-// is not a configurable nick: a backend that normalizes to "auto" is
-// rejected at load so the reserved word stays unambiguous.
-const AutoSelector = "auto"
+// baseURLSuffix and backendInfix are the two structural markers inside an
+// EnvPrefix key. backendInfix is checked first so a member declaration
+// always wins over the base-URL shape.
+const (
+	baseURLSuffix = "_BASE_URL"
+	backendInfix  = "_BACKEND_"
+)
 
-// AutoResolver is the gateway's auto-selector strategy, kept as an
-// interface here so the resolver middleware can call it without the
-// backend package importing the auto package (which itself depends on
-// this one). The concrete implementation lives in internal/auto.
-type AutoResolver interface {
-	// ResolveAuto returns the sticky backend to serve an `auto` request.
-	// When exhausted is true the whole pool is rate-limited and the
-	// caller must emit 429 with the given Retry-After (the wait until the
-	// soonest backend resets); b is then the soonest-resetting backend
-	// the client's post-wait retry will land on.
-	ResolveAuto() (b Backend, retryAfter time.Duration, exhausted bool)
-}
+// credURLSep splits a member's value into its credential and an optional
+// per-member base-URL override: <credential>|<url>. A credential that
+// itself contains this byte is rejected at load because the tail must
+// then parse as a URL and won't.
+const credURLSep = '|'
 
-// IsAutoSelector reports whether a selector names the reserved auto
-// selector, matched with the same normalization as a nick.
-func IsAutoSelector(selector string) bool {
-	return normalizeSelector(selector) == AutoSelector
-}
-
-// Backend is one resolved upstream identity. Credential is the real
-// secret the proxy stamps outbound; Nick is the stable key the selector
-// resolves to and the quota store files snapshots under.
+// Backend is one resolved upstream identity within a pool. Credential is
+// the real secret the proxy stamps outbound; Nick is the stable per-pool
+// handle the quota store and logs use; BaseURL is the upstream this
+// backend forwards to (the pool default, or a per-member override). Pool
+// is the client-facing selector this backend belongs to.
+//
+// All fields are strings so Backend stays comparable and safe to carry
+// by value on a request context.
 type Backend struct {
+	Pool       string
 	Nick       string
 	Credential string
+	BaseURL    string
 }
 
-// Registry maps selector nicks to backends. It is immutable after Load
+// QuotaKey is the stable key the quota store files this backend's
+// snapshots under. Nicks are unique only within a pool, so the key is
+// qualified by pool to stay globally unique.
+func (b Backend) QuotaKey() string {
+	return b.Pool + "/" + b.Nick
+}
+
+// Registry maps pool names to their members. It is immutable after Load
 // and safe for concurrent reads.
 type Registry struct {
-	byNick map[string]Backend
+	pools map[string]*pool
 }
 
-// Load builds a Registry from AQG_BACKEND_* environment variables.
-//
-// It fails closed: an empty credential, two declarations that normalize
-// to the same nick, or no backends at all are all startup errors rather
-// than a gateway that silently can't route. The credential value itself
-// is never included in an error message.
-func Load() (*Registry, error) {
-	return loadFrom(os.Environ())
+// pool is one named, immutable set of interchangeable backends.
+type pool struct {
+	name   string
+	byNick map[string]Backend
+	nicks  []string // sorted, stable order for the auto controller
+}
+
+// Load builds a Registry from AQG_POOL_* environment variables, using
+// defaultBaseURL (the gateway's ANTHROPIC_BASE_URL) for any pool that
+// does not declare its own.
+func Load(defaultBaseURL string) (*Registry, error) {
+	return loadFrom(os.Environ(), defaultBaseURL)
+}
+
+// rawMember is a parsed member declaration before its base URL is
+// resolved (the pool default may appear later in the environ scan).
+type rawMember struct {
+	pool        string
+	nick        string
+	cred        string
+	urlOverride string // "" when the member did not override the pool default
+	originKey   string // the env var, for collision/error messages
 }
 
 // loadFrom is Load's testable core: it takes "KEY=VALUE" entries in the
 // same shape as os.Environ().
-func loadFrom(environ []string) (*Registry, error) {
-	byNick := make(map[string]Backend)
-	// originKey records which env var produced each nick so a collision
-	// error can name both sides.
-	originKey := make(map[string]string)
+//
+// It fails closed: a malformed key, an empty credential/nick/pool, a
+// collision, a base URL on a pool with no members, a malformed upstream
+// URL, or no pools at all are all startup errors rather than a gateway
+// that silently can't route. Credential values are never echoed in an
+// error.
+func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
+	poolBaseURL := make(map[string]string) // pool -> declared default upstream
+	poolURLOrigin := make(map[string]string)
+	var members []rawMember
+	originKey := make(map[string]string) // pool/nick -> env var that produced it
 
 	for _, kv := range environ {
 		eq := strings.IndexByte(kv, '=')
@@ -90,98 +125,183 @@ func loadFrom(environ []string) (*Registry, error) {
 		if !strings.HasPrefix(key, EnvPrefix) {
 			continue
 		}
-		rawNick := strings.TrimPrefix(key, EnvPrefix)
-		nick := normalizeNick(rawNick)
-		if nick == "" {
-			return nil, fmt.Errorf("backend: %s has an empty nick", key)
+		rest := key[len(EnvPrefix):]
+
+		// A member declaration wins over the base-URL shape: a value like
+		// AQG_POOL_X_BACKEND_A is always "member A of pool X".
+		if idx := strings.Index(rest, backendInfix); idx >= 0 {
+			poolName := normalizeName(rest[:idx])
+			nick := normalizeName(rest[idx+len(backendInfix):])
+			if poolName == "" {
+				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
+			}
+			if nick == "" {
+				return nil, fmt.Errorf("backend: %s has an empty nick", key)
+			}
+			cred, override, err := splitCredURL(val)
+			if err != nil {
+				return nil, fmt.Errorf("backend: %s %w", key, err)
+			}
+			qkey := poolName + "/" + nick
+			if prev, dup := originKey[qkey]; dup {
+				return nil, fmt.Errorf("backend: %s and %s both map to pool %q nick %q", prev, key, poolName, nick)
+			}
+			originKey[qkey] = key
+			members = append(members, rawMember{
+				pool:        poolName,
+				nick:        nick,
+				cred:        cred,
+				urlOverride: override,
+				originKey:   key,
+			})
+			continue
 		}
-		if nick == AutoSelector {
-			return nil, fmt.Errorf("backend: %s maps to the reserved nick %q; %q is the auto selector and cannot be a backend", key, AutoSelector, AutoSelector)
+
+		if poolPart, ok := strings.CutSuffix(rest, baseURLSuffix); ok {
+			poolName := normalizeName(poolPart)
+			if poolName == "" {
+				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
+			}
+			if val == "" {
+				return nil, fmt.Errorf("backend: %s has an empty base URL", key)
+			}
+			if prev, dup := poolURLOrigin[poolName]; dup {
+				return nil, fmt.Errorf("backend: %s and %s both set the base URL for pool %q", prev, key, poolName)
+			}
+			poolURLOrigin[poolName] = key
+			poolBaseURL[poolName] = val
+			continue
 		}
-		if val == "" {
-			return nil, fmt.Errorf("backend: %s has an empty credential", key)
-		}
-		if prev, dup := originKey[nick]; dup {
-			return nil, fmt.Errorf("backend: %s and %s both map to nick %q", prev, key, nick)
-		}
-		originKey[nick] = key
-		byNick[nick] = Backend{Nick: nick, Credential: val}
+
+		return nil, fmt.Errorf("backend: %s is not a recognised %s<POOL>%s or %s<POOL>%s<NICK> declaration", key, EnvPrefix, baseURLSuffix, EnvPrefix, backendInfix)
 	}
 
-	if len(byNick) == 0 {
-		return nil, fmt.Errorf("backend: no backends configured; set at least one %s<NICK>", EnvPrefix)
+	if len(members) == 0 {
+		return nil, fmt.Errorf("backend: no backends configured; set at least one %s<POOL>%s<NICK>", EnvPrefix, backendInfix)
 	}
-	return &Registry{byNick: byNick}, nil
+
+	pools := make(map[string]*pool)
+	for _, m := range members {
+		raw := defaultBaseURL
+		if u, ok := poolBaseURL[m.pool]; ok {
+			raw = u
+		}
+		if m.urlOverride != "" {
+			raw = m.urlOverride
+		}
+		baseURL, err := validateBaseURL(raw)
+		if err != nil {
+			return nil, fmt.Errorf("backend: %s has an invalid base URL: %w", m.originKey, err)
+		}
+		p := pools[m.pool]
+		if p == nil {
+			p = &pool{name: m.pool, byNick: make(map[string]Backend)}
+			pools[m.pool] = p
+		}
+		p.byNick[m.nick] = Backend{
+			Pool:       m.pool,
+			Nick:       m.nick,
+			Credential: m.cred,
+			BaseURL:    baseURL,
+		}
+	}
+
+	// A base URL declared for a pool with no members is almost certainly a
+	// typo'd nick; fail closed rather than silently ignore it.
+	for poolName, origin := range poolURLOrigin {
+		if _, ok := pools[poolName]; !ok {
+			return nil, fmt.Errorf("backend: %s sets a base URL for pool %q, which has no backends", origin, poolName)
+		}
+	}
+
+	for _, p := range pools {
+		p.nicks = make([]string, 0, len(p.byNick))
+		for nick := range p.byNick {
+			p.nicks = append(p.nicks, nick)
+		}
+		sort.Strings(p.nicks)
+	}
+	return &Registry{pools: pools}, nil
 }
 
-// Resolve returns the backend a selector names. The selector is matched
-// case-insensitively against the normalized nick. ok is false when no
-// backend matches — the caller must fail closed rather than fall back.
-func (r *Registry) Resolve(selector string) (Backend, bool) {
-	b, ok := r.byNick[normalizeSelector(selector)]
-	return b, ok
+// splitCredURL splits a member value into its credential and an optional
+// base-URL override. The override is everything after the first
+// separator byte. An empty credential is an error.
+func splitCredURL(val string) (cred, override string, err error) {
+	cred = val
+	if i := strings.IndexByte(val, credURLSep); i >= 0 {
+		cred = val[:i]
+		override = val[i+1:]
+	}
+	if cred == "" {
+		return "", "", fmt.Errorf("has an empty credential")
+	}
+	return cred, override, nil
 }
 
-// Nicks returns the configured nicks in sorted order. Intended for
-// startup logging and diagnostics — it exposes names, never credentials.
-func (r *Registry) Nicks() []string {
-	out := make([]string, 0, len(r.byNick))
-	for nick := range r.byNick {
-		out = append(out, nick)
+// validateBaseURL enforces that an upstream has a scheme and host, the
+// same contract config applies to ANTHROPIC_BASE_URL. The validated
+// value is returned unchanged.
+func validateBaseURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("scheme and host are required, got %q", raw)
+	}
+	return raw, nil
+}
+
+// HasPool reports whether name (normalized) is a configured pool.
+func (r *Registry) HasPool(name string) bool {
+	_, ok := r.pools[normalizeName(name)]
+	return ok
+}
+
+// PoolNames returns the configured pool names in sorted order. Intended
+// for startup logging and for building one auto controller per pool — it
+// exposes names, never credentials.
+func (r *Registry) PoolNames() []string {
+	out := make([]string, 0, len(r.pools))
+	for name := range r.pools {
+		out = append(out, name)
 	}
 	sort.Strings(out)
 	return out
 }
 
-// normalizeNick canonicalizes the env-key suffix into a selector nick:
-// lowercase, with underscores folded to hyphens so AQG_BACKEND_CLAUDE_A
-// is addressed as "claude-a". Surrounding hyphens are trimmed.
-func normalizeNick(raw string) string {
-	n := strings.ToLower(strings.TrimSpace(raw))
-	n = strings.ReplaceAll(n, "_", "-")
-	return strings.Trim(n, "-")
+// PoolNicks returns the member nicks of a pool in sorted order, or nil
+// when the pool is unknown.
+func (r *Registry) PoolNicks(poolName string) []string {
+	p, ok := r.pools[normalizeName(poolName)]
+	if !ok {
+		return nil
+	}
+	out := make([]string, len(p.nicks))
+	copy(out, p.nicks)
+	return out
 }
 
-// normalizeSelector canonicalizes an inbound selector the same way a
-// nick is canonicalized, so the value a client puts in
-// ANTHROPIC_AUTH_TOKEN matches the configured nick regardless of case.
-func normalizeSelector(sel string) string {
-	return normalizeNick(sel)
-}
-
-// ctxKey is unexported so no other package can collide with our context
-// value.
-type ctxKey struct{}
-
-// WithBackend returns a copy of ctx carrying b, for the proxy director
-// and quota observer to read after the resolver middleware runs.
-func WithBackend(ctx context.Context, b Backend) context.Context {
-	return context.WithValue(ctx, ctxKey{}, b)
-}
-
-// FromContext returns the backend stored by WithBackend. ok is false
-// when no backend was resolved for the request.
-func FromContext(ctx context.Context) (Backend, bool) {
-	b, ok := ctx.Value(ctxKey{}).(Backend)
+// ResolveIn returns the backend named by nick within poolName. ok is
+// false when either the pool or the nick is unknown — the caller must
+// fail closed rather than fall back.
+func (r *Registry) ResolveIn(poolName, nick string) (Backend, bool) {
+	p, ok := r.pools[normalizeName(poolName)]
+	if !ok {
+		return Backend{}, false
+	}
+	b, ok := p.byNick[normalizeName(nick)]
 	return b, ok
 }
 
-// autoKey is unexported so no other package can collide with our
-// auto-flag context value.
-type autoKey struct{}
-
-// MarkAuto returns a copy of ctx flagged as an auto-routed request. The
-// auto controller's response hook reads this to decide whether an
-// upstream 429 should trigger failover (auto) or pass through honestly
-// (an explicit selector has no failover target).
-func MarkAuto(ctx context.Context) context.Context {
-	return context.WithValue(ctx, autoKey{}, true)
-}
-
-// IsAutoRequest reports whether ctx was flagged by MarkAuto — i.e. the
-// request resolved through the `auto` selector rather than an explicit
-// backend nick.
-func IsAutoRequest(ctx context.Context) bool {
-	v, _ := ctx.Value(autoKey{}).(bool)
-	return v
+// normalizeName canonicalizes a pool name or nick: lowercase, with
+// underscores folded to hyphens (so AQG_POOL_Z_AI is addressed as
+// "z-ai"), and surrounding hyphens trimmed. The same normalization is
+// applied to an inbound selector so the client value matches regardless
+// of case.
+func normalizeName(raw string) string {
+	n := strings.ToLower(strings.TrimSpace(raw))
+	n = strings.ReplaceAll(n, "_", "-")
+	return strings.Trim(n, "-")
 }

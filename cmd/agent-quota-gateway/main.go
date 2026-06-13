@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,16 +40,16 @@ func run() error {
 		return fmt.Errorf("config: %w", err)
 	}
 
-	registry, err := backend.Load()
+	registry, err := backend.Load(cfg.AnthropicBaseURL)
 	if err != nil {
 		return fmt.Errorf("backend: %w", err)
 	}
 
-	// autoCtl is the `auto` selector's global-sticky controller. The
-	// random start index (start < 0) anchors each restart at a different
-	// backend with no probe traffic; its quota snapshot fills in from the
+	// pools fronts every configured pool with its own sticky controller.
+	// Each controller starts at a random member (start < 0) so no probe
+	// traffic is needed to anchor it; its quota snapshot fills in from the
 	// first real response.
-	autoCtl := auto.NewController(registry, -1, nil, nil)
+	pools := auto.NewPools(registry, nil, nil)
 
 	store := quota.NewStore()
 
@@ -71,17 +72,16 @@ func run() error {
 		key := defaultBackendKey
 		if resp.Request != nil {
 			if b, ok := backend.FromContext(resp.Request.Context()); ok {
-				key = b.Nick
+				key = b.QuotaKey()
 			}
 		}
 		store.Put(key, snap)
 	}
 
-	// The auto controller's ModifyResponse hook runs after the observer:
-	// it fails over (429 -> 503) or forwards an honest 429 only for
-	// auto-routed requests, leaving every explicit-selector response
-	// untouched.
-	proxyHandler, err := proxy.New(cfg.AnthropicBaseURL, observer, autoCtl.ModifyResponse)
+	// The pools' ModifyResponse hook runs after the observer: it dispatches
+	// to the controller of the pool the request resolved through and fails
+	// over (429 -> 503) or forwards an honest 429 within that pool.
+	proxyHandler, err := proxy.New(observer, pools.ModifyResponse)
 	if err != nil {
 		return fmt.Errorf("proxy: %w", err)
 	}
@@ -93,8 +93,8 @@ func run() error {
 	// endpoints are mounted directly and take no selector.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/health", healthHandler())
-	mux.HandleFunc("/_gateway/quota", quotaHandler(store, autoCtl))
-	mux.Handle("/", backend.Middleware(registry, autoCtl, proxyHandler))
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
+	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
 	handler := logging.Middleware(mux)
 
@@ -120,7 +120,7 @@ func run() error {
 		errCh <- nil
 	}()
 
-	fmt.Fprintf(os.Stderr, "agent-quota-gateway listening on %s -> %s\n", cfg.ListenAddr, cfg.AnthropicBaseURL)
+	fmt.Fprintf(os.Stderr, "agent-quota-gateway listening on %s; default upstream %s; pools %s\n", cfg.ListenAddr, cfg.AnthropicBaseURL, strings.Join(registry.PoolNames(), ", "))
 
 	select {
 	case err := <-errCh:
@@ -162,30 +162,28 @@ func healthHandler() http.HandlerFunc {
 	}
 }
 
-// autoQuotaView is the /_gateway/quota?backend=auto response: the active
-// sticky backend's snapshot with an added active_backend field naming the
-// nick. The embedded Snapshot promotes its fields into the same JSON
-// object, so a consumer that asks `auto` gets the snapshot it would have
-// gotten by naming the backend directly, plus the name itself — it needs
+// poolQuotaView is the /_gateway/quota?backend=<pool> response: the
+// pool's active sticky member's snapshot with an added active_backend
+// field naming the member nick. The embedded Snapshot promotes its
+// fields into the same JSON object, so a consumer that asks for a pool
+// gets the active member's snapshot plus the member's name — it needs
 // zero knowledge of pool membership, and the 99%->5% jump on a switch is
 // self-explained because active_backend changes alongside it.
-type autoQuotaView struct {
+type poolQuotaView struct {
 	quota.Snapshot
 	ActiveBackend string `json:"active_backend"`
 }
 
-// quotaHandler returns the JSON snapshot for the requested backend.
+// quotaHandler returns the JSON snapshot for the requested pool.
 //
 // Method is GET only — POSTing here would suggest the endpoint mutates
-// state, which it does not. The backend nick comes from the `?backend=`
-// query param and defaults to defaultBackendKey, so a plain `curl
-// /_gateway/quota` reads the default snapshot back. The reserved value
-// `auto` resolves to the current sticky backend and adds active_backend.
-// Unknown keys return 200 with an empty snapshot (just backend + as_of) —
-// the distinction the caller cares about ("did I get quota data?") is
-// answered by which fields are present in the JSON body, not by the
-// status code.
-func quotaHandler(store *quota.Store, autoCtl *auto.Controller) http.HandlerFunc {
+// state, which it does not. The pool name comes from the `?backend=`
+// query param. A known pool resolves to its active sticky member and adds
+// active_backend. An unknown pool (or a missing param) returns 200 with
+// an empty snapshot (just backend + as_of) — the distinction the caller
+// cares about ("did I get quota data?") is answered by which fields are
+// present in the JSON body, not by the status code.
+func quotaHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -193,17 +191,15 @@ func quotaHandler(store *quota.Store, autoCtl *auto.Controller) http.HandlerFunc
 			return
 		}
 		key := r.URL.Query().Get("backend")
-		if key == "" {
-			key = defaultBackendKey
-		}
 		w.Header().Set("Content-Type", "application/json")
-		if autoCtl != nil && backend.IsAutoSelector(key) {
-			nick := autoCtl.Current()
-			_ = json.NewEncoder(w).Encode(autoQuotaView{
-				Snapshot:      store.Get(nick),
-				ActiveBackend: nick,
-			})
-			return
+		if pools != nil {
+			if b, ok := pools.Current(key); ok {
+				_ = json.NewEncoder(w).Encode(poolQuotaView{
+					Snapshot:      store.Get(b.QuotaKey()),
+					ActiveBackend: b.Nick,
+				})
+				return
+			}
 		}
 		_ = json.NewEncoder(w).Encode(store.Get(key))
 	}

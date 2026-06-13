@@ -8,45 +8,54 @@ import (
 	"time"
 )
 
+// PoolRouter picks the backend an inbound request resolves to. The
+// gateway fronts every pool with auto-rotation, so a request names a
+// pool and the router returns that pool's current sticky backend.
+//
+// The interface is kept here so the resolver middleware can call it
+// without the backend package importing the auto package (which itself
+// depends on this one). The concrete implementation lives in
+// internal/auto.
+type PoolRouter interface {
+	// Route returns the backend to serve a request for the named pool.
+	// ok is false when the pool name is unknown (the middleware fails
+	// closed with 403). When exhausted is true the whole pool is
+	// rate-limited and the caller must emit 429 with the given
+	// Retry-After (the wait until the soonest member resets); b is then
+	// the soonest-resetting member the client's post-wait retry lands on.
+	Route(pool string) (b Backend, retryAfter time.Duration, ok, exhausted bool)
+}
+
 // Middleware resolves the inbound selector to a backend and stores it on
 // the request context for the proxy director and quota observer. It
 // wraps only the proxy handler — the gateway's own /_gateway endpoints
 // take no selector.
 //
 // The selector arrives as the Authorization bearer token: Claude Code
-// puts ANTHROPIC_AUTH_TOKEN there, and here that value is a local
-// backend name, not a credential. An unknown or missing selector fails
-// closed with 403 and never reaches the upstream. The selector value is
-// deliberately never logged or echoed — a misconfigured client could
-// have put a real token there, and we must not leak it.
-//
-// The reserved selector "auto" routes through the supplied AutoResolver
-// instead of the static registry: the gateway picks the sticky backend
-// and flags the request so the proxy's response hook can fail over on a
-// 429. When auto is nil (no resolver wired) the word "auto" has no
-// special meaning and falls through to the registry, which fails closed
-// because "auto" is a reserved nick that can never be configured.
-func Middleware(reg *Registry, auto AutoResolver, next http.Handler) http.Handler {
+// puts ANTHROPIC_AUTH_TOKEN there, and here that value is a local *pool
+// name*, not a credential. The router auto-rotates within that pool. An
+// unknown pool fails closed with 403 and never reaches the upstream; an
+// exhausted pool returns an honest 429 with a precise Retry-After. The
+// selector value is deliberately never logged or echoed — a
+// misconfigured client could have put a real token there, and we must
+// not leak it.
+func Middleware(router PoolRouter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		selector := bearerToken(r.Header.Get("Authorization"))
+		// Normalize the selector here so the router does a direct lookup
+		// against the (already normalized) pool names: the client may send
+		// any case, and ANTHROPIC_AUTH_TOKEN=AUTO must match pool "auto".
+		selector := normalizeName(bearerToken(r.Header.Get("Authorization")))
 
-		if auto != nil && IsAutoSelector(selector) {
-			b, retryAfter, exhausted := auto.ResolveAuto()
-			if exhausted {
-				// Whole pool is rate-limited; there is nothing to switch
-				// to, so be honest: 429 with the precise wait until the
-				// soonest backend resets.
-				writeRateLimited(w, retryAfter)
-				return
-			}
-			ctx := MarkAuto(WithBackend(r.Context(), b))
-			next.ServeHTTP(w, r.WithContext(ctx))
-			return
-		}
-
-		b, ok := reg.Resolve(selector)
+		b, retryAfter, ok, exhausted := router.Route(selector)
 		if !ok {
 			writeForbidden(w)
+			return
+		}
+		if exhausted {
+			// Whole pool is rate-limited; there is nothing to switch to,
+			// so be honest: 429 with the precise wait until the soonest
+			// member resets.
+			writeRateLimited(w, retryAfter)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(WithBackend(r.Context(), b)))
@@ -55,7 +64,7 @@ func Middleware(reg *Registry, auto AutoResolver, next http.Handler) http.Handle
 
 // bearerToken extracts the token from an "Authorization: Bearer <tok>"
 // header value. The scheme is matched case-insensitively per RFC 7235.
-// A header without the bearer scheme yields "", which Resolve rejects.
+// A header without the bearer scheme yields "", which Route rejects.
 func bearerToken(authHeader string) string {
 	const scheme = "bearer "
 	if len(authHeader) < len(scheme) || !strings.EqualFold(authHeader[:len(scheme)], scheme) {
@@ -66,7 +75,7 @@ func bearerToken(authHeader string) string {
 
 // writeForbidden emits the fail-closed response. The body is generic on
 // purpose: it names neither the rejected selector nor the set of valid
-// nicks, so nothing about the gateway's configuration leaks to a client
+// pools, so nothing about the gateway's configuration leaks to a client
 // that guessed wrong.
 func writeForbidden(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
@@ -74,11 +83,11 @@ func writeForbidden(w http.ResponseWriter) {
 	_, _ = w.Write([]byte(`{"error":"unknown backend selector"}`))
 }
 
-// writeRateLimited emits the honest 429 the auto selector returns when
-// every pooled backend is exhausted. Retry-After carries the precise
-// wait until the soonest backend resets (ceiled to whole seconds, floored
-// at 1 so a client never busy-loops on a zero/negative hint). The body is
-// generic and leaks no nick.
+// writeRateLimited emits the honest 429 returned when every member of a
+// pool is exhausted. Retry-After carries the precise wait until the
+// soonest member resets (ceiled to whole seconds, floored at 1 so a
+// client never busy-loops on a zero/negative hint). The body is generic
+// and leaks no nick.
 func writeRateLimited(w http.ResponseWriter, retryAfter time.Duration) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))

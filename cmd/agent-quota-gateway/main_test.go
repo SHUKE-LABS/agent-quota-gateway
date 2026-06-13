@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,27 +21,46 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
+// poolView decodes a /_gateway/quota?backend=<pool> response: the active
+// member's snapshot plus the active_backend field.
+type poolView struct {
+	quota.Snapshot
+	ActiveBackend string `json:"active_backend"`
+}
+
+// mkObserver mirrors the observer run() wires: it files snapshots that
+// carry quota data under the resolved backend's quota key.
+func mkObserver(store *quota.Store) proxy.ResponseObserver {
+	return func(resp *http.Response) {
+		snap := quota.Extract(resp)
+		if !snap.HasData() {
+			return
+		}
+		key := defaultBackendKey
+		if resp.Request != nil {
+			if b, ok := backend.FromContext(resp.Request.Context()); ok {
+				key = b.QuotaKey()
+			}
+		}
+		store.Put(key, snap)
+	}
+}
+
 // TestIntegration_fullStack is the end-to-end smoke test for the gateway:
 // it rebuilds the same mux `run()` wires (config is stubbed inline so the
-// test does not depend on the ambient environment), points the proxy at
-// a fake upstream that streams SSE events with Anthropic rate-limit
-// headers, and asserts:
+// test does not depend on the ambient environment), points a single-member
+// "auto" pool at a fake upstream that streams SSE events with Anthropic
+// rate-limit headers, and asserts:
 //
 //   - streaming passthrough works (first SSE event arrives within 150ms)
-//   - the quota snapshot captured from upstream headers is readable via
-//     GET /_gateway/quota
+//   - the gateway swaps in the backend's real credential and drops the selector
+//   - the quota snapshot is readable via GET /_gateway/quota?backend=auto
 //   - GET /_gateway/health returns 200 with {"status":"ok"}
-//   - no credential headers or request body bytes appear in the stderr
-//     log lines
-//
-// If `run()` ever changes shape (new handlers, new middleware), this
-// test should change in lockstep — its job is to pin the wired surface,
-// not the individual component behavior, which the per-package tests
-// already cover.
+//   - no credential headers or request body bytes appear in the stderr log
 func TestIntegration_fullStack(t *testing.T) {
-	// Capture stderr so the logging middleware does not contaminate
-	// the test runner output, and so we can grep the captured stream
-	// for credential leakage.
+	// Capture stderr so the logging middleware does not contaminate the
+	// test runner output, and so we can grep the captured stream for
+	// credential leakage.
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
@@ -57,10 +77,10 @@ func TestIntegration_fullStack(t *testing.T) {
 	}()
 
 	// Fake upstream: streams three SSE events with rate-limit headers,
-	// flushing between each so a buffered proxy would take the full
-	// stream duration to surface the first event. It also records the
-	// credential headers it received so the test can prove the gateway
-	// swapped in the backend's real credential and dropped the selector.
+	// flushing between each. It records the credential headers it received
+	// so the test can prove the gateway swapped in the backend's real
+	// credential and dropped the selector.
+	const realCred = "sk-ant-api-real-upstream-cred"
 	var gotUpstreamKey, gotUpstreamAuth string
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUpstreamKey = r.Header.Get("x-api-key")
@@ -87,55 +107,41 @@ func TestIntegration_fullStack(t *testing.T) {
 	upSrv := httptest.NewServer(upstream)
 	t.Cleanup(upSrv.Close)
 
-	// Rebuild the wiring `run()` produces, minus the signal-driven
-	// shutdown path (httptest.Server handles cleanup). The backend
-	// "test-backend" owns the real upstream credential; the client only
-	// ever sends its nick as a selector.
-	t.Setenv("AQG_BACKEND_TEST_BACKEND", "real-upstream-credential")
-	registry, err := backend.Load()
+	// Rebuild the wiring `run()` produces. The pool default upstream is the
+	// fake server. The backend "test-backend" in pool "auto" owns the real
+	// upstream credential; the client only ever sends the pool name.
+	t.Setenv("AQG_POOL_AUTO_BACKEND_TEST_BACKEND", realCred)
+	registry, err := backend.Load(upSrv.URL)
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
+	pools := auto.NewPools(registry, nil, io.Discard)
 
 	store := quota.NewStore()
-	observer := func(resp *http.Response) {
-		snap := quota.Extract(resp)
-		if !snap.HasData() {
-			return
-		}
-		key := defaultBackendKey
-		if resp.Request != nil {
-			if b, ok := backend.FromContext(resp.Request.Context()); ok {
-				key = b.Nick
-			}
-		}
-		store.Put(key, snap)
-	}
-	proxyHandler, err := proxy.New(upSrv.URL, observer, nil)
+	proxyHandler, err := proxy.New(mkObserver(store), pools.ModifyResponse)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/health", healthHandler())
-	mux.HandleFunc("/_gateway/quota", quotaHandler(store, nil))
-	mux.Handle("/", backend.Middleware(registry, nil, proxyHandler))
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
+	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
 	handler := logging.Middleware(mux)
 	gw := httptest.NewServer(handler)
 	t.Cleanup(gw.Close)
 
-	// 1. Streaming passthrough. The client names the backend by putting
-	// its nick in the bearer token (where Claude Code puts
-	// ANTHROPIC_AUTH_TOKEN) and sends a stray x-api-key the gateway must
-	// drop.
+	// 1. Streaming passthrough. The client names the pool by putting it in
+	// the bearer token (where Claude Code puts ANTHROPIC_AUTH_TOKEN) and
+	// sends a stray x-api-key the gateway must drop.
 	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/messages", strings.NewReader(`{"secret":"prompt-body-should-not-leak"}`))
 	if err != nil {
 		t.Fatalf("req: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", "client-supplied-attacker-key")
-	req.Header.Set("Authorization", "Bearer test-backend")
+	req.Header.Set("Authorization", "Bearer auto")
 
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -168,18 +174,17 @@ func TestIntegration_fullStack(t *testing.T) {
 	}
 
 	// 1b. The gateway must have swapped in the backend's real credential
-	// (an API key here → x-api-key) and dropped the inbound selector that
-	// arrived on Authorization.
-	if gotUpstreamKey != "real-upstream-credential" {
-		t.Errorf("upstream x-api-key = %q, want real-upstream-credential", gotUpstreamKey)
+	// (an API key here → x-api-key) and dropped the inbound selector.
+	if gotUpstreamKey != realCred {
+		t.Errorf("upstream x-api-key = %q, want %q", gotUpstreamKey, realCred)
 	}
 	if gotUpstreamAuth != "" {
 		t.Errorf("upstream Authorization = %q, want empty (selector must not reach upstream)", gotUpstreamAuth)
 	}
 
-	// 2. Quota snapshot readable via /_gateway/quota under the resolved
-	// backend nick.
-	quotaResp, err := http.Get(gw.URL + "/_gateway/quota?backend=test-backend")
+	// 2. Quota snapshot readable via /_gateway/quota?backend=auto, filed
+	// under the active member's quota key with its nick surfaced.
+	quotaResp, err := http.Get(gw.URL + "/_gateway/quota?backend=auto")
 	if err != nil {
 		t.Fatalf("quota get: %v", err)
 	}
@@ -187,29 +192,32 @@ func TestIntegration_fullStack(t *testing.T) {
 	if quotaResp.StatusCode != http.StatusOK {
 		t.Fatalf("quota status = %d, want 200", quotaResp.StatusCode)
 	}
-	var snap quota.Snapshot
-	if err := json.NewDecoder(quotaResp.Body).Decode(&snap); err != nil {
+	var view poolView
+	if err := json.NewDecoder(quotaResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode quota: %v", err)
 	}
-	if snap.Backend != "test-backend" {
-		t.Errorf("backend = %q, want test-backend", snap.Backend)
+	if view.ActiveBackend != "test-backend" {
+		t.Errorf("active_backend = %q, want test-backend", view.ActiveBackend)
 	}
-	if snap.UnifiedStatus != "allowed" {
-		t.Errorf("unified_status = %q, want allowed", snap.UnifiedStatus)
+	if view.Backend != "auto/test-backend" {
+		t.Errorf("backend = %q, want auto/test-backend (pool-qualified quota key)", view.Backend)
 	}
-	if snap.Unified5hUtilization == nil || *snap.Unified5hUtilization != 0.25 {
-		t.Errorf("unified_5h_utilization = %v, want 0.25", snap.Unified5hUtilization)
+	if view.UnifiedStatus != "allowed" {
+		t.Errorf("unified_status = %q, want allowed", view.UnifiedStatus)
 	}
-	if snap.Unified5hReset == nil || !snap.Unified5hReset.Equal(time.Unix(1781352600, 0).UTC()) {
-		t.Errorf("unified_5h_reset = %v, want %v", snap.Unified5hReset, time.Unix(1781352600, 0).UTC())
+	if view.Unified5hUtilization == nil || *view.Unified5hUtilization != 0.25 {
+		t.Errorf("unified_5h_utilization = %v, want 0.25", view.Unified5hUtilization)
 	}
-	if snap.Unified7dUtilization == nil || *snap.Unified7dUtilization != 0.07 {
-		t.Errorf("unified_7d_utilization = %v, want 0.07", snap.Unified7dUtilization)
+	if view.Unified5hReset == nil || !view.Unified5hReset.Equal(time.Unix(1781352600, 0).UTC()) {
+		t.Errorf("unified_5h_reset = %v, want %v", view.Unified5hReset, time.Unix(1781352600, 0).UTC())
 	}
-	if snap.OrgID != "org_test123" {
-		t.Errorf("org_id = %q, want org_test123", snap.OrgID)
+	if view.Unified7dUtilization == nil || *view.Unified7dUtilization != 0.07 {
+		t.Errorf("unified_7d_utilization = %v, want 0.07", view.Unified7dUtilization)
 	}
-	if snap.AsOf.IsZero() {
+	if view.OrgID != "org_test123" {
+		t.Errorf("org_id = %q, want org_test123", view.OrgID)
+	}
+	if view.AsOf.IsZero() {
 		t.Errorf("as_of is zero; gateway should stamp it")
 	}
 
@@ -240,7 +248,7 @@ func TestIntegration_fullStack(t *testing.T) {
 	for _, banned := range []string{
 		"prompt-body-should-not-leak",
 		"client-supplied-attacker-key",
-		"real-upstream-credential",
+		realCred,
 	} {
 		if strings.Contains(logs, banned) {
 			t.Errorf("stderr leaked %q\nlogs: %s", banned, logs)
@@ -248,61 +256,54 @@ func TestIntegration_fullStack(t *testing.T) {
 	}
 }
 
-// TestIntegration_autoFailover drives the full wired stack: an `auto`
-// request routed to a backend whose upstream 429s comes back to the
-// client as a 503 (switchable), the sticky pointer advances, and the
-// client's retry lands on the healthy backend and succeeds — all without
-// the gateway buffering the request body. It also confirms the auto quota
-// view follows the switch.
+// TestIntegration_autoFailover drives the full wired stack: a request to a
+// pool whose first member's upstream 429s comes back to the client as a
+// 503 (switchable), the sticky pointer advances, and the client's retry
+// lands on the healthy member and succeeds. The upstream 429s the first
+// distinct credential it sees so the test is robust to the pool's random
+// start member. It also confirms the quota view follows the switch.
 func TestIntegration_autoFailover(t *testing.T) {
-	// Upstream 429s the first backend's credential (with a future reset)
-	// and serves 200 for the second.
+	var mu sync.Mutex
+	firstKey := ""
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Header.Get("x-api-key") {
-		case "cred-a":
+		key := r.Header.Get("x-api-key")
+		mu.Lock()
+		if firstKey == "" {
+			firstKey = key
+		}
+		is429 := key == firstKey
+		mu.Unlock()
+		if is429 {
 			w.Header().Set("anthropic-ratelimit-unified-status", "rejected")
 			w.Header().Set("anthropic-ratelimit-unified-reset", fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()))
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error"}}`))
-		default:
-			w.Header().Set("anthropic-ratelimit-unified-status", "allowed")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
 		}
+		w.Header().Set("anthropic-ratelimit-unified-status", "allowed")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	upSrv := httptest.NewServer(upstream)
 	t.Cleanup(upSrv.Close)
 
-	// Two backends; sorted nicks => ["acct-a","acct-b"], start at index 0.
-	t.Setenv("AQG_BACKEND_ACCT_A", "cred-a")
-	t.Setenv("AQG_BACKEND_ACCT_B", "cred-b")
-	registry, err := backend.Load()
+	// Two API-key members in pool "auto".
+	t.Setenv("AQG_POOL_AUTO_BACKEND_ACCT_A", "sk-ant-api-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_ACCT_B", "sk-ant-api-b")
+	registry, err := backend.Load(upSrv.URL)
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	autoCtl := auto.NewController(registry, 0, nil, io.Discard)
+	pools := auto.NewPools(registry, nil, io.Discard)
 
 	store := quota.NewStore()
-	observer := func(resp *http.Response) {
-		snap := quota.Extract(resp)
-		if !snap.HasData() {
-			return
-		}
-		key := defaultBackendKey
-		if resp.Request != nil {
-			if b, ok := backend.FromContext(resp.Request.Context()); ok {
-				key = b.Nick
-			}
-		}
-		store.Put(key, snap)
-	}
-	proxyHandler, err := proxy.New(upSrv.URL, observer, autoCtl.ModifyResponse)
+	proxyHandler, err := proxy.New(mkObserver(store), pools.ModifyResponse)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/quota", quotaHandler(store, autoCtl))
-	mux.Handle("/", backend.Middleware(registry, autoCtl, proxyHandler))
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
+	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 	gw := httptest.NewServer(logging.Middleware(mux))
 	t.Cleanup(gw.Close)
 
@@ -316,7 +317,7 @@ func TestIntegration_autoFailover(t *testing.T) {
 		return resp
 	}
 
-	// 1. First auto request hits acct-a → upstream 429 → client sees 503.
+	// 1. First request hits the start member → upstream 429 → client 503.
 	resp1 := autoPost()
 	resp1.Body.Close()
 	if resp1.StatusCode != http.StatusServiceUnavailable {
@@ -325,11 +326,11 @@ func TestIntegration_autoFailover(t *testing.T) {
 	if ra := resp1.Header.Get("Retry-After"); ra == "" {
 		t.Errorf("503 missing Retry-After")
 	}
-	if got := autoCtl.Current(); got != "acct-b" {
-		t.Fatalf("after 429, currentAuto=%q, want acct-b", got)
+	if cur, _ := pools.Current("auto"); cur.Nick == "" {
+		t.Fatal("no active backend after switch")
 	}
 
-	// 2. The client's retry lands on acct-b and succeeds.
+	// 2. The client's retry lands on the healthy member and succeeds.
 	resp2 := autoPost()
 	body, _ := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
@@ -340,38 +341,43 @@ func TestIntegration_autoFailover(t *testing.T) {
 		t.Errorf("retry body=%q, want upstream success payload", body)
 	}
 
-	// 3. The auto quota view follows the switch.
+	// 3. The quota view follows the switch: active_backend names the
+	// current member, which is the one that served the 200.
 	qResp, err := http.Get(gw.URL + "/_gateway/quota?backend=auto")
 	if err != nil {
 		t.Fatalf("quota get: %v", err)
 	}
 	defer qResp.Body.Close()
-	var view map[string]any
-	if err := json.NewDecoder(qResp.Body).Decode(&view); err != nil {
+	var qview poolView
+	if err := json.NewDecoder(qResp.Body).Decode(&qview); err != nil {
 		t.Fatalf("decode quota: %v", err)
 	}
-	if view["active_backend"] != "acct-b" {
-		t.Errorf("active_backend=%v, want acct-b", view["active_backend"])
+	cur, _ := pools.Current("auto")
+	if qview.ActiveBackend != cur.Nick {
+		t.Errorf("active_backend=%q, want %q (the switched-to member)", qview.ActiveBackend, cur.Nick)
+	}
+	if qview.ActiveBackend != "acct-a" && qview.ActiveBackend != "acct-b" {
+		t.Errorf("active_backend=%q, want one of the configured nicks", qview.ActiveBackend)
 	}
 }
 
-// TestQuotaHandler_autoViewAddsActiveBackend proves the quota endpoint's
-// `auto` path returns the active sticky backend's snapshot with an
-// active_backend field naming it — so a consumer asking `auto` needs zero
-// knowledge of pool membership.
-func TestQuotaHandler_autoViewAddsActiveBackend(t *testing.T) {
-	t.Setenv("AQG_BACKEND_ACCT_ONE", "cred-one")
-	registry, err := backend.Load()
+// TestQuotaHandler_poolViewAddsActiveBackend proves the quota endpoint's
+// pool path returns the active member's snapshot with an active_backend
+// field naming it — so a consumer asking for a pool needs zero knowledge
+// of pool membership.
+func TestQuotaHandler_poolViewAddsActiveBackend(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_ACCT_ONE", "sk-ant-oat-one")
+	registry, err := backend.Load("https://api.anthropic.com")
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	autoCtl := auto.NewController(registry, 0, nil, io.Discard) // start at acct-one
+	pools := auto.NewPools(registry, nil, io.Discard) // single member → deterministic
 
 	store := quota.NewStore()
 	util := 0.42
-	store.Put("acct-one", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util})
+	store.Put("auto/acct-one", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util})
 
-	srv := httptest.NewServer(quotaHandler(store, autoCtl))
+	srv := httptest.NewServer(quotaHandler(store, pools))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/_gateway/quota?backend=auto")
@@ -390,8 +396,8 @@ func TestQuotaHandler_autoViewAddsActiveBackend(t *testing.T) {
 	if got["active_backend"] != "acct-one" {
 		t.Errorf("active_backend=%v, want acct-one", got["active_backend"])
 	}
-	if got["backend"] != "acct-one" {
-		t.Errorf("backend=%v, want acct-one (snapshot promoted into the view)", got["backend"])
+	if got["backend"] != "auto/acct-one" {
+		t.Errorf("backend=%v, want auto/acct-one (pool-qualified key promoted into the view)", got["backend"])
 	}
 	if got["unified_status"] != "allowed" {
 		t.Errorf("unified_status=%v, want allowed", got["unified_status"])
@@ -401,18 +407,44 @@ func TestQuotaHandler_autoViewAddsActiveBackend(t *testing.T) {
 	}
 }
 
+// TestQuotaHandler_unknownPoolEmptySnapshot proves an unknown pool (or a
+// missing param) returns 200 with an empty snapshot rather than an error.
+func TestQuotaHandler_unknownPoolEmptySnapshot(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-oat-a")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, io.Discard)
+	srv := httptest.NewServer(quotaHandler(quota.NewStore(), pools))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/quota?backend=nope")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["unified_status"] != nil {
+		t.Errorf("unknown pool returned quota data: %v", got)
+	}
+	if _, hasActive := got["active_backend"]; hasActive {
+		t.Errorf("unknown pool view should not carry active_backend: %v", got)
+	}
+}
+
 // TestHealthHandler_methodGuard pins the GET-only contract on
-// /_gateway/health. The README documents the endpoint as GET, but the
-// handler used to accept any verb and return 200 — same shape as the
-// GET response, which let a client that learned POST-on-health then
-// trip on quota's 405. healthHandler and quotaHandler must agree, so
-// this test fires POST/PUT/DELETE/OPTIONS and asserts 405 + Allow: GET
-// (matching quotaHandler's policy).
+// /_gateway/health: GET works, other verbs get 405 + Allow: GET.
 func TestHealthHandler_methodGuard(t *testing.T) {
 	srv := httptest.NewServer(healthHandler())
 	defer srv.Close()
 
-	// Sanity: GET still works.
 	getResp, err := http.Get(srv.URL + "/_gateway/health")
 	if err != nil {
 		t.Fatalf("health GET: %v", err)

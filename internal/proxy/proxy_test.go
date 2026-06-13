@@ -17,6 +17,10 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
 )
 
+// testAPIKey is an Anthropic API key (sk-ant-api prefix), which the proxy
+// stamps via the x-api-key header.
+const testAPIKey = "sk-ant-api-test-key"
+
 // injectBackend wraps a handler so every request arrives with b on its
 // context, standing in for the resolver middleware the real gateway runs
 // in front of the proxy.
@@ -26,21 +30,22 @@ func injectBackend(b backend.Backend, next http.Handler) http.Handler {
 	})
 }
 
-// newGateway spins up a fake upstream plus a proxy that targets it,
-// fronted by a backend that carries an API-key credential ("test-api-key"
-// is not an sk-ant-oat token, so the proxy uses the x-api-key scheme).
-// The fake upstream records the headers it saw, returns a configurable
-// response, and (for the streaming test) flushes each chunk on a delay.
+// newGateway spins up a fake upstream plus a proxy, fronted by a backend
+// whose BaseURL targets that upstream and whose credential is an API key
+// (so the proxy uses the x-api-key scheme). The fake upstream records the
+// headers it saw, returns a configurable response, and (for the streaming
+// test) flushes each chunk on a delay.
 func newGateway(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *httptest.Server) {
 	t.Helper()
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 
-	gw, err := proxy.New(upstream.URL, nil, nil)
+	gw, err := proxy.New(nil, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	gwSrv := httptest.NewServer(injectBackend(backend.Backend{Nick: "default", Credential: "test-api-key"}, gw))
+	b := backend.Backend{Pool: "api", Nick: "default", Credential: testAPIKey, BaseURL: upstream.URL}
+	gwSrv := httptest.NewServer(injectBackend(b, gw))
 	t.Cleanup(gwSrv.Close)
 	return gwSrv, upstream
 }
@@ -140,8 +145,8 @@ func TestProxy_messagesForwardsAPIKey(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if got != "test-api-key" {
-		t.Errorf("upstream x-api-key = %q, want test-api-key", got)
+	if got != testAPIKey {
+		t.Errorf("upstream x-api-key = %q, want %q", got, testAPIKey)
 	}
 }
 
@@ -263,8 +268,8 @@ func TestProxy_unknownPathForwardsToUpstream(t *testing.T) {
 	if gotPath != "/v1/models" {
 		t.Errorf("upstream saw path %q, want /v1/models", gotPath)
 	}
-	if gotKey != "test-api-key" {
-		t.Errorf("upstream x-api-key = %q, want test-api-key", gotKey)
+	if gotKey != testAPIKey {
+		t.Errorf("upstream x-api-key = %q, want %q", gotKey, testAPIKey)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -272,6 +277,39 @@ func TestProxy_unknownPathForwardsToUpstream(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "claude-opus-4-8") {
 		t.Errorf("body = %q, want upstream payload forwarded", string(body))
+	}
+}
+
+// TestProxy_perBackendBaseURLAndPathPrefix proves the upstream is taken
+// from the resolved backend (not a single construction-time URL) and that
+// a base URL carrying a path prefix (a non-native pool, e.g.
+// https://host/anthropic) has that prefix preserved on the forwarded
+// request.
+func TestProxy_perBackendBaseURLAndPathPrefix(t *testing.T) {
+	var gotPath string
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	})
+	upSrv := httptest.NewServer(upstream)
+	t.Cleanup(upSrv.Close)
+
+	gw, err := proxy.New(nil, nil)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	b := backend.Backend{Pool: "z-ai", Nick: "x", Credential: "znative", BaseURL: upSrv.URL + "/anthropic"}
+	gwSrv := httptest.NewServer(injectBackend(b, gw))
+	t.Cleanup(gwSrv.Close)
+
+	resp, err := http.Post(gwSrv.URL+"/v1/messages", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotPath != "/anthropic/v1/messages" {
+		t.Errorf("upstream saw path %q, want /anthropic/v1/messages (pool base-URL prefix preserved)", gotPath)
 	}
 }
 
@@ -292,37 +330,38 @@ func TestProxy_disallowedMethodReturns405(t *testing.T) {
 }
 
 // TestProxy_observerFiresWithResponse confirms the ModifyResponse hook
-// runs once per upstream round-trip and receives a response whose
-// Header set and Request still reflect what the upstream sent and what
-// the client originally asked for. This is the integration point quota
+// runs once per upstream round-trip and receives a response whose Header
+// set and Request still reflect what the upstream sent and what the
+// client originally asked for. This is the integration point quota
 // capture relies on; if it ever stops firing, the snapshot cache goes
 // silently stale.
 func TestProxy_observerFiresWithResponse(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("anthropic-ratelimit-tokens-remaining", "42")
+		w.Header().Set("anthropic-ratelimit-unified-5h-utilization", "0.42")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	upSrv := httptest.NewServer(upstream)
 	t.Cleanup(upSrv.Close)
 
-	var seenHeader, seenBackend string
+	var seenHeader, seenKey string
 	var calls atomic.Int32
 	observer := func(resp *http.Response) {
 		calls.Add(1)
-		seenHeader = resp.Header.Get("anthropic-ratelimit-tokens-remaining")
+		seenHeader = resp.Header.Get("anthropic-ratelimit-unified-5h-utilization")
 		if resp.Request != nil {
 			if b, ok := backend.FromContext(resp.Request.Context()); ok {
-				seenBackend = b.Nick
+				seenKey = b.QuotaKey()
 			}
 		}
 	}
 
-	gw, err := proxy.New(upSrv.URL, observer, nil)
+	gw, err := proxy.New(observer, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	gwSrv := httptest.NewServer(injectBackend(backend.Backend{Nick: "mybackend", Credential: "test-api-key"}, gw))
+	b := backend.Backend{Pool: "auto", Nick: "mybackend", Credential: testAPIKey, BaseURL: upSrv.URL}
+	gwSrv := httptest.NewServer(injectBackend(b, gw))
 	t.Cleanup(gwSrv.Close)
 
 	req, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/messages", strings.NewReader("{}"))
@@ -335,20 +374,18 @@ func TestProxy_observerFiresWithResponse(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Errorf("observer call count = %d, want 1", got)
 	}
-	if seenHeader != "42" {
-		t.Errorf("observer saw anthropic-ratelimit-tokens-remaining = %q, want 42", seenHeader)
+	if seenHeader != "0.42" {
+		t.Errorf("observer saw unified-5h-utilization = %q, want 0.42", seenHeader)
 	}
-	if seenBackend != "mybackend" {
-		t.Errorf("observer saw backend nick = %q, want mybackend (resolved backend must reach ModifyResponse via context)", seenBackend)
+	if seenKey != "auto/mybackend" {
+		t.Errorf("observer saw quota key = %q, want auto/mybackend (resolved backend must reach ModifyResponse via context)", seenKey)
 	}
 }
 
 // TestProxy_observerNotCalledForRejectedRequests proves the hook does
 // not fire for requests the proxy rejects before they reach the
 // upstream. A non-POST method → no observer call, since there is no
-// upstream response to inspect. (Paths are no longer rejected; any path
-// forwards to the upstream, so only the method gate stops a request
-// short of a round-trip.)
+// upstream response to inspect.
 func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("upstream must not be hit; got %s %s", r.Method, r.URL.Path)
@@ -357,11 +394,12 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 	t.Cleanup(upSrv.Close)
 
 	var calls atomic.Int32
-	gw, err := proxy.New(upSrv.URL, func(*http.Response) { calls.Add(1) }, nil)
+	gw, err := proxy.New(func(*http.Response) { calls.Add(1) }, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	gwSrv := httptest.NewServer(injectBackend(backend.Backend{Nick: "default", Credential: "test-api-key"}, gw))
+	b := backend.Backend{Pool: "api", Nick: "default", Credential: testAPIKey, BaseURL: upSrv.URL}
+	gwSrv := httptest.NewServer(injectBackend(b, gw))
 	t.Cleanup(gwSrv.Close)
 
 	resp, err := http.Get(gwSrv.URL + "/v1/messages")
@@ -380,18 +418,18 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 const oauthBetaValue = "oauth-2025-04-20"
 
 // newGatewayWithKey is like newGateway but lets the test choose the
-// backend credential so OAuth vs API-key auth can be exercised.
+// backend credential so the three auth schemes can be exercised.
 func newGatewayWithKey(t *testing.T, key string, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 
-	gw, err := proxy.New(upstream.URL, nil, nil)
+	gw, err := proxy.New(nil, nil)
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	gw = injectBackend(backend.Backend{Nick: "test", Credential: key}, gw)
-	gwSrv := httptest.NewServer(gw)
+	b := backend.Backend{Pool: "test", Nick: "test", Credential: key, BaseURL: upstream.URL}
+	gwSrv := httptest.NewServer(injectBackend(b, gw))
 	t.Cleanup(gwSrv.Close)
 	return gwSrv
 }
@@ -428,6 +466,39 @@ func TestProxy_oauthTokenUsesBearer(t *testing.T) {
 	}
 	if gotBeta != oauthBetaValue {
 		t.Errorf("anthropic-beta = %q, want %q", gotBeta, oauthBetaValue)
+	}
+}
+
+// TestProxy_nonNativeTokenUsesBearerWithoutBeta proves a credential that
+// is neither an OAuth token nor an API key (a non-native Claude-compatible
+// provider's key) is sent as a plain Bearer with no anthropic-beta flag.
+func TestProxy_nonNativeTokenUsesBearerWithoutBeta(t *testing.T) {
+	const token = "znative-compatible-key"
+	var gotAuth, gotKey, gotBeta string
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotKey = r.Header.Get("x-api-key")
+		gotBeta = r.Header.Get("anthropic-beta")
+		w.WriteHeader(http.StatusOK)
+	})
+	gw := newGatewayWithKey(t, token, upstream)
+
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/messages", strings.NewReader("{}"))
+	req.Header.Set("x-api-key", "client-placeholder")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotAuth != "Bearer "+token {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer "+token)
+	}
+	if gotKey != "" {
+		t.Errorf("x-api-key = %q, want empty (Bearer providers must not get x-api-key)", gotKey)
+	}
+	if gotBeta != "" {
+		t.Errorf("anthropic-beta = %q, want empty (no oauth beta for non-native providers)", gotBeta)
 	}
 }
 
