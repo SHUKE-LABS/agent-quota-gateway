@@ -60,10 +60,10 @@ func TestIntegration_fullStack(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("anthropic-version", "2023-06-01")
-		w.Header().Set("anthropic-ratelimit-requests-limit", "1000")
-		w.Header().Set("anthropic-ratelimit-requests-remaining", "997")
-		w.Header().Set("anthropic-ratelimit-tokens-limit", "80000")
-		w.Header().Set("anthropic-ratelimit-tokens-remaining", "79412")
+		w.Header().Set("anthropic-ratelimit-unified-status", "allowed")
+		w.Header().Set("anthropic-ratelimit-unified-5h-utilization", "0.25")
+		w.Header().Set("anthropic-ratelimit-unified-5h-reset", "1781352600")
+		w.Header().Set("anthropic-ratelimit-unified-7d-utilization", "0.07")
 		w.Header().Set("anthropic-organization-id", "org_test123")
 		w.WriteHeader(http.StatusOK)
 
@@ -168,17 +168,17 @@ func TestIntegration_fullStack(t *testing.T) {
 	if snap.Backend != "test-backend" {
 		t.Errorf("backend = %q, want test-backend", snap.Backend)
 	}
-	if snap.RequestsLimit == nil || *snap.RequestsLimit != 1000 {
-		t.Errorf("requests_limit = %v, want 1000", snap.RequestsLimit)
+	if snap.UnifiedStatus != "allowed" {
+		t.Errorf("unified_status = %q, want allowed", snap.UnifiedStatus)
 	}
-	if snap.RequestsRemaining == nil || *snap.RequestsRemaining != 997 {
-		t.Errorf("requests_remaining = %v, want 997", snap.RequestsRemaining)
+	if snap.Unified5hUtilization == nil || *snap.Unified5hUtilization != 0.25 {
+		t.Errorf("unified_5h_utilization = %v, want 0.25", snap.Unified5hUtilization)
 	}
-	if snap.TokensLimit == nil || *snap.TokensLimit != 80000 {
-		t.Errorf("tokens_limit = %v, want 80000", snap.TokensLimit)
+	if snap.Unified5hReset == nil || !snap.Unified5hReset.Equal(time.Unix(1781352600, 0).UTC()) {
+		t.Errorf("unified_5h_reset = %v, want %v", snap.Unified5hReset, time.Unix(1781352600, 0).UTC())
 	}
-	if snap.TokensRemaining == nil || *snap.TokensRemaining != 79412 {
-		t.Errorf("tokens_remaining = %v, want 79412", snap.TokensRemaining)
+	if snap.Unified7dUtilization == nil || *snap.Unified7dUtilization != 0.07 {
+		t.Errorf("unified_7d_utilization = %v, want 0.07", snap.Unified7dUtilization)
 	}
 	if snap.OrgID != "org_test123" {
 		t.Errorf("org_id = %q, want org_test123", snap.OrgID)

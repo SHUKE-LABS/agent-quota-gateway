@@ -15,40 +15,69 @@ import (
 	"time"
 )
 
-// Anthropic rate-limit response headers. Names are case-insensitive
-// per RFC 7230, and http.Header.Get already handles canonical lookup.
-// See: https://docs.anthropic.com/en/api/rate-limits#response-headers
+// Anthropic unified rate-limit response headers. Names are
+// case-insensitive per RFC 7230, and http.Header.Get already handles
+// canonical lookup.
+//
+// The unified scheme is what subscription / OAuth (Claude Code) tokens
+// report: usage against rolling 5-hour and 7-day windows, expressed as
+// a utilization fraction (0..1) plus a status. This is the quota the
+// gateway exists to meter. The older anthropic-ratelimit-requests-* and
+// -tokens-* headers (per-minute RPM/TPM throttles on API-key traffic)
+// are intentionally not captured — they are a throughput rate, not the
+// subscription budget.
 const (
-	HeaderRequestsLimit     = "anthropic-ratelimit-requests-limit"
-	HeaderRequestsRemaining = "anthropic-ratelimit-requests-remaining"
-	HeaderRequestsReset     = "anthropic-ratelimit-requests-reset"
-	HeaderTokensLimit       = "anthropic-ratelimit-tokens-limit"
-	HeaderTokensRemaining   = "anthropic-ratelimit-tokens-remaining"
-	HeaderTokensReset       = "anthropic-ratelimit-tokens-reset"
-	HeaderOrgID             = "anthropic-organization-id"
+	HeaderUnifiedStatus              = "anthropic-ratelimit-unified-status"
+	HeaderUnifiedReset               = "anthropic-ratelimit-unified-reset"
+	HeaderUnifiedRepresentativeClaim = "anthropic-ratelimit-unified-representative-claim"
+
+	HeaderUnified5hStatus      = "anthropic-ratelimit-unified-5h-status"
+	HeaderUnified5hUtilization = "anthropic-ratelimit-unified-5h-utilization"
+	HeaderUnified5hReset       = "anthropic-ratelimit-unified-5h-reset"
+
+	HeaderUnified7dStatus      = "anthropic-ratelimit-unified-7d-status"
+	HeaderUnified7dUtilization = "anthropic-ratelimit-unified-7d-utilization"
+	HeaderUnified7dReset       = "anthropic-ratelimit-unified-7d-reset"
+
+	HeaderUnifiedFallbackPercentage    = "anthropic-ratelimit-unified-fallback-percentage"
+	HeaderUnifiedOverageStatus         = "anthropic-ratelimit-unified-overage-status"
+	HeaderUnifiedOverageDisabledReason = "anthropic-ratelimit-unified-overage-disabled-reason"
+
+	HeaderOrgID = "anthropic-organization-id"
 )
 
 // Snapshot is the latest known quota state for a single backend key.
 //
-// Pointer fields are nil when the corresponding header was absent on
-// the most recent response. Anthropic's tier-dependent header set means
-// partial snapshots are normal — for example, the token-bucket pair may
-// be present while the request-bucket pair is not. JSON consumers can
-// distinguish "header missing" (field absent in JSON) from "zero" by
-// the nil case.
+// Fields are zero/nil when the corresponding header was absent on the
+// most recent response. The unified scheme is reported per rolling
+// window (5h, 7d); a given response may carry some windows and not
+// others, so partial snapshots are normal. Utilization is a *float64 so
+// JSON consumers can distinguish "header missing" (field absent) from a
+// real 0.0 (window untouched — full quota available).
 type Snapshot struct {
 	// Backend is the cache key the snapshot was filed under. It is the
 	// value of X-Mux-Backend-Nick on the inbound request, or "default"
 	// when that header was empty.
 	Backend string `json:"backend"`
 
-	RequestsLimit     *int64     `json:"requests_limit,omitempty"`
-	RequestsRemaining *int64     `json:"requests_remaining,omitempty"`
-	RequestsReset     *time.Time `json:"requests_reset,omitempty"`
+	// UnifiedStatus is the overall allow/reject decision; UnifiedReset
+	// is when the representative window resets; RepresentativeClaim
+	// names which window (e.g. "five_hour") drove that decision.
+	UnifiedStatus              string     `json:"unified_status,omitempty"`
+	UnifiedReset               *time.Time `json:"unified_reset,omitempty"`
+	UnifiedRepresentativeClaim string     `json:"unified_representative_claim,omitempty"`
 
-	TokensLimit     *int64     `json:"tokens_limit,omitempty"`
-	TokensRemaining *int64     `json:"tokens_remaining,omitempty"`
-	TokensReset     *time.Time `json:"tokens_reset,omitempty"`
+	Unified5hStatus      string     `json:"unified_5h_status,omitempty"`
+	Unified5hUtilization *float64   `json:"unified_5h_utilization,omitempty"`
+	Unified5hReset       *time.Time `json:"unified_5h_reset,omitempty"`
+
+	Unified7dStatus      string     `json:"unified_7d_status,omitempty"`
+	Unified7dUtilization *float64   `json:"unified_7d_utilization,omitempty"`
+	Unified7dReset       *time.Time `json:"unified_7d_reset,omitempty"`
+
+	UnifiedFallbackPercentage    *float64 `json:"unified_fallback_percentage,omitempty"`
+	UnifiedOverageStatus         string   `json:"unified_overage_status,omitempty"`
+	UnifiedOverageDisabledReason string   `json:"unified_overage_disabled_reason,omitempty"`
 
 	OrgID string `json:"org_id,omitempty"`
 
@@ -72,12 +101,22 @@ func Extract(resp *http.Response) Snapshot {
 		return s
 	}
 	h := resp.Header
-	s.RequestsLimit = parseInt(h.Get(HeaderRequestsLimit))
-	s.RequestsRemaining = parseInt(h.Get(HeaderRequestsRemaining))
-	s.RequestsReset = parseTime(h.Get(HeaderRequestsReset))
-	s.TokensLimit = parseInt(h.Get(HeaderTokensLimit))
-	s.TokensRemaining = parseInt(h.Get(HeaderTokensRemaining))
-	s.TokensReset = parseTime(h.Get(HeaderTokensReset))
+	s.UnifiedStatus = h.Get(HeaderUnifiedStatus)
+	s.UnifiedReset = parseUnixTime(h.Get(HeaderUnifiedReset))
+	s.UnifiedRepresentativeClaim = h.Get(HeaderUnifiedRepresentativeClaim)
+
+	s.Unified5hStatus = h.Get(HeaderUnified5hStatus)
+	s.Unified5hUtilization = parseFloat(h.Get(HeaderUnified5hUtilization))
+	s.Unified5hReset = parseUnixTime(h.Get(HeaderUnified5hReset))
+
+	s.Unified7dStatus = h.Get(HeaderUnified7dStatus)
+	s.Unified7dUtilization = parseFloat(h.Get(HeaderUnified7dUtilization))
+	s.Unified7dReset = parseUnixTime(h.Get(HeaderUnified7dReset))
+
+	s.UnifiedFallbackPercentage = parseFloat(h.Get(HeaderUnifiedFallbackPercentage))
+	s.UnifiedOverageStatus = h.Get(HeaderUnifiedOverageStatus)
+	s.UnifiedOverageDisabledReason = h.Get(HeaderUnifiedOverageDisabledReason)
+
 	s.OrgID = h.Get(HeaderOrgID)
 	return s
 }
@@ -87,12 +126,18 @@ func Extract(resp *http.Response) Snapshot {
 // /_gateway/quota endpoint uses this to distinguish "no traffic yet"
 // from "traffic returned no rate-limit headers".
 func (s Snapshot) HasData() bool {
-	return s.RequestsLimit != nil ||
-		s.RequestsRemaining != nil ||
-		s.RequestsReset != nil ||
-		s.TokensLimit != nil ||
-		s.TokensRemaining != nil ||
-		s.TokensReset != nil ||
+	return s.UnifiedStatus != "" ||
+		s.UnifiedReset != nil ||
+		s.UnifiedRepresentativeClaim != "" ||
+		s.Unified5hStatus != "" ||
+		s.Unified5hUtilization != nil ||
+		s.Unified5hReset != nil ||
+		s.Unified7dStatus != "" ||
+		s.Unified7dUtilization != nil ||
+		s.Unified7dReset != nil ||
+		s.UnifiedFallbackPercentage != nil ||
+		s.UnifiedOverageStatus != "" ||
+		s.UnifiedOverageDisabledReason != "" ||
 		s.OrgID != ""
 }
 
@@ -131,31 +176,34 @@ func (s *Store) Get(key string) Snapshot {
 	return snap
 }
 
-// parseInt returns a pointer to the parsed int64, or nil when the
-// input is empty or not a valid integer. We use a pointer so the
-// caller can tell "header absent" from "header present and zero".
-func parseInt(v string) *int64 {
+// parseFloat returns a pointer to the parsed float64, or nil when the
+// input is empty or not a valid number. The pointer lets the caller
+// tell "header absent" from a real 0.0 (a window at zero utilization is
+// full quota, not missing data).
+func parseFloat(v string) *float64 {
 	if v == "" {
 		return nil
 	}
-	n, err := strconv.ParseInt(v, 10, 64)
+	f, err := strconv.ParseFloat(v, 64)
 	if err != nil {
 		return nil
 	}
-	return &n
+	return &f
 }
 
-// parseTime parses an RFC 3339 timestamp. Anthropic's reset headers
-// are documented to use this format; unparseable values yield nil
-// rather than a default, so a malformed upstream cannot quietly look
-// like "reset at the Unix epoch" to downstream consumers.
-func parseTime(v string) *time.Time {
+// parseUnixTime parses a Unix-seconds timestamp into an absolute time.
+// The unified reset headers carry epoch seconds (e.g. "1781352600"),
+// not RFC 3339. Unparseable values yield nil rather than a default, so
+// a malformed upstream cannot quietly look like "reset at the Unix
+// epoch" to downstream consumers.
+func parseUnixTime(v string) *time.Time {
 	if v == "" {
 		return nil
 	}
-	t, err := time.Parse(time.RFC3339, v)
+	secs, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
 		return nil
 	}
+	t := time.Unix(secs, 0).UTC()
 	return &t
 }

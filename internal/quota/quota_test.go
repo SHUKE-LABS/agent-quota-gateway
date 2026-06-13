@@ -19,37 +19,62 @@ func makeResp(headers map[string]string) *http.Response {
 }
 
 func TestExtract_fullHeaderSet(t *testing.T) {
+	// A real subscription-token response: both rolling windows plus the
+	// top-level decision and overage fields. Reset headers are Unix
+	// seconds; utilization is a 0..1 fraction.
 	resp := makeResp(map[string]string{
-		HeaderRequestsLimit:     "1000",
-		HeaderRequestsRemaining: "997",
-		HeaderRequestsReset:     "2026-06-13T13:45:00Z",
-		HeaderTokensLimit:       "80000",
-		HeaderTokensRemaining:   "79412",
-		HeaderTokensReset:       "2026-06-13T13:45:30Z",
-		HeaderOrgID:             "org_abc123",
+		HeaderUnifiedStatus:                "allowed",
+		HeaderUnifiedReset:                 "1781352600",
+		HeaderUnifiedRepresentativeClaim:   "five_hour",
+		HeaderUnified5hStatus:              "allowed",
+		HeaderUnified5hUtilization:         "0.25",
+		HeaderUnified5hReset:               "1781352600",
+		HeaderUnified7dStatus:              "allowed",
+		HeaderUnified7dUtilization:         "0.07",
+		HeaderUnified7dReset:               "1781445600",
+		HeaderUnifiedFallbackPercentage:    "0.5",
+		HeaderUnifiedOverageStatus:         "rejected",
+		HeaderUnifiedOverageDisabledReason: "org_level_disabled",
+		HeaderOrgID:                        "org_abc123",
 	})
 
 	s := Extract(resp)
 
-	wantInt := func(t *testing.T, name string, got *int64, want int64) {
+	wantFloat := func(name string, got *float64, want float64) {
 		t.Helper()
 		if got == nil {
-			t.Fatalf("%s: nil, want %d", name, want)
+			t.Fatalf("%s: nil, want %v", name, want)
 		}
 		if *got != want {
-			t.Errorf("%s = %d, want %d", name, *got, want)
+			t.Errorf("%s = %v, want %v", name, *got, want)
 		}
 	}
-	wantInt(t, "RequestsLimit", s.RequestsLimit, 1000)
-	wantInt(t, "RequestsRemaining", s.RequestsRemaining, 997)
-	wantInt(t, "TokensLimit", s.TokensLimit, 80000)
-	wantInt(t, "TokensRemaining", s.TokensRemaining, 79412)
-
-	if s.RequestsReset == nil || !s.RequestsReset.Equal(time.Date(2026, 6, 13, 13, 45, 0, 0, time.UTC)) {
-		t.Errorf("RequestsReset = %v, want 2026-06-13T13:45:00Z", s.RequestsReset)
+	wantStr := func(name, got, want string) {
+		t.Helper()
+		if got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
 	}
-	if s.TokensReset == nil || !s.TokensReset.Equal(time.Date(2026, 6, 13, 13, 45, 30, 0, time.UTC)) {
-		t.Errorf("TokensReset = %v, want 2026-06-13T13:45:30Z", s.TokensReset)
+
+	wantStr("UnifiedStatus", s.UnifiedStatus, "allowed")
+	wantStr("UnifiedRepresentativeClaim", s.UnifiedRepresentativeClaim, "five_hour")
+	wantStr("Unified5hStatus", s.Unified5hStatus, "allowed")
+	wantStr("Unified7dStatus", s.Unified7dStatus, "allowed")
+	wantStr("UnifiedOverageStatus", s.UnifiedOverageStatus, "rejected")
+	wantStr("UnifiedOverageDisabledReason", s.UnifiedOverageDisabledReason, "org_level_disabled")
+
+	wantFloat("Unified5hUtilization", s.Unified5hUtilization, 0.25)
+	wantFloat("Unified7dUtilization", s.Unified7dUtilization, 0.07)
+	wantFloat("UnifiedFallbackPercentage", s.UnifiedFallbackPercentage, 0.5)
+
+	if s.UnifiedReset == nil || !s.UnifiedReset.Equal(time.Unix(1781352600, 0).UTC()) {
+		t.Errorf("UnifiedReset = %v, want %v", s.UnifiedReset, time.Unix(1781352600, 0).UTC())
+	}
+	if s.Unified5hReset == nil || !s.Unified5hReset.Equal(time.Unix(1781352600, 0).UTC()) {
+		t.Errorf("Unified5hReset = %v, want %v", s.Unified5hReset, time.Unix(1781352600, 0).UTC())
+	}
+	if s.Unified7dReset == nil || !s.Unified7dReset.Equal(time.Unix(1781445600, 0).UTC()) {
+		t.Errorf("Unified7dReset = %v, want %v", s.Unified7dReset, time.Unix(1781445600, 0).UTC())
 	}
 	if s.OrgID != "org_abc123" {
 		t.Errorf("OrgID = %q, want org_abc123", s.OrgID)
@@ -62,35 +87,60 @@ func TestExtract_fullHeaderSet(t *testing.T) {
 	}
 }
 
-func TestExtract_partialHeaders(t *testing.T) {
-	// Tier 1 / probe responses sometimes carry only the token bucket.
-	// The extractor must surface what is present and leave the missing
-	// fields nil — not invent zeros that would look like "exhausted".
+func TestExtract_zeroUtilizationIsNotMissing(t *testing.T) {
+	// A window at 0.0 utilization is full quota, not absent data. The
+	// *float64 must be non-nil and equal to 0, distinguishable from a
+	// header that was never sent.
 	resp := makeResp(map[string]string{
-		HeaderTokensLimit:     "40000",
-		HeaderTokensRemaining: "40000",
-		HeaderTokensReset:     "2026-06-13T14:00:00Z",
+		HeaderUnified5hStatus:      "allowed",
+		HeaderUnified5hUtilization: "0",
+		HeaderUnified5hReset:       "1781352600",
 	})
 
 	s := Extract(resp)
 
-	if s.RequestsLimit != nil {
-		t.Errorf("RequestsLimit = %d, want nil", *s.RequestsLimit)
+	if s.Unified5hUtilization == nil {
+		t.Fatal("Unified5hUtilization = nil, want a pointer to 0.0")
 	}
-	if s.RequestsRemaining != nil {
-		t.Errorf("RequestsRemaining = %d, want nil", *s.RequestsRemaining)
+	if *s.Unified5hUtilization != 0 {
+		t.Errorf("Unified5hUtilization = %v, want 0", *s.Unified5hUtilization)
 	}
-	if s.RequestsReset != nil {
-		t.Errorf("RequestsReset = %v, want nil", s.RequestsReset)
+	if s.Unified7dUtilization != nil {
+		t.Errorf("Unified7dUtilization = %v, want nil (header absent)", *s.Unified7dUtilization)
 	}
-	if s.TokensLimit == nil || *s.TokensLimit != 40000 {
-		t.Errorf("TokensLimit not preserved: %v", s.TokensLimit)
+	if !s.HasData() {
+		t.Error("HasData() = false despite a present 5h window")
+	}
+}
+
+func TestExtract_partialWindows(t *testing.T) {
+	// Only the 7d window is present. The extractor must surface it and
+	// leave the 5h fields zero/nil — not invent values.
+	resp := makeResp(map[string]string{
+		HeaderUnified7dStatus:      "allowed",
+		HeaderUnified7dUtilization: "0.42",
+		HeaderUnified7dReset:       "1781445600",
+	})
+
+	s := Extract(resp)
+
+	if s.Unified5hStatus != "" {
+		t.Errorf("Unified5hStatus = %q, want empty", s.Unified5hStatus)
+	}
+	if s.Unified5hUtilization != nil {
+		t.Errorf("Unified5hUtilization = %v, want nil", *s.Unified5hUtilization)
+	}
+	if s.Unified5hReset != nil {
+		t.Errorf("Unified5hReset = %v, want nil", s.Unified5hReset)
+	}
+	if s.Unified7dUtilization == nil || *s.Unified7dUtilization != 0.42 {
+		t.Errorf("Unified7dUtilization not preserved: %v", s.Unified7dUtilization)
 	}
 	if s.OrgID != "" {
 		t.Errorf("OrgID = %q, want empty", s.OrgID)
 	}
 	if !s.HasData() {
-		t.Error("HasData() = false despite token headers present")
+		t.Error("HasData() = false despite 7d window present")
 	}
 }
 
@@ -112,25 +162,29 @@ func TestExtract_noHeaders(t *testing.T) {
 
 func TestExtract_malformedHeadersIgnored(t *testing.T) {
 	// Defensive: a future upstream-bug or middlebox could rewrite a
-	// numeric header to a non-number. parseInt/parseTime must return
-	// nil rather than 0/epoch so downstream consumers see "missing"
-	// not "exhausted at the epoch".
+	// numeric header to a non-number. parseFloat/parseUnixTime must
+	// return nil rather than 0/epoch so downstream consumers see
+	// "missing" not "untouched at the epoch". A string status field is
+	// passed through verbatim — there is nothing to validate.
 	resp := makeResp(map[string]string{
-		HeaderRequestsLimit:     "not-a-number",
-		HeaderRequestsRemaining: "",
-		HeaderRequestsReset:     "yesterday",
-		HeaderTokensReset:       "2026-13-99T99:99:99Z",
+		HeaderUnified5hUtilization: "not-a-number",
+		HeaderUnified5hReset:       "yesterday",
+		HeaderUnified7dUtilization: "",
+		HeaderUnifiedReset:         "3.14",
 	})
 
 	s := Extract(resp)
-	if s.RequestsLimit != nil {
-		t.Errorf("RequestsLimit should be nil on parse failure, got %d", *s.RequestsLimit)
+	if s.Unified5hUtilization != nil {
+		t.Errorf("Unified5hUtilization should be nil on parse failure, got %v", *s.Unified5hUtilization)
 	}
-	if s.RequestsReset != nil {
-		t.Errorf("RequestsReset should be nil on parse failure, got %v", *s.RequestsReset)
+	if s.Unified5hReset != nil {
+		t.Errorf("Unified5hReset should be nil on parse failure, got %v", s.Unified5hReset)
 	}
-	if s.TokensReset != nil {
-		t.Errorf("TokensReset should be nil on parse failure, got %v", *s.TokensReset)
+	if s.Unified7dUtilization != nil {
+		t.Errorf("Unified7dUtilization should be nil on empty header, got %v", *s.Unified7dUtilization)
+	}
+	if s.UnifiedReset != nil {
+		t.Errorf("UnifiedReset should be nil on non-integer seconds, got %v", s.UnifiedReset)
 	}
 }
 
@@ -143,18 +197,18 @@ func TestExtract_nilResponse(t *testing.T) {
 
 func TestStore_putGetBackendKeyEnforced(t *testing.T) {
 	st := NewStore()
-	one := int64(99)
+	util := 0.25
 	// Caller passes a snapshot without the Backend field — Put must
 	// stamp it. This is the contract main.go relies on so Get never
 	// returns a snapshot mislabelled with a stale key.
-	st.Put("anthropic-prod", Snapshot{RequestsRemaining: &one, AsOf: time.Unix(1, 0).UTC()})
+	st.Put("anthropic-prod", Snapshot{Unified5hUtilization: &util, AsOf: time.Unix(1, 0).UTC()})
 
 	got := st.Get("anthropic-prod")
 	if got.Backend != "anthropic-prod" {
 		t.Errorf("Backend = %q, want anthropic-prod", got.Backend)
 	}
-	if got.RequestsRemaining == nil || *got.RequestsRemaining != 99 {
-		t.Errorf("RequestsRemaining lost in round trip: %v", got.RequestsRemaining)
+	if got.Unified5hUtilization == nil || *got.Unified5hUtilization != 0.25 {
+		t.Errorf("Unified5hUtilization lost in round trip: %v", got.Unified5hUtilization)
 	}
 }
 
@@ -187,8 +241,8 @@ func TestStore_concurrentReadWrite(t *testing.T) {
 		go func(seed int) {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
-				n := int64(seed*1000 + i)
-				st.Put(keys[i%len(keys)], Snapshot{RequestsRemaining: &n})
+				u := float64(seed*1000+i) / 10000
+				st.Put(keys[i%len(keys)], Snapshot{Unified5hUtilization: &u})
 			}
 		}(w)
 	}

@@ -141,7 +141,7 @@ guarantees that follow from that:
 
 ## Quota snapshots
 
-The gateway watches the `anthropic-ratelimit-*` and
+The gateway watches the `anthropic-ratelimit-unified-*` and
 `anthropic-organization-id` response headers on every forwarded
 request and keeps the latest snapshot per backend key in an
 in-process cache. Reads go through a small loopback endpoint:
@@ -150,26 +150,42 @@ in-process cache. Reads go through a small loopback endpoint:
 curl http://127.0.0.1:8080/_gateway/quota?backend=mybackend
 ```
 
-Response shape (all rate-limit fields are optional — they are
-omitted when the upstream response did not carry the corresponding
-header):
+The unified scheme is what subscription / OAuth (Claude Code) tokens
+report: usage against rolling 5-hour and 7-day windows, expressed as a
+utilization fraction (`0`..`1`) plus an allow/reject status. This is
+the quota the gateway exists to meter. The legacy
+`anthropic-ratelimit-requests-*` / `-tokens-*` headers — per-minute
+RPM/TPM throttles on API-key traffic, not a depletable budget — are
+intentionally **not** captured.
+
+Response shape (all unified fields are optional — they are omitted
+when the upstream response did not carry the corresponding header):
 
 ```json
 {
   "backend": "mybackend",
-  "requests_limit": 1000,
-  "requests_remaining": 997,
-  "requests_reset": "2026-06-13T13:45:00Z",
-  "tokens_limit": 80000,
-  "tokens_remaining": 79412,
-  "tokens_reset": "2026-06-13T13:45:30Z",
+  "unified_status": "allowed",
+  "unified_reset": "2026-06-13T13:30:00Z",
+  "unified_representative_claim": "five_hour",
+  "unified_5h_status": "allowed",
+  "unified_5h_utilization": 0.25,
+  "unified_5h_reset": "2026-06-13T13:30:00Z",
+  "unified_7d_status": "allowed",
+  "unified_7d_utilization": 0.07,
+  "unified_7d_reset": "2026-06-14T15:20:00Z",
+  "unified_fallback_percentage": 0.5,
+  "unified_overage_status": "rejected",
+  "unified_overage_disabled_reason": "org_level_disabled",
   "org_id": "org_abc123",
   "as_of": "2026-06-13T13:42:11.038Z"
 }
 ```
 
 `as_of` is the gateway-side time the snapshot was recorded; the
-`*_reset` fields are absolute upstream timestamps.
+`*_reset` fields are absolute upstream timestamps (the gateway decodes
+the Unix-seconds headers into RFC 3339). A utilization of `0` means a
+window is untouched (full quota); a missing utilization field means the
+last response did not advertise that window at all.
 
 ### Backend keying
 
@@ -182,8 +198,9 @@ empty, the snapshot is filed under `default` and `GET
 
 `GET /_gateway/quota?backend=unknown` always returns 200; if no
 traffic for that key has been seen, the body is just `{"backend":
-"unknown", "as_of": "..."}`. Use the presence of `tokens_limit` /
-`requests_limit` to decide whether quota data is actually available.
+"unknown", "as_of": "..."}`. Use the presence of a `unified_*` field
+(e.g. `unified_5h_utilization`) to decide whether quota data is
+actually available.
 
 ### Freshness model
 
@@ -200,10 +217,11 @@ The gateway publishes whatever fields the upstream response carried
 and omits the rest; consumers are expected to adapt to the shape
 they observe rather than rely on a frozen schema. This means:
 
-- Field presence is signal, not noise. A `tokens_limit` field that
-  exists today may be absent tomorrow if Anthropic stops sending it.
-  Treat missing fields as "not advertised on the last response" rather
-  than "zero".
+- Field presence is signal, not noise. A `unified_7d_utilization` field
+  that exists today may be absent tomorrow if Anthropic stops sending
+  it. Treat missing fields as "not advertised on the last response"
+  rather than "zero" — note that an explicit `0` utilization is full
+  quota, which is the opposite of absent.
 - The endpoint returns `200` for known and unknown backend keys; the
   caller decides whether the snapshot is meaningful by inspecting the
   body.
