@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMiddleware_emitsRequiredFields checks that the JSON log line
@@ -147,4 +148,91 @@ func TestMiddleware_generatesRequestIDWhenAbsent(t *testing.T) {
 		}
 		ids[id] = true
 	}
+}
+
+// TestMiddleware_preservesFlushChain pins the contract that a logging
+// wrapper must not break streaming. The proxy relies on
+// http.NewResponseController reaching an http.Flusher on the real
+// ResponseWriter; without Unwrap, the controller stops at statusRecorder
+// and httputil.ReverseProxy's per-Write Flush silently no-ops, which
+// collapses SSE into a single buffered payload.
+//
+// We model the chain with an httptest.ResponseRecorder (which has
+// supported http.Flusher since Go 1.20) wrapped in Middleware, hand
+// the inner handler a ResponseWriter derived via http.NewResponseController
+// (the same call ReverseProxy makes), and assert that Flush() drives a
+// Write through to the recorder and does not panic.
+func TestMiddleware_preservesFlushChain(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	handler := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		// http.NewResponseController must find an http.Flusher through
+		// the logging wrapper. If Unwrap is missing this returns an
+		// "response controller unavailable" error and Flush() below
+		// would never reach the underlying recorder.
+		_, _ = w.Write([]byte("first "))
+		if err := rc.Flush(); err != nil {
+			t.Fatalf("Flush after first write: %v", err)
+		}
+		_, _ = w.Write([]byte("second"))
+		if err := rc.Flush(); err != nil {
+			t.Fatalf("Flush after second write: %v", err)
+		}
+	}))
+
+	// Use a real handler invocation (not ServeHTTP directly) so the
+	// wrapper is engaged exactly the way the gateway engages it.
+	req := httptest.NewRequest(http.MethodGet, "/v1/messages", nil)
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Body.String(); got != "first second" {
+		t.Errorf("body = %q, want %q (chunks must round-trip through logging wrapper)", got, "first second")
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+
+	// Belt-and-braces: even when the inner handler never calls Flush,
+	// http.NewResponseController must be able to *negotiate* one without
+	// panicking — otherwise a downstream handler that probes Flusher
+	// availability during the request would crash.
+	rec2 := httptest.NewRecorder()
+	probe := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	probe.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/", nil))
+	if got := rec2.Body.String(); got != "ok" {
+		t.Errorf("probe body = %q, want ok", got)
+	}
+}
+
+// TestMiddleware_unwrapsToUnderlying pins the Unwrap method directly so
+// that any future refactor of statusRecorder that drops the method
+// fails with a targeted assertion, not via a downstream streaming
+// regression. NewResponseController is the public Go stdlib entry point
+// for walking Unwrap; if it cannot reach the inner ResponseWriter, this
+// test fails before any streaming happens.
+func TestMiddleware_unwrapsToUnderlying(t *testing.T) {
+	rec := httptest.NewRecorder()
+	handler := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// NewResponseController walks Unwrap() to find http.Flusher;
+		// if the chain dies at statusRecorder, Flush() returns an
+		// error here rather than silently succeeding.
+		rc := http.NewResponseController(w)
+		_, _ = w.Write([]byte("x"))
+		done := make(chan error, 1)
+		go func() {
+			done <- rc.Flush()
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Flush returned %v; Unwrap chain is broken", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Flush did not return; controller is stuck on a wrapper")
+		}
+	}))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 }

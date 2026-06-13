@@ -24,7 +24,7 @@ import (
 // a fake upstream that streams SSE events with Anthropic rate-limit
 // headers, and asserts:
 //
-//   - streaming passthrough works (first SSE event arrives within 250ms)
+//   - streaming passthrough works (first SSE event arrives within 150ms)
 //   - the quota snapshot captured from upstream headers is readable via
 //     GET /_gateway/quota
 //   - GET /_gateway/health returns 200 with {"status":"ok"}
@@ -74,7 +74,7 @@ func TestIntegration_fullStack(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			fmt.Fprintf(w, "event: message\ndata: {\"chunk\":%d}\n\n", i)
 			flusher.Flush()
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 		}
 	})
 	upSrv := httptest.NewServer(upstream)
@@ -147,8 +147,8 @@ func TestIntegration_fullStack(t *testing.T) {
 	if firstAt == 0 {
 		t.Fatal("never received first SSE event")
 	}
-	if firstAt > 250*time.Millisecond {
-		t.Errorf("first event arrived at %v; proxy appears to buffer (want < 250ms)", firstAt)
+	if firstAt > 150*time.Millisecond {
+		t.Errorf("first event arrived at %v; proxy appears to buffer (want < 150ms)", firstAt)
 	}
 
 	// 2. Quota snapshot readable via /_gateway/quota with the backend

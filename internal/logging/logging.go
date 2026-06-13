@@ -55,6 +55,18 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap exposes the underlying ResponseWriter so http.NewResponseController
+// can walk through this wrapper to find an http.Flusher (or any other
+// optional interface) on the real writer. Without this, a logging wrapper
+// silently breaks streaming: httputil.ReverseProxy.FlushInterval = -1 calls
+// http.NewResponseController(w).Flush() per Write, and that controller
+// stops at the first writer that lacks the interface — i.e. this one —
+// so SSE frames accumulate in the response buffer instead of reaching
+// the client chunk-by-chunk.
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
 // requestID returns the inbound X-Request-Id header if present, otherwise
 // a fresh 16-hex-char random ID. The random form is generated once per
 // request so uninstrumented traffic can still be correlated across the
