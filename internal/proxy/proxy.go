@@ -63,6 +63,9 @@ func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error
 	// own config so any client-supplied credential is replaced.
 	basePath := strings.TrimRight(upstream.Path, "/")
 	oauth := isOAuthToken(apiKey)
+	// Trim once for the Bearer value so the same whitespace tolerance
+	// that classifies the token doesn't leak into the header.
+	bearer := "Bearer " + strings.TrimSpace(apiKey)
 	rp.Director = func(r *http.Request) {
 		r.URL.Scheme = upstream.Scheme
 		r.URL.Host = upstream.Host
@@ -73,7 +76,7 @@ func New(baseURL, apiKey string, observer ResponseObserver) (http.Handler, error
 			// Drop any client-supplied x-api-key so the two schemes
 			// don't collide, and ensure the oauth beta flag is set.
 			r.Header.Del("x-api-key")
-			r.Header.Set("Authorization", "Bearer "+apiKey)
+			r.Header.Set("Authorization", bearer)
 			ensureBeta(r.Header, oauthBeta)
 		} else {
 			r.Header.Set("x-api-key", apiKey)
