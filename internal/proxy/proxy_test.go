@@ -223,20 +223,43 @@ func TestProxy_errorStatusPropagates(t *testing.T) {
 	}
 }
 
-func TestProxy_unknownPathReturns404(t *testing.T) {
+// TestProxy_unknownPathForwardsToUpstream proves the proxy no longer
+// whitelists paths: an arbitrary path (here a plausible future Anthropic
+// endpoint) reaches the upstream with the auth header stamped, and the
+// upstream's response is returned verbatim. The upstream — not a closed
+// route table in the gateway — is the authority on what it serves.
+func TestProxy_unknownPathForwardsToUpstream(t *testing.T) {
+	var gotPath, gotKey string
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("upstream should not have been called for unknown path; got %s", r.URL.Path)
+		gotPath = r.URL.Path
+		gotKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(w, strings.NewReader(`{"data":["claude-opus-4-8"]}`))
 	})
 	gw, _ := newGateway(t, upstream)
 
-	resp, err := http.Post(gw.URL+"/v1/unknown", "application/json", strings.NewReader("{}"))
+	resp, err := http.Post(gw.URL+"/v1/models", "application/json", strings.NewReader("{}"))
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", resp.StatusCode)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (unknown path must forward to upstream)", resp.StatusCode)
+	}
+	if gotPath != "/v1/models" {
+		t.Errorf("upstream saw path %q, want /v1/models", gotPath)
+	}
+	if gotKey != "test-api-key" {
+		t.Errorf("upstream x-api-key = %q, want test-api-key", gotKey)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), "claude-opus-4-8") {
+		t.Errorf("body = %q, want upstream payload forwarded", string(body))
 	}
 }
 
@@ -309,8 +332,10 @@ func TestProxy_observerFiresWithResponse(t *testing.T) {
 
 // TestProxy_observerNotCalledForRejectedRequests proves the hook does
 // not fire for requests the proxy rejects before they reach the
-// upstream. Wrong method or wrong path → no observer call, since there
-// is no upstream response to inspect.
+// upstream. A non-POST method → no observer call, since there is no
+// upstream response to inspect. (Paths are no longer rejected; any path
+// forwards to the upstream, so only the method gate stops a request
+// short of a round-trip.)
 func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("upstream must not be hit; got %s %s", r.Method, r.URL.Path)
@@ -326,13 +351,7 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 	gwSrv := httptest.NewServer(gw)
 	t.Cleanup(gwSrv.Close)
 
-	resp, err := http.Post(gwSrv.URL+"/v1/unknown", "application/json", strings.NewReader("{}"))
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
-	resp.Body.Close()
-
-	resp, err = http.Get(gwSrv.URL + "/v1/messages")
+	resp, err := http.Get(gwSrv.URL + "/v1/messages")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

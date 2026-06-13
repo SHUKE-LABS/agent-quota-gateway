@@ -6,17 +6,20 @@ local Claude Code workflows.
 ## What it is
 
 A single-binary Go server that listens on `127.0.0.1` and forwards
-`/v1/messages` and `/v1/messages/count_tokens` to
-`https://api.anthropic.com`, preserving streaming and the
-`anthropic-*` headers Claude Code sends. The gateway owns the
+any `POST` to `https://api.anthropic.com` (Claude Code uses
+`/v1/messages` and `/v1/messages/count_tokens`), preserving streaming
+and the `anthropic-*` headers Claude Code sends. The gateway owns the
 `ANTHROPIC_API_KEY` so client processes never see the upstream
 credential directly.
 
 ## V1 scope
 
 - Anthropic-only. No OpenAI / Google / other providers.
-- The Messages surface only: `POST /v1/messages` and
-  `POST /v1/messages/count_tokens`.
+- POST-only. Any path is forwarded to the upstream — the upstream is
+  the authority on what it serves, so new or compatible-API endpoints
+  pass through instead of hitting a gateway 404. Non-POST methods are
+  rejected with `405` before any upstream round-trip. Claude Code uses
+  `POST /v1/messages` and `POST /v1/messages/count_tokens`.
 - Streaming (SSE) is forwarded without buffering — the first event
   reaches the client as soon as the upstream writes it.
 - Error responses from upstream propagate to the client with the

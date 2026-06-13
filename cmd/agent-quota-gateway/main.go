@@ -74,10 +74,10 @@ func run() error {
 		return fmt.Errorf("proxy: %w", err)
 	}
 
-	// The proxy still owns the catch-all so unknown paths get its
-	// closed-route 404 (rather than a generic mux 404). The quota
-	// endpoint is mounted on a gateway-specific prefix so it cannot
-	// collide with anything the upstream Messages surface defines.
+	// The proxy owns the catch-all so every non-gateway path forwards
+	// to the upstream (the upstream is the authority on what it serves).
+	// The quota endpoint is mounted on a gateway-specific prefix so it
+	// cannot collide with anything the upstream Messages surface defines.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/health", healthHandler())
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store))
