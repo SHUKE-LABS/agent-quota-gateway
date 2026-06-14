@@ -1,0 +1,46 @@
+[Unit]
+Description=agent-quota-gateway (Anthropic pool proxy)
+Documentation=https://github.com/shukebeta/agent-quota-gateway
+# Shared mode binds a Tailscale address, so wait for the network and the
+# tailscaled interface. If the IP is not assigned yet at boot the bind
+# fails and Restart=always retries until tailscaled brings it up.
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agent-quota-gateway
+# Pool credentials and SHARED_LISTEN_ADDR live here. The file is read by
+# the systemd manager (root) and the values are injected into the process
+# environment, so the file stays 0600 root:root and the DynamicUser below
+# never reads it directly.
+EnvironmentFile=/etc/agent-quota-gateway/aqg.env
+Restart=always
+RestartSec=2
+# The app drains in-flight streaming responses for up to 30s on shutdown;
+# give it a hair more before SIGKILL.
+TimeoutStopSec=35
+
+# --- Hardening -----------------------------------------------------------
+# An ephemeral, unprivileged service account created per start. No manual
+# useradd, no home, nothing on disk to own. The binary keeps all state in
+# memory and writes no files.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# Only IP sockets are needed (outbound HTTPS to upstreams + the listener).
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

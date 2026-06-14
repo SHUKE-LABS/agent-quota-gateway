@@ -7,6 +7,7 @@ import (
 func TestLoad_defaults(t *testing.T) {
 	t.Setenv(EnvAnthropicBaseURL, "")
 	t.Setenv(EnvListenAddr, "")
+	t.Setenv(EnvSharedListenAddr, "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -23,6 +24,7 @@ func TestLoad_defaults(t *testing.T) {
 func TestLoad_overrides(t *testing.T) {
 	t.Setenv(EnvAnthropicBaseURL, "https://example.test")
 	t.Setenv(EnvListenAddr, "127.0.0.1:9000")
+	t.Setenv(EnvSharedListenAddr, "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -45,6 +47,7 @@ func TestLoad_loopbackVariants(t *testing.T) {
 	for _, addr := range cases {
 		t.Run(addr, func(t *testing.T) {
 			t.Setenv(EnvAnthropicBaseURL, "")
+			t.Setenv(EnvSharedListenAddr, "")
 			t.Setenv(EnvListenAddr, addr)
 			if _, err := Load(); err != nil {
 				t.Errorf("Load() addr=%q: unexpected error %v", addr, err)
@@ -62,6 +65,7 @@ func TestLoad_rejectsNonLoopback(t *testing.T) {
 	for _, addr := range cases {
 		t.Run(addr, func(t *testing.T) {
 			t.Setenv(EnvAnthropicBaseURL, "")
+			t.Setenv(EnvSharedListenAddr, "")
 			t.Setenv(EnvListenAddr, addr)
 			if _, err := Load(); err == nil {
 				t.Errorf("Load() addr=%q: expected loopback rejection", addr)
@@ -72,6 +76,7 @@ func TestLoad_rejectsNonLoopback(t *testing.T) {
 
 func TestLoad_rejectsMalformedAddr(t *testing.T) {
 	t.Setenv(EnvAnthropicBaseURL, "")
+	t.Setenv(EnvSharedListenAddr, "")
 	t.Setenv(EnvListenAddr, "no-port")
 	if _, err := Load(); err == nil {
 		t.Error("Load() expected error for malformed LISTEN_ADDR")
@@ -170,6 +175,7 @@ func TestLoad_rejectsMalformedBaseURL(t *testing.T) {
 	for _, raw := range cases {
 		t.Run(raw, func(t *testing.T) {
 			t.Setenv(EnvAnthropicBaseURL, raw)
+			t.Setenv(EnvSharedListenAddr, "")
 			t.Setenv(EnvListenAddr, "127.0.0.1:8080")
 			cfg, err := Load()
 			if err == nil {
@@ -181,6 +187,7 @@ func TestLoad_rejectsMalformedBaseURL(t *testing.T) {
 
 func TestLoad_acceptsValidBaseURL(t *testing.T) {
 	t.Setenv(EnvAnthropicBaseURL, "https://api.anthropic.com")
+	t.Setenv(EnvSharedListenAddr, "")
 	t.Setenv(EnvListenAddr, "127.0.0.1:8080")
 
 	if _, err := Load(); err != nil {

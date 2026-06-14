@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -28,7 +29,18 @@ import (
 // context. In normal operation the resolver middleware guarantees one.
 const defaultBackendKey = "default"
 
+// version is stamped at build time via -ldflags "-X main.version=...".
+// It defaults to "dev" for a plain `go build`. The deploy script sets it
+// from `git describe` so an upgraded service is verifiable with -version.
+var version = "dev"
+
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
+	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "agent-quota-gateway: %v\n", err)
 		os.Exit(1)
@@ -144,7 +156,7 @@ func run() error {
 		// make the exposure loud rather than let it pass as a normal start.
 		fmt.Fprintf(os.Stderr, "agent-quota-gateway: SHARED MODE — bound to Tailscale address %s, reachable by tailnet members. A Tailscale ACL restricting this port is REQUIRED; the gateway adds no authentication of its own.\n", cfg.ListenAddr)
 	}
-	fmt.Fprintf(os.Stderr, "agent-quota-gateway listening on %s; default upstream %s; pools %s\n", cfg.ListenAddr, cfg.AnthropicBaseURL, strings.Join(registry.PoolNames(), ", "))
+	fmt.Fprintf(os.Stderr, "agent-quota-gateway %s listening on %s; default upstream %s; pools %s\n", version, cfg.ListenAddr, cfg.AnthropicBaseURL, strings.Join(registry.PoolNames(), ", "))
 
 	select {
 	case err := <-errCh:
