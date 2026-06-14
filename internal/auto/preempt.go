@@ -264,7 +264,7 @@ func (c *Controller) preemptView() preemptView {
 			continue
 		}
 		ms := memberState{nick: nick, quotaKey: c.backendAt(idx).QuotaKey()}
-		if r, ok := c.exhausted[nick]; ok && c.now().Before(r) {
+		if r, ok := c.exhaustedUntilLocked(nick); ok {
 			ms.exhausted = true
 			ms.reset = r
 		}

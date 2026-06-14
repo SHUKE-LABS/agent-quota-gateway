@@ -61,10 +61,13 @@ across vendors loses the prompt cache, and quota semantics differ).
 Out of scope:
 
 - Non-Anthropic *protocols*.
-- Quota-watermark or concurrency-aware load spreading. A pool switches
-  **only** on a real `429` (to maximize prompt-cache retention); it never
-  pre-empts on a utilization threshold and never spreads concurrent
-  requests across accounts.
+- Quota-watermark or concurrency-aware load spreading. A pool fails off a
+  member on a real `429`, or once the quota store reports its window **fully
+  consumed** (utilization `1.0` — the only exhaustion signal a poller-tracked
+  backend produces; see [Proprietary quota polling](#proprietary-quota-polling)).
+  It never pre-empts below `100%` (a member at 95% keeps serving, to maximize
+  prompt-cache retention) and never spreads concurrent requests across
+  accounts.
 - **Cross-pool fallback / manual pool switching** — e.g. "all
   subscription pools are exhausted, borrow the `api` pool for 30 minutes".
   Pools are independent here; choosing between them is the client's job
@@ -245,10 +248,14 @@ zero-probe**, per pool:
 - **Sticky.** Every request to a pool reuses the same member so Anthropic's
   per-account prompt cache keeps paying off. The gateway does not compare
   or balance across members.
-- **Reactive switch, no watermark.** A member is ridden until it actually
-  returns a `429`. There is no utilization threshold — a member at 95% can
-  still finish a small task, and switching only on a real rejection means
-  fewer switches and better cache retention.
+- **Reactive switch, no watermark below full.** A member is ridden until it
+  returns a `429` or its quota store window reads **fully consumed**
+  (utilization `1.0`). The only threshold is `100%`: a member at 95% keeps
+  serving a small task, so failover stays rare and cache retention high. The
+  `1.0` check exists because a poller-tracked backend (Z.ai / MiniMaxi)
+  signals a spent window through its dashboard API, not a clean pre-stream
+  `429` — without it such a member would never fail off. At `100%` the next
+  request would `429` anyway, so failing off then costs no usable cache.
 - **Zero probe.** The starting member is chosen at random on startup (or by
   declared priority — see below) and its quota fills in from the first real
   response. No member is ever contacted just to measure it. This is also why

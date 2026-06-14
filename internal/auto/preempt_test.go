@@ -318,7 +318,7 @@ func TestNewPreemptor_skipsNonPriorityPools(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	// Single non-priority pool → no controllers collected → Run returns.
 	reg := testRegistry(t, "a", "b")
-	pools := NewPools(reg, clock.now, io.Discard)
+	pools := NewPools(reg, nil, clock.now, io.Discard)
 	p := NewPreemptor(pools, quota.NewStore(), 0, clock.now, io.Discard)
 	if len(p.controllers) != 0 {
 		t.Fatalf("collected %d controllers, want 0 (no priority pool)", len(p.controllers))
