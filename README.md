@@ -38,7 +38,8 @@ across vendors loses the prompt cache, and quota semantics differ).
 - POST-only. Any path is forwarded to the upstream — the upstream is the
   authority on what it serves, so new or compatible-API endpoints pass
   through instead of hitting a gateway 404. Non-POST methods are rejected
-  with `405` before any upstream round-trip.
+  with `405` (carrying the standard `Allow: POST` response header) before any
+  upstream round-trip.
 - Streaming (SSE) is forwarded without buffering — the first event
   reaches the client as soon as the upstream writes it.
 - Error responses from upstream propagate to the client with the original
@@ -324,6 +325,9 @@ Z.ai / ZhipuAI and MiniMaxi backends are the exception: a background poller
 fills their snapshots from each provider's own quota endpoint (see
 [Proprietary quota polling](#proprietary-quota-polling)).
 
+The endpoint is `GET`-only; any other method returns `405` with an
+`Allow: GET` response header.
+
 ## Layout
 
 - `cmd/agent-quota-gateway/` — service entrypoint and integration tests
@@ -341,7 +345,8 @@ A loopback-only liveness probe is exposed at `GET /_gateway/health`. It
 returns `200` with body `{"status":"ok"}` and a `Content-Type` of
 `application/json`. The response is intentionally minimal — no version, no
 uptime, no upstream reachability check — because the trust model treats
-any local process as legitimate.
+any local process as legitimate. Like `/_gateway/quota`, it is `GET`-only;
+any other method returns `405` with an `Allow: GET` response header.
 
 ## Security model
 

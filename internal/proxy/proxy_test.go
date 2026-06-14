@@ -327,6 +327,9 @@ func TestProxy_disallowedMethodReturns405(t *testing.T) {
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", resp.StatusCode)
 	}
+	if allow := resp.Header.Get("Allow"); allow != http.MethodPost {
+		t.Errorf("Allow header = %q, want %q", allow, http.MethodPost)
+	}
 }
 
 // TestProxy_observerFiresWithResponse confirms the ModifyResponse hook

@@ -486,3 +486,38 @@ func TestHealthHandler_methodGuard(t *testing.T) {
 		resp.Body.Close()
 	}
 }
+
+// /_gateway/quota: GET works, other verbs get 405 + Allow: GET — mirrors the
+// health guard so the documented Allow contract is enforced for both
+// gateway endpoints.
+func TestQuotaHandler_methodGuard(t *testing.T) {
+	srv := httptest.NewServer(quotaHandler(quota.NewStore(), nil))
+	defer srv.Close()
+
+	getResp, err := http.Get(srv.URL + "/_gateway/quota?backend=auto")
+	if err != nil {
+		t.Fatalf("quota GET: %v", err)
+	}
+	getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("quota GET status = %d, want 200", getResp.StatusCode)
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions} {
+		req, err := http.NewRequest(method, srv.URL+"/_gateway/quota", nil)
+		if err != nil {
+			t.Fatalf("NewRequest %s: %v", method, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s status = %d, want 405", method, resp.StatusCode)
+		}
+		if allow := resp.Header.Get("Allow"); allow != http.MethodGet {
+			t.Errorf("%s Allow header = %q, want %q", method, allow, http.MethodGet)
+		}
+		resp.Body.Close()
+	}
+}
