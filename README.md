@@ -484,6 +484,57 @@ LAN for subscription pools." Bare-LAN (RFC1918) and public listen addresses
 are rejected for this reason: there is no "the LAN is trusted" middle
 ground.
 
+## Deploying as a systemd service
+
+For an always-on shared-mode instance, run it under systemd on a host that
+stays up. The target needs **no Go toolchain** — the binary is a static
+`linux/amd64` build shipped over ssh.
+
+From a checkout on a machine that *does* have Go:
+
+```bash
+scripts/deploy.sh <ssh-host>        # e.g. scripts/deploy.sh e6420
+```
+
+This builds a version-stamped static binary, copies it (plus the unit and a
+remote installer) to the host, and under `sudo`:
+
+- installs `/usr/local/bin/agent-quota-gateway` (atomic replace),
+- installs `/etc/systemd/system/agent-quota-gateway.service`,
+- creates `/etc/agent-quota-gateway/aqg.env` (`0600 root:root`) from a
+  template **only if it does not already exist** — your secrets are never
+  overwritten on upgrade,
+- `daemon-reload`, enables, and restarts the service.
+
+On a fresh install the env file is a template, so the service will not come
+up until you fill it in:
+
+```bash
+sudo nano /etc/agent-quota-gateway/aqg.env   # set SHARED_LISTEN_ADDR + pools
+sudo systemctl restart agent-quota-gateway
+```
+
+See [`deploy/aqg.env.example`](deploy/aqg.env.example) for the full
+template. `SHARED_LISTEN_ADDR` should be the host's Tailscale IP
+(`tailscale ip -4`); omit it to run loopback-only instead.
+
+**Upgrading** is the same command — `scripts/deploy.sh <host>` again. It
+rebuilds, re-ships, and restarts; the env file is left untouched. Confirm
+what is running:
+
+```bash
+ssh <host> agent-quota-gateway -version
+ssh <host> journalctl -u agent-quota-gateway -f
+```
+
+The unit runs under `DynamicUser=yes` with a strict hardening profile
+(`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, no new privileges,
+IP sockets only). The env file is read by the systemd manager and the
+values are injected into the process, so the ephemeral service account
+never reads the credential file directly. `Restart=always` covers the boot
+race where the Tailscale interface IP is not assigned yet — the bind
+retries until `tailscaled` brings it up.
+
 ## Quota snapshots
 
 The gateway watches the `anthropic-ratelimit-unified-*` and
