@@ -43,6 +43,16 @@ import (
 // is never re-selected until it is known to have recovered.
 const defaultExhaustionWindow = 5 * time.Hour
 
+// exhaustionUtilizationThreshold is the unified-window utilization at or
+// above which a member is treated as exhausted from the quota store alone,
+// without waiting for a live HTTP 429 on the proxy path. 1.0 means "the
+// window reports fully consumed" — the value z.ai / MiniMaxi report at cap
+// (via the poller) and that Anthropic reports in its rate-limit headers.
+// Keeping it at the cap preserves the sticky-until-exhausted design: a
+// member is failed off proactively only once its window is genuinely spent,
+// never merely busy.
+const exhaustionUtilizationThreshold = 1.0
+
 // switchRetryAfterSeconds is the Retry-After the synthetic 503 carries
 // when a pool switches members. It is deliberately short: the switch is
 // instantaneous server-side, so the client should retry almost
@@ -57,11 +67,14 @@ type Pools struct {
 
 // NewPools builds one Controller per pool in reg. Each controller starts
 // at a random member (start < 0) so no probe traffic is needed to anchor
-// it. now defaults to time.Now and logOut to os.Stderr when nil.
-func NewPools(reg *backend.Registry, now func() time.Time, logOut io.Writer) *Pools {
+// it. store is the shared quota store the controllers consult to fail off a
+// member reported fully consumed (poller- or header-sourced) even without a
+// live 429; a nil store disables that signal and keeps pure 429-driven
+// failover. now defaults to time.Now and logOut to os.Stderr when nil.
+func NewPools(reg *backend.Registry, store *quota.Store, now func() time.Time, logOut io.Writer) *Pools {
 	byPool := make(map[string]*Controller)
 	for _, name := range reg.PoolNames() {
-		byPool[name] = NewController(reg, name, -1, now, logOut)
+		byPool[name] = NewController(reg, name, -1, store, now, logOut)
 	}
 	return &Pools{byPool: byPool}
 }
@@ -115,6 +128,13 @@ type Controller struct {
 	pool  string
 	nicks []string // the pool's members, in stable sorted order; len >= 1
 
+	// store is the shared quota store. A member whose snapshot reports its
+	// unified window fully consumed (with a reset still ahead) is treated as
+	// exhausted even when no live 429 was seen on the proxy path — the only
+	// exhaustion signal for poller-tracked backends (z.ai / MiniMaxi). nil
+	// disables the signal, leaving pure 429-driven failover.
+	store *quota.Store
+
 	// priority is the full preference order (highest first) when the pool
 	// opted into priority routing via AQG_POOL_<POOL>_PRIORITY: the
 	// declared nicks first, then any unlisted members in sorted order. It
@@ -141,7 +161,7 @@ type Controller struct {
 // equally valid); otherwise start selects the index deterministically
 // (used by tests). now defaults to time.Now and logOut to os.Stderr when
 // nil.
-func NewController(reg *backend.Registry, poolName string, start int, now func() time.Time, logOut io.Writer) *Controller {
+func NewController(reg *backend.Registry, poolName string, start int, store *quota.Store, now func() time.Time, logOut io.Writer) *Controller {
 	if now == nil {
 		now = time.Now
 	}
@@ -154,6 +174,7 @@ func NewController(reg *backend.Registry, poolName string, start int, now func()
 		pool:      poolName,
 		nicks:     nicks,
 		priority:  effectiveOrder(reg.PoolPriority(poolName), nicks),
+		store:     store,
 		exhausted: make(map[string]time.Time),
 		now:       now,
 		logOut:    logOut,
@@ -335,11 +356,60 @@ func (c *Controller) clearExpiredLocked() {
 	}
 }
 
-// isExhaustedLocked reports whether nick currently has an active (future)
-// exhausted mark. Caller holds c.mu.
+// isExhaustedLocked reports whether nick is currently unselectable, by
+// either signal: the live-429 park or the quota store's fully-consumed
+// window. Caller holds c.mu.
 func (c *Controller) isExhaustedLocked(nick string) bool {
+	_, ok := c.exhaustedUntilLocked(nick)
+	return ok
+}
+
+// exhaustedUntilLocked returns the time nick stays unselectable and whether
+// it is exhausted at all, unifying the two exhaustion signals: the explicit
+// park set by a live 429 (record429) and the quota store's fully-consumed
+// window (poller- or header-sourced). When both apply the later reset wins,
+// so a member is never re-selected while either signal still blocks it.
+// Caller holds c.mu.
+func (c *Controller) exhaustedUntilLocked(nick string) (time.Time, bool) {
 	reset, ok := c.exhausted[nick]
-	return ok && c.now().Before(reset)
+	if ok && !c.now().Before(reset) {
+		ok = false // park already elapsed
+	}
+	if sReset, sOK := c.storeExhaustedUntilLocked(nick); sOK {
+		if !ok || sReset.After(reset) {
+			reset, ok = sReset, true
+		}
+	}
+	return reset, ok
+}
+
+// storeExhaustedUntilLocked reports nick's window reset when the quota store
+// shows it fully consumed (utilization at or above the threshold) with a
+// reset still in the future. ok is false when the store has no usable signal
+// — no store, no snapshot, utilization below threshold, or a missing/past
+// reset. This is how a backend that signals exhaustion through the poller
+// (z.ai / MiniMaxi) or rate-limit headers (Anthropic) rather than a clean
+// proxy-path 429 still drives failover. Requiring a future reset also makes
+// a stale frozen entry (the poller only tracks the active member, so a
+// failed-off member's snapshot freezes at its reset) read healthy once that
+// reset passes, without a re-poll. Caller holds c.mu; the store has its own
+// lock and never calls back into the controller.
+func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
+	if c.store == nil {
+		return time.Time{}, false
+	}
+	idx := c.indexOf(nick)
+	if idx < 0 {
+		return time.Time{}, false
+	}
+	snap := c.store.Get(c.backendAt(idx).QuotaKey())
+	if snap.Unified5hUtilization == nil || *snap.Unified5hUtilization < exhaustionUtilizationThreshold {
+		return time.Time{}, false
+	}
+	if snap.Unified5hReset == nil || !c.now().Before(*snap.Unified5hReset) {
+		return time.Time{}, false
+	}
+	return *snap.Unified5hReset, true
 }
 
 // firstHealthyLocked finds the backend to fail over to. For a priority
@@ -378,7 +448,7 @@ func (c *Controller) soonestLocked() (int, time.Time) {
 	bestIdx, bestSet := c.cur, false
 	var bestReset time.Time
 	for idx, nick := range c.nicks {
-		reset, ok := c.exhausted[nick]
+		reset, ok := c.exhaustedUntilLocked(nick)
 		if !ok {
 			continue
 		}

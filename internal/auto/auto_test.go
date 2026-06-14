@@ -72,7 +72,7 @@ func resp429(b backend.Backend, clock *fixedClock, resetIn time.Duration) *http.
 
 func newController(t *testing.T, start int, clock *fixedClock, logOut io.Writer, nicks ...string) *Controller {
 	t.Helper()
-	return NewController(testRegistry(t, nicks...), "auto", start, clock.now, logOut)
+	return NewController(testRegistry(t, nicks...), "auto", start, nil, clock.now, logOut)
 }
 
 func (c *Controller) resolve(t *testing.T, nick string) backend.Backend {
@@ -309,7 +309,7 @@ func TestNewController_randomStartIsValid(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	valid := map[string]bool{"a": true, "b": true, "c": true}
 	for i := 0; i < 20; i++ {
-		c := NewController(testRegistry(t, "a", "b", "c"), "auto", -1, clock.now, io.Discard)
+		c := NewController(testRegistry(t, "a", "b", "c"), "auto", -1, nil, clock.now, io.Discard)
 		if got := c.Current(); !valid[got] {
 			t.Fatalf("random start produced invalid nick %q", got)
 		}
@@ -329,7 +329,7 @@ func TestPools_routesPerPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	pools := NewPools(reg, clock.now, io.Discard)
+	pools := NewPools(reg, nil, clock.now, io.Discard)
 
 	// Unknown pool fails closed.
 	if _, _, ok, _ := pools.Route("nope"); ok {
@@ -381,7 +381,7 @@ func newPriorityController(t *testing.T, start int, clock *fixedClock, logOut io
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	return NewController(reg, "auto", start, clock.now, logOut)
+	return NewController(reg, "auto", start, nil, clock.now, logOut)
 }
 
 // TestPriority_startsAtHighest proves a priority pool anchors its initial

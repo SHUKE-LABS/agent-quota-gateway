@@ -58,13 +58,16 @@ func run() error {
 		return fmt.Errorf("backend: %w", err)
 	}
 
+	store := quota.NewStore()
+
 	// pools fronts every configured pool with its own sticky controller.
 	// Each controller starts at a random member (start < 0) so no probe
 	// traffic is needed to anchor it; its quota snapshot fills in from the
-	// first real response.
-	pools := auto.NewPools(registry, nil, nil)
-
-	store := quota.NewStore()
+	// first real response. The controllers consult the shared store so a
+	// member the poller or headers report fully consumed is failed off even
+	// without a live 429 — the only exhaustion signal poller-tracked
+	// backends (z.ai / MiniMaxi) ever produce.
+	pools := auto.NewPools(registry, store, nil, nil)
 
 	// observer is invoked once per upstream response, before the proxy
 	// streams the body back to the client. It extracts the rate-limit

@@ -115,7 +115,7 @@ func TestIntegration_fullStack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	pools := auto.NewPools(registry, nil, io.Discard)
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
 
 	store := quota.NewStore()
 	proxyHandler, err := proxy.New(mkObserver(store), pools.ModifyResponse)
@@ -294,7 +294,7 @@ func TestIntegration_autoFailover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	pools := auto.NewPools(registry, nil, io.Discard)
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
 
 	store := quota.NewStore()
 	proxyHandler, err := proxy.New(mkObserver(store), pools.ModifyResponse)
@@ -371,7 +371,7 @@ func TestQuotaHandler_poolViewAddsActiveBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	pools := auto.NewPools(registry, nil, io.Discard) // single member → deterministic
+	pools := auto.NewPools(registry, nil, nil, io.Discard) // single member → deterministic
 
 	store := quota.NewStore()
 	util := 0.42
@@ -429,7 +429,7 @@ func TestQuotaHandler_unknownPoolEmptySnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	pools := auto.NewPools(registry, nil, io.Discard)
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
 	srv := httptest.NewServer(quotaHandler(quota.NewStore(), pools))
 	t.Cleanup(srv.Close)
 
