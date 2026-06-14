@@ -115,6 +115,13 @@ type Controller struct {
 	pool  string
 	nicks []string // the pool's members, in stable sorted order; len >= 1
 
+	// priority is the full preference order (highest first) when the pool
+	// opted into priority routing via AQG_POOL_<POOL>_PRIORITY: the
+	// declared nicks first, then any unlisted members in sorted order. It
+	// is nil for a pool with no declared priority, which keeps the default
+	// random-start, round-robin-failover behaviour.
+	priority []string
+
 	// cur indexes nicks: nicks[cur] is the backend every request to this
 	// pool sticks to until it 429s.
 	cur int
@@ -146,6 +153,7 @@ func NewController(reg *backend.Registry, poolName string, start int, now func()
 		reg:       reg,
 		pool:      poolName,
 		nicks:     nicks,
+		priority:  effectiveOrder(reg.PoolPriority(poolName), nicks),
 		exhausted: make(map[string]time.Time),
 		now:       now,
 		logOut:    logOut,
@@ -157,10 +165,53 @@ func NewController(reg *backend.Registry, poolName string, start int, now func()
 		return c
 	}
 	if start < 0 {
-		start = randIndex(n)
+		// A priority pool anchors on its highest-priority member (nothing is
+		// exhausted at construction, so that is priority[0]); a plain pool
+		// starts at a random member as before.
+		if len(c.priority) > 0 {
+			start = c.indexOf(c.priority[0])
+		} else {
+			start = randIndex(n)
+		}
 	}
 	c.cur = ((start % n) + n) % n
 	return c
+}
+
+// effectiveOrder expands a declared priority subset into a total order
+// over the pool's members: the declared nicks first (highest priority
+// first), then any members not named in the declaration, in their stable
+// sorted order. It returns nil when no priority was declared, which is the
+// signal to keep the default random/round-robin behaviour.
+func effectiveOrder(declared, nicks []string) []string {
+	if len(declared) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(declared))
+	out := make([]string, 0, len(nicks))
+	for _, nick := range declared {
+		if !seen[nick] {
+			seen[nick] = true
+			out = append(out, nick)
+		}
+	}
+	for _, nick := range nicks {
+		if !seen[nick] {
+			out = append(out, nick)
+		}
+	}
+	return out
+}
+
+// indexOf returns the index of nick in c.nicks, or -1 if absent. Pools are
+// small, so a linear scan is cheaper than maintaining a map.
+func (c *Controller) indexOf(nick string) int {
+	for i, n := range c.nicks {
+		if n == nick {
+			return i
+		}
+	}
+	return -1
 }
 
 // ResolveAuto returns the backend a request to this pool should use now.
@@ -291,11 +342,24 @@ func (c *Controller) isExhaustedLocked(nick string) bool {
 	return ok && c.now().Before(reset)
 }
 
-// firstHealthyLocked finds the next non-exhausted backend, scanning
+// firstHealthyLocked finds the backend to fail over to. For a priority
+// pool it returns the highest-priority non-exhausted member, so failover
+// always climbs toward the preferred backend. For a plain pool it scans
 // round-robin from just after cur so switches spread across the pool
 // rather than always hopping to the lexically-first nick. Caller holds
 // c.mu.
 func (c *Controller) firstHealthyLocked() (int, bool) {
+	if len(c.priority) > 0 {
+		for _, nick := range c.priority {
+			if c.isExhaustedLocked(nick) {
+				continue
+			}
+			if idx := c.indexOf(nick); idx >= 0 {
+				return idx, true
+			}
+		}
+		return 0, false
+	}
 	n := len(c.nicks)
 	for off := 1; off <= n; off++ {
 		idx := (c.cur + off) % n

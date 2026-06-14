@@ -26,23 +26,33 @@ import (
 )
 
 // EnvPrefix marks an environment variable as belonging to the pool
-// configuration namespace. Two shapes are recognised under it:
+// configuration namespace. Three shapes are recognised under it:
 //
 //	AQG_POOL_<POOL>_BASE_URL=<upstream>            // the pool's default upstream
 //	AQG_POOL_<POOL>_BACKEND_<NICK>=<cred>[|<url>]  // one member of the pool
+//	AQG_POOL_<POOL>_PRIORITY=<nick>,<nick>,...     // ordered preference (optional)
 //
 // <POOL> and <NICK> are normalized (see normalizeName): lowercased, with
 // underscores folded to hyphens, so AQG_POOL_Z_AI_BACKEND_KEY_A is
 // addressed as pool "z-ai", member "key-a".
+//
+// PRIORITY is optional and opt-in: when present, the pool prefers its
+// listed members in order (highest first) for the auto controller's
+// initial pick and failover target; when absent, the pool keeps the
+// default random-start, round-robin behaviour. It carries no credential.
 const EnvPrefix = "AQG_POOL_"
 
-// baseURLSuffix and backendInfix are the two structural markers inside an
-// EnvPrefix key. backendInfix is checked first so a member declaration
-// always wins over the base-URL shape.
+// baseURLSuffix, backendInfix, and prioritySuffix are the structural
+// markers inside an EnvPrefix key. backendInfix is checked first so a
+// member declaration always wins over the suffix shapes.
 const (
-	baseURLSuffix = "_BASE_URL"
-	backendInfix  = "_BACKEND_"
+	baseURLSuffix  = "_BASE_URL"
+	backendInfix   = "_BACKEND_"
+	prioritySuffix = "_PRIORITY"
 )
+
+// priorityListSep separates nicks in an AQG_POOL_<POOL>_PRIORITY value.
+const priorityListSep = ","
 
 // credURLSep splits a member's value into its credential and an optional
 // per-member base-URL override: <credential>|<url>. A credential that
@@ -83,6 +93,11 @@ type pool struct {
 	name   string
 	byNick map[string]Backend
 	nicks  []string // sorted, stable order for the auto controller
+
+	// priority is the operator-declared preference order (highest first),
+	// a subset of nicks. nil when the pool declared no AQG_POOL_<POOL>_PRIORITY
+	// — that pool keeps the default random-start, round-robin behaviour.
+	priority []string
 }
 
 // Load builds a Registry from AQG_POOL_* environment variables, using
@@ -113,6 +128,8 @@ type rawMember struct {
 func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 	poolBaseURL := make(map[string]string) // pool -> declared default upstream
 	poolURLOrigin := make(map[string]string)
+	poolPriority := make(map[string][]string) // pool -> declared preference order
+	poolPriorityOrigin := make(map[string]string)
 	var members []rawMember
 	originKey := make(map[string]string) // pool/nick -> env var that produced it
 
@@ -173,7 +190,24 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 			continue
 		}
 
-		return nil, fmt.Errorf("backend: %s is not a recognised %s<POOL>%s or %s<POOL>%s<NICK> declaration", key, EnvPrefix, baseURLSuffix, EnvPrefix, backendInfix)
+		if poolPart, ok := strings.CutSuffix(rest, prioritySuffix); ok {
+			poolName := normalizeName(poolPart)
+			if poolName == "" {
+				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
+			}
+			if prev, dup := poolPriorityOrigin[poolName]; dup {
+				return nil, fmt.Errorf("backend: %s and %s both set the priority for pool %q", prev, key, poolName)
+			}
+			order, err := parsePriority(val)
+			if err != nil {
+				return nil, fmt.Errorf("backend: %s %w", key, err)
+			}
+			poolPriorityOrigin[poolName] = key
+			poolPriority[poolName] = order
+			continue
+		}
+
+		return nil, fmt.Errorf("backend: %s is not a recognised %s<POOL>%s, %s<POOL>%s<NICK>, or %s<POOL>%s declaration", key, EnvPrefix, baseURLSuffix, EnvPrefix, backendInfix, EnvPrefix, prioritySuffix)
 	}
 
 	if len(members) == 0 {
@@ -214,6 +248,22 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 		}
 	}
 
+	// A priority list must name a real pool and only real members of it.
+	// Fail closed on a typo'd pool or nick rather than silently routing by
+	// a misspelled preference.
+	for poolName, order := range poolPriority {
+		p, ok := pools[poolName]
+		if !ok {
+			return nil, fmt.Errorf("backend: %s sets a priority for pool %q, which has no backends", poolPriorityOrigin[poolName], poolName)
+		}
+		for _, nick := range order {
+			if _, ok := p.byNick[nick]; !ok {
+				return nil, fmt.Errorf("backend: %s lists nick %q, which is not a member of pool %q", poolPriorityOrigin[poolName], nick, poolName)
+			}
+		}
+		p.priority = order
+	}
+
 	for _, p := range pools {
 		p.nicks = make([]string, 0, len(p.byNick))
 		for nick := range p.byNick {
@@ -237,6 +287,32 @@ func splitCredURL(val string) (cred, override string, err error) {
 		return "", "", fmt.Errorf("has an empty credential")
 	}
 	return cred, override, nil
+}
+
+// parsePriority parses an AQG_POOL_<POOL>_PRIORITY value into an ordered,
+// duplicate-free list of normalized nicks. An empty value, an empty
+// entry, or a repeated nick is an error — the membership of each nick is
+// checked later, once all members are known. The order is preserved as
+// given (highest priority first).
+func parsePriority(val string) ([]string, error) {
+	if strings.TrimSpace(val) == "" {
+		return nil, fmt.Errorf("has an empty priority list")
+	}
+	parts := strings.Split(val, priorityListSep)
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		nick := normalizeName(p)
+		if nick == "" {
+			return nil, fmt.Errorf("has an empty nick in its priority list")
+		}
+		if seen[nick] {
+			return nil, fmt.Errorf("lists nick %q more than once in its priority list", nick)
+		}
+		seen[nick] = true
+		out = append(out, nick)
+	}
+	return out, nil
 }
 
 // validateBaseURL enforces that an upstream has a scheme and host, the
@@ -280,6 +356,20 @@ func (r *Registry) PoolNicks(poolName string) []string {
 	}
 	out := make([]string, len(p.nicks))
 	copy(out, p.nicks)
+	return out
+}
+
+// PoolPriority returns the pool's declared preference order (highest
+// first), or nil when the pool is unknown or declared no priority. The
+// returned slice is a copy. A non-nil result is the auto controller's
+// signal to use priority-ordered selection instead of random/round-robin.
+func (r *Registry) PoolPriority(poolName string) []string {
+	p, ok := r.pools[normalizeName(poolName)]
+	if !ok || len(p.priority) == 0 {
+		return nil
+	}
+	out := make([]string, len(p.priority))
+	copy(out, p.priority)
 	return out
 }
 

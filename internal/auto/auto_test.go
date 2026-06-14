@@ -367,3 +367,120 @@ func TestPools_routesPerPool(t *testing.T) {
 		t.Errorf("Current(auto) = (%+v,%v), want an auto-pool member", cur, ok)
 	}
 }
+
+// newPriorityController builds a controller over the "auto" pool with an
+// AQG_POOL_AUTO_PRIORITY declaration, exercising the full env → registry →
+// controller path so the priority wiring is covered end to end.
+func newPriorityController(t *testing.T, start int, clock *fixedClock, logOut io.Writer, priorityCSV string, nicks ...string) *Controller {
+	t.Helper()
+	for _, n := range nicks {
+		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
+	}
+	t.Setenv(backend.EnvPrefix+"AUTO_PRIORITY", priorityCSV)
+	reg, err := backend.Load(testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	return NewController(reg, "auto", start, clock.now, logOut)
+}
+
+// TestPriority_startsAtHighest proves a priority pool anchors its initial
+// sticky pointer on the highest-priority member, not a random one — even
+// though nicks sort to [a b c], priority [c,a,b] starts on c.
+func TestPriority_startsAtHighest(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	for i := 0; i < 10; i++ { // start < 0 is "auto"; must be deterministic under priority
+		c := newPriorityController(t, -1, clock, io.Discard, "c,a,b", "a", "b", "c")
+		if got := c.Current(); got != "c" {
+			t.Fatalf("priority start = %q, want c (highest priority)", got)
+		}
+	}
+}
+
+// TestPriority_failoverClimbsToHighest proves failover targets the
+// highest-priority healthy member rather than round-robin-from-current.
+// Priority is [c,b,a]; starting on c, each 429 steps down the priority
+// order: c → b → a.
+func TestPriority_failoverClimbsToHighest(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newPriorityController(t, -1, clock, io.Discard, "c,b,a", "a", "b", "c")
+
+	if got := c.Current(); got != "c" {
+		t.Fatalf("start = %q, want c", got)
+	}
+	if err := c.ModifyResponse(resp429(c.resolve(t, "c"), clock, time.Hour)); err != nil {
+		t.Fatalf("ModifyResponse c: %v", err)
+	}
+	if got := c.Current(); got != "b" {
+		t.Fatalf("after c 429, Current = %q, want b (next priority)", got)
+	}
+	if err := c.ModifyResponse(resp429(c.resolve(t, "b"), clock, time.Hour)); err != nil {
+		t.Fatalf("ModifyResponse b: %v", err)
+	}
+	if got := c.Current(); got != "a" {
+		t.Fatalf("after b 429, Current = %q, want a (last priority)", got)
+	}
+}
+
+// TestPriority_failoverPicksHighestNotNeighbour proves the target is
+// chosen by priority, not by adjacency to the current index. Priority is
+// [c,b,a]; sitting on the lowest-priority a, a 429 jumps straight to the
+// highest-priority healthy member c (round-robin would have picked b).
+func TestPriority_failoverPicksHighestNotNeighbour(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	// start index 0 == nick "a" (nicks sort to [a b c]); a is lowest priority.
+	c := newPriorityController(t, 0, clock, io.Discard, "c,b,a", "a", "b", "c")
+
+	if got := c.Current(); got != "a" {
+		t.Fatalf("start = %q, want a", got)
+	}
+	if err := c.ModifyResponse(resp429(c.resolve(t, "a"), clock, time.Hour)); err != nil {
+		t.Fatalf("ModifyResponse a: %v", err)
+	}
+	if got := c.Current(); got != "c" {
+		t.Fatalf("after a 429, Current = %q, want c (highest healthy, not neighbour b)", got)
+	}
+}
+
+// TestPriority_subsetRanksUnlistedLast proves members omitted from the
+// PRIORITY list rank after the listed ones in sorted order. Priority lists
+// only "c"; with c exhausted, failover goes to a (first unlisted, sorted).
+func TestPriority_subsetRanksUnlistedLast(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newPriorityController(t, -1, clock, io.Discard, "c", "a", "b", "c")
+
+	if got := c.Current(); got != "c" {
+		t.Fatalf("start = %q, want c (only listed member)", got)
+	}
+	if err := c.ModifyResponse(resp429(c.resolve(t, "c"), clock, time.Hour)); err != nil {
+		t.Fatalf("ModifyResponse c: %v", err)
+	}
+	if got := c.Current(); got != "a" {
+		t.Fatalf("after c 429, Current = %q, want a (first unlisted, sorted)", got)
+	}
+}
+
+// TestPriority_staysOnLowerUntil429 documents the Phase 1 limitation: once
+// a priority pool fails over to a lower-priority member, it does not
+// preempt back when the higher-priority member recovers — it rides the
+// current member until that member itself 429s. (Preempt-back is #31.)
+func TestPriority_staysOnLowerUntil429(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newPriorityController(t, -1, clock, io.Discard, "b,a", "a", "b")
+
+	if got := c.Current(); got != "b" {
+		t.Fatalf("start = %q, want b", got)
+	}
+	// b 429s with a 1h reset → fail over to a.
+	if err := c.ModifyResponse(resp429(c.resolve(t, "b"), clock, time.Hour)); err != nil {
+		t.Fatalf("ModifyResponse b: %v", err)
+	}
+	if got := c.Current(); got != "a" {
+		t.Fatalf("after b 429, Current = %q, want a", got)
+	}
+	// b's window resets; a is still healthy, so the pool keeps riding a.
+	clock.advance(2 * time.Hour)
+	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "a" {
+		t.Fatalf("after b recovered, ResolveAuto = (%q, exhausted=%v), want a still sticky", b.Nick, exhausted)
+	}
+}

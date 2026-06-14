@@ -136,10 +136,47 @@ AQG_POOL_API_BACKEND_K=sk-ant-api...
 AQG_POOL_Z_AI_BASE_URL=https://open.example/anthropic
 AQG_POOL_Z_AI_BACKEND_X=vendor-key-x
 AQG_POOL_Z_AI_BACKEND_Y=vendor-key-y|https://mirror.example/anthropic
+
+# A mixed pool that prefers one member over another. PRIORITY makes the
+# pool start on (and fail over toward) the highest-priority healthy member
+# instead of a random one — drain the preferred backend first, fall to the
+# next when it 429s.
+AQG_POOL_CHN_BACKEND_ZAI=zai-key
+AQG_POOL_CHN_BACKEND_M3=m3-key
+AQG_POOL_CHN_PRIORITY=zai,m3
 ```
 
-Clients then select `auto`, `api`, or `z-ai`. Each pool rotates
+Clients then select `auto`, `api`, `z-ai`, or `chn`. Each pool rotates
 independently; the gateway does not move traffic between pools on its own.
+
+### Priority within a pool
+
+By default a pool's members are interchangeable: the controller starts on a
+random one and, on a `429`, fails over round-robin (spreading load and
+preserving each account's prompt cache — see
+[Pools and selectors](#pools-and-selectors)). That is ideal for a pool of
+equal-strength subscriptions.
+
+When a pool mixes a *preferred* backend with a weaker fallback, declare an
+order with `AQG_POOL_<POOL>_PRIORITY=<nick>,<nick>,...` (highest first):
+
+- The pool **starts on** its highest-priority member instead of a random one.
+- On a `429` it **fails over to** the highest-priority *healthy* member, so
+  failover always climbs back toward the preferred backend.
+- Members omitted from the list rank after the listed ones, in sorted order.
+- The variable is **opt-in**: a pool without it keeps the random-start,
+  round-robin behaviour unchanged. Listing a nonexistent nick (or a pool
+  with no members) is a startup error.
+
+The order is by member nick only — no vendor or model names appear in the
+gateway's routing logic, so adding a new vendor's subscription is a config
+change, never a code change.
+
+Phase 1 (this release) honours priority for the **initial pick** and the
+**failover target** only. Once a pool falls over to a lower-priority member
+it rides that member until the member itself `429`s — it does not yet
+preempt back when the preferred backend's quota window resets (tracked
+separately).
 
 ## Environment variables
 
@@ -147,14 +184,16 @@ independently; the gateway does not move traffic between pools on its own.
 |----------|---------|-------|
 | `AQG_POOL_<POOL>_BACKEND_<NICK>` | _(at least one required)_ | A pool member's credential, optionally `=<cred>\|<base-url>` to override the pool default upstream for that member. `<POOL>` and `<NICK>` are normalized (`AQG_POOL_Z_AI_BACKEND_KEY_A` → pool `z-ai`, member `key-a`). |
 | `AQG_POOL_<POOL>_BASE_URL` | `ANTHROPIC_BASE_URL` | The pool's default upstream; scheme and host are required. Omit it for pools that hit `api.anthropic.com`. |
+| `AQG_POOL_<POOL>_PRIORITY` | _(optional)_ | Comma-separated member nicks, highest priority first (e.g. `zai,m3`). When set, the pool starts on and fails over toward the highest-priority healthy member instead of random/round-robin. Unlisted members rank last (sorted). Carries no credential. See [Priority within a pool](#priority-within-a-pool). |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only; the build refuses anything else. |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
-`AQG_POOL_*` shape, or two keys colliding on the same pool/member. A `|`
-in a credential is rejected because the tail must parse as a URL — tokens
-do not contain `|`.
+`AQG_POOL_*` shape, two keys colliding on the same pool/member, or a
+`PRIORITY` that is empty, repeats a nick, names a nick that is not a member
+of the pool, or targets a pool with no members. A `|` in a credential is
+rejected because the tail must parse as a URL — tokens do not contain `|`.
 
 Pools live in the environment, not a file — the gateway never reads a
 credential from disk (see [Security model](#security-model)). If you
@@ -195,12 +234,18 @@ zero-probe**, per pool:
   returns a `429`. There is no utilization threshold — a member at 95% can
   still finish a small task, and switching only on a real rejection means
   fewer switches and better cache retention.
-- **Zero probe.** The starting member is chosen at random on startup and
-  its quota fills in from the first real response. No member is ever
-  contacted just to measure it. This is also why resets stay naturally
-  staggered: each account's rolling 5-hour window is anchored to its own
-  real first use, so the windows drift apart and there is almost always
-  one member freeing up before the others.
+- **Zero probe.** The starting member is chosen at random on startup (or by
+  declared priority — see below) and its quota fills in from the first real
+  response. No member is ever contacted just to measure it. This is also why
+  resets stay naturally staggered: each account's rolling 5-hour window is
+  anchored to its own real first use, so the windows drift apart and there
+  is almost always one member freeing up before the others.
+
+A pool may opt out of the random start and round-robin failover by
+declaring a preference order with `AQG_POOL_<POOL>_PRIORITY` — see
+[Priority within a pool](#priority-within-a-pool). This changes only
+*which* healthy member is picked; the sticky, reactive, zero-probe model is
+otherwise unchanged.
 
 ### What the client sees on a switch
 

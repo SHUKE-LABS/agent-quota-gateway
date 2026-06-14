@@ -206,6 +206,87 @@ func TestLoadFrom_unrecognisedShapeRejected(t *testing.T) {
 	}
 }
 
+func TestLoadFrom_priorityParsed(t *testing.T) {
+	// PRIORITY may appear before the members it names, and is normalized
+	// the same way nicks are.
+	reg, err := loadFrom([]string{
+		"AQG_POOL_CHN_PRIORITY=ZAI,M3",
+		"AQG_POOL_CHN_BACKEND_ZAI=cred-zai",
+		"AQG_POOL_CHN_BACKEND_M3=cred-m3",
+	}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("loadFrom: %v", err)
+	}
+	if got := reg.PoolPriority("chn"); !reflect.DeepEqual(got, []string{"zai", "m3"}) {
+		t.Errorf("PoolPriority(chn) = %v, want [zai m3]", got)
+	}
+}
+
+func TestLoadFrom_priorityAbsentIsNil(t *testing.T) {
+	reg, err := loadFrom([]string{"AQG_POOL_AUTO_BACKEND_A=cred-a"}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("loadFrom: %v", err)
+	}
+	if got := reg.PoolPriority("auto"); got != nil {
+		t.Errorf("PoolPriority(auto) = %v, want nil for a pool with no PRIORITY", got)
+	}
+	if got := reg.PoolPriority("nope"); got != nil {
+		t.Errorf("PoolPriority(unknown) = %v, want nil", got)
+	}
+}
+
+func TestLoadFrom_prioritySubsetAllowed(t *testing.T) {
+	// Listing only some members is valid; the controller ranks the rest
+	// after the listed ones.
+	reg, err := loadFrom([]string{
+		"AQG_POOL_CHN_PRIORITY=zai",
+		"AQG_POOL_CHN_BACKEND_ZAI=cred-zai",
+		"AQG_POOL_CHN_BACKEND_M3=cred-m3",
+	}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("loadFrom: %v", err)
+	}
+	if got := reg.PoolPriority("chn"); !reflect.DeepEqual(got, []string{"zai"}) {
+		t.Errorf("PoolPriority(chn) = %v, want [zai]", got)
+	}
+}
+
+func TestLoadFrom_priorityRejectsBadInput(t *testing.T) {
+	cases := map[string][]string{
+		"unknown nick": {
+			"AQG_POOL_CHN_PRIORITY=zai,ghost",
+			"AQG_POOL_CHN_BACKEND_ZAI=cred-zai",
+		},
+		"pool with no members": {
+			"AQG_POOL_CHN_PRIORITY=zai",
+			"AQG_POOL_OTHER_BACKEND_A=cred-a",
+		},
+		"empty list": {
+			"AQG_POOL_CHN_PRIORITY=",
+			"AQG_POOL_CHN_BACKEND_ZAI=cred-zai",
+		},
+		"empty entry": {
+			"AQG_POOL_CHN_PRIORITY=zai,,m3",
+			"AQG_POOL_CHN_BACKEND_ZAI=cred-zai",
+			"AQG_POOL_CHN_BACKEND_M3=cred-m3",
+		},
+		"duplicate nick": {
+			"AQG_POOL_CHN_PRIORITY=zai,zai",
+			"AQG_POOL_CHN_BACKEND_ZAI=cred-zai",
+		},
+		"duplicate priority var": {
+			"AQG_POOL_CHN_PRIORITY=zai",
+			"AQG_POOL_chn_PRIORITY=zai",
+			"AQG_POOL_CHN_BACKEND_ZAI=cred-zai",
+		},
+	}
+	for name, env := range cases {
+		if _, err := loadFrom(env, testDefaultBaseURL); err == nil {
+			t.Errorf("%s: expected error, got nil", name)
+		}
+	}
+}
+
 func TestContext_roundTrip(t *testing.T) {
 	b := Backend{Pool: "auto", Nick: "claude-a", Credential: "cred-a", BaseURL: testDefaultBaseURL}
 	ctx := WithBackend(context.Background(), b)
