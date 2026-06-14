@@ -603,6 +603,14 @@ into RFC 3339). A utilization of `0` means a window is untouched (full
 quota); a missing utilization field means the last response did not
 advertise that window.
 
+`org_id` is the Anthropic organization that owns the account behind the
+snapshot, copied verbatim from the `anthropic-organization-id` response
+header on the request that drove it. It follows the same presence
+semantics as the unified fields — present only when the upstream returned
+the header on the most recent response, omitted otherwise — so a consumer
+can surface which organization a pool member is using, which matters when a
+pool mixes accounts from different orgs.
+
 ### Pool keying
 
 Snapshots are filed under `<pool>/<member>`, and the read endpoint takes a

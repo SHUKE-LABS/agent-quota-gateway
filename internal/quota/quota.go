@@ -78,6 +78,9 @@ type Snapshot struct {
 	UnifiedOverageStatus         string   `json:"unified_overage_status,omitempty"`
 	UnifiedOverageDisabledReason string   `json:"unified_overage_disabled_reason,omitempty"`
 
+	// OrgID is the Anthropic organization that owns the backend's account,
+	// copied from the anthropic-organization-id response header. Present
+	// only when that header was on the snapshot-driving response.
 	OrgID string `json:"org_id,omitempty"`
 
 	// AsOf is the gateway-side time the snapshot was recorded. The
