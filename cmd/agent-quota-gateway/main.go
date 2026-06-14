@@ -18,6 +18,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
+	"github.com/shukebeta/agent-quota-gateway/internal/poller"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
@@ -109,6 +110,14 @@ func run() error {
 	// without a hand-rolled signal channel.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// The poller fills the quota store for backends that never emit
+	// Anthropic rate-limit headers (Z.ai / ZhipuAI, MiniMaxi) by polling
+	// each provider's proprietary quota API for the active member of each
+	// pool. It is a no-op for Anthropic and any other untracked backend.
+	// It shares the shutdown context, so it stops when the process does.
+	qp := poller.New(registry.PoolNames(), pools.Current, store, nil, 0, nil, nil)
+	go qp.Run(ctx)
 
 	errCh := make(chan error, 1)
 	go func() {

@@ -12,3 +12,4 @@ bin/
 dist/
 coverage.out
 
+.playwright-mcp/

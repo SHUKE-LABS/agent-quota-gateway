@@ -49,7 +49,11 @@ across vendors loses the prompt cache, and quota semantics differ).
   closed with `403` — there is no silent fallback.
 - Quota snapshots are captured passively from upstream rate-limit headers
   and exposed at `GET /_gateway/quota`, keyed per pool. No synthetic probe
-  requests — freshness depends on real client traffic.
+  requests against the Messages API — header-derived freshness depends on
+  real client traffic. The exception is providers that never return
+  rate-limit headers (Z.ai / ZhipuAI, MiniMaxi): a background poller reads
+  their proprietary quota endpoint for the active member of each pool (see
+  [Proprietary quota polling](#proprietary-quota-polling)).
 
 Out of scope:
 
@@ -249,6 +253,9 @@ switch is self-explained: the gateway moved to a fresher account. An
 unknown pool returns `200` with an empty snapshot. Pools whose members do
 not report `anthropic-ratelimit-unified-*` (API keys, most non-native
 vendors) return empty snapshots — failover still works off the real `429`.
+Z.ai / ZhipuAI and MiniMaxi backends are the exception: a background poller
+fills their snapshots from each provider's own quota endpoint (see
+[Proprietary quota polling](#proprietary-quota-polling)).
 
 ## Layout
 
@@ -258,6 +265,7 @@ vendors) return empty snapshots — failover still works off the real `429`.
 - `internal/config/` — env loading and validation
 - `internal/proxy/` — reverse-proxy handler and tests
 - `internal/quota/` — rate-limit header extraction and snapshot store
+- `internal/poller/` — background poller for proprietary quota APIs
 - `internal/logging/` — middleware and tests
 
 ### Health
@@ -293,8 +301,12 @@ that follow:
   holds. How the environment is populated is the operator's choice.
 - Quota snapshots are stored only in process memory. There is no on-disk
   state and no telemetry egress; stopping the gateway erases the cache.
-- The proxy does not issue probe traffic. Every snapshot is the side
-  effect of a real request a client made.
+- The proxy does not issue probe traffic against the Messages API: every
+  header-derived snapshot is the side effect of a real client request. The
+  only gateway-originated requests are the background poller's reads of
+  Z.ai / ZhipuAI and MiniMaxi quota endpoints, sent with the active
+  member's own credential to that member's own provider — never to
+  Anthropic, and never carrying request/response bodies.
 - The listen address is loopback-only. `config.validate` rejects
   `0.0.0.0`, public IPs, and unresolvable names so a misconfigured
   deployment fails closed at startup.
@@ -365,9 +377,14 @@ local read-only view, gated by the loopback boundary like
 
 ### Freshness model
 
-Snapshots only update when real traffic flows. The gateway never issues
-synthetic probe requests — if no client has hit the pool recently, the
+For Anthropic and other header-reporting backends, snapshots only update
+when real traffic flows. The gateway issues no synthetic probe requests
+against the Messages API — if no client has hit the pool recently, the
 snapshot is stale by exactly that gap.
+
+Z.ai / ZhipuAI and MiniMaxi backends are kept fresh independently of
+traffic by the background poller (see
+[Proprietary quota polling](#proprietary-quota-polling)).
 
 ### Consumer contract
 
@@ -384,6 +401,40 @@ on a frozen schema:
   decides whether the snapshot is meaningful by inspecting the body.
 - The gateway ships no compatibility shims. Renames, unit conversions, or
   derived values live in the consumer.
+
+### Proprietary quota polling
+
+Z.ai / ZhipuAI and MiniMaxi never return `anthropic-ratelimit-unified-*`
+headers, so their store entries would stay permanently empty under the
+passive header model. Each exposes a proprietary quota endpoint instead, so
+a background poller refreshes them on a fixed cadence and writes the result
+into the same per-member store the header path uses. The
+`/_gateway/quota?backend=<pool>` response shape is identical — a consumer
+cannot tell a polled snapshot from a header-derived one.
+
+How it behaves:
+
+- **Active member only.** Every 2 minutes the poller asks each pool for its
+  current sticky member and polls only that backend. A pool that has failed
+  over to an untracked member (e.g. Anthropic) is not polled until it fails
+  back, so polling naturally tracks where traffic is going.
+- **Detection by base URL.** A backend is polled when its base URL contains
+  `api.z.ai`, `open.bigmodel.cn`, or `minimaxi.com`. Anything else
+  (Anthropic, ByteDance Ark, other vendors) is left to the header path.
+- **Per-provider auth and mapping.** Z.ai / Zhipu authenticate with the raw
+  credential on `Authorization` and report *used* percentages; MiniMaxi
+  authenticates with `Authorization: Bearer` and reports *remaining*
+  percentages, which the poller inverts to utilization. Both map onto the
+  unified 5h / 7d utilization and reset fields.
+- **Failure is silent and non-destructive.** A network error, non-`200`, or
+  unparseable body is logged and skipped; the last good snapshot survives.
+- **Startup.** The poller runs one pass immediately at startup, so a tracked
+  pool's snapshot is populated well within the first 2-minute interval —
+  without any client request. It shares the process shutdown signal and
+  stops when the gateway does.
+
+The poller's reads are the only gateway-originated upstream traffic; see
+[Security model](#security-model).
 
 ## Why a thin proxy
 
