@@ -146,13 +146,22 @@ func (s Snapshot) HasData() bool {
 // Store holds the most recent Snapshot per backend key. The zero value
 // is not usable; call NewStore.
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]Snapshot
+	mu       sync.RWMutex
+	data     map[string]Snapshot
+	onChange func() // called (non-blocking) after every Put; nil by default
 }
 
 // NewStore returns an empty Store ready for concurrent use.
 func NewStore() *Store {
 	return &Store{data: make(map[string]Snapshot)}
+}
+
+// SetOnChange installs a callback invoked (non-blocking) after every Put.
+// Used by the persister to coalesce writes without importing this package.
+func (s *Store) SetOnChange(fn func()) {
+	s.mu.Lock()
+	s.onChange = fn
+	s.mu.Unlock()
 }
 
 // Put records s under key, replacing any prior snapshot for that key.
@@ -162,7 +171,11 @@ func (s *Store) Put(key string, snap Snapshot) {
 	snap.Backend = key
 	s.mu.Lock()
 	s.data[key] = snap
+	onChange := s.onChange
 	s.mu.Unlock()
+	if onChange != nil {
+		onChange()
+	}
 }
 
 // Get returns the snapshot recorded for key. When no snapshot has been
@@ -176,6 +189,18 @@ func (s *Store) Get(key string) Snapshot {
 		return Snapshot{Backend: key, AsOf: time.Now().UTC()}
 	}
 	return snap
+}
+
+// Snapshot returns a copy of all currently stored snapshots. Used by the
+// persister to capture the full store state for serialisation.
+func (s *Store) Snapshot() map[string]Snapshot {
+	s.mu.RLock()
+	out := make(map[string]Snapshot, len(s.data))
+	for k, v := range s.data {
+		out[k] = v
+	}
+	s.mu.RUnlock()
+	return out
 }
 
 // parseFloat returns a pointer to the parsed float64, or nil when the

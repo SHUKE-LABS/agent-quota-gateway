@@ -23,9 +23,12 @@ TimeoutStopSec=35
 
 # --- Hardening -----------------------------------------------------------
 # An ephemeral, unprivileged service account created per start. No manual
-# useradd, no home, nothing on disk to own. The binary keeps all state in
-# memory and writes no files.
+# useradd, no home, nothing on disk to own.
 DynamicUser=yes
+# StateDirectory gives the dynamic user a writable /var/lib/agent-quota-gateway/
+# and sets $STATE_DIRECTORY in the process environment; the binary uses
+# $STATE_DIRECTORY/state.json for write-through persistence by default.
+StateDirectory=agent-quota-gateway
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

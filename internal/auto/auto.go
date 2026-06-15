@@ -25,6 +25,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -119,6 +120,79 @@ func (p *Pools) Current(poolName string) (backend.Backend, bool) {
 	return c.CurrentBackend(), true
 }
 
+// MemberStatus describes one pool member's current state for /_gateway/pool.
+type MemberStatus struct {
+	Nick           string          `json:"nick"`
+	Status         string          `json:"status"`          // "active", "exhausted", "idle"
+	ExhaustedUntil *time.Time      `json:"exhausted_until"` // RFC 3339 or null
+	Snapshot       *quota.Snapshot `json:"snapshot"`        // null when no snapshot recorded
+}
+
+// PoolStatus is the /_gateway/pool response for one pool.
+type PoolStatus struct {
+	Pool    string         `json:"pool"`
+	Active  string         `json:"active"`
+	Members []MemberStatus `json:"members"`
+}
+
+// PoolStatus returns the current status of the named pool, or ok=false for an unknown pool.
+func (p *Pools) PoolStatus(poolName string, store *quota.Store) (PoolStatus, bool) {
+	c, ok := p.byPool[poolName]
+	if !ok {
+		return PoolStatus{}, false
+	}
+	return c.poolStatus(store), true
+}
+
+// AllPoolStatuses returns status for every pool in sorted order.
+func (p *Pools) AllPoolStatuses(store *quota.Store) []PoolStatus {
+	names := make([]string, 0, len(p.byPool))
+	for name := range p.byPool {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]PoolStatus, 0, len(names))
+	for _, name := range names {
+		out = append(out, p.byPool[name].poolStatus(store))
+	}
+	return out
+}
+
+// PoolPersistState is the serializable routing state for one pool.
+// It is exported so the persist package can embed it in GatewayState.
+type PoolPersistState struct {
+	Sticky    string               `json:"sticky"`
+	Exhausted map[string]time.Time `json:"exhausted"`
+}
+
+// LoadPersistState applies previously persisted routing state to each pool's
+// controller. Called once at startup, before the server begins serving.
+func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
+	for name, s := range states {
+		if c, ok := p.byPool[name]; ok {
+			c.loadState(s.Sticky, s.Exhausted)
+		}
+	}
+}
+
+// PersistState snapshots the current routing state for all pools.
+func (p *Pools) PersistState() map[string]PoolPersistState {
+	out := make(map[string]PoolPersistState, len(p.byPool))
+	for name, c := range p.byPool {
+		out[name] = c.persistState()
+	}
+	return out
+}
+
+// SetOnMutate installs a callback that every controller calls (non-blocking)
+// after any mutation to its sticky pointer or exhausted map. Used by the
+// persister to coalesce writes without importing this package.
+func (p *Pools) SetOnMutate(fn func()) {
+	for _, c := range p.byPool {
+		c.onMutate = fn
+	}
+}
+
 // Controller is the sticky selector for one pool. The zero value is not
 // usable; call NewController.
 type Controller struct {
@@ -153,6 +227,10 @@ type Controller struct {
 
 	now    func() time.Time
 	logOut io.Writer
+
+	// onMutate, if non-nil, is called (non-blocking) after any mutation to
+	// cur or exhausted. Set by Pools.SetOnMutate to notify the persister.
+	onMutate func()
 }
 
 // NewController builds the sticky selector over the members of poolName
@@ -250,12 +328,14 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	}
 	if idx, ok := c.firstHealthyLocked(); ok {
 		c.cur = idx
+		c.notifyMutate()
 		return c.backendAt(idx), 0, false
 	}
 	// All exhausted: point at the soonest to free up so the client's
 	// post-wait retry lands on it, and report the precise wait.
 	idx, reset := c.soonestLocked()
 	c.cur = idx
+	c.notifyMutate()
 	return c.backendAt(idx), c.waitUntil(reset), true
 }
 
@@ -271,6 +351,75 @@ func (c *Controller) CurrentBackend() backend.Backend {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.backendAt(c.cur)
+}
+
+// notifyMutate calls c.onMutate if set. It is safe to call while holding
+// c.mu because onMutate is a non-blocking channel send in the persister.
+func (c *Controller) notifyMutate() {
+	if c.onMutate != nil {
+		c.onMutate()
+	}
+}
+
+// poolStatus builds the /_gateway/pool response for this controller. store
+// is consulted for each member's latest snapshot; a member with no recorded
+// snapshot gets snapshot:null. Caller must not hold c.mu.
+func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearExpiredLocked()
+
+	curNick := c.nicks[c.cur]
+	members := make([]MemberStatus, 0, len(c.nicks))
+	for _, nick := range c.nicks {
+		ms := MemberStatus{Nick: nick}
+		if nick == curNick {
+			ms.Status = "active"
+		} else if reset, ok := c.exhaustedUntilLocked(nick); ok {
+			ms.Status = "exhausted"
+			r := reset.UTC()
+			ms.ExhaustedUntil = &r
+		} else {
+			ms.Status = "idle"
+		}
+		if idx := c.indexOf(nick); idx >= 0 {
+			snap := store.Get(c.backendAt(idx).QuotaKey())
+			if snap.HasData() {
+				snapCopy := snap
+				ms.Snapshot = &snapCopy
+			}
+		}
+		members = append(members, ms)
+	}
+	return PoolStatus{Pool: c.pool, Active: curNick, Members: members}
+}
+
+// loadState applies persisted routing state. Exhausted entries whose reset
+// has already passed are silently dropped. Called once at startup before
+// the server begins serving; does not call onMutate.
+func (c *Controller) loadState(sticky string, exhausted map[string]time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if idx := c.indexOf(sticky); idx >= 0 {
+		c.cur = idx
+	}
+	now := c.now()
+	for nick, reset := range exhausted {
+		if reset.After(now) {
+			c.exhausted[nick] = reset
+		}
+	}
+}
+
+// persistState snapshots the controller's routing state for serialisation.
+func (c *Controller) persistState() PoolPersistState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ex := make(map[string]time.Time, len(c.exhausted))
+	for k, v := range c.exhausted {
+		ex[k] = v
+	}
+	return PoolPersistState{Sticky: c.nicks[c.cur], Exhausted: ex}
 }
 
 // ModifyResponse is the per-pool failover hook. It acts on a request that
@@ -333,15 +482,18 @@ func (c *Controller) record429(nick string, reset time.Time) record429Result {
 	// Another request may have already rotated off the failed backend; if
 	// the current sticky is healthy, keep it.
 	if !c.isExhaustedLocked(c.nicks[c.cur]) {
+		c.notifyMutate()
 		return record429Result{to: c.nicks[c.cur]}
 	}
 	if idx, ok := c.firstHealthyLocked(); ok {
 		from := c.cur
 		c.cur = idx
+		c.notifyMutate()
 		return record429Result{to: c.nicks[idx], switched: idx != from}
 	}
 	idx, soonest := c.soonestLocked()
 	c.cur = idx
+	c.notifyMutate()
 	return record429Result{to: c.nicks[idx], retryAfter: c.waitUntil(soonest), allExhausted: true}
 }
 

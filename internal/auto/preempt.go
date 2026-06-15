@@ -302,6 +302,7 @@ func (c *Controller) PreemptTo(nick string) bool {
 		return false
 	}
 	c.cur = idx
+	c.notifyMutate()
 	return true
 }
 
@@ -315,6 +316,7 @@ func (c *Controller) noteRecovered(nick string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.exhausted, nick)
+	c.notifyMutate()
 }
 
 // rankLocked returns nick's position in the pool's priority order (lower is

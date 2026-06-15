@@ -207,6 +207,7 @@ never preempt, so their prompt cache is never interrupted.
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
+| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all state is in-memory only and lost on restart. The file stores sticky pointers, exhausted maps, and quota snapshots — no credentials. Writes are atomic (temp-file + rename) and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
@@ -331,6 +332,49 @@ endpoint (see [Proprietary quota polling](#proprietary-quota-polling)).
 The endpoint is `GET`-only; any other method returns `405` with an
 `Allow: GET` response header.
 
+### Inspecting pool health
+
+`GET /_gateway/pool` returns the full member roster for every configured
+pool. With `?pool=<name>` it narrows to a single pool; without the
+parameter it returns all pools in sorted order.
+
+```bash
+curl http://127.0.0.1:8080/_gateway/pool?pool=auto
+```
+
+```json
+{
+  "pool": "auto",
+  "active": "b",
+  "members": [
+    { "nick": "a", "status": "exhausted", "exhausted_until": "2026-06-15T18:00:00Z", "snapshot": { ... } },
+    { "nick": "b", "status": "active",    "exhausted_until": null,                   "snapshot": { ... } },
+    { "nick": "c", "status": "idle",      "exhausted_until": null,                   "snapshot": null }
+  ]
+}
+```
+
+**`status`** values:
+
+| Value | Meaning |
+|-------|---------|
+| `active` | Currently selected by the sticky pointer |
+| `exhausted` | Parked — either a live-429 park or store-driven exhaustion; `exhausted_until` is the reset time |
+| `idle` | Healthy and not currently active |
+
+`exhausted_until` is an RFC 3339 timestamp when `status == "exhausted"`,
+`null` otherwise. `snapshot` is the same `quota.Snapshot` object
+`/_gateway/quota` returns, or `null` when no snapshot has been recorded
+for that member yet.
+
+**Caveat for Anthropic/Claude members:** the gateway never probes — quota
+state is learned only from real proxied responses. An idle or never-active
+member will have `snapshot: null` or a stale value. This is intentional:
+probing would start a new session and consume quota.
+
+`?pool=<unknown>` returns HTTP 404. The endpoint is `GET`-only; non-GET
+returns `405` with `Allow: GET`.
+
 ## Layout
 
 - `cmd/agent-quota-gateway/` — service entrypoint and integration tests
@@ -376,8 +420,11 @@ guarantees that follow:
 - Credentials live only in the process environment and in memory — the
   gateway reads no credential file, so its "no on-disk state" posture
   holds. How the environment is populated is the operator's choice.
-- Quota snapshots are stored only in process memory. There is no on-disk
-  state and no telemetry egress; stopping the gateway erases the cache.
+- Quota snapshots, sticky pointers, and exhausted maps can optionally be
+  persisted to a local state file (see `AQG_STATE_FILE` below) so state
+  survives a restart. The file contains only quota utilization data and
+  timing — no credentials — and is `0600` so only the service account can
+  read it. There is no telemetry egress.
 - The proxy does not issue probe traffic against the Messages API: every
   header-derived snapshot is the side effect of a real client request. The
   only gateway-originated requests are the background poller's reads of

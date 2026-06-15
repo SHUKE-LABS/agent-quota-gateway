@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -33,6 +34,12 @@ const (
 	// in shared mode is a Tailscale ACL, not the loopback interface; the
 	// gateway adds no auth of its own. See the README "Shared mode" section.
 	EnvSharedListenAddr = "SHARED_LISTEN_ADDR"
+
+	// EnvStateFile sets the path for the persistent state file. When unset,
+	// the gateway checks $STATE_DIRECTORY (set automatically by systemd when
+	// StateDirectory= is configured) and uses $STATE_DIRECTORY/state.json if
+	// present. An empty result disables persistence.
+	EnvStateFile = "AQG_STATE_FILE"
 
 	// DefaultBaseURL is the Anthropic production endpoint.
 	DefaultBaseURL = "https://api.anthropic.com"
@@ -66,6 +73,10 @@ type Config struct {
 	// Tailscale address). It selects the listen-address validator and
 	// drives the loud startup warning in main.
 	Shared bool
+
+	// StateFile is the path for the persistent state file. Empty string
+	// disables persistence (the gateway runs as before, all state in memory).
+	StateFile string
 }
 
 // Load reads the gateway configuration from the process environment.
@@ -86,6 +97,7 @@ func Load() (Config, error) {
 
 	cfg := Config{
 		AnthropicBaseURL: getEnv(EnvAnthropicBaseURL, DefaultBaseURL),
+		StateFile:        resolveStateFile(),
 	}
 	if sharedSet {
 		cfg.ListenAddr = shared
@@ -177,4 +189,18 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// resolveStateFile returns the path for the persistent state file.
+// Priority: AQG_STATE_FILE > $STATE_DIRECTORY/state.json > "" (disabled).
+// $STATE_DIRECTORY is set automatically by systemd when StateDirectory= is
+// configured in the unit file.
+func resolveStateFile() string {
+	if v, ok := lookupEnv(EnvStateFile); ok {
+		return v
+	}
+	if d, ok := lookupEnv("STATE_DIRECTORY"); ok {
+		return filepath.Join(d, "state.json")
+	}
+	return ""
 }

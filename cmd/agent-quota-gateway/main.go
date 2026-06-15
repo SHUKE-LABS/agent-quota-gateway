@@ -19,6 +19,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
+	"github.com/shukebeta/agent-quota-gateway/internal/persist"
 	"github.com/shukebeta/agent-quota-gateway/internal/poller"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
@@ -60,6 +61,19 @@ func run() error {
 
 	store := quota.NewStore()
 
+	// Load persisted state from the state file (if configured). A missing
+	// or corrupt file starts fresh; any other I/O error aborts startup.
+	persisted, err := persist.Load(cfg.StateFile)
+	if err != nil {
+		return fmt.Errorf("persist: load %q: %w", cfg.StateFile, err)
+	}
+
+	// Restore quota snapshots first so controllers can read them when
+	// deciding the initial exhaustion state from the store.
+	for key, snap := range persisted.Snapshots {
+		store.Put(key, snap)
+	}
+
 	// pools fronts every configured pool with its own sticky controller.
 	// Each controller starts at a random member (start < 0) so no probe
 	// traffic is needed to anchor it; its quota snapshot fills in from the
@@ -68,6 +82,21 @@ func run() error {
 	// without a live 429 — the only exhaustion signal poller-tracked
 	// backends (z.ai / MiniMaxi) ever produce.
 	pools := auto.NewPools(registry, store, nil, nil)
+
+	// Restore sticky pointers and exhausted maps from the persisted state.
+	// Expired exhausted entries are silently dropped by LoadPersistState.
+	pools.LoadPersistState(persisted.Pools)
+
+	// Wire up the persister so state mutations are coalesced and flushed
+	// atomically to disk. The persister goroutine is started below.
+	statePersister := persist.NewPersister(cfg.StateFile, func() persist.GatewayState {
+		return persist.GatewayState{
+			Pools:     pools.PersistState(),
+			Snapshots: store.Snapshot(),
+		}
+	})
+	pools.SetOnMutate(statePersister.MarkDirty)
+	store.SetOnChange(statePersister.MarkDirty)
 
 	// observer is invoked once per upstream response, before the proxy
 	// streams the body back to the client. It extracts the rate-limit
@@ -110,6 +139,7 @@ func run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/health", healthHandler())
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
+	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
 	handler := logging.Middleware(mux)
@@ -125,6 +155,11 @@ func run() error {
 	// without a hand-rolled signal channel.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// The persister coalesces state mutations and writes them atomically to
+	// the state file. It shares the shutdown context so the final flush
+	// lands before the process exits.
+	go statePersister.Run(ctx)
 
 	// The poller fills the quota store for backends that never emit
 	// Anthropic rate-limit headers (Z.ai / ZhipuAI, MiniMaxi) by polling
@@ -243,5 +278,31 @@ func quotaHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(store.Get(key))
+	}
+}
+
+// poolHandler serves GET /_gateway/pool — the per-member health view for
+// every configured pool. With ?pool=<name> it returns a single pool; without
+// the param it returns all pools in sorted order. Non-GET returns 405.
+func poolHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		poolName := backend.NormalizeName(r.URL.Query().Get("pool"))
+		if poolName == "" {
+			_ = json.NewEncoder(w).Encode(pools.AllPoolStatuses(store))
+			return
+		}
+		status, ok := pools.PoolStatus(poolName, store)
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool not found"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(status)
 	}
 }

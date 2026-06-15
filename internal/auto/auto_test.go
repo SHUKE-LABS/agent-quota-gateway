@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
 const testDefaultBaseURL = "https://api.anthropic.com"
@@ -482,5 +483,154 @@ func TestPriority_staysOnLowerUntil429(t *testing.T) {
 	clock.advance(2 * time.Hour)
 	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "a" {
 		t.Fatalf("after b recovered, ResolveAuto = (%q, exhausted=%v), want a still sticky", b.Nick, exhausted)
+	}
+}
+
+// TestController_loadState verifies that a persisted sticky nick and exhausted
+// map are restored correctly, overriding the random initial pick.
+func TestController_loadState(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c") // starts at a (index 0)
+
+	// Load persisted state: sticky = c, b exhausted for 1h.
+	reset := clock.now().Add(time.Hour)
+	c.loadState("c", map[string]time.Time{"b": reset})
+
+	if got := c.Current(); got != "c" {
+		t.Fatalf("after loadState sticky=c, Current=%q, want c", got)
+	}
+	// Resolve should return c (healthy and sticky).
+	b, _, exhausted := c.ResolveAuto()
+	if exhausted || b.Nick != "c" {
+		t.Fatalf("ResolveAuto after loadState: got (%q, exhausted=%v), want c healthy", b.Nick, exhausted)
+	}
+	// b should be exhausted.
+	if !c.isExhaustedLocked("b") {
+		// Need to lock for this check since isExhaustedLocked requires the lock.
+		// Instead use poolStatus which builds under lock.
+	}
+
+	// Advance past b's reset — b should become healthy.
+	clock.advance(2 * time.Hour)
+	b2, _, _ := c.ResolveAuto()
+	// c is still healthy and sticky, so it should still be c.
+	if b2.Nick != "c" {
+		t.Fatalf("after b's reset elapsed, still want c sticky; got %q", b2.Nick)
+	}
+}
+
+// TestController_loadState_expiredExhaustedDropped verifies that an exhausted
+// entry whose reset is already in the past is dropped on load.
+func TestController_loadState_expiredExhaustedDropped(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+
+	pastReset := clock.now().Add(-time.Hour) // already expired
+	c.loadState("a", map[string]time.Time{"b": pastReset})
+
+	// b's reset is in the past; resolve should reach b without exhaustion.
+	c.setCur("b")
+	b, _, exhausted := c.ResolveAuto()
+	if exhausted || b.Nick != "b" {
+		t.Fatalf("expired exhausted entry: got (%q, exhausted=%v), want b healthy", b.Nick, exhausted)
+	}
+}
+
+// TestPools_poolStatus verifies the three member status values.
+func TestPools_poolStatus(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	// Two-member pool starting at index 0 (a).
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+	store := quota.NewStore()
+
+	status, ok := pools.PoolStatus("auto", store)
+	if !ok {
+		t.Fatal("PoolStatus returned ok=false for known pool")
+	}
+	if status.Pool != "auto" {
+		t.Errorf("Pool=%q, want auto", status.Pool)
+	}
+	if status.Active != "a" {
+		t.Errorf("Active=%q, want a", status.Active)
+	}
+	if len(status.Members) != 2 {
+		t.Fatalf("Members len=%d, want 2", len(status.Members))
+	}
+
+	byNick := make(map[string]MemberStatus)
+	for _, m := range status.Members {
+		byNick[m.Nick] = m
+	}
+
+	if byNick["a"].Status != "active" {
+		t.Errorf("a status=%q, want active", byNick["a"].Status)
+	}
+	if byNick["b"].Status != "idle" {
+		t.Errorf("b status=%q, want idle", byNick["b"].Status)
+	}
+	if byNick["a"].ExhaustedUntil != nil {
+		t.Errorf("active member exhausted_until should be nil")
+	}
+	if byNick["b"].ExhaustedUntil != nil {
+		t.Errorf("idle member exhausted_until should be nil")
+	}
+
+	// After a 429 on a, a becomes exhausted and b becomes active.
+	if err := c.ModifyResponse(resp429(c.resolve(t, "a"), clock, time.Hour)); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+	status2, _ := pools.PoolStatus("auto", store)
+	byNick2 := make(map[string]MemberStatus)
+	for _, m := range status2.Members {
+		byNick2[m.Nick] = m
+	}
+	if byNick2["b"].Status != "active" {
+		t.Errorf("after a 429, b status=%q, want active", byNick2["b"].Status)
+	}
+	if byNick2["a"].Status != "exhausted" {
+		t.Errorf("after a 429, a status=%q, want exhausted", byNick2["a"].Status)
+	}
+	if byNick2["a"].ExhaustedUntil == nil {
+		t.Error("exhausted member exhausted_until should be non-nil")
+	}
+}
+
+// TestPools_poolStatus_unknownReturnsNotFound verifies ok=false for unknown pool.
+func TestPools_poolStatus_unknownReturnsNotFound(t *testing.T) {
+	pools := &Pools{byPool: map[string]*Controller{}}
+	_, ok := pools.PoolStatus("nonexistent", quota.NewStore())
+	if ok {
+		t.Fatal("PoolStatus returned ok=true for unknown pool")
+	}
+}
+
+// TestPools_persistState_loadPersistState verifies round-trip serialisation.
+func TestPools_persistState_loadPersistState(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+
+	// Start at a; park b for 1h.
+	reset := clock.now().Add(time.Hour)
+	c.mu.Lock()
+	c.exhausted["b"] = reset
+	c.mu.Unlock()
+
+	saved := pools.PersistState()
+	if saved["auto"].Sticky != "a" {
+		t.Errorf("PersistState sticky=%q, want a", saved["auto"].Sticky)
+	}
+	if _, ok := saved["auto"].Exhausted["b"]; !ok {
+		t.Error("PersistState missing b exhausted entry")
+	}
+
+	// Fresh pool, load state.
+	c2 := newController(t, 1, clock, io.Discard, "a", "b") // starts at b
+	pools2 := &Pools{byPool: map[string]*Controller{"auto": c2}}
+	pools2.LoadPersistState(saved)
+
+	if got := c2.Current(); got != "a" {
+		t.Errorf("after LoadPersistState, Current=%q, want a", got)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
+	"github.com/shukebeta/agent-quota-gateway/internal/persist"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
@@ -519,5 +520,264 @@ func TestQuotaHandler_methodGuard(t *testing.T) {
 			t.Errorf("%s Allow header = %q, want %q", method, allow, http.MethodGet)
 		}
 		resp.Body.Close()
+	}
+}
+
+// TestPoolHandler_singlePool verifies /_gateway/pool?pool=<name> returns the
+// single-pool JSON shape with correct status values.
+func TestPoolHandler_singlePool(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_ACCT_ONE", "sk-ant-oat-one")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_ACCT_TWO", "sk-ant-oat-two")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	store := quota.NewStore()
+	util := 0.9
+	store.Put("auto/acct-one", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util})
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+
+	srv := httptest.NewServer(poolHandler(store, pools))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/pool?pool=auto")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["pool"] != "auto" {
+		t.Errorf("pool=%v, want auto", got["pool"])
+	}
+	if got["active"] == "" {
+		t.Error("active field is empty")
+	}
+	members, ok := got["members"].([]any)
+	if !ok || len(members) == 0 {
+		t.Fatalf("members=%v, want non-empty array", got["members"])
+	}
+	activeNick, _ := got["active"].(string)
+	if activeNick == "" {
+		t.Fatal("active field is empty")
+	}
+	foundActive := false
+	for _, m := range members {
+		mm := m.(map[string]any)
+		nick := mm["nick"].(string)
+		if nick == activeNick {
+			foundActive = true
+			if mm["status"] != "active" {
+				t.Errorf("member %q status=%v, want active", nick, mm["status"])
+			}
+		}
+		// exhausted_until must be present in the JSON (null or a string), not absent.
+		if _, hasKey := mm["exhausted_until"]; !hasKey {
+			t.Errorf("member %q missing exhausted_until key", nick)
+		}
+	}
+	if !foundActive {
+		t.Errorf("active member %q not found in members list", activeNick)
+	}
+}
+
+// TestPoolHandler_allPools verifies /_gateway/pool (no param) returns an array.
+func TestPoolHandler_allPools(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+
+	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/pool")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	var got []any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("expected at least one pool in response")
+	}
+	// Find the "auto" pool in the response (there may be more in an env with
+	// live credentials set, matching the pattern of existing tests).
+	var found bool
+	for _, p := range got {
+		if pm, ok := p.(map[string]any); ok && pm["pool"] == "auto" {
+			found = true
+			if _, hasMem := pm["members"]; !hasMem {
+				t.Error("auto pool entry missing members field")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("auto pool not found in response: %v", got)
+	}
+}
+
+// TestPoolHandler_unknownPool verifies /_gateway/pool?pool=<unknown> returns 404.
+func TestPoolHandler_unknownPool(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+
+	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/pool?pool=nonexistent")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", resp.StatusCode)
+	}
+}
+
+// TestPoolHandler_methodGuard verifies non-GET returns 405 with Allow: GET.
+func TestPoolHandler_methodGuard(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+
+	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools))
+	t.Cleanup(srv.Close)
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		req, err := http.NewRequest(method, srv.URL+"/_gateway/pool", nil)
+		if err != nil {
+			t.Fatalf("NewRequest %s: %v", method, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s status=%d, want 405", method, resp.StatusCode)
+		}
+		if allow := resp.Header.Get("Allow"); allow != http.MethodGet {
+			t.Errorf("%s Allow=%q, want GET", method, allow)
+		}
+	}
+}
+
+// TestPersist_roundTrip verifies that persisted state survives a simulated
+// restart: write state to a file, reload it, and confirm sticky + snapshots
+// are restored.
+func TestPersist_roundTrip(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := dir + "/state.json"
+
+	t.Setenv("AQG_POOL_AUTO_BACKEND_CCW", "sk-ant-ccw")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_CCH", "sk-ant-cch")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	store := quota.NewStore()
+	util5h := 0.55
+	store.Put("auto/ccw", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util5h})
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+
+	// Build and write persisted state with ccw as sticky.
+	ps := persist.GatewayState{
+		Pools:     pools.PersistState(),
+		Snapshots: store.Snapshot(),
+	}
+	if poolState, ok := ps.Pools["auto"]; ok {
+		poolState.Sticky = "ccw"
+		ps.Pools["auto"] = poolState
+	}
+	data, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(stateFile, data, 0600); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	// Simulate restart: load state, restore into fresh pools.
+	loaded, err := persist.Load(stateFile)
+	if err != nil {
+		t.Fatalf("persist.Load: %v", err)
+	}
+	store2 := quota.NewStore()
+	for key, snap := range loaded.Snapshots {
+		store2.Put(key, snap)
+	}
+	pools2 := auto.NewPools(registry, store2, nil, io.Discard)
+	pools2.LoadPersistState(loaded.Pools)
+
+	srv := httptest.NewServer(quotaHandler(store2, pools2))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/quota?backend=auto")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["active_backend"] != "ccw" {
+		t.Errorf("active_backend=%v, want ccw (sticky should survive restart)", got["active_backend"])
+	}
+	if got["unified_5h_utilization"] != 0.55 {
+		t.Errorf("unified_5h_utilization=%v, want 0.55 (snapshot should survive restart)", got["unified_5h_utilization"])
+	}
+}
+
+// TestPersist_missingFileStartsFresh verifies that a missing state file is
+// not an error and the gateway starts normally.
+func TestPersist_missingFileStartsFresh(t *testing.T) {
+	state, err := persist.Load("/tmp/does-not-exist-agq-test-state.json")
+	if err != nil {
+		t.Fatalf("Load missing file: want nil error, got %v", err)
+	}
+	if len(state.Pools) != 0 || len(state.Snapshots) != 0 {
+		t.Errorf("expected empty state for missing file, got %+v", state)
+	}
+}
+
+// TestPersist_corruptFileStartsFresh verifies an unparseable file logs and
+// starts fresh rather than failing startup.
+func TestPersist_corruptFileStartsFresh(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := dir + "/corrupt.json"
+	if err := os.WriteFile(stateFile, []byte("not json {{{"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	state, err := persist.Load(stateFile)
+	if err != nil {
+		t.Fatalf("Load corrupt file: want nil error, got %v", err)
+	}
+	if len(state.Pools) != 0 || len(state.Snapshots) != 0 {
+		t.Errorf("expected empty state for corrupt file, got %+v", state)
 	}
 }
