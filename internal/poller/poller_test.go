@@ -105,6 +105,94 @@ func TestParseMinimaxi_emptyRemainsIsError(t *testing.T) {
 	}
 }
 
+func TestParseVolcengine_sessionWeeklyMapped(t *testing.T) {
+	// session → 5h window, weekly → 7d window. ResetTimestamp is epoch
+	// seconds (not milliseconds). monthly is ignored.
+	// Use percentages that are exact in float64 (multiples of 0.25) to
+	// avoid rounding noise in the /100 division.
+	body := []byte(`{
+		"Result": {
+			"Status": "Running",
+			"QuotaUsage": [
+				{ "Level": "session", "Percent": 25,   "ResetTimestamp": 1781484774 },
+				{ "Level": "weekly",  "Percent": 50,   "ResetTimestamp": 1782057600 },
+				{ "Level": "monthly", "Percent": 61.2, "ResetTimestamp": 1783007999 }
+			]
+		}
+	}`)
+
+	snap, err := parseVolcengine(body, fixedNow)
+	if err != nil {
+		t.Fatalf("parseVolcengine: %v", err)
+	}
+	wantFloatPtr(t, "Unified5hUtilization", snap.Unified5hUtilization, 0.25)
+	wantFloatPtr(t, "Unified7dUtilization", snap.Unified7dUtilization, 0.50)
+	// ResetTimestamp is epoch seconds; verify by Unix(), not UnixMilli().
+	if snap.Unified5hReset == nil || snap.Unified5hReset.Unix() != 1781484774 {
+		t.Errorf("Unified5hReset = %v, want Unix %d", snap.Unified5hReset, int64(1781484774))
+	}
+	if snap.Unified7dReset == nil || snap.Unified7dReset.Unix() != 1782057600 {
+		t.Errorf("Unified7dReset = %v, want Unix %d", snap.Unified7dReset, int64(1782057600))
+	}
+	if !snap.AsOf.Equal(fixedNow) {
+		t.Errorf("AsOf = %v, want %v", snap.AsOf, fixedNow)
+	}
+}
+
+func TestParseVolcengine_unknownLevelSkipped(t *testing.T) {
+	// monthly-only response: no recognised levels → error, not empty snapshot.
+	body := []byte(`{"Result":{"QuotaUsage":[{"Level":"monthly","Percent":50,"ResetTimestamp":1783007999}]}}`)
+	_, err := parseVolcengine(body, fixedNow)
+	if err == nil {
+		t.Fatal("parseVolcengine: want error when no recognised levels, got nil")
+	}
+}
+
+func TestParseVolcengine_emptyUsageIsError(t *testing.T) {
+	if _, err := parseVolcengine([]byte(`{"Result":{"QuotaUsage":[]}}`), fixedNow); err == nil {
+		t.Fatal("parseVolcengine: want error for empty QuotaUsage, got nil")
+	}
+}
+
+func TestVolcengineSign_missingAccessKey(t *testing.T) {
+	t.Setenv("VOLC_ACCESSKEY", "")
+	t.Setenv("VOLC_SECRETKEY", "test-sk")
+	req, _ := http.NewRequest(http.MethodPost, "https://open.volcengineapi.com/?Action=GetCodingPlanUsage&Version=2024-01-01", strings.NewReader("{}"))
+	if err := volcengineSign(req, ""); err == nil {
+		t.Fatal("volcengineSign: want error when VOLC_ACCESSKEY absent, got nil")
+	}
+}
+
+func TestVolcengineSign_missingSecretKey(t *testing.T) {
+	t.Setenv("VOLC_ACCESSKEY", "test-ak")
+	t.Setenv("VOLC_SECRETKEY", "")
+	req, _ := http.NewRequest(http.MethodPost, "https://open.volcengineapi.com/?Action=GetCodingPlanUsage&Version=2024-01-01", strings.NewReader("{}"))
+	if err := volcengineSign(req, ""); err == nil {
+		t.Fatal("volcengineSign: want error when VOLC_SECRETKEY absent, got nil")
+	}
+}
+
+func TestVolcengineSign_setsRequiredHeaders(t *testing.T) {
+	t.Setenv("VOLC_ACCESSKEY", "test-ak")
+	t.Setenv("VOLC_SECRETKEY", "test-sk")
+	req, _ := http.NewRequest(http.MethodPost, "https://open.volcengineapi.com/?Action=GetCodingPlanUsage&Version=2024-01-01", strings.NewReader("{}"))
+	if err := volcengineSign(req, ""); err != nil {
+		t.Fatalf("volcengineSign: %v", err)
+	}
+	if req.Header.Get("X-Date") == "" {
+		t.Error("X-Date header absent after volcengineSign")
+	}
+	if req.Header.Get("Authorization") == "" {
+		t.Error("Authorization header absent after volcengineSign")
+	}
+	if !strings.HasPrefix(req.Header.Get("Authorization"), "HMAC-SHA256 ") {
+		t.Errorf("Authorization = %q, want HMAC-SHA256 prefix", req.Header.Get("Authorization"))
+	}
+	if req.Header.Get("X-Content-Sha256") == "" {
+		t.Error("X-Content-Sha256 header absent after volcengineSign")
+	}
+}
+
 func TestMsToTime_nonPositiveIsNil(t *testing.T) {
 	if got := msToTime(0); got != nil {
 		t.Errorf("msToTime(0) = %v, want nil", got)
@@ -114,6 +202,18 @@ func TestMsToTime_nonPositiveIsNil(t *testing.T) {
 	}
 	if got := msToTime(1781402400000); got == nil {
 		t.Error("msToTime(positive) = nil, want time")
+	}
+}
+
+func TestSecToTime_nonPositiveIsNil(t *testing.T) {
+	if got := secToTime(0); got != nil {
+		t.Errorf("secToTime(0) = %v, want nil", got)
+	}
+	if got := secToTime(-1); got != nil {
+		t.Errorf("secToTime(-1) = %v, want nil", got)
+	}
+	if got := secToTime(1781484774); got == nil || got.Unix() != 1781484774 {
+		t.Errorf("secToTime(1781484774) = %v, want Unix 1781484774", got)
 	}
 }
 
@@ -127,8 +227,8 @@ func TestProviderFor(t *testing.T) {
 		{"https://open.bigmodel.cn/api/anthropic", "z.ai/zhipu", true},
 		{"https://API.Z.AI/v1", "z.ai/zhipu", true}, // case-insensitive
 		{"https://api.minimaxi.com/v1", "minimaxi", true},
+		{"https://ark.cn-beijing.volces.com/api/v3", "volcengine-ark", true},
 		{"https://api.anthropic.com", "", false},
-		{"https://ark.cn-beijing.volces.com", "", false},
 	}
 	for _, c := range cases {
 		prov, ok := providerFor(c.baseURL)
@@ -155,11 +255,20 @@ func TestHostURL_keepsHostReplacesPath(t *testing.T) {
 }
 
 func TestAuthSchemes(t *testing.T) {
-	if n, v := rawAuth("zkey"); n != "Authorization" || v != "zkey" {
-		t.Errorf("rawAuth = (%q, %q), want (Authorization, zkey)", n, v)
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
+	if err := rawAuth(req, "zkey"); err != nil {
+		t.Fatalf("rawAuth: %v", err)
 	}
-	if n, v := bearerAuth("mkey"); n != "Authorization" || v != "Bearer mkey" {
-		t.Errorf("bearerAuth = (%q, %q), want (Authorization, Bearer mkey)", n, v)
+	if got := req.Header.Get("Authorization"); got != "zkey" {
+		t.Errorf("rawAuth Authorization = %q, want %q", got, "zkey")
+	}
+
+	req2, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
+	if err := bearerAuth(req2, "mkey"); err != nil {
+		t.Fatalf("bearerAuth: %v", err)
+	}
+	if got := req2.Header.Get("Authorization"); got != "Bearer mkey" {
+		t.Errorf("bearerAuth Authorization = %q, want %q", got, "Bearer mkey")
 	}
 }
 
@@ -267,6 +376,58 @@ func TestPollAll_logsFailure(t *testing.T) {
 	}
 }
 
+func TestPollAll_volcenginePopulatesStore(t *testing.T) {
+	var gotMethod, gotXDate, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotXDate = r.Header.Get("X-Date")
+		gotAuth = r.Header.Get("Authorization")
+		fmt.Fprint(w, `{"Result":{"Status":"Running","QuotaUsage":[
+			{"Level":"session","Percent":25,"ResetTimestamp":1781484774},
+			{"Level":"weekly","Percent":50,"ResetTimestamp":1782057600}
+		]}}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("VOLC_ACCESSKEY", "test-ak")
+	t.Setenv("VOLC_SECRETKEY", "test-sk")
+
+	b := backend.Backend{Pool: "ark", Nick: "key-a", Credential: "", BaseURL: srv.URL}
+	store := quota.NewStore()
+	p := New([]string{"ark"}, stubCurrent(map[string]backend.Backend{"ark": b}), store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
+
+	// Register a test provider matching the httptest server with POST + volcengine sign.
+	orig := providers
+	providers = append([]provider{{
+		name:     "test-volc",
+		matches:  func(u string) bool { return strings.Contains(u, srv.URL) },
+		quotaURL: fixedURL(srv.URL),
+		sign:     volcengineSign,
+		method:   http.MethodPost,
+		body:     []byte("{}"),
+		parse:    parseVolcengine,
+	}}, providers...)
+	t.Cleanup(func() { providers = orig })
+
+	p.pollAll(context.Background())
+
+	snap := store.Get(b.QuotaKey())
+	if !snap.HasData() {
+		t.Fatal("store not populated for volcengine backend")
+	}
+	wantFloatPtr(t, "Unified5hUtilization", snap.Unified5hUtilization, 0.25)
+	wantFloatPtr(t, "Unified7dUtilization", snap.Unified7dUtilization, 0.50)
+	if gotMethod != http.MethodPost {
+		t.Errorf("upstream method = %q, want POST", gotMethod)
+	}
+	if gotXDate == "" {
+		t.Error("X-Date header absent on volcengine poll")
+	}
+	if !strings.HasPrefix(gotAuth, "HMAC-SHA256 ") {
+		t.Errorf("Authorization = %q, want HMAC-SHA256 prefix", gotAuth)
+	}
+}
+
 func TestRun_pollsImmediatelyThenStopsOnContextCancel(t *testing.T) {
 	var mu sync.Mutex
 	var calls int
@@ -323,14 +484,14 @@ func TestRun_pollsImmediatelyThenStopsOnContextCancel(t *testing.T) {
 // httptest hosts are 127.0.0.1:port, which no real provider matcher would
 // recognise, so this lets the poll-loop tests exercise the full path
 // against a local server.
-func withTestProvider(t *testing.T, matchFragment string, quotaURL func(string) (string, error), auth func(string) (string, string), parse func([]byte, time.Time) (quota.Snapshot, error)) {
+func withTestProvider(t *testing.T, matchFragment string, quotaURL func(string) (string, error), sign func(*http.Request, string) error, parse func([]byte, time.Time) (quota.Snapshot, error)) {
 	t.Helper()
 	orig := providers
 	providers = append([]provider{{
 		name:     "test",
 		matches:  func(u string) bool { return strings.Contains(u, matchFragment) },
 		quotaURL: quotaURL,
-		auth:     auth,
+		sign:     sign,
 		parse:    parse,
 	}}, providers...)
 	t.Cleanup(func() { providers = orig })

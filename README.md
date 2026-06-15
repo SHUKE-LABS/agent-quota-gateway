@@ -55,8 +55,9 @@ across vendors loses the prompt cache, and quota semantics differ).
   and exposed at `GET /_gateway/quota`, keyed per pool. No synthetic probe
   requests against the Messages API — header-derived freshness depends on
   real client traffic. The exception is providers that never return
-  rate-limit headers (Z.ai / ZhipuAI, MiniMaxi): a background poller reads
-  their proprietary quota endpoint for the active member of each pool (see
+  rate-limit headers (Z.ai / ZhipuAI, MiniMaxi, Volcengine Ark): a
+  background poller reads their proprietary quota endpoint for the active
+  member of each pool (see
   [Proprietary quota polling](#proprietary-quota-polling)).
 
 Out of scope:
@@ -204,6 +205,8 @@ never preempt, so their prompt cache is never interrupted.
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
+| `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
+| `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
@@ -321,9 +324,9 @@ switch is self-explained: the gateway moved to a fresher account. An
 unknown pool returns `200` with an empty snapshot. Pools whose members do
 not report `anthropic-ratelimit-unified-*` (API keys, most non-native
 vendors) return empty snapshots — failover still works off the real `429`.
-Z.ai / ZhipuAI and MiniMaxi backends are the exception: a background poller
-fills their snapshots from each provider's own quota endpoint (see
-[Proprietary quota polling](#proprietary-quota-polling)).
+Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark backends are the exception: a
+background poller fills their snapshots from each provider's own quota
+endpoint (see [Proprietary quota polling](#proprietary-quota-polling)).
 
 The endpoint is `GET`-only; any other method returns `405` with an
 `Allow: GET` response header.
@@ -378,9 +381,10 @@ guarantees that follow:
 - The proxy does not issue probe traffic against the Messages API: every
   header-derived snapshot is the side effect of a real client request. The
   only gateway-originated requests are the background poller's reads of
-  Z.ai / ZhipuAI and MiniMaxi quota endpoints, sent with the active
-  member's own credential to that member's own provider — never to
-  Anthropic, and never carrying request/response bodies.
+  Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark quota endpoints, sent with
+  the active member's own credential (or IAM key pair for Volcengine) to
+  that member's own provider — never to Anthropic, and never carrying
+  request/response bodies.
 - The listen address is loopback-only by default. `config.validate`
   rejects `0.0.0.0`, public IPs, and unresolvable names so a misconfigured
   deployment fails closed at startup. The one sanctioned way off loopback
@@ -633,8 +637,8 @@ when real traffic flows. The gateway issues no synthetic probe requests
 against the Messages API — if no client has hit the pool recently, the
 snapshot is stale by exactly that gap.
 
-Z.ai / ZhipuAI and MiniMaxi backends are kept fresh independently of
-traffic by the background poller (see
+Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark backends are kept fresh
+independently of traffic by the background poller (see
 [Proprietary quota polling](#proprietary-quota-polling)).
 
 ### Consumer contract
@@ -655,13 +659,13 @@ on a frozen schema:
 
 ### Proprietary quota polling
 
-Z.ai / ZhipuAI and MiniMaxi never return `anthropic-ratelimit-unified-*`
-headers, so their store entries would stay permanently empty under the
-passive header model. Each exposes a proprietary quota endpoint instead, so
-a background poller refreshes them on a fixed cadence and writes the result
-into the same per-member store the header path uses. The
-`/_gateway/quota?backend=<pool>` response shape is identical — a consumer
-cannot tell a polled snapshot from a header-derived one.
+Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark never return
+`anthropic-ratelimit-unified-*` headers, so their store entries would stay
+permanently empty under the passive header model. Each exposes a proprietary
+quota endpoint instead, so a background poller refreshes them on a fixed
+cadence and writes the result into the same per-member store the header path
+uses. The `/_gateway/quota?backend=<pool>` response shape is identical — a
+consumer cannot tell a polled snapshot from a header-derived one.
 
 How it behaves:
 
@@ -670,15 +674,22 @@ How it behaves:
   over to an untracked member (e.g. Anthropic) is not polled until it fails
   back, so polling naturally tracks where traffic is going.
 - **Detection by base URL.** A backend is polled when its base URL contains
-  `api.z.ai`, `open.bigmodel.cn`, or `minimaxi.com`. Anything else
-  (Anthropic, ByteDance Ark, other vendors) is left to the header path.
+  `api.z.ai`, `open.bigmodel.cn`, `minimaxi.com`, or `volces.com`. Anything
+  else (Anthropic, other vendors) is left to the header path.
 - **Per-provider auth and mapping.** Z.ai / Zhipu authenticate with the raw
   credential on `Authorization` and report *used* percentages; MiniMaxi
   authenticates with `Authorization: Bearer` and reports *remaining*
-  percentages, which the poller inverts to utilization. Both map onto the
+  percentages, which the poller inverts to utilization. Volcengine Ark
+  authenticates with HMAC-SHA256 IAM signing (`VOLC_ACCESSKEY` /
+  `VOLC_SECRETKEY`) via POST to `GetCodingPlanUsage` and reports *used*
+  percentages; its `session` window maps to 5h and `weekly` to 7d (reset
+  timestamps are epoch seconds, not milliseconds). All three map onto the
   unified 5h / 7d utilization and reset fields.
 - **Failure is silent and non-destructive.** A network error, non-`200`, or
   unparseable body is logged and skipped; the last good snapshot survives.
+  For Volcengine, absent `VOLC_ACCESSKEY` or `VOLC_SECRETKEY` is treated the
+  same as a network error — the poll is skipped and the prior snapshot is
+  preserved.
 - **Startup.** The poller runs one pass immediately at startup, so a tracked
   pool's snapshot is populated well within the first 2-minute interval —
   without any client request. It shares the process shutdown signal and
