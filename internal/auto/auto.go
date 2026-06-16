@@ -395,19 +395,33 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 }
 
 // loadState applies persisted routing state. Exhausted entries whose reset
-// has already passed are silently dropped. Called once at startup before
-// the server begins serving; does not call onMutate.
+// has already passed are silently dropped. Persisted nicks absent from the
+// current pool membership are logged and skipped. Called once at startup
+// before the server begins serving; does not call onMutate.
 func (c *Controller) loadState(sticky string, exhausted map[string]time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if idx := c.indexOf(sticky); idx >= 0 {
 		c.cur = idx
+	} else if sticky != "" {
+		reason := "random"
+		if len(c.priority) > 0 {
+			reason = "priority"
+		}
+		fmt.Fprintf(c.logOut, "loadState[%s]: persisted sticky=%s not in current pool members; falling back to %s (%s)\n",
+			c.pool, sticky, c.nicks[c.cur], reason)
 	}
 	now := c.now()
 	for nick, reset := range exhausted {
-		if reset.After(now) {
-			c.exhausted[nick] = reset
+		if !reset.After(now) {
+			continue
 		}
+		if c.indexOf(nick) < 0 {
+			fmt.Fprintf(c.logOut, "loadState[%s]: dropping persisted exhausted entry %s (not in current pool members)\n",
+				c.pool, nick)
+			continue
+		}
+		c.exhausted[nick] = reset
 	}
 }
 

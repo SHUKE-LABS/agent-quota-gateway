@@ -536,6 +536,70 @@ func TestController_loadState_expiredExhaustedDropped(t *testing.T) {
 	}
 }
 
+// TestController_loadState_unchangedMembership verifies no log lines when pool membership is unchanged.
+func TestController_loadState_unchangedMembership(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf strings.Builder
+	c := newController(t, 0, clock, &logBuf, "a", "b", "c")
+	reset := clock.now().Add(time.Hour)
+	c.loadState("b", map[string]time.Time{"a": reset})
+	if logBuf.Len() != 0 {
+		t.Fatalf("expected no log output for unchanged membership, got: %q", logBuf.String())
+	}
+	if got := c.Current(); got != "b" {
+		t.Fatalf("Current=%q, want b", got)
+	}
+}
+
+// TestController_loadState_additiveMembership verifies no log lines when pool only gains members.
+func TestController_loadState_additiveMembership(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf strings.Builder
+	// Pool now has a, b, c, d but persisted state only knew a, b, c.
+	c := newController(t, 0, clock, &logBuf, "a", "b", "c", "d")
+	reset := clock.now().Add(time.Hour)
+	c.loadState("c", map[string]time.Time{"b": reset})
+	if logBuf.Len() != 0 {
+		t.Fatalf("expected no log output for additive membership, got: %q", logBuf.String())
+	}
+	if got := c.Current(); got != "c" {
+		t.Fatalf("Current=%q, want c", got)
+	}
+}
+
+// TestController_loadState_missingStickyLogs verifies a log line when the persisted sticky is gone.
+func TestController_loadState_missingStickyLogs(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf strings.Builder
+	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
+	c.loadState("old", map[string]time.Time{})
+	out := logBuf.String()
+	if !strings.Contains(out, "persisted sticky=old") {
+		t.Fatalf("expected log about missing sticky, got: %q", out)
+	}
+	if !strings.Contains(out, "random") {
+		t.Fatalf("expected 'random' reason in log for plain pool, got: %q", out)
+	}
+}
+
+// TestController_loadState_staleExhaustedEntryLogged verifies logging and skipping of stale exhausted nicks.
+func TestController_loadState_staleExhaustedEntryLogged(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf strings.Builder
+	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
+	reset := clock.now().Add(time.Hour)
+	c.loadState("a", map[string]time.Time{"old": reset})
+	out := logBuf.String()
+	if !strings.Contains(out, "dropping persisted exhausted entry old") {
+		t.Fatalf("expected log about stale exhausted entry, got: %q", out)
+	}
+	// "old" must not be in c.exhausted (verify via persistState — it won't appear in the snapshot).
+	snap := c.persistState()
+	if _, present := snap.Exhausted["old"]; present {
+		t.Fatal("stale exhausted entry 'old' must not be in persistState snapshot")
+	}
+}
+
 // TestPools_poolStatus verifies the three member status values.
 func TestPools_poolStatus(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
