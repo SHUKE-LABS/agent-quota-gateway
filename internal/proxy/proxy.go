@@ -22,6 +22,8 @@
 package proxy
 
 import (
+	"crypto/rand"
+	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -106,13 +108,19 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 		r.URL.Path = joinPath(strings.TrimRight(upstream.Path, "/"), r.URL.Path)
 
 		stampAuth(r.Header, b.Credential)
-		// OAuth requests require ?beta=true on the URL — the Anthropic SDK
-		// always adds this when using OAuth tokens and Anthropic uses it to
-		// unlock extra usage on Claude Code subscriptions.
+		// OAuth requests need additional Claude Code identity signals so
+		// Anthropic routes them to the primary subscription quota rather
+		// than the "extra usage" bucket.
 		if isOAuthToken(strings.TrimSpace(b.Credential)) {
 			q := r.URL.Query()
 			q.Set("beta", "true")
 			r.URL.RawQuery = q.Encode()
+			// Override user-agent to match the Claude Code CLI format.
+			r.Header.Set("User-Agent", claudeCodeUserAgent)
+			// Supply a session ID if the client didn't include one.
+			if r.Header.Get("X-Claude-Code-Session-Id") == "" {
+				r.Header.Set("X-Claude-Code-Session-Id", newUUID())
+			}
 		}
 	}
 
@@ -227,6 +235,20 @@ func joinPath(basePath, requestPath string) string {
 // (Claude Code subscription) tokens. Without it, a Bearer-authenticated
 // request is rejected.
 const oauthBeta = "oauth-2025-04-20"
+
+// claudeCodeUserAgent matches the Claude Code CLI format. Anthropic uses it
+// together with the other Claude Code signals to route requests to the primary
+// subscription quota rather than the limited "extra usage" bucket.
+const claudeCodeUserAgent = "claude-cli/2.1.0 (external, cli)"
+
+// newUUID generates a random UUID v4 for X-Claude-Code-Session-Id.
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
 
 // claudeCodeBeta gates the "extra usage" quota on Claude Code subscriptions.
 // Anthropic checks for this flag (and X-App: cli) to decide whether a request
