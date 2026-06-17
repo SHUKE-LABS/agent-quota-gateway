@@ -48,6 +48,7 @@ func (c *Controller) exhaustedUntil(nick string) (time.Time, bool) {
 // nil store and exercise pure 429-driven failover).
 func newPriorityControllerWithStore(t *testing.T, start int, clock *fixedClock, store *quota.Store, priorityCSV string, nicks ...string) *Controller {
 	t.Helper()
+	scrubPoolEnv(t)
 	for _, n := range nicks {
 		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
 	}

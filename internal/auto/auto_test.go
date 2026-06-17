@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,11 +38,29 @@ func (c *fixedClock) advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
+// scrubPoolEnv removes all ambient AQG_POOL_* variables from the process
+// environment for the duration of the test. This prevents a developer's
+// shell settings (e.g. AQG_POOL_CHN_PRIORITY) from bleeding extra pools
+// into registries created by backend.Load inside test helpers.
+// t.Setenv registers a restore-on-cleanup so the original values return
+// when the test ends; os.Unsetenv actually removes each var for this test.
+func scrubPoolEnv(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		k, _, ok := strings.Cut(kv, "=")
+		if ok && strings.HasPrefix(k, backend.EnvPrefix) {
+			t.Setenv(k, "")
+			os.Unsetenv(k) //nolint:errcheck // only fails on empty key
+		}
+	}
+}
+
 // testRegistry builds a Registry with all nicks in a single "auto" pool
 // via the public env path (loadFrom is unexported in package backend).
 // Credentials are "cred-<nick>" so a leak test can grep for "cred".
 func testRegistry(t *testing.T, nicks ...string) *backend.Registry {
 	t.Helper()
+	scrubPoolEnv(t)
 	for _, n := range nicks {
 		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
 	}
@@ -323,6 +342,7 @@ func TestNewController_randomStartIsValid(t *testing.T) {
 // is untouched.
 func TestPools_routesPerPool(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	scrubPoolEnv(t)
 	t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_A", "cred-a")
 	t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_B", "cred-b")
 	t.Setenv(backend.EnvPrefix+"API_BACKEND_K", "cred-k")
@@ -374,6 +394,7 @@ func TestPools_routesPerPool(t *testing.T) {
 // controller path so the priority wiring is covered end to end.
 func newPriorityController(t *testing.T, start int, clock *fixedClock, logOut io.Writer, priorityCSV string, nicks ...string) *Controller {
 	t.Helper()
+	scrubPoolEnv(t)
 	for _, n := range nicks {
 		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
 	}
