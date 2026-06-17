@@ -416,11 +416,12 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 	}
 }
 
-// oauthBetaValue and claudeCodeBetaValue mirror the proxy's internal constants;
-// the external test package can't reach the unexported ones.
+// oauthBetaValue, claudeCodeBetaValue, and claudeCodeFullBetaValue mirror the
+// proxy's internal constants; the external test package can't reach the unexported ones.
 const (
-	oauthBetaValue     = "oauth-2025-04-20"
+	oauthBetaValue      = "oauth-2025-04-20"
 	claudeCodeBetaValue = "claude-code-20250219"
+	claudeCodeFullBetaValue = "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,effort-2025-11-24,oauth-2025-04-20"
 )
 
 // newGatewayWithKey is like newGateway but lets the test choose the
@@ -471,9 +472,8 @@ func TestProxy_oauthTokenUsesBearer(t *testing.T) {
 	if gotKey != "" {
 		t.Errorf("x-api-key = %q, want empty (OAuth tokens must not be sent as x-api-key)", gotKey)
 	}
-	wantBeta := oauthBetaValue + "," + claudeCodeBetaValue
-	if gotBeta != wantBeta {
-		t.Errorf("anthropic-beta = %q, want %q", gotBeta, wantBeta)
+	if gotBeta != claudeCodeFullBetaValue {
+		t.Errorf("anthropic-beta = %q, want %q", gotBeta, claudeCodeFullBetaValue)
 	}
 	if gotApp != "cli" {
 		t.Errorf("X-App = %q, want %q", gotApp, "cli")
@@ -534,9 +534,9 @@ func TestProxy_oauthTokenPreservesClientBeta(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	want := "prompt-caching-2024-07-31," + oauthBetaValue + "," + claudeCodeBetaValue
-	if gotBeta != want {
-		t.Errorf("anthropic-beta = %q, want %q (client beta preserved, oauth flag appended once)", gotBeta, want)
+	// Full beta set replaces whatever the client sent.
+	if gotBeta != claudeCodeFullBetaValue {
+		t.Errorf("anthropic-beta = %q, want %q (full Claude Code beta set)", gotBeta, claudeCodeFullBetaValue)
 	}
 }
 
@@ -562,9 +562,8 @@ func TestProxy_oauthTokenDoesNotDuplicateBeta(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Client sent oauthBeta already; claudeCodeBeta still gets appended once.
-	want := oauthBetaValue + "," + claudeCodeBetaValue
-	if gotBeta != want {
-		t.Errorf("anthropic-beta = %q, want %q (no duplication of oauth flag, claude-code flag appended)", gotBeta, want)
+	// Full beta set replaces client-supplied flags regardless of what client sent.
+	if gotBeta != claudeCodeFullBetaValue {
+		t.Errorf("anthropic-beta = %q, want %q (full Claude Code beta set)", gotBeta, claudeCodeFullBetaValue)
 	}
 }

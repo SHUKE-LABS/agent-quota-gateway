@@ -108,19 +108,21 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 		r.URL.Path = joinPath(strings.TrimRight(upstream.Path, "/"), r.URL.Path)
 
 		stampAuth(r.Header, b.Credential)
-		// OAuth requests need additional Claude Code identity signals so
+		// OAuth requests need the full Claude Code identity fingerprint so
 		// Anthropic routes them to the primary subscription quota rather
 		// than the "extra usage" bucket.
 		if isOAuthToken(strings.TrimSpace(b.Credential)) {
 			q := r.URL.Query()
 			q.Set("beta", "true")
 			r.URL.RawQuery = q.Encode()
-			// Override user-agent to match the Claude Code CLI format.
 			r.Header.Set("User-Agent", claudeCodeUserAgent)
-			// Supply a session ID if the client didn't include one.
 			if r.Header.Get("X-Claude-Code-Session-Id") == "" {
 				r.Header.Set("X-Claude-Code-Session-Id", newUUID())
 			}
+			// Replace the beta header with the full Claude Code standard set.
+			// Individual flags from the client are intentionally dropped —
+			// a partial set may not satisfy Anthropic's fingerprint check.
+			r.Header.Set("Anthropic-Beta", claudeCodeFullBeta)
 		}
 	}
 
@@ -236,10 +238,13 @@ func joinPath(basePath, requestPath string) string {
 // request is rejected.
 const oauthBeta = "oauth-2025-04-20"
 
-// claudeCodeUserAgent matches the Claude Code CLI format. Anthropic uses it
-// together with the other Claude Code signals to route requests to the primary
-// subscription quota rather than the limited "extra usage" bucket.
+// claudeCodeUserAgent matches the Claude Code CLI format.
 const claudeCodeUserAgent = "claude-cli/2.1.0 (external, cli)"
+
+// claudeCodeFullBeta is the complete set of Anthropic-Beta flags that the
+// Claude Code CLI sends. Anthropic may fingerprint the full set to decide
+// whether a request qualifies for primary subscription quota vs extra usage.
+const claudeCodeFullBeta = "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,effort-2025-11-24,oauth-2025-04-20"
 
 // newUUID generates a random UUID v4 for X-Claude-Code-Session-Id.
 func newUUID() string {
