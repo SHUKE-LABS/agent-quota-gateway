@@ -106,6 +106,14 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 		r.URL.Path = joinPath(strings.TrimRight(upstream.Path, "/"), r.URL.Path)
 
 		stampAuth(r.Header, b.Credential)
+		// OAuth requests require ?beta=true on the URL — the Anthropic SDK
+		// always adds this when using OAuth tokens and Anthropic uses it to
+		// unlock extra usage on Claude Code subscriptions.
+		if isOAuthToken(strings.TrimSpace(b.Credential)) {
+			q := r.URL.Query()
+			q.Set("beta", "true")
+			r.URL.RawQuery = q.Encode()
+		}
 	}
 
 	// ModifyResponse runs after headers are received but before the body
