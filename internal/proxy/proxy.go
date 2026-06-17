@@ -171,9 +171,13 @@ func stampAuth(h http.Header, credential string) {
 		ensureBeta(h, claudeCodeBeta)
 	case isAPIKey(cred):
 		// Anthropic API keys use x-api-key; drop the inbound selector that
-		// arrived on Authorization so it never goes upstream.
+		// arrived on Authorization so it never goes upstream. Stamp the same
+		// Claude Code signals as OAuth — Teams/Pro workspaces gate extra usage
+		// on these headers regardless of credential type.
 		h.Del("Authorization")
 		h.Set("x-api-key", cred)
+		h.Set("X-App", "cli")
+		ensureBeta(h, claudeCodeBeta)
 	default:
 		// Non-native Claude-compatible providers authenticate over Bearer
 		// without the Anthropic beta flag.

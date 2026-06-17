@@ -177,7 +177,7 @@ func TestProxy_messagesPreservesAnthropicHeaders(t *testing.T) {
 	if gotVersion != "2023-06-01" {
 		t.Errorf("anthropic-version lost: %q", gotVersion)
 	}
-	if gotBeta != "prompt-caching-2024-07-31" {
+	if gotBeta != "prompt-caching-2024-07-31,"+claudeCodeBetaValue {
 		t.Errorf("anthropic-beta lost: %q", gotBeta)
 	}
 	if gotCustom != "keep-me" {
