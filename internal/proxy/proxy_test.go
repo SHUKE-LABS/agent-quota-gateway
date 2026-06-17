@@ -177,7 +177,7 @@ func TestProxy_messagesPreservesAnthropicHeaders(t *testing.T) {
 	if gotVersion != "2023-06-01" {
 		t.Errorf("anthropic-version lost: %q", gotVersion)
 	}
-	if gotBeta != "prompt-caching-2024-07-31,"+claudeCodeBetaValue {
+	if gotBeta != "prompt-caching-2024-07-31" {
 		t.Errorf("anthropic-beta lost: %q", gotBeta)
 	}
 	if gotCustom != "keep-me" {
@@ -416,13 +416,9 @@ func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
 	}
 }
 
-// oauthBetaValue, claudeCodeBetaValue, and claudeCodeFullBetaValue mirror the
-// proxy's internal constants; the external test package can't reach the unexported ones.
-const (
-	oauthBetaValue      = "oauth-2025-04-20"
-	claudeCodeBetaValue = "claude-code-20250219"
-	claudeCodeFullBetaValue = "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,effort-2025-11-24,oauth-2025-04-20"
-)
+// oauthBetaValue mirrors the proxy's internal oauthBeta constant; the
+// external test package can't reach the unexported one.
+const oauthBetaValue = "oauth-2025-04-20"
 
 // newGatewayWithKey is like newGateway but lets the test choose the
 // backend credential so the three auth schemes can be exercised.
@@ -443,12 +439,11 @@ func newGatewayWithKey(t *testing.T, key string, handler http.HandlerFunc) *http
 
 func TestProxy_oauthTokenUsesBearer(t *testing.T) {
 	const token = "sk-ant-oat01-secret-token"
-	var gotAuth, gotKey, gotBeta, gotApp string
+	var gotAuth, gotKey, gotBeta string
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotKey = r.Header.Get("x-api-key")
 		gotBeta = r.Header.Get("anthropic-beta")
-		gotApp = r.Header.Get("X-App")
 		w.WriteHeader(http.StatusOK)
 	})
 	gw := newGatewayWithKey(t, token, upstream)
@@ -472,11 +467,8 @@ func TestProxy_oauthTokenUsesBearer(t *testing.T) {
 	if gotKey != "" {
 		t.Errorf("x-api-key = %q, want empty (OAuth tokens must not be sent as x-api-key)", gotKey)
 	}
-	if gotBeta != claudeCodeFullBetaValue {
-		t.Errorf("anthropic-beta = %q, want %q", gotBeta, claudeCodeFullBetaValue)
-	}
-	if gotApp != "cli" {
-		t.Errorf("X-App = %q, want %q", gotApp, "cli")
+	if gotBeta != oauthBetaValue {
+		t.Errorf("anthropic-beta = %q, want %q", gotBeta, oauthBetaValue)
 	}
 }
 
@@ -534,9 +526,9 @@ func TestProxy_oauthTokenPreservesClientBeta(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Full beta set replaces whatever the client sent.
-	if gotBeta != claudeCodeFullBetaValue {
-		t.Errorf("anthropic-beta = %q, want %q (full Claude Code beta set)", gotBeta, claudeCodeFullBetaValue)
+	want := "prompt-caching-2024-07-31," + oauthBetaValue
+	if gotBeta != want {
+		t.Errorf("anthropic-beta = %q, want %q (client beta preserved, oauth flag appended once)", gotBeta, want)
 	}
 }
 
@@ -562,8 +554,7 @@ func TestProxy_oauthTokenDoesNotDuplicateBeta(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Full beta set replaces client-supplied flags regardless of what client sent.
-	if gotBeta != claudeCodeFullBetaValue {
-		t.Errorf("anthropic-beta = %q, want %q (full Claude Code beta set)", gotBeta, claudeCodeFullBetaValue)
+	if gotBeta != oauthBetaValue {
+		t.Errorf("anthropic-beta = %q, want %q (no duplication)", gotBeta, oauthBetaValue)
 	}
 }
