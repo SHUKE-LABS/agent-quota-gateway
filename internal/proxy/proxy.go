@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/reqlog"
 )
 
 // allowedMethods is the HTTP method set the proxy forwards. Anthropic's
@@ -137,10 +138,11 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 	// per-request idle time so a hung upstream does not pin goroutines
 	// forever. These values match the standard library defaults, made
 	// explicit so the SSE behavior is auditable.
-	rp.Transport = &http.Transport{
+	base := &http.Transport{
 		IdleConnTimeout:    90 * time.Second,
 		DisableCompression: true,
 	}
+	rp.Transport = reqlog.WrapTransport(base)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !allowedMethods[r.Method] {
