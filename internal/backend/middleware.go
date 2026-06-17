@@ -48,6 +48,17 @@ func Middleware(router PoolRouter, next http.Handler) http.Handler {
 
 		b, retryAfter, ok, exhausted := router.Route(selector)
 		if !ok {
+			// Fallback: some clients (e.g. pi.dev with api:"anthropic-messages")
+			// send the pool name via X-Api-Key rather than as a Bearer token.
+			// If the Bearer lookup failed and there is an X-Api-Key value that
+			// names a known pool, use it. A real API key that doesn't match any
+			// pool still fails closed — this is a named-pool check, not a
+			// passthrough.
+			if xKey := normalizeName(r.Header.Get("X-Api-Key")); xKey != "" {
+				b, retryAfter, ok, exhausted = router.Route(xKey)
+			}
+		}
+		if !ok {
 			writeForbidden(w)
 			return
 		}

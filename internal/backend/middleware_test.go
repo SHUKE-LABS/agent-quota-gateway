@@ -113,6 +113,74 @@ func TestMiddleware_exhaustedReturns429(t *testing.T) {
 	}
 }
 
+// poolAwareRouter routes only the single named pool, rejecting everything else.
+type poolAwareRouter struct {
+	pool string
+	b    Backend
+}
+
+func (r *poolAwareRouter) Route(pool string) (Backend, time.Duration, bool, bool) {
+	if pool == r.pool {
+		return r.b, 0, true, false
+	}
+	return Backend{}, 0, false, false
+}
+
+func TestMiddleware_xApiKeyFallback(t *testing.T) {
+	want := Backend{Pool: "claude", Nick: "k1", Credential: "cred", BaseURL: testDefaultBaseURL}
+	router := &poolAwareRouter{pool: "claude", b: want}
+
+	cases := []struct {
+		name    string
+		auth    string
+		xApiKey string
+		wantOK  bool
+	}{
+		{"x-api-key only", "", "claude", true},
+		{"x-api-key uppercase", "", "CLAUDE", true},        // normalized
+		{"bearer wins, no x-api-key", "Bearer claude", "", true},
+		{"bearer unknown, x-api-key fallback", "Bearer unknown", "claude", true},
+		{"both unknown", "Bearer unknown", "unknown", false},
+		{"neither header", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var called bool
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusOK)
+			})
+			h := Middleware(router, next)
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			if tc.auth != "" {
+				req.Header.Set("Authorization", tc.auth)
+			}
+			if tc.xApiKey != "" {
+				req.Header.Set("X-Api-Key", tc.xApiKey)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if tc.wantOK {
+				if rec.Code != http.StatusOK {
+					t.Errorf("status = %d, want 200", rec.Code)
+				}
+				if !called {
+					t.Error("next handler not called")
+				}
+			} else {
+				if rec.Code != http.StatusForbidden {
+					t.Errorf("status = %d, want 403", rec.Code)
+				}
+				if called {
+					t.Error("next handler should not be called on unknown selector")
+				}
+			}
+		})
+	}
+}
+
 func TestBearerToken(t *testing.T) {
 	cases := map[string]string{
 		"Bearer abc":   "abc",
