@@ -209,6 +209,11 @@ type PoolPersistState struct {
 	Sticky            string               `json:"sticky"`
 	Exhausted         map[string]time.Time `json:"exhausted"`
 	LastBalanceSwitch time.Time            `json:"last_balance_switch,omitempty"`
+	// BalanceSeq and LastSelectedSeq persist the selection-recency tiebreaker
+	// state for balanced pools. Absent in older state files; treated as zero /
+	// never-selected on load (backward-compatible).
+	BalanceSeq      uint64            `json:"balance_seq,omitempty"`
+	LastSelectedSeq map[string]uint64 `json:"last_selected_seq,omitempty"`
 }
 
 // LoadPersistState applies previously persisted routing state to each pool's
@@ -216,7 +221,7 @@ type PoolPersistState struct {
 func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 	for name, s := range states {
 		if c, ok := p.byPool[name]; ok {
-			c.loadState(s.Sticky, s.Exhausted, s.LastBalanceSwitch)
+			c.loadState(s.Sticky, s.Exhausted, s.LastBalanceSwitch, s.BalanceSeq, s.LastSelectedSeq)
 		}
 	}
 }
@@ -288,6 +293,17 @@ type Controller struct {
 	// lastBalanceSwitch records the most recent balance switch time for
 	// dwell enforcement. Zero when no balance switch has occurred.
 	lastBalanceSwitch time.Time
+
+	// balanceSeq is a pool-level monotonic counter incremented each time the
+	// sticky pointer moves to a different member in a balanced pool. Together
+	// with lastSelectedSeq it implements the equal-lead tiebreaker: among
+	// eligible candidates with the same best lead, the one with the smallest
+	// lastSelectedSeq (least recently selected) wins.
+	balanceSeq uint64
+	// lastSelectedSeq maps a nick to the sequence number at which it last
+	// became the active member in a balanced pool. 0 (absent) means the
+	// member has never been selected.
+	lastSelectedSeq map[string]uint64
 }
 
 // NewController builds the sticky selector over the members of poolName
@@ -305,16 +321,17 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 	}
 	nicks := reg.PoolNicks(poolName) // sorted; Load guarantees at least one per pool
 	c := &Controller{
-		reg:          reg,
-		pool:         poolName,
-		nicks:        nicks,
-		priority:     effectiveOrder(reg.PoolPriority(poolName), nicks),
-		store:        store,
-		exhausted:    make(map[string]time.Time),
-		now:          now,
-		logOut:       logOut,
-		balanceGap:   reg.PoolBalanceGap(poolName),
-		balanceDwell: reg.PoolBalanceDwell(poolName),
+		reg:             reg,
+		pool:            poolName,
+		nicks:           nicks,
+		priority:        effectiveOrder(reg.PoolPriority(poolName), nicks),
+		store:           store,
+		exhausted:       make(map[string]time.Time),
+		now:             now,
+		logOut:          logOut,
+		balanceGap:      reg.PoolBalanceGap(poolName),
+		balanceDwell:    reg.PoolBalanceDwell(poolName),
+		lastSelectedSeq: make(map[string]uint64),
 	}
 	n := len(nicks)
 	if n == 0 {
@@ -333,6 +350,9 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		}
 	}
 	c.cur = ((start % n) + n) % n
+	// Stamp the initial pick so it is distinguishable from members that have
+	// never been active. loadState may overwrite this with persisted values.
+	c.stampSelectionLocked(c.nicks[c.cur])
 	return c
 }
 
@@ -388,6 +408,7 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 				from := c.nicks[c.cur]
 				c.cur = idx
 				c.lastBalanceSwitch = c.now()
+				c.stampSelectionLocked(c.nicks[idx])
 				c.notifyMutate()
 				fmt.Fprintf(c.logOut, "auto[%s]: balance %s -> %s (lead gap)\n", c.pool, from, c.nicks[idx])
 			}
@@ -396,6 +417,7 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	}
 	if idx, ok := c.firstHealthyLocked(); ok {
 		c.cur = idx
+		c.stampSelectionLocked(c.nicks[idx])
 		c.notifyMutate()
 		return c.backendAt(idx), 0, false
 	}
@@ -452,6 +474,17 @@ func (c *Controller) notifyMutate() {
 	}
 }
 
+// stampSelectionLocked records that nick just became the active member in a
+// balanced pool. It increments the pool-level sequence counter and stores the
+// new value for nick. No-op for non-balanced pools. Caller holds c.mu.
+func (c *Controller) stampSelectionLocked(nick string) {
+	if c.balanceGap == 0 {
+		return
+	}
+	c.balanceSeq++
+	c.lastSelectedSeq[nick] = c.balanceSeq
+}
+
 // poolStatus builds the /_gateway/pool response for this controller. store
 // is consulted for each member's latest snapshot; a member with no recorded
 // snapshot gets snapshot:null. Caller must not hold c.mu.
@@ -504,7 +537,7 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 // has already passed are silently dropped. Persisted nicks absent from the
 // current pool membership are logged and skipped. Called once at startup
 // before the server begins serving; does not call onMutate.
-func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, lastBalanceSwitch time.Time) {
+func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, lastBalanceSwitch time.Time, balanceSeq uint64, lastSelectedSeq map[string]uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if idx := c.indexOf(sticky); idx >= 0 {
@@ -532,6 +565,24 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, la
 	if c.balanceDwell > 0 && !lastBalanceSwitch.IsZero() {
 		c.lastBalanceSwitch = lastBalanceSwitch
 	}
+	if c.balanceGap > 0 {
+		// Load persisted selection-recency state, skipping nicks no longer in the pool.
+		if balanceSeq > c.balanceSeq {
+			c.balanceSeq = balanceSeq
+		}
+		for nick, seq := range lastSelectedSeq {
+			if c.indexOf(nick) >= 0 {
+				c.lastSelectedSeq[nick] = seq
+			}
+		}
+		// Seed the sticky member if no persisted seq exists (fresh install or
+		// upgrade from a state file that predates this feature). This ensures
+		// the currently active member is never treated as "never selected",
+		// which would let it win all future equal-lead tiebreaks indefinitely.
+		if _, stamped := c.lastSelectedSeq[c.nicks[c.cur]]; !stamped {
+			c.stampSelectionLocked(c.nicks[c.cur])
+		}
+	}
 }
 
 // persistState snapshots the controller's routing state for serialisation.
@@ -542,11 +593,20 @@ func (c *Controller) persistState() PoolPersistState {
 	for k, v := range c.exhausted {
 		ex[k] = v
 	}
-	return PoolPersistState{
+	ps := PoolPersistState{
 		Sticky:            c.nicks[c.cur],
 		Exhausted:         ex,
 		LastBalanceSwitch: c.lastBalanceSwitch,
 	}
+	if c.balanceGap > 0 && c.balanceSeq > 0 {
+		ps.BalanceSeq = c.balanceSeq
+		seqs := make(map[string]uint64, len(c.lastSelectedSeq))
+		for k, v := range c.lastSelectedSeq {
+			seqs[k] = v
+		}
+		ps.LastSelectedSeq = seqs
+	}
+	return ps
 }
 
 // ModifyResponse is the per-pool failover hook. It acts on a request that
@@ -647,6 +707,9 @@ func (c *Controller) record429(nick string, reset time.Time) record429Result {
 	if idx, ok := c.firstHealthyLocked(); ok {
 		from := c.cur
 		c.cur = idx
+		if idx != from {
+			c.stampSelectionLocked(c.nicks[idx])
+		}
 		c.notifyMutate()
 		return record429Result{to: c.nicks[idx], switched: idx != from}
 	}
@@ -796,6 +859,12 @@ func (c *Controller) memberLeadsLocked(nick string) (overall, lead5h, lead7d flo
 // at least balanceGap and the dwell timer has elapsed since the last
 // switch. Returns (0, false) when no switch is warranted. Caller holds
 // c.mu.
+//
+// Among eligible candidates with the same best lead (including the common
+// all-zero / no-snapshot case), the one with the smallest lastSelectedSeq
+// wins: the member that was least recently active is preferred, spreading
+// 5-hour cycles across pool members rather than repeatedly re-selecting
+// the lexically-first nick.
 func (c *Controller) balanceSwitchLocked() (int, bool) {
 	if !c.lastBalanceSwitch.IsZero() && c.now().Sub(c.lastBalanceSwitch) < c.balanceDwell {
 		return 0, false
@@ -804,14 +873,20 @@ func (c *Controller) balanceSwitchLocked() (int, bool) {
 
 	bestIdx := -1
 	bestLead := curOverall
+	var bestSeq uint64
 	for i, nick := range c.nicks {
 		if i == c.cur || c.isExhaustedLocked(nick) {
 			continue
 		}
 		candOverall, _, _, _, _ := c.memberLeadsLocked(nick)
-		if curOverall-candOverall >= c.balanceGap && candOverall < bestLead {
+		if curOverall-candOverall < c.balanceGap {
+			continue
+		}
+		seq := c.lastSelectedSeq[nick]
+		if bestIdx < 0 || candOverall < bestLead || (candOverall == bestLead && seq < bestSeq) {
 			bestLead = candOverall
 			bestIdx = i
+			bestSeq = seq
 		}
 	}
 	if bestIdx < 0 {

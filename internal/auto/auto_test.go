@@ -580,7 +580,7 @@ func TestController_loadState(t *testing.T) {
 
 	// Load persisted state: sticky = c, b exhausted for 1h.
 	reset := clock.now().Add(time.Hour)
-	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{})
+	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{}, 0, nil)
 
 	if got := c.Current(); got != "c" {
 		t.Fatalf("after loadState sticky=c, Current=%q, want c", got)
@@ -644,7 +644,7 @@ func TestController_loadState_expiredExhaustedDropped(t *testing.T) {
 	c := newController(t, 0, clock, io.Discard, "a", "b")
 
 	pastReset := clock.now().Add(-time.Hour) // already expired
-	c.loadState("a", map[string]time.Time{"b": pastReset}, time.Time{})
+	c.loadState("a", map[string]time.Time{"b": pastReset}, time.Time{}, 0, nil)
 
 	// b's reset is in the past; resolve should reach b without exhaustion.
 	c.setCur("b")
@@ -660,7 +660,7 @@ func TestController_loadState_unchangedMembership(t *testing.T) {
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b", "c")
 	reset := clock.now().Add(time.Hour)
-	c.loadState("b", map[string]time.Time{"a": reset}, time.Time{})
+	c.loadState("b", map[string]time.Time{"a": reset}, time.Time{}, 0, nil)
 	if logBuf.Len() != 0 {
 		t.Fatalf("expected no log output for unchanged membership, got: %q", logBuf.String())
 	}
@@ -676,7 +676,7 @@ func TestController_loadState_additiveMembership(t *testing.T) {
 	// Pool now has a, b, c, d but persisted state only knew a, b, c.
 	c := newController(t, 0, clock, &logBuf, "a", "b", "c", "d")
 	reset := clock.now().Add(time.Hour)
-	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{})
+	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{}, 0, nil)
 	if logBuf.Len() != 0 {
 		t.Fatalf("expected no log output for additive membership, got: %q", logBuf.String())
 	}
@@ -690,7 +690,7 @@ func TestController_loadState_missingStickyLogs(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
-	c.loadState("old", map[string]time.Time{}, time.Time{})
+	c.loadState("old", map[string]time.Time{}, time.Time{}, 0, nil)
 	out := logBuf.String()
 	if !strings.Contains(out, "persisted sticky=old") {
 		t.Fatalf("expected log about missing sticky, got: %q", out)
@@ -706,7 +706,7 @@ func TestController_loadState_staleExhaustedEntryLogged(t *testing.T) {
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
 	reset := clock.now().Add(time.Hour)
-	c.loadState("a", map[string]time.Time{"old": reset}, time.Time{})
+	c.loadState("a", map[string]time.Time{"old": reset}, time.Time{}, 0, nil)
 	out := logBuf.String()
 	if !strings.Contains(out, "dropping persisted exhausted entry old") {
 		t.Fatalf("expected log about stale exhausted entry, got: %q", out)
@@ -1138,5 +1138,115 @@ func TestBalance_poolStatusExposesLead(t *testing.T) {
 		if m.Nick == "b" && m.Lead != nil {
 			t.Error("member b: Lead should be nil (no snapshot data)")
 		}
+	}
+}
+
+// TestBalance_equalLeadPrefersLeastRecentlySelected verifies that when two
+// candidates have the same best lead (e.g. both zero / no data), the one with
+// the smaller lastSelectedSeq — i.e. the least recently active member — wins.
+//
+// Setup: pool a, b, c in balanced mode. A was the first active member
+// (construction stamp → seq 1). B was selected next (seq 2). C was never
+// selected (seq 0). B is currently active and over-budget; A and C both have
+// no snapshot data (lead = 0). The tiebreaker should prefer C over A.
+func TestBalance_equalLeadPrefersLeastRecentlySelected(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b", "c")
+	// After construction: cur=0 (a), lastSelectedSeq={a:1}, balanceSeq=1.
+
+	// Simulate B having been selected after A: stamp B with seq=2.
+	c.mu.Lock()
+	c.balanceSeq = 2
+	c.lastSelectedSeq["b"] = 2
+	// Point the sticky at B.
+	c.cur = c.indexOf("b")
+	c.mu.Unlock()
+
+	// B is over-budget (high lead); A and C have no data (lead = 0).
+	reset := clock.now().Add(window5h / 2)
+	putSnap(store, c, "b", fptr(0.9), nil, tptr(reset), nil)
+	// No snapshot for A or C → lead = 0 for both.
+
+	b, _, exhausted := c.ResolveAuto()
+	if exhausted {
+		t.Fatal("ResolveAuto: pool reported exhausted, want healthy")
+	}
+	if b.Nick != "c" {
+		t.Fatalf("balance tiebreak: got %q, want c (seq 0 < a's seq 1)", b.Nick)
+	}
+}
+
+// TestBalance_equalLeadFallsBackWhenPreferredIsExhausted verifies that if the
+// least-recently-selected candidate is exhausted, the next best is chosen.
+//
+// Same setup as above, but C is now parked as exhausted. The tiebreak must
+// skip C and correctly select A.
+func TestBalance_equalLeadFallsBackWhenPreferredIsExhausted(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b", "c")
+
+	c.mu.Lock()
+	c.balanceSeq = 2
+	c.lastSelectedSeq["b"] = 2
+	c.cur = c.indexOf("b")
+	// Park C for one hour.
+	c.exhausted["c"] = clock.now().Add(time.Hour)
+	c.mu.Unlock()
+
+	reset := clock.now().Add(window5h / 2)
+	putSnap(store, c, "b", fptr(0.9), nil, tptr(reset), nil)
+
+	b, _, exhausted := c.ResolveAuto()
+	if exhausted {
+		t.Fatal("ResolveAuto: pool reported exhausted, want healthy")
+	}
+	if b.Nick != "a" {
+		t.Fatalf("exhausted preferred candidate: got %q, want a (c is parked)", b.Nick)
+	}
+}
+
+// TestBalance_selectionRecencyPersistedAcrossRestart verifies that
+// lastSelectedSeq survives a persist/load round-trip and continues to drive
+// the equal-lead tiebreaker after the controller is reconstructed.
+func TestBalance_selectionRecencyPersistedAcrossRestart(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b", "c")
+
+	// Stamp A=1, B=2; point sticky at B.
+	c.mu.Lock()
+	c.balanceSeq = 2
+	c.lastSelectedSeq["b"] = 2
+	c.cur = c.indexOf("b")
+	c.mu.Unlock()
+
+	// Persist and reload into a fresh controller.
+	saved := (&Pools{byPool: map[string]*Controller{"auto": c}}).PersistState()
+	if saved["auto"].BalanceSeq != 2 {
+		t.Fatalf("PersistState: BalanceSeq=%d, want 2", saved["auto"].BalanceSeq)
+	}
+	if saved["auto"].LastSelectedSeq["b"] != 2 {
+		t.Fatalf("PersistState: LastSelectedSeq[b]=%d, want 2", saved["auto"].LastSelectedSeq["b"])
+	}
+
+	c2 := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b", "c")
+	(&Pools{byPool: map[string]*Controller{"auto": c2}}).LoadPersistState(saved)
+
+	if c2.Current() != "b" {
+		t.Fatalf("after LoadPersistState: Current=%q, want b", c2.Current())
+	}
+
+	// B over-budget; A and C at no-data lead. C should still win (seq 0 < A's seq 1).
+	reset := clock.now().Add(window5h / 2)
+	putSnap(store, c2, "b", fptr(0.9), nil, tptr(reset), nil)
+
+	b, _, exhausted := c2.ResolveAuto()
+	if exhausted {
+		t.Fatal("ResolveAuto: pool reported exhausted after reload")
+	}
+	if b.Nick != "c" {
+		t.Fatalf("post-reload tiebreak: got %q, want c (seq 0 < a's seq 1)", b.Nick)
 	}
 }

@@ -244,6 +244,14 @@ AQG_POOL_SUB_BALANCE=lead
   as the balance target.
 - When no snapshot data is available for a member its lead is treated as 0
   (neutral); the pool stays sticky until real traffic trains the store.
+- **Equal-lead tiebreaker:** when multiple candidates share the same best
+  lead (the common case when none have snapshot data yet, all reading as 0),
+  the gateway prefers the member that was least recently active — tracked by
+  a per-member selection-sequence counter that increments each time a member
+  becomes the sticky backend. This prevents the lexically-first nick from
+  winning every equal-lead comparison and accumulating disproportionate
+  5-hour cycles. The selection-sequence state is persisted in the state file
+  and survives restarts.
 
 **Cache-locality tradeoff:** a balance switch breaks prompt-cache continuity
 for the in-flight session, just like any other mid-session switch. Unlike a
