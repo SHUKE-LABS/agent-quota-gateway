@@ -23,6 +23,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/poller"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
+	"github.com/shukebeta/agent-quota-gateway/internal/reqlog"
 )
 
 // defaultBackendKey is the quota cache key used as a defensive fallback
@@ -142,7 +143,7 @@ func run() error {
 	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
-	handler := logging.Middleware(mux)
+	handler := reqlog.Middleware(logging.Middleware(mux))
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
