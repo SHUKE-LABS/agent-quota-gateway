@@ -281,3 +281,56 @@ func TestStoreExhausted_pastResetOn7dNotExhausted(t *testing.T) {
 		t.Errorf("ResolveAuto picked %q, want a (7d window already reset)", b.Nick)
 	}
 }
+
+// TestStoreExhaustion_runtimePriorityPreemptsBack proves that a pool with
+// no static PRIORITY declaration, given a runtime priority via SetPriority,
+// correctly preempts back to a recovered higher-priority member. This is the
+// fix for issue #70: before the change, NewPreemptor filtered out non-priority
+// pools at startup, so the preemptor never saw a pool that acquired priority
+// at runtime.
+func TestStoreExhaustion_runtimePriorityPreemptsBack(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+
+	// Create a pool with NO static priority (plain controller, no AQG_POOL_AUTO_PRIORITY).
+	reg := testRegistry(t, "a", "b")
+	pools := NewPools(reg, nil, clock.now, io.Discard)
+	c := pools.byPool["auto"]
+
+	// NewPreemptor now collects all controllers, including this non-priority one.
+	p := NewPreemptor(pools, store, 0, clock.now, io.Discard)
+	if len(p.controllers) != 1 {
+		t.Fatalf("preemptor collected %d controllers, want 1", len(p.controllers))
+	}
+
+	// Set runtime priority: a > b.
+	if _, err := pools.SetPriority("auto", []string{"a", "b"}); err != nil {
+		t.Fatalf("SetPriority: %v", err)
+	}
+
+	// Store a utilization snapshot on a, marking it exhausted.
+	reset := clock.now().Add(time.Hour)
+	putUtil(t, store, c, "a", 1.0, reset)
+
+	// Move to the other member (b) to set up the preempt-back scenario.
+	// This simulates having failed over to the lower-priority member.
+	c.setCur("b")
+	if got := c.Current(); got != "b" {
+		t.Fatalf("Current()=%q, want b (after setCur)", got)
+	}
+
+	// Preemptor tick before the reset: schedule a wake at a's reset.
+	if wait := p.tick(); wait != time.Hour {
+		t.Fatalf("tick wait=%v, want 1h (a's reset)", wait)
+	}
+	if got := c.Current(); got != "b" {
+		t.Fatalf("Current()=%q, want b (no preempt before reset)", got)
+	}
+
+	// Advance past the reset and tick: should preempt back to a.
+	clock.advance(time.Hour + time.Second)
+	p.tick()
+	if got := c.Current(); got != "a" {
+		t.Errorf("Current()=%q, want a (preempted back after reset)", got)
+	}
+}

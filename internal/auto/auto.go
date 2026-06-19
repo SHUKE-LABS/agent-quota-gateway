@@ -293,14 +293,6 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
 	}
 
-	// Reject priority override on a balanced pool (mutually exclusive modes).
-	c.mu.Lock()
-	balanceGap := c.balanceGap
-	c.mu.Unlock()
-	if balanceGap > 0 {
-		return http.StatusConflict, fmt.Errorf("balanced pools do not support priority override")
-	}
-
 	// Normalize and validate the input order.
 	seen := make(map[string]bool)
 	validOrder := make([]string, 0, len(order))
@@ -320,8 +312,14 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 	}
 
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Reject priority override on a balanced pool (mutually exclusive modes).
+	if c.balanceGap > 0 {
+		return http.StatusConflict, fmt.Errorf("balanced pools do not support priority override")
+	}
+
 	c.setPriorityOverrideLocked(validOrder)
-	c.mu.Unlock()
 	return http.StatusOK, nil
 }
 
@@ -1580,6 +1578,9 @@ func (c *Controller) soonestLocked() (int, time.Time) {
 	bestIdx, bestSet := c.cur, false
 	var bestReset time.Time
 	for idx, nick := range c.nicks {
+		if c.disabled[nick] {
+			continue
+		}
 		reset, ok := c.exhaustedUntilLocked(nick)
 		if !ok {
 			continue
@@ -1693,6 +1694,9 @@ func (c *Controller) soonestNickLocked() (string, time.Time) {
 	bestSet := false
 
 	for _, nick := range effectiveNicks {
+		if c.disabled[nick] {
+			continue
+		}
 		reset, ok := c.exhaustedUntilLocked(nick)
 		if !ok {
 			continue
