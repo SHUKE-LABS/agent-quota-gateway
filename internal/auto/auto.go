@@ -621,11 +621,11 @@ func (c *Controller) persistState() PoolPersistState {
 // upstream response; everything else passes through untouched.
 //
 //   - 429 Too Many Requests: it first classifies whether the 429 signals
-//     genuine quota exhaustion (utilization at cap) or is a policy/punishment
-//     429 (no utilization signal). Policy 429s are not parked — the backend
-//     stays in rotation and the client receives a 503 carrying the upstream
-//     error body. Only genuine exhaustion 429s park the backend and advance
-//     the sticky pointer.
+//     genuine quota exhaustion (a "rejected" rate-limit status) or is a
+//     policy/punishment 429 (no rate-limit headers). Policy 429s are not
+//     parked — the backend stays in rotation and the client receives a 503
+//     carrying the upstream error body. Only genuine exhaustion 429s park the
+//     backend and advance the sticky pointer.
 //   - 401 Unauthorized / 403 Forbidden: the backend's own credential was
 //     rejected — revoked, expired, or the account pulled. The gateway stamps
 //     the credential itself (the client never supplies one), so the rejection
@@ -692,27 +692,42 @@ func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset tim
 }
 
 // isGenuineExhaustionSignal reports whether a 429 response for nick represents
-// real quota exhaustion. It checks the 429 response headers first (a genuine
-// rate-limit 429 self-reports utilization at cap), then falls back to the most
-// recent store snapshot for that backend. Returns false — fail safe toward not
-// parking — when neither source carries any utilization data.
+// real quota exhaustion (park it) versus a policy/punishment 429 such as an
+// "unsupported third-party client" rejection (leave it in rotation, forward
+// the body).
+//
+// The discriminator is the rate-limit *status*, not utilization. Utilization
+// is an unreliable proxy in both directions — Anthropic has rejected at 0.99
+// and still served at 1.0 (the soft-cap/overage zone) — so a 1.0 threshold
+// both misses genuine 429s (the member then loops: not parked → retried →
+// 429 again) and parks members that are fine. A genuine rate-limit 429 self-
+// reports a "rejected" unified status (overall or per-window); a policy 429
+// carries no unified rate-limit headers at all. Utilization at the cap is
+// kept only as a secondary positive signal, and is the sole signal for
+// poller-tracked backends (z.ai / MiniMaxi / Ark) that report no status.
+// It checks the 429 response first, then the most recent store snapshot.
 func (c *Controller) isGenuineExhaustionSignal(nick string, respSnap quota.Snapshot) bool {
-	for _, u := range []*float64{respSnap.Unified5hUtilization, respSnap.Unified7dUtilization} {
-		if u != nil && *u >= exhaustionUtilizationThreshold {
-			return true
-		}
+	if snapRejects(respSnap) {
+		return true
 	}
 	if c.store != nil {
 		if idx := c.indexOf(nick); idx >= 0 {
-			storeSnap := c.store.Get(c.backendAt(idx).QuotaKey())
-			for _, u := range []*float64{storeSnap.Unified5hUtilization, storeSnap.Unified7dUtilization} {
-				if u != nil && *u >= exhaustionUtilizationThreshold {
-					return true
-				}
+			if snapRejects(c.store.Get(c.backendAt(idx).QuotaKey())) {
+				return true
 			}
 		}
 	}
 	return false
+}
+
+// snapRejects reports whether snap shows the backend actually rate-limited:
+// an overall "rejected" unified status, or either unified window blocking
+// (see windowBlocks — a per-window "rejected", or, absent a status, a
+// utilization at the cap).
+func snapRejects(snap quota.Snapshot) bool {
+	return snap.UnifiedStatus == unifiedStatusRejected ||
+		windowBlocks(snap.Unified5hUtilization, snap.Unified5hStatus) ||
+		windowBlocks(snap.Unified7dUtilization, snap.Unified7dStatus)
 }
 
 // record429Result reports the outcome of recording an upstream 429.

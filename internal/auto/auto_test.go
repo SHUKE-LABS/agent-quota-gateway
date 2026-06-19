@@ -344,6 +344,40 @@ func TestModifyResponse_policy429NotParked(t *testing.T) {
 	}
 }
 
+// TestModifyResponse_rejected429BelowCapParks is the regression for the
+// "0.99 but keeps 429ing" loop: a genuine rate-limit 429 can arrive with
+// utilization below 1.0. The classifier must key off the rejected status, not
+// the utilization value — otherwise the 429 is misread as a policy 429, the
+// member is never parked, and every retry hits the same exhausted backend.
+func TestModifyResponse_rejected429BelowCapParks(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := newController(t, 0, clock, &logBuf, "a", "b")
+
+	// 429 with status rejected but utilization only 0.99.
+	ctx := backend.WithBackend(context.Background(), c.resolve(t, "a"))
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
+	h := http.Header{}
+	h.Set("anthropic-ratelimit-unified-status", "rejected")
+	h.Set("anthropic-ratelimit-unified-5h-status", "rejected")
+	h.Set("anthropic-ratelimit-unified-5h-utilization", "0.99")
+	h.Set("anthropic-ratelimit-unified-reset", strconv.FormatInt(clock.now().Add(time.Hour).Unix(), 10))
+	resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Request: req, Body: io.NopCloser(strings.NewReader("x"))}
+
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503 (switch, parked)", resp.StatusCode)
+	}
+	if got := c.Current(); got != "b" {
+		t.Errorf("Current()=%q, want b (a parked on rejected 429 at 0.99)", got)
+	}
+	if _, parked := c.exhausted["a"]; !parked {
+		t.Errorf("a not parked on a rejected 429 below the utilization cap")
+	}
+}
+
 // TestModifyResponse_authRejectionParksAndAdvances proves that a 401/403 from
 // a pulled/revoked account parks the backend and fails the pool over to a
 // healthy member, rewriting the response to a switch 503 — the fix for a pool
