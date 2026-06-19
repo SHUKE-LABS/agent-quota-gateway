@@ -282,7 +282,7 @@ Declaring both is a startup error.
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
-| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all state is in-memory only and lost on restart. The file stores sticky pointers, exhausted maps, and quota snapshots — no credentials. Writes are atomic (temp-file + rename) and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. |
+| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all state is in-memory only and lost on restart. The file stores sticky pointers, exhausted maps, quota snapshots, and runtime-added members (including their credentials). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
@@ -587,8 +587,8 @@ from selection (like an exhausted member, but operator-set and never
 auto-cleared). The overlay is persisted to the state file alongside routing
 state and re-applied on top of the static base at startup; a persisted
 reference to a member or pool that no longer exists in the base is dropped
-with a logged warning, not a startup failure. No credential is written to
-the state file.
+with a logged warning, not a startup failure. Runtime-added members are
+persisted with their credentials (the state file is protected at mode 0600).
 
 A priority reorder does **not** force the pool off a healthy active member
 (prompt-cache preservation is unchanged): the new order takes effect on the

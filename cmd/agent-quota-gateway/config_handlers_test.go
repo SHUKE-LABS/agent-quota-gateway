@@ -21,6 +21,8 @@ func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools))
+	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -177,4 +179,103 @@ func memberDisabled(t *testing.T, baseURL, pool, nick string) bool {
 func poolPriority(t *testing.T, baseURL, pool string) []string {
 	t.Helper()
 	return fetchPool(t, baseURL, pool).Priority
+}
+
+// TestAddRemoveEndpoints tests adding and removing runtime pool members.
+func TestAddRemoveEndpoints(t *testing.T) {
+	const secretC = "sk-ant-secret-c"
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
+	srv := configMux(t, loadPools(t))
+
+	// Add a runtime member.
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/c", `{"credential":"`+secretC+`"}`, http.StatusOK)
+
+	// Verify the member appears in config with source: "runtime".
+	view := fetchPool(t, srv.URL, "auto")
+	found := false
+	for _, m := range view.Members {
+		if m.Nick == "c" {
+			found = true
+			if m.Source != "runtime" {
+				t.Errorf("added member c has source=%q, want 'runtime'", m.Source)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("added member c not found in config view")
+	}
+
+	// Verify credential is not leaked in config response.
+	resp, err := http.Get(srv.URL + "/_gateway/config")
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), secretC) {
+		t.Error("config response leaked credential from added member")
+	}
+
+	// Remove the runtime member.
+	delete(t, srv.URL+"/_gateway/pool/auto/member/c", http.StatusOK)
+
+	// Verify the member is gone from config.
+	view = fetchPool(t, srv.URL, "auto")
+	for _, m := range view.Members {
+		if m.Nick == "c" {
+			t.Error("removed member c still appears in config view")
+		}
+	}
+
+	// Remove a static member (hide it from selection).
+	delete(t, srv.URL+"/_gateway/pool/auto/member/a", http.StatusOK)
+	view = fetchPool(t, srv.URL, "auto")
+	for _, m := range view.Members {
+		if m.Nick == "a" && !m.Disabled {
+			// Note: static members that are "removed" via this endpoint stay
+			// in the config but are hidden from selection. The current behavior
+			// is that they disappear from the effective member list.
+		}
+	}
+
+	// Error cases.
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/a", `{"credential":"sk-ant-x"}`, http.StatusConflict) // duplicate nick
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{}`, http.StatusBadRequest)           // empty credential
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{"credential":"x","base_url":"!"}`, http.StatusBadRequest) // invalid URL
+	delete(t, srv.URL+"/_gateway/pool/ghost/member/a", http.StatusNotFound) // unknown pool
+}
+
+func addJSON(t *testing.T, url, body string, wantStatus int) {
+	t.Helper()
+	req, err := http.NewRequest("POST", url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post %s: %v", url, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		t.Errorf("post %s body=%s status=%d, want %d", url, body, resp.StatusCode, wantStatus)
+	}
+}
+
+func delete(t *testing.T, url string, wantStatus int) {
+	t.Helper()
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("delete %s: %v", url, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		t.Errorf("delete %s status=%d, want %d", url, resp.StatusCode, wantStatus)
+	}
 }

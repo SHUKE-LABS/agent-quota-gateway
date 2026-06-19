@@ -1,14 +1,16 @@
 // Package persist handles atomic read/write of gateway state across restarts.
 //
 // GatewayState is the on-disk JSON record: per-pool routing state (sticky
-// nick + exhausted map) and per-backend quota snapshots. A single
-// Persister goroutine debounces writes so the proxy hot path is never
-// blocked on I/O — callers just call MarkDirty() (non-blocking channel
-// send) and the persister coalesces flushes at most once per 200ms.
+// nick + exhausted map), per-backend quota snapshots, and runtime configuration
+// (priority overrides, disabled members, and runtime-added members with their
+// credentials). A single Persister goroutine debounces writes so the proxy hot
+// path is never blocked on I/O — callers just call MarkDirty() (non-blocking
+// channel send) and the persister coalesces flushes at most once per 200ms.
 //
-// Atomic write is temp-file + rename so a crash mid-write never leaves a
-// torn JSON. A missing or unparseable state file logs and starts fresh
-// rather than failing startup.
+// Atomic write is temp-file + rename at mode 0600 so a crash mid-write never
+// leaves a torn JSON. The state file may contain credentials for runtime-added
+// members, so it is protected at 0600. A missing or unparseable state file logs
+// and starts fresh rather than failing startup.
 package persist
 
 import (

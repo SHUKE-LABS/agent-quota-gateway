@@ -103,3 +103,64 @@ func enableMemberHandler(pools *auto.Pools) http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 	}
 }
+
+// addMemberRequest is the JSON request body for adding a pool member.
+type addMemberRequest struct {
+	Credential string `json:"credential"` // required
+	BaseURL    string `json:"base_url"`  // optional
+}
+
+// addMemberHandler serves POST /_gateway/pool/{name}/member/{nick} —
+// adds a runtime member to a pool with a credential.
+func addMemberHandler(pools *auto.Pools) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		poolName := backend.NormalizeName(r.PathValue("name"))
+		nick := backend.NormalizeName(r.PathValue("nick"))
+		if poolName == "" || nick == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool name and nick are required"})
+			return
+		}
+
+		var req addMemberRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
+			return
+		}
+
+		status, err := pools.AddMember(poolName, nick, req.Credential, req.BaseURL)
+		if err != nil {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	}
+}
+
+// removeMemberHandler serves DELETE /_gateway/pool/{name}/member/{nick} —
+// removes a member (static or runtime-added) from pool selection.
+func removeMemberHandler(pools *auto.Pools) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		poolName := backend.NormalizeName(r.PathValue("name"))
+		nick := backend.NormalizeName(r.PathValue("nick"))
+		if poolName == "" || nick == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool name and nick are required"})
+			return
+		}
+
+		status, err := pools.RemoveMember(poolName, nick)
+		if err != nil {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	}
+}

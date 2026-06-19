@@ -540,7 +540,7 @@ func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
 		if m.urlOverride != "" {
 			raw = m.urlOverride
 		}
-		baseURL, err := validateBaseURL(raw)
+		baseURL, err := ValidateBaseURL(raw)
 		if err != nil {
 			return nil, fmt.Errorf("backend: %s has an invalid base URL: %w", m.originKey, err)
 		}
@@ -685,10 +685,10 @@ func parsePriority(val string) ([]string, error) {
 	return out, nil
 }
 
-// validateBaseURL enforces that an upstream has a scheme and host, the
+// ValidateBaseURL enforces that an upstream has a scheme and host, the
 // same contract config applies to ANTHROPIC_BASE_URL. The validated
 // value is returned unchanged.
-func validateBaseURL(raw string) (string, error) {
+func ValidateBaseURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", err

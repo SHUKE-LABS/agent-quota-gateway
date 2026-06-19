@@ -206,6 +206,7 @@ type PoolMemberConfigView struct {
 	BaseURL  string `json:"base_url"`
 	Disabled bool   `json:"disabled"`
 	Status   string `json:"status"` // "active", "idle", "exhausted", "disabled"
+	Source   string `json:"source"` // "static" or "runtime"
 }
 
 // PoolStatus returns the current status of the named pool, or ok=false for an unknown pool.
@@ -246,7 +247,8 @@ type PoolPersistState struct {
 
 // PoolRuntimeConfig is the serializable runtime configuration for one pool.
 // It carries operator mutations that overlay the immutable static config:
-// a priority order override and a per-member disabled flag.
+// a priority order override, a per-member disabled flag, and runtime-added
+// members with their credentials.
 // It is exported so the persist package can embed it in GatewayState.
 type PoolRuntimeConfig struct {
 	// PriorityOverride is the expanded total order (highest first) when the
@@ -258,6 +260,17 @@ type PoolRuntimeConfig struct {
 	// Disabled is the list of member nicks that are operator-disabled.
 	// Each nick appears at most once. Empty means no members are disabled.
 	Disabled []string `json:"disabled,omitempty"`
+	// AddedMembers is the set of runtime-added pool members with their credentials.
+	// Keys are normalized nicks; values include credential and optional base URL.
+	// The state file may contain credentials after this change, so it must be
+	// protected at 0600 (see persist package).
+	AddedMembers map[string]AddedMember `json:"added_members,omitempty"`
+}
+
+// AddedMember is a runtime-added pool member with credential.
+type AddedMember struct {
+	Credential string `json:"credential"`           // stored, never returned in config views
+	BaseURL    string `json:"base_url,omitempty"` // optional; pool default when empty
 }
 
 // LoadPersistState applies previously persisted routing state to each pool's
@@ -333,6 +346,110 @@ func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) 
 	return http.StatusOK, nil
 }
 
+// AddMember adds a runtime member to a pool with a credential. Returns
+// (httpStatus, error) with error containing a credential-free message.
+func (p *Pools) AddMember(poolName, nick, credential, baseURL string) (int, error) {
+	c, ok := p.byPool[poolName]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+	normalized := backend.NormalizeName(nick)
+	if normalized == "" {
+		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
+	}
+	if credential == "" {
+		return http.StatusBadRequest, fmt.Errorf("credential is required")
+	}
+	// Validate baseURL if provided.
+	if baseURL != "" {
+		if _, err := backend.ValidateBaseURL(baseURL); err != nil {
+			return http.StatusBadRequest, fmt.Errorf("invalid base_url: %w", err)
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Validate baseURL is provided when pool has no static members to fall back to.
+	if baseURL == "" && len(c.nicks) == 0 {
+		return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no static members")
+	}
+
+	// Check for duplicate: already exists as static or runtime-added.
+	if c.indexOf(normalized) >= 0 {
+		return http.StatusConflict, fmt.Errorf("nick %s already exists as a static member", normalized)
+	}
+	if _, exists := c.addedMembers[normalized]; exists {
+		return http.StatusConflict, fmt.Errorf("nick %s already exists as a runtime-added member", normalized)
+	}
+
+	// If previously removed, clear the removed flag so it becomes selectable again.
+	delete(c.removedMembers, normalized)
+
+	// Store the added member.
+	c.addedMembers[normalized] = AddedMember{
+		Credential: credential,
+		BaseURL:    baseURL,
+	}
+	c.notifyMutate()
+	fmt.Fprintf(c.logOut, "auto[%s]: added runtime member %s\n", c.pool, normalized)
+	return http.StatusOK, nil
+}
+
+// RemoveMember removes a member (static or runtime-added) from pool selection.
+// Returns (httpStatus, error) with error containing a credential-free message.
+func (p *Pools) RemoveMember(poolName, nick string) (int, error) {
+	c, ok := p.byPool[poolName]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+	normalized := backend.NormalizeName(nick)
+	if normalized == "" {
+		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check if it's a static member or a runtime-added member.
+	isStatic := c.indexOf(normalized) >= 0
+	_, isAdded := c.addedMembers[normalized]
+
+	if !isStatic && !isAdded {
+		return http.StatusBadRequest, fmt.Errorf("nick %s not found in pool", normalized)
+	}
+
+	// If it's a runtime-added member, remove it entirely.
+	if isAdded {
+		delete(c.addedMembers, normalized)
+		fmt.Fprintf(c.logOut, "auto[%s]: removed runtime-added member %s\n", c.pool, normalized)
+	}
+
+	// Mark as removed so it's hidden from selection.
+	// For static members, this is the only effect (they stay in static config).
+	// For added members, we already deleted them, but set removed flag anyway
+	// for consistency and in case of races.
+	c.removedMembers[normalized] = true
+
+	// If the removed member was the active sticky pointer, force-switch to
+	// the next healthy member. This is similar to what happens on a 429.
+	isActive := (c.curAddedNick == normalized) || (c.curAddedNick == "" && normalized == c.nicks[c.cur])
+	if isActive {
+		if nick, ok := c.firstHealthyNickLocked(); ok {
+			// Determine "from" directly without calling Current() (we already hold the lock)
+			from := c.curAddedNick
+			if from == "" && len(c.nicks) > c.cur {
+				from = c.nicks[c.cur]
+			}
+			c.setActiveMemberLocked(nick)
+			fmt.Fprintf(c.logOut, "auto[%s]: switched %s -> %s (removed member %s)\n", c.pool, from, nick, normalized)
+		}
+	}
+
+	c.notifyMutate()
+	return http.StatusOK, nil
+}
+
 // EffectiveConfig returns the effective configuration for all pools,
 // with credentials fully redacted. Each pool's view includes its balance
 // settings, effective priority (runtime override when set, else env priority),
@@ -365,17 +482,52 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 		}
 
 		// Members.
-		view.Members = make([]PoolMemberConfigView, 0, len(c.nicks))
-		curNick := c.nicks[c.cur]
+		// Include both static and runtime-added members.
+		// Static members always appear (even if removed), runtime-added
+		// members disappear when removed.
+		allMembers := make([]string, 0, len(c.nicks)+len(c.addedMembers))
 		for _, nick := range c.nicks {
+			allMembers = append(allMembers, nick)
+		}
+		for nick := range c.addedMembers {
+			if !c.removedMembers[nick] {
+				allMembers = append(allMembers, nick)
+			}
+		}
+		sort.Strings(allMembers)
+
+		view.Members = make([]PoolMemberConfigView, 0, len(allMembers))
+		curNick := c.curAddedNick
+		if curNick == "" && len(c.nicks) > 0 {
+			curNick = c.nicks[c.cur]
+		}
+
+		for _, nick := range allMembers {
 			member := PoolMemberConfigView{
 				Nick:     nick,
-				BaseURL:  c.backendAt(c.indexOf(nick)).BaseURL,
 				Disabled: c.disabled[nick],
 			}
+			// Determine source and get BaseURL.
+			if c.isAddedMemberLocked(nick) {
+				member.Source = "runtime"
+				if am, ok := c.addedMembers[nick]; ok {
+					if am.BaseURL != "" {
+						member.BaseURL = am.BaseURL
+					} else if len(c.nicks) > 0 {
+						member.BaseURL = c.backendAt(0).BaseURL
+					}
+				}
+			} else {
+				member.Source = "static"
+				member.BaseURL = c.backendAt(c.indexOf(nick)).BaseURL
+			}
 			// Determine status.
-			if c.disabled[nick] {
+			if c.disabled[nick] || c.removedMembers[nick] {
 				member.Status = "disabled"
+				// Mark removed members as disabled too
+				if c.removedMembers[nick] {
+					member.Disabled = true
+				}
 			} else if nick == curNick {
 				member.Status = "active"
 			} else if _, ok := c.exhaustedUntilLocked(nick); ok {
@@ -466,6 +618,19 @@ type Controller struct {
 	// on reset). Accessed only under c.mu.
 	disabled map[string]bool
 
+	// addedMembers holds runtime-added pool members with their credentials.
+	// Keys are normalized nicks. Accessed only under c.mu.
+	addedMembers map[string]AddedMember
+	// removedMembers marks members (static or runtime-added) as operator-removed.
+	// A removed member is hidden from selection even if it exists in the static
+	// base or was previously added. Accessed only under c.mu.
+	removedMembers map[string]bool
+
+	// curAddedNick is the nick of the currently active runtime-added member.
+	// When empty, the active member is a static member at index c.cur.
+	// Accessed only under c.mu.
+	curAddedNick string
+
 	// cur indexes nicks: nicks[cur] is the backend every request to this
 	// pool sticks to until it 429s.
 	cur int
@@ -532,6 +697,8 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		balanceDwell:    reg.PoolBalanceDwell(poolName),
 		lastSelectedSeq: make(map[string]uint64),
 		disabled:        make(map[string]bool),
+		addedMembers:    make(map[string]AddedMember),
+		removedMembers:  make(map[string]bool),
 	}
 	n := len(nicks)
 	if n == 0 {
@@ -592,6 +759,42 @@ func (c *Controller) indexOf(nick string) int {
 	return -1
 }
 
+// isAddedMemberLocked reports whether nick is a runtime-added member.
+// Caller holds c.mu.
+func (c *Controller) isAddedMemberLocked(nick string) bool {
+	_, ok := c.addedMembers[nick]
+	return ok
+}
+
+// isRemovedLocked reports whether nick has been operator-removed (hidden
+// from selection). This applies to both static members and runtime-added members.
+// Caller holds c.mu.
+func (c *Controller) isRemovedLocked(nick string) bool {
+	return c.removedMembers[nick]
+}
+
+// addedMembersLocked returns the union of static member nicks and runtime-added
+// member nicks, sorted. Caller holds c.mu.
+func (c *Controller) addedMembersLocked() []string {
+	// Start with static nicks (already sorted)
+	out := make([]string, 0, len(c.nicks)+len(c.addedMembers))
+	seen := make(map[string]bool, len(c.nicks)+len(c.addedMembers))
+
+	for _, nick := range c.nicks {
+		if !c.removedMembers[nick] {
+			out = append(out, nick)
+			seen[nick] = true
+		}
+	}
+	for nick := range c.addedMembers {
+		if !seen[nick] && !c.removedMembers[nick] {
+			out = append(out, nick)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // effectivePriorityLocked returns the effective priority order for this pool:
 // c.priorityOverride when set, otherwise c.priority. The override is the
 // runtime-configurable order; the base priority is the env-declared order.
@@ -604,12 +807,13 @@ func (c *Controller) effectivePriorityLocked() []string {
 }
 
 // isUnavailableLocked reports whether nick is currently unavailable for
-// selection, by either signal: exhausted (live 429 or store-driven) or
-// operator-disabled. This unifies the two blocking signals so the selection
-// path can ask one question. The disabled flag is never auto-cleared,
-// unlike exhausted marks which age out on reset. Caller holds c.mu.
+// selection, by either signal: exhausted (live 429 or store-driven),
+// operator-disabled, or operator-removed. This unifies the blocking signals
+// so the selection path can ask one question. The disabled and removed flags
+// are never auto-cleared, unlike exhausted marks which age out on reset.
+// Caller holds c.mu.
 func (c *Controller) isUnavailableLocked(nick string) bool {
-	if c.disabled[nick] {
+	if c.disabled[nick] || c.removedMembers[nick] {
 		return true
 	}
 	_, ok := c.exhaustedUntilLocked(nick)
@@ -626,8 +830,18 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 
 	c.clearExpiredLocked()
 
-	if !c.isUnavailableLocked(c.nicks[c.cur]) {
-		if c.balanceGap > 0 {
+	// Determine the current member's nick.
+	var curNick string
+	if c.curAddedNick != "" {
+		curNick = c.curAddedNick
+	} else {
+		curNick = c.nicks[c.cur]
+	}
+
+	// If current is healthy, return it (with balance check for static).
+	if !c.isUnavailableLocked(curNick) {
+		// For balanced mode with static members, check for a balance switch.
+		if c.balanceGap > 0 && c.curAddedNick == "" {
 			if idx, ok := c.balanceSwitchLocked(); ok {
 				from := c.nicks[c.cur]
 				c.cur = idx
@@ -635,22 +849,37 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 				c.stampSelectionLocked(c.nicks[idx])
 				c.notifyMutate()
 				fmt.Fprintf(c.logOut, "auto[%s]: balance %s -> %s (lead gap)\n", c.pool, from, c.nicks[idx])
+				return c.backendAt(idx), 0, false
 			}
 		}
-		return c.backendAt(c.cur), 0, false
+		// Current added member: return it directly.
+		if c.curAddedNick != "" {
+			if b, ok := c.backendByNickLocked(c.curAddedNick); ok {
+				return b, 0, false
+			}
+			// Fallback if something went wrong: clear and continue.
+			c.curAddedNick = ""
+		} else {
+			return c.backendAt(c.cur), 0, false
+		}
 	}
-	if idx, ok := c.firstHealthyLocked(); ok {
-		c.cur = idx
-		c.stampSelectionLocked(c.nicks[idx])
-		c.notifyMutate()
-		return c.backendAt(idx), 0, false
+
+	// Current is unavailable; find a healthy replacement.
+	if nick, ok := c.firstHealthyNickLocked(); ok {
+		c.setActiveMemberLocked(nick)
+		if b, ok := c.backendByNickLocked(nick); ok {
+			return b, 0, false
+		}
 	}
-	// All exhausted: point at the soonest to free up so the client's
-	// post-wait retry lands on it, and report the precise wait.
-	idx, reset := c.soonestLocked()
-	c.cur = idx
-	c.notifyMutate()
-	return c.backendAt(idx), c.waitUntil(reset), true
+
+	// All exhausted: point at the soonest to free up.
+	nick, reset := c.soonestNickLocked()
+	c.setActiveMemberLocked(nick)
+	if b, ok := c.backendByNickLocked(nick); ok {
+		return b, c.waitUntil(reset), true
+	}
+	// Should never reach here, but return zero values for safety.
+	return backend.Backend{}, 0, true
 }
 
 // ClearExhausted drops every live-429 park for this pool, making each
@@ -680,6 +909,9 @@ func (c *Controller) ClearExhausted() []string {
 func (c *Controller) Current() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.curAddedNick != "" {
+		return c.curAddedNick
+	}
 	return c.nicks[c.cur]
 }
 
@@ -687,6 +919,13 @@ func (c *Controller) Current() string {
 func (c *Controller) CurrentBackend() backend.Backend {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.curAddedNick != "" {
+		if b, ok := c.backendByNickLocked(c.curAddedNick); ok {
+			return b
+		}
+		// Fallback if something went wrong.
+		return c.backendAt(c.cur)
+	}
 	return c.backendAt(c.cur)
 }
 
@@ -879,9 +1118,20 @@ func (c *Controller) runtimeConfig() PoolRuntimeConfig {
 		disabled = append(disabled, nick)
 	}
 	sort.Strings(disabled)
+
+	// Include added members with credentials (state file may contain credentials).
+	addedMembers := make(map[string]AddedMember, len(c.addedMembers))
+	for nick, am := range c.addedMembers {
+		addedMembers[nick] = AddedMember{
+			Credential: am.Credential, // stored, never returned in config views
+			BaseURL:    am.BaseURL,
+		}
+	}
+
 	return PoolRuntimeConfig{
 		PriorityOverride: priOverride,
 		Disabled:         disabled,
+		AddedMembers:     addedMembers,
 	}
 }
 
@@ -922,6 +1172,24 @@ func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
 			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from disabled list\n", c.pool, nick)
 		}
 	}
+
+	// Restore added members (including their credentials).
+	c.addedMembers = make(map[string]AddedMember)
+	for nick, am := range cfg.AddedMembers {
+		// Validate that the nick doesn't collide with a static member.
+		if c.indexOf(nick) >= 0 {
+			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping added member %q (collides with static member)\n", c.pool, nick)
+			continue
+		}
+		// Restore with credential intact.
+		c.addedMembers[nick] = AddedMember{
+			Credential: am.Credential,
+			BaseURL:    am.BaseURL,
+		}
+	}
+	// Note: removedMembers is intentionally not persisted.
+	// A removed static member is re-selected on restart unless removed again.
+	// A removed added member is simply absent from addedMembers on reload.
 }
 
 // ModifyResponse is the per-pool failover hook. It acts on two classes of
@@ -1331,6 +1599,135 @@ func (c *Controller) soonestLocked() (int, time.Time) {
 func (c *Controller) backendAt(i int) backend.Backend {
 	b, _ := c.reg.ResolveIn(c.pool, c.nicks[i])
 	return b
+}
+
+// backendByNickLocked resolves a backend by nick, handling both static and
+// runtime-added members. For static members it uses the registry; for added
+// members it builds a Backend from the stored credential and base URL.
+// Caller holds c.mu.
+func (c *Controller) backendByNickLocked(nick string) (backend.Backend, bool) {
+	// Check if it's a runtime-added member first.
+	if am, ok := c.addedMembers[nick]; ok {
+		baseURL := am.BaseURL
+		if baseURL == "" && len(c.nicks) > 0 {
+			// Fall back to pool's default base URL (from the first static member).
+			baseURL = c.backendAt(0).BaseURL
+		}
+		return backend.Backend{
+			Pool:       c.pool,
+			Nick:       nick,
+			Credential: am.Credential,
+			BaseURL:    baseURL,
+		}, true
+	}
+	// Static member: use the registry.
+	if idx := c.indexOf(nick); idx >= 0 {
+		return c.backendAt(idx), true
+	}
+	return backend.Backend{}, false
+}
+
+// firstHealthyNickLocked finds the nick of a healthy member, considering both
+// runtime-added and static members. For a priority pool it returns the
+// highest-priority available member; for a plain pool it scans round-robin.
+// Returns (nick, true) when found, ("", false) when all are unavailable.
+// Caller holds c.mu.
+func (c *Controller) firstHealthyNickLocked() (string, bool) {
+	// Build the effective member list (static + added, excluding removed).
+	effectiveNicks := c.addedMembersLocked()
+
+	if pri := c.effectivePriorityLocked(); len(pri) > 0 {
+		// Priority pool: check in priority order.
+		for _, nick := range pri {
+			if !c.isUnavailableLocked(nick) {
+				return nick, true
+			}
+		}
+		return "", false
+	}
+
+	// Plain pool: scan round-robin from current position.
+	// Find current position in effective list.
+	curNick := c.curAddedNick
+	if curNick == "" && len(c.nicks) > 0 {
+		curNick = c.nicks[c.cur]
+	}
+	startIdx := 0
+	for i, nick := range effectiveNicks {
+		if nick == curNick {
+			startIdx = i
+			break
+		}
+	}
+
+	// Scan from startIdx+1 to end, then from 0 to startIdx.
+	n := len(effectiveNicks)
+	if n == 0 {
+		return "", false
+	}
+	for off := 1; off <= n; off++ {
+		idx := (startIdx + off) % n
+		if !c.isUnavailableLocked(effectiveNicks[idx]) {
+			return effectiveNicks[idx], true
+		}
+	}
+	return "", false
+}
+
+// soonestNickLocked returns the nick and reset time of the member that frees up
+// soonest. It considers both runtime-added and static members.
+// Caller holds c.mu.
+func (c *Controller) soonestNickLocked() (string, time.Time) {
+	effectiveNicks := c.addedMembersLocked()
+	if len(effectiveNicks) == 0 {
+		// Fallback to static only.
+		if len(c.nicks) == 0 {
+			return "", c.now()
+		}
+		idx, reset := c.soonestLocked()
+		return c.nicks[idx], reset
+	}
+
+	var bestNick string
+	var bestReset time.Time
+	bestSet := false
+
+	for _, nick := range effectiveNicks {
+		reset, ok := c.exhaustedUntilLocked(nick)
+		if !ok {
+			continue
+		}
+		if !bestSet || reset.Before(bestReset) {
+			bestNick, bestReset, bestSet = nick, reset, true
+		}
+	}
+
+	if !bestSet {
+		// No exhausted members: return current.
+		if len(effectiveNicks) > 0 {
+			return effectiveNicks[0], c.now()
+		}
+		return "", c.now()
+	}
+	return bestNick, bestReset
+}
+
+// setActiveMemberLocked updates the controller's active member state to nick.
+// If nick is a runtime-added member, curAddedNick is set and cur is unchanged.
+// If nick is a static member, curAddedNick is cleared and cur is set to the index.
+// Caller holds c.mu.
+func (c *Controller) setActiveMemberLocked(nick string) {
+	if c.isAddedMemberLocked(nick) {
+		c.curAddedNick = nick
+		// Keep cur at a valid static index for balance mode.
+	} else {
+		if idx := c.indexOf(nick); idx >= 0 {
+			c.cur = idx
+			c.curAddedNick = ""
+			c.stampSelectionLocked(nick)
+		}
+	}
+	c.notifyMutate()
 }
 
 // waitUntil is the non-negative duration from now until reset, floored so
