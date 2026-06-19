@@ -83,6 +83,53 @@ func TestResolveAuto_failsOffStoreExhaustedMember(t *testing.T) {
 	}
 }
 
+// TestResolveAuto_util1ButAllowedStaysSticky is the regression for the
+// all-exhausted-but-actually-serving bug: Anthropic reports a window at
+// utilization 1.0 with status "allowed_warning" while still serving it (the
+// soft-cap/overage zone). The status, not the raw 1.0, is authoritative, so
+// the member must stay selectable. Before the fix, util>=1.0 alone parked it,
+// which locked whole pools out as "all exhausted".
+func TestResolveAuto_util1ButAllowedStaysSticky(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	reset := clock.now().Add(time.Hour)
+	util := 1.0
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      "allowed_warning",
+		Unified5hReset:       &reset,
+		AsOf:                 clock.now(),
+	})
+
+	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "a" {
+		t.Errorf("ResolveAuto picked %q exhausted=%v, want a / false (allowed_warning is still served)", b.Nick, exhausted)
+	}
+}
+
+// TestResolveAuto_rejectedStatusParks proves the authoritative path: a window
+// whose status is "rejected" parks the member even if utilization is reported
+// below the cap (e.g. an org-level block), failing the pool over.
+func TestResolveAuto_rejectedStatusParks(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	reset := clock.now().Add(time.Hour)
+	util := 0.4 // below the cap, but the status says rejected
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      "rejected",
+		Unified5hReset:       &reset,
+		AsOf:                 clock.now(),
+	})
+
+	if b, _, _ := c.ResolveAuto(); b.Nick != "b" {
+		t.Errorf("ResolveAuto picked %q, want b (a's 5h window is rejected)", b.Nick)
+	}
+}
+
 // TestResolveAuto_storeBelowThresholdStaysSticky proves a busy-but-not-spent
 // window does not trigger failover: the sticky-until-exhausted design holds
 // for any utilization short of the cap.

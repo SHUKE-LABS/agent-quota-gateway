@@ -330,13 +330,16 @@ zero-probe**, per pool:
   per-account prompt cache keeps paying off. The gateway does not compare
   or balance across members.
 - **Reactive switch, no watermark below full.** A member is ridden until it
-  returns a `429` or its quota store window reads **fully consumed**
-  (utilization `1.0`). The only threshold is `100%`: a member at 95% keeps
-  serving a small task, so failover stays rare and cache retention high. The
-  `1.0` check exists because a poller-tracked backend (Z.ai / MiniMaxi)
-  signals a spent window through its dashboard API, not a clean pre-stream
-  `429` — without it such a member would never fail off. At `100%` the next
-  request would `429` anyway, so failing off then costs no usable cache.
+  returns a `429` or its quota store window reads **blocking**. What counts as
+  blocking depends on the snapshot: for an Anthropic backend, whose headers
+  carry a per-window status, only a `rejected` status blocks — a window at
+  utilization `1.0` with status `allowed_warning` is in the soft-cap / overage
+  zone and **still served**, so the gateway keeps using it rather than wrongly
+  parking it (and, with every member at `1.0`-but-allowed, reporting the whole
+  pool exhausted). For a poller-tracked backend (Z.ai / MiniMaxi / Ark), whose
+  dashboard API reports only a utilization fraction and no status, the
+  `1.0` cap is the signal — without it such a member, which emits no clean
+  pre-stream `429`, would never fail off.
 - **Dead-credential switch.** A member that returns `401`/`403` (its
   credential was revoked, expired, or the account pulled) is parked for the
   conservative default window and the pool fails over — a dead account never

@@ -54,6 +54,14 @@ const defaultExhaustionWindow = 5 * time.Hour
 // never merely busy.
 const exhaustionUtilizationThreshold = 1.0
 
+// unifiedStatusRejected is the per-window unified-status value Anthropic
+// reports when a window is actually blocking requests. The other values
+// ("allowed", "allowed_warning") are still served — a window can sit at
+// utilization 1.0 with status "allowed_warning" in the soft-cap/overage
+// zone — so when a snapshot carries a status it, not the utilization, is the
+// authoritative exhaustion signal. See windowBlocks.
+const unifiedStatusRejected = "rejected"
+
 // switchRetryAfterSeconds is the Retry-After the synthetic 503 carries
 // when a pool switches members. It is deliberately short: the switch is
 // instantaneous server-side, so the client should retry almost
@@ -789,12 +797,13 @@ func (c *Controller) exhaustedUntilLocked(nick string) (time.Time, bool) {
 }
 
 // storeExhaustedUntilLocked reports nick's window reset when the quota store
-// shows a unified window fully consumed (utilization at or above the
-// threshold) with a reset still in the future. It considers BOTH the 5h and
-// 7d windows: each contributes only when its own utilization is at the cap
-// and its own reset is ahead, and when both qualify the later reset wins, so
-// the returned time is always anchored to the window that actually flagged
-// the member — never the 7d reset for a 5h-only exhaustion or vice versa.
+// shows a unified window actually blocking (see windowBlocks: a "rejected"
+// status, or — absent a status — utilization at the cap) with a reset still
+// in the future. It considers BOTH the 5h and 7d windows: each contributes
+// only when its own window blocks and its own reset is ahead, and when both
+// qualify the later reset wins, so the returned time is always anchored to
+// the window that actually flagged the member — never the 7d reset for a
+// 5h-only exhaustion or vice versa.
 // Checking 7d matters for poller-tracked backends (z.ai / MiniMaxi), which
 // report a weekly cap through the dashboard API and emit no clean
 // proxy-path 429 to catch a 7d-exhausted-but-5h-healthy member the reactive
@@ -817,13 +826,14 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 	snap := c.store.Get(c.backendAt(idx).QuotaKey())
 	reset, ok := time.Time{}, false
 	for _, w := range [...]struct {
-		util  *float64
-		reset *time.Time
+		util   *float64
+		status string
+		reset  *time.Time
 	}{
-		{snap.Unified5hUtilization, snap.Unified5hReset},
-		{snap.Unified7dUtilization, snap.Unified7dReset},
+		{snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset},
+		{snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset},
 	} {
-		if w.util == nil || *w.util < exhaustionUtilizationThreshold {
+		if !windowBlocks(w.util, w.status) {
 			continue
 		}
 		if w.reset == nil || !c.now().Before(*w.reset) {
@@ -834,6 +844,24 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 		}
 	}
 	return reset, ok
+}
+
+// windowBlocks reports whether a unified rate-limit window is actually
+// rejecting requests, deciding by whichever signal the snapshot carries:
+//
+//   - When the window has a status (Anthropic header path), the status is
+//     authoritative. Only "rejected" blocks — Anthropic reports a window at
+//     utilization 1.0 with status "allowed"/"allowed_warning" while still
+//     serving it (the soft-cap / overage / fallback zone). Treating 1.0 as
+//     exhausted there wrongly parks a member Anthropic would happily serve,
+//     which can lock an entire pool out as "all exhausted".
+//   - When the window has no status (poller-tracked z.ai / MiniMaxi / Ark,
+//     which report only a utilization fraction), fall back to the cap.
+func windowBlocks(util *float64, status string) bool {
+	if status != "" {
+		return status == unifiedStatusRejected
+	}
+	return util != nil && *util >= exhaustionUtilizationThreshold
 }
 
 // memberLeadsLocked computes the routing pressure for nick from the quota
