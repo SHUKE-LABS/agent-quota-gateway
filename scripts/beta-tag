@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "${SCRIPT_PATH}" ]]; do
+    SCRIPT_DIR="$(cd -P -- "$(dirname -- "${SCRIPT_PATH}")" && pwd)"
+    SCRIPT_PATH="$(readlink -- "${SCRIPT_PATH}")"
+    [[ "${SCRIPT_PATH}" == /* ]] || SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_PATH}"
+done
+ROOT="$(cd -P -- "$(dirname -- "${SCRIPT_PATH}")/.." && pwd)"
+
+# shellcheck source=../lib/release.sh
+source "${ROOT}/lib/release.sh"
+
+release_create_beta_tag

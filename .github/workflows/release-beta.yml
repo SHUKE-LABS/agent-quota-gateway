@@ -1,0 +1,38 @@
+name: Beta Release
+
+on:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: beta-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  beta-tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch tags
+        run: git fetch --force --tags origin
+      - name: Create beta tag
+        id: beta_tag
+        run: |
+          tag="$(bash scripts/beta-tag)"
+          printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
+      - name: Push beta tag
+        run: git push origin "refs/tags/${{ steps.beta_tag.outputs.tag }}"
+      - name: Generate changelog
+        run: bash scripts/generate-changelog CHANGELOG.md
+      - name: Commit changelog
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --quiet CHANGELOG.md || \
+            git commit -m "docs: regenerate changelog [skip ci]" CHANGELOG.md
+      - name: Push changelog
+        run: git push origin HEAD:main
