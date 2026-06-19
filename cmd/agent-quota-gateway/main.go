@@ -161,6 +161,7 @@ func run(configFlag string) error {
 	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
 	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
 	mux.HandleFunc("/_gateway/config", configHandler(pools))
+	mux.HandleFunc("/_gateway/ui", uiHandler())
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))

@@ -603,6 +603,18 @@ exclusive). All error bodies are credential-free.
 > ACL restricting this port is the only gate; the gateway adds no auth of its
 > own.
 
+A single-file management page is served at `GET /_gateway/ui`. Open it in a
+browser to view every pool, its priority order, the active member, and each
+member's live status (`active` / `exhausted` / `disabled` / `idle`), and to
+reorder priority or toggle enable/disable. It contains no auth and no build
+step — it inherits the gateway's trust boundary. In shared mode this exposes
+write controls to any tailnet member that can reach the port; a Tailscale
+ACL restricting the port is the only gate.
+
+```bash
+curl http://127.0.0.1:8080/_gateway/ui
+```
+
 ## Layout
 
 - `cmd/agent-quota-gateway/` — service entrypoint and integration tests

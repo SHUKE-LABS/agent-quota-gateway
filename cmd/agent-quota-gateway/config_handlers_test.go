@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -14,6 +15,8 @@ import (
 
 // configMux builds a ServeMux with the runtime-config routes wired exactly as
 // run() wires them, so the path-pattern handlers can resolve r.PathValue.
+// The /_gateway/ui route is exercised by uiMux instead — that handler is
+// pools-free and does not belong in this mux.
 func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -23,6 +26,18 @@ func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools))
 	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// uiMux builds a ServeMux that registers only /_gateway/ui. The UI handler
+// takes no *auto.Pools — it serves a static embedded asset — so the UI tests
+// do not need the full runtime-config mux or any AQG_POOL_* env setup.
+func uiMux(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_gateway/ui", uiHandler())
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -277,5 +292,122 @@ func delete(t *testing.T, url string, wantStatus int) {
 	resp.Body.Close()
 	if resp.StatusCode != wantStatus {
 		t.Errorf("delete %s status=%d, want %d", url, resp.StatusCode, wantStatus)
+	}
+}
+
+// TestUIHandler_servesHTML confirms GET /_gateway/ui returns 200 with the
+// HTML content type, the expected mount point, and a no-cache header so an
+// upgraded binary takes effect on the next reload.
+func TestUIHandler_servesHTML(t *testing.T) {
+	srv := uiMux(t)
+
+	resp, err := http.Get(srv.URL + "/_gateway/ui")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Errorf("Content-Type=%q, want text/html; charset=utf-8", got)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("Cache-Control=%q, want no-cache", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	bs := string(body)
+	if !strings.Contains(bs, "<title>Agent Quota Gateway") {
+		t.Errorf("body missing <title>: %s", bs)
+	}
+	if !strings.Contains(bs, `<div id="pools">`) {
+		t.Errorf("body missing #pools mount point: %s", bs)
+	}
+	if uiSHA256 == "" {
+		t.Error("uiSHA256 not computed at init")
+	}
+	if got := resp.Header.Get("X-UI-SHA256"); got != uiSHA256 {
+		t.Errorf("X-UI-SHA256=%q, want %q", got, uiSHA256)
+	}
+}
+
+// TestUIHandler_methodNotAllowed confirms non-GET methods receive 405 with
+// an Allow header, matching the policy of the other /_gateway/* endpoints.
+func TestUIHandler_methodNotAllowed(t *testing.T) {
+	srv := uiMux(t)
+
+	req, err := http.NewRequest("POST", srv.URL+"/_gateway/ui", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status=%d, want 405", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Allow"); got != http.MethodGet {
+		t.Errorf("Allow=%q, want GET", got)
+	}
+}
+
+// TestUIHandler_noCredentialSubstring is the static guard that catches a
+// credential leak before the file is ever served. It scans the embedded
+// page for known credential substrings (sk-ant and a case-insensitive
+// match on credential|secret|token|api[_-]?key). The JS contract comment
+// is the only allowed exception; the regex strip below removes it from
+// the search space so a future copy that omits the comment does not break
+// the test silently.
+func TestUIHandler_noCredentialSubstring(t *testing.T) {
+	if strings.Contains(uiHTML, "sk-ant") {
+		t.Fatalf("UI HTML contains sk-ant credential substring")
+	}
+	// Strip the contract-comment block so its keyword prose doesn't trigger
+	// a false positive; the page is searched as a flat string after.
+	stripped := stripCredentialContractComment(uiHTML)
+	re := regexp.MustCompile(`(?i)credential|secret|token|api[_-]?key`)
+	if loc := re.FindStringIndex(stripped); loc != nil {
+		t.Fatalf("UI HTML contains forbidden credential substring %q at %d..%d", stripped[loc[0]:loc[1]], loc[0], loc[1])
+	}
+}
+
+// stripCredentialContractComment removes the JS line comments that
+// document the credential-leak contract, so they do not trip the static
+// substring check. The contract is one or more `// ...` lines that start
+// with `// Credential contract:` and run until the next blank line or
+// non-comment line. Only the lines inside the script block are touched;
+// any prose in <p> elements is left in place because the regex would
+// match it and trip a real failure.
+func stripCredentialContractComment(s string) string {
+	const marker = "// Credential contract:"
+	for {
+		start := strings.Index(s, marker)
+		if start < 0 {
+			return s
+		}
+		// Walk back to the start of the line.
+		lineStart := strings.LastIndex(s[:start], "\n") + 1
+		// Walk forward through consecutive `// ...` lines.
+		scan := start
+		for {
+			nl := strings.Index(s[scan:], "\n")
+			if nl < 0 {
+				scan = len(s)
+				break
+			}
+			next := scan + nl + 1
+			rest := strings.TrimLeft(s[next:], " \t")
+			if !strings.HasPrefix(rest, "//") {
+				scan = next
+				break
+			}
+			scan = next
+		}
+		s = s[:lineStart] + s[scan:]
 	}
 }

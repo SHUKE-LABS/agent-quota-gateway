@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Quota Gateway — Pool Management</title>
+<style>
+  /* Self-contained stylesheet — no external fonts, no CDN. */
+  :root {
+    --bg: #f7f7f8;
+    --panel: #ffffff;
+    --border: #d6d8db;
+    --text: #1f2328;
+    --muted: #57606a;
+    --accent: #0969da;
+    --accent-text: #ffffff;
+    --danger: #cf222e;
+    --ok: #1a7f37;
+    --warn: #9a6700;
+    --shadow: 0 1px 2px rgba(31, 35, 40, 0.04), 0 3px 6px rgba(31, 35, 40, 0.06);
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #2f81f7;
+      --accent-text: #ffffff;
+      --danger: #f85149;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 3px 6px rgba(0, 0, 0, 0.4);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--text);
+    background: var(--bg);
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:focus, button:focus, .toggle:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  header.top {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+  }
+  header.top h1 { font-size: 18px; margin: 0; }
+  header.top .meta { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+
+  main { padding: 16px 24px 32px; max-width: 960px; margin: 0 auto; }
+
+  #banner {
+    display: none;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    border-radius: 6px;
+    background: rgba(207, 34, 46, 0.1);
+    color: var(--danger);
+    border: 1px solid var(--danger);
+  }
+  #banner.show { display: block; }
+
+  .pool {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .pool header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .pool h2 { margin: 0; font-size: 15px; font-family: var(--mono); }
+  .pool .badge { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .pool .updated { margin-left: auto; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+
+  .columns {
+    display: grid;
+    grid-template-columns: minmax(220px, 1fr) minmax(280px, 1.4fr);
+    gap: 0;
+  }
+  @media (max-width: 720px) {
+    .columns { grid-template-columns: 1fr; }
+  }
+  .col {
+    padding: 12px 16px;
+  }
+  .col + .col { border-left: 1px solid var(--border); }
+  @media (max-width: 720px) {
+    .col + .col { border-left: none; border-top: 1px solid var(--border); }
+  }
+  .col h3 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+
+  ol.priority {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    counter-reset: prio;
+  }
+  ol.priority li {
+    counter-increment: prio;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    margin-bottom: 6px;
+    font-family: var(--mono);
+  }
+  ol.priority li::before {
+    content: counter(prio);
+    color: var(--muted);
+    width: 1.5em;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  ol.priority li .nick { flex: 1; }
+  ol.priority li button {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-family: var(--mono);
+    cursor: pointer;
+  }
+  ol.priority li button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  ol.priority li button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .balanced-note { color: var(--muted); font-style: italic; }
+
+  table.members {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  table.members th, table.members td {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  table.members th { font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  table.members tr:last-child td { border-bottom: none; }
+  table.members td.nick { font-family: var(--mono); }
+
+  .status {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: lowercase;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    background: var(--bg);
+  }
+  .status[data-status="active"] { color: var(--ok); border-color: var(--ok); }
+  .status[data-status="exhausted"] { color: var(--danger); border-color: var(--danger); }
+  .status[data-status="disabled"] { color: var(--muted); }
+  .status[data-status="idle"] { color: var(--accent); border-color: var(--accent); }
+
+  .toggle {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .toggle[disabled] { color: var(--muted); }
+  .toggle[data-state="enabled"] { color: var(--danger); border-color: var(--danger); }
+  .toggle[data-state="enabled"]:hover { background: rgba(207, 34, 46, 0.08); }
+  .toggle[data-state="disabled"] { color: var(--ok); border-color: var(--ok); }
+  .toggle[data-state="disabled"]:hover { background: rgba(26, 127, 55, 0.08); }
+  .toggle:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .empty {
+    color: var(--muted);
+    font-style: italic;
+    padding: 16px;
+    text-align: center;
+  }
+
+  footer.bottom {
+    padding: 16px 24px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 12px;
+    background: var(--panel);
+  }
+  footer.bottom p { margin: 0 0 6px; }
+  footer.bottom p:last-child { margin-bottom: 0; }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>Agent Quota Gateway</h1>
+  <span class="meta">Pool Management</span>
+</header>
+<main>
+  <div id="banner" role="alert"></div>
+  <div id="pools"></div>
+</main>
+<footer class="bottom">
+  <p>Inherits the gateway&rsquo;s trust boundary. Default mode: loopback only.</p>
+  <p>Shared mode: any tailnet member that can reach this port can read the pool layout and issue writes (reorder priority, disable members). The Tailscale ACL is the only gate.</p>
+</footer>
+<script>
+(function () {
+  'use strict';
+
+  // Credential contract: only the fields below are read. Anything that looks
+  // like a credential, secret, token, or api key is refused. The page must
+  // contain no <input> for credentials in Phase 1; the add-member form is
+  // Phase 2 (#65 follow-up) and is gated behind a separate static check.
+  var ALLOWED_MEMBER_KEYS = ['nick', 'base_url', 'disabled', 'status', 'source'];
+
+  var root = document.getElementById('pools');
+  var banner = document.getElementById('banner');
+  var POLL_MS = 3000;
+
+  function showBanner(msg) {
+    banner.textContent = msg;
+    banner.classList.add('show');
+    clearTimeout(showBanner._t);
+    showBanner._t = setTimeout(function () {
+      banner.classList.remove('show');
+    }, 5000);
+  }
+
+  function escapeHTML(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function isBalanced(view) {
+    return !!view.balance_mode && view.balance_mode.length > 0;
+  }
+
+  function sanitizeView(view) {
+    // Defensive: drop any member field that is not on the allowlist.
+    var members = (view.members || []).map(function (m) {
+      var out = {};
+      ALLOWED_MEMBER_KEYS.forEach(function (k) {
+        if (m && Object.prototype.hasOwnProperty.call(m, k)) {
+          out[k] = m[k];
+        }
+      });
+      return out;
+    });
+    return {
+      pool: String(view.pool || ''),
+      balance_mode: view.balance_mode || '',
+      priority: Array.isArray(view.priority) ? view.priority.slice() : [],
+      members: members,
+    };
+  }
+
+  function fetchJSON(url, opts) {
+    return fetch(url, opts || {}).then(function (resp) {
+      var ct = resp.headers.get('content-type') || '';
+      var p = resp.text().then(function (text) {
+        var body = text;
+        if (ct.indexOf('application/json') !== -1) {
+          try { body = JSON.parse(text); } catch (e) { body = null; }
+        }
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+      return p;
+    });
+  }
+
+  function renderEmpty(msg) {
+    root.innerHTML = '';
+    var d = document.createElement('div');
+    d.className = 'empty';
+    d.textContent = msg;
+    root.appendChild(d);
+  }
+
+  function renderSection(view) {
+    var section = document.createElement('section');
+    section.className = 'pool';
+    section.setAttribute('data-pool', view.pool);
+
+    var head = document.createElement('header');
+    var h2 = document.createElement('h2');
+    h2.textContent = view.pool;
+    head.appendChild(h2);
+
+    if (isBalanced(view)) {
+      var badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = 'balanced — priority N/A';
+      head.appendChild(badge);
+    } else if (view.priority.length > 0) {
+      var badge2 = document.createElement('span');
+      badge2.className = 'badge';
+      badge2.textContent = 'priority pool';
+      head.appendChild(badge2);
+    }
+
+    var updated = document.createElement('span');
+    updated.className = 'updated';
+    updated.setAttribute('data-role', 'updated');
+    updated.textContent = '';
+    head.appendChild(updated);
+
+    section.appendChild(head);
+
+    var cols = document.createElement('div');
+    cols.className = 'columns';
+
+    var colPrio = document.createElement('div');
+    colPrio.className = 'col';
+    var h3p = document.createElement('h3');
+    h3p.textContent = 'Priority order';
+    colPrio.appendChild(h3p);
+
+    if (isBalanced(view)) {
+      var note = document.createElement('p');
+      note.className = 'balanced-note';
+      note.textContent = 'Balanced pools rotate automatically; manual priority is not applicable.';
+      colPrio.appendChild(note);
+    } else {
+      colPrio.appendChild(renderPriority(view));
+    }
+    cols.appendChild(colPrio);
+
+    var colMem = document.createElement('div');
+    colMem.className = 'col';
+    var h3m = document.createElement('h3');
+    h3m.textContent = 'Members';
+    colMem.appendChild(h3m);
+    colMem.appendChild(renderMembers(view));
+    cols.appendChild(colMem);
+
+    section.appendChild(cols);
+    return section;
+  }
+
+  function renderPriority(view) {
+    var ol = document.createElement('ol');
+    ol.className = 'priority';
+    ol.setAttribute('data-role', 'priority');
+
+    view.priority.forEach(function (nick, idx) {
+      var li = document.createElement('li');
+      li.setAttribute('data-nick', nick);
+      var name = document.createElement('span');
+      name.className = 'nick';
+      name.textContent = nick;
+      li.appendChild(name);
+
+      var up = document.createElement('button');
+      up.type = 'button';
+      up.textContent = '↑';
+      up.setAttribute('aria-label', 'Move ' + nick + ' up');
+      up.disabled = idx === 0;
+      up.addEventListener('click', function () {
+        movePriority(view.pool, idx, idx - 1);
+      });
+      li.appendChild(up);
+
+      var down = document.createElement('button');
+      down.type = 'button';
+      down.textContent = '↓';
+      down.setAttribute('aria-label', 'Move ' + nick + ' down');
+      down.disabled = idx === view.priority.length - 1;
+      down.addEventListener('click', function () {
+        movePriority(view.pool, idx, idx + 1);
+      });
+      li.appendChild(down);
+
+      ol.appendChild(li);
+    });
+
+    return ol;
+  }
+
+  function renderMembers(view) {
+    var table = document.createElement('table');
+    table.className = 'members';
+
+    var thead = document.createElement('thead');
+    var trh = document.createElement('tr');
+    ['Nick', 'Status', ''].forEach(function (h) {
+      var th = document.createElement('th');
+      th.textContent = h;
+      trh.appendChild(th);
+    });
+    thead.appendChild(trh);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    view.members.forEach(function (m) {
+      var tr = document.createElement('tr');
+      tr.setAttribute('data-nick', m.nick);
+
+      var tdN = document.createElement('td');
+      tdN.className = 'nick';
+      tdN.textContent = m.nick;
+      tr.appendChild(tdN);
+
+      var tdS = document.createElement('td');
+      var status = document.createElement('span');
+      status.className = 'status';
+      status.setAttribute('data-status', m.status || 'idle');
+      status.setAttribute('data-role', 'status');
+      status.textContent = m.status || 'idle';
+      tdS.appendChild(status);
+      tr.appendChild(tdS);
+
+      var tdA = document.createElement('td');
+      tdA.style.textAlign = 'right';
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'toggle';
+      btn.setAttribute('data-role', 'toggle');
+      btn.setAttribute('data-state', m.disabled ? 'disabled' : 'enabled');
+      btn.textContent = m.disabled ? 'Enable' : 'Disable';
+      btn.addEventListener('click', function () {
+        toggleMember(view.pool, m.nick, !m.disabled);
+      });
+      tdA.appendChild(btn);
+      tr.appendChild(tdA);
+
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    return table;
+  }
+
+  function loadConfig() {
+    return fetchJSON('/_gateway/config').then(function (r) {
+      if (!r.ok || !Array.isArray(r.body)) {
+        showBanner('Failed to load /_gateway/config (status ' + r.status + ')');
+        return [];
+      }
+      return r.body.map(sanitizeView);
+    });
+  }
+
+  function loadStatus() {
+    return fetchJSON('/_gateway/pool').then(function (r) {
+      if (!r.ok || !Array.isArray(r.body)) return null;
+      return r.body;
+    });
+  }
+
+  function applyLiveStatus(statuses) {
+    if (!statuses) return;
+    var byPool = {};
+    statuses.forEach(function (s) { byPool[s.pool] = s; });
+    var sections = root.querySelectorAll('section.pool');
+    var now = new Date();
+    var hh = String(now.getHours()).padStart(2, '0');
+    var mm = String(now.getMinutes()).padStart(2, '0');
+    var ss = String(now.getSeconds()).padStart(2, '0');
+    var stamp = 'updated ' + hh + ':' + mm + ':' + ss;
+
+    sections.forEach(function (section) {
+      var pool = section.getAttribute('data-pool');
+      var s = byPool[pool];
+      var upd = section.querySelector('[data-role="updated"]');
+      if (upd) upd.textContent = stamp;
+      if (!s) return;
+      var rows = section.querySelectorAll('table.members tbody tr');
+      rows.forEach(function (tr) {
+        var nick = tr.getAttribute('data-nick');
+        var match = null;
+        s.members.forEach(function (m) { if (m.nick === nick) match = m; });
+        if (!match) return;
+        var badge = tr.querySelector('[data-role="status"]');
+        if (badge) {
+          badge.setAttribute('data-status', match.status || 'idle');
+          badge.textContent = match.status || 'idle';
+        }
+      });
+    });
+  }
+
+  function renderAll(views) {
+    if (!views.length) {
+      renderEmpty('No pools configured.');
+      return;
+    }
+    root.innerHTML = '';
+    views.forEach(function (v) {
+      root.appendChild(renderSection(v));
+    });
+  }
+
+  function movePriority(pool, from, to) {
+    var section = root.querySelector('section.pool[data-pool="' + cssEscape(pool) + '"]');
+    if (!section) return;
+    var items = section.querySelectorAll('ol.priority li');
+    var order = [];
+    items.forEach(function (li) { order.push(li.getAttribute('data-nick')); });
+    if (from < 0 || to < 0 || from >= order.length || to >= order.length) return;
+    var nick = order.splice(from, 1)[0];
+    order.splice(to, 0, nick);
+    postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/priority', order)
+      .then(function (r) { return refreshAfter(r, 'Failed to reorder priority'); });
+  }
+
+  function toggleMember(pool, nick, disabled) {
+    var verb = disabled ? 'disable' : 'enable';
+    postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick) + '/' + verb, null)
+      .then(function (r) { return refreshAfter(r, 'Failed to ' + verb + ' member'); });
+  }
+
+  function postJSON(url, body) {
+    var opts = { method: 'POST', headers: { 'Accept': 'application/json' } };
+    if (body !== null && body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    return fetchJSON(url, opts);
+  }
+
+  function refreshAfter(resp, msg) {
+    if (resp && resp.ok) {
+      return loadConfig().then(renderAll).then(loadStatus).then(applyLiveStatus);
+    }
+    var err = (resp && resp.body && resp.body.error) || (resp ? ('status ' + resp.status) : 'network error');
+    showBanner(msg + ': ' + err);
+    // Re-fetch to reconcile UI with server state after a failed write.
+    return loadConfig().then(renderAll);
+  }
+
+  function cssEscape(s) {
+    if (window.CSS && window.CSS.escape) return window.CSS.escape(s);
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, function (c) { return '\\' + c; });
+  }
+
+  function tick() {
+    loadStatus().then(applyLiveStatus).then(function () {
+      setTimeout(tick, POLL_MS);
+    }).catch(function (e) {
+      console.error('status poll failed', e);
+      setTimeout(tick, POLL_MS);
+    });
+  }
+
+  function boot() {
+    loadConfig()
+      .then(renderAll)
+      .then(loadStatus)
+      .then(applyLiveStatus)
+      .then(tick)
+      .catch(function (e) {
+        console.error('boot failed', e);
+        renderEmpty('Failed to reach the gateway. ' + (e && e.message ? e.message : ''));
+      });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();
+</script>
+</body>
+</html>
