@@ -180,6 +180,26 @@ type PoolStatus struct {
 	Members []MemberStatus `json:"members"`
 }
 
+// PoolConfigView is the /_gateway/config response for one pool.
+// It carries the effective configuration (static + runtime overlay) with
+// all credentials redacted.
+type PoolConfigView struct {
+	Pool         string                 `json:"pool"`
+	BalanceMode  string                 `json:"balance_mode,omitempty"`
+	BalanceGap   float64                `json:"balance_gap,omitempty"`
+	BalanceDwell string                 `json:"balance_dwell,omitempty"`
+	Priority     []string               `json:"priority,omitempty"`
+	Members      []PoolMemberConfigView `json:"members"`
+}
+
+// PoolMemberConfigView describes one pool member in the config view.
+type PoolMemberConfigView struct {
+	Nick     string `json:"nick"`
+	BaseURL  string `json:"base_url"`
+	Disabled bool   `json:"disabled"`
+	Status   string `json:"status"` // "active", "idle", "exhausted", "disabled"
+}
+
 // PoolStatus returns the current status of the named pool, or ok=false for an unknown pool.
 func (p *Pools) PoolStatus(poolName string, store *quota.Store) (PoolStatus, bool) {
 	c, ok := p.byPool[poolName]
@@ -216,12 +236,171 @@ type PoolPersistState struct {
 	LastSelectedSeq map[string]uint64 `json:"last_selected_seq,omitempty"`
 }
 
+// PoolRuntimeConfig is the serializable runtime configuration for one pool.
+// It carries operator mutations that overlay the immutable static config:
+// a priority order override and a per-member disabled flag.
+// It is exported so the persist package can embed it in GatewayState.
+type PoolRuntimeConfig struct {
+	// PriorityOverride is the expanded total order (highest first) when the
+	// operator has set a runtime priority order. A partial list (e.g. ["b"])
+	// is expanded via effectiveOrder to include all unlisted members in sorted
+	// order, so the stored form is always a complete total order. nil means
+	// no override is in effect.
+	PriorityOverride []string `json:"priority_override,omitempty"`
+	// Disabled is the list of member nicks that are operator-disabled.
+	// Each nick appears at most once. Empty means no members are disabled.
+	Disabled []string `json:"disabled,omitempty"`
+}
+
 // LoadPersistState applies previously persisted routing state to each pool's
 // controller. Called once at startup, before the server begins serving.
 func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 	for name, s := range states {
 		if c, ok := p.byPool[name]; ok {
 			c.loadState(s.Sticky, s.Exhausted, s.LastBalanceSwitch, s.BalanceSeq, s.LastSelectedSeq)
+		}
+	}
+}
+
+// SetPriority sets the runtime priority override for the named pool.
+// The order list is validated (all nicks must exist in the pool, no duplicates,
+// no empty strings) and then expanded via effectiveOrder() to a total order.
+// Returns (httpStatus, error) with error containing a credential-free message.
+func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
+	c, ok := p.byPool[poolName]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+
+	// Reject priority override on a balanced pool (mutually exclusive modes).
+	c.mu.Lock()
+	balanceGap := c.balanceGap
+	c.mu.Unlock()
+	if balanceGap > 0 {
+		return http.StatusConflict, fmt.Errorf("balanced pools do not support priority override")
+	}
+
+	// Normalize and validate the input order.
+	seen := make(map[string]bool)
+	validOrder := make([]string, 0, len(order))
+	for _, raw := range order {
+		nick := backend.NormalizeName(raw)
+		if nick == "" {
+			return http.StatusBadRequest, fmt.Errorf("priority list contains empty nick")
+		}
+		if seen[nick] {
+			return http.StatusBadRequest, fmt.Errorf("priority list contains duplicate nick: %s", nick)
+		}
+		seen[nick] = true
+		if c.indexOf(nick) < 0 {
+			return http.StatusBadRequest, fmt.Errorf("unknown nick: %s", nick)
+		}
+		validOrder = append(validOrder, nick)
+	}
+
+	c.mu.Lock()
+	c.setPriorityOverrideLocked(validOrder)
+	c.mu.Unlock()
+	return http.StatusOK, nil
+}
+
+// SetMemberDisabled sets or clears the disabled flag for a member in a pool.
+// Returns (httpStatus, error) with error containing a credential-free message.
+func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) {
+	c, ok := p.byPool[poolName]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+	normalized := backend.NormalizeName(nick)
+	if normalized == "" {
+		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
+	}
+	if c.indexOf(normalized) < 0 {
+		return http.StatusBadRequest, fmt.Errorf("unknown nick: %s", normalized)
+	}
+
+	c.mu.Lock()
+	c.setDisabledLocked(normalized, off)
+	c.mu.Unlock()
+	return http.StatusOK, nil
+}
+
+// EffectiveConfig returns the effective configuration for all pools,
+// with credentials fully redacted. Each pool's view includes its balance
+// settings, effective priority (runtime override when set, else env priority),
+// and per-member status including the disabled flag.
+func (p *Pools) EffectiveConfig() []PoolConfigView {
+	names := make([]string, 0, len(p.byPool))
+	for name := range p.byPool {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]PoolConfigView, 0, len(names))
+	for _, name := range names {
+		c := p.byPool[name]
+		c.mu.Lock()
+		view := PoolConfigView{Pool: name}
+
+		// Balance settings.
+		if c.balanceGap > 0 {
+			view.BalanceMode = "lead"
+			view.BalanceGap = c.balanceGap
+			view.BalanceDwell = c.balanceDwell.String()
+		}
+
+		// Effective priority.
+		pri := c.effectivePriorityLocked()
+		if len(pri) > 0 {
+			view.Priority = make([]string, len(pri))
+			copy(view.Priority, pri)
+		}
+
+		// Members.
+		view.Members = make([]PoolMemberConfigView, 0, len(c.nicks))
+		curNick := c.nicks[c.cur]
+		for _, nick := range c.nicks {
+			member := PoolMemberConfigView{
+				Nick:     nick,
+				BaseURL:  c.backendAt(c.indexOf(nick)).BaseURL,
+				Disabled: c.disabled[nick],
+			}
+			// Determine status.
+			if c.disabled[nick] {
+				member.Status = "disabled"
+			} else if nick == curNick {
+				member.Status = "active"
+			} else if _, ok := c.exhaustedUntilLocked(nick); ok {
+				// exhaustedUntilLocked already returns ok=false once the park
+				// elapses by c.now(), so it is the single source of truth for
+				// the exhausted status — consistent with poolStatus and the
+				// selection path, which all use the controller clock.
+				member.Status = "exhausted"
+			} else {
+				member.Status = "idle"
+			}
+			view.Members = append(view.Members, member)
+		}
+		c.mu.Unlock()
+		out = append(out, view)
+	}
+	return out
+}
+
+// PersistRuntimeConfig snapshots the runtime configuration for all pools.
+func (p *Pools) PersistRuntimeConfig() map[string]PoolRuntimeConfig {
+	out := make(map[string]PoolRuntimeConfig, len(p.byPool))
+	for name, c := range p.byPool {
+		out[name] = c.runtimeConfig()
+	}
+	return out
+}
+
+// LoadRuntimeConfig restores runtime configuration from persisted state.
+func (p *Pools) LoadRuntimeConfig(cfg map[string]PoolRuntimeConfig) {
+	for name, poolCfg := range cfg {
+		if c, ok := p.byPool[name]; ok {
+			c.loadRuntimeConfig(poolCfg)
 		}
 	}
 }
@@ -266,6 +445,18 @@ type Controller struct {
 	// is nil for a pool with no declared priority, which keeps the default
 	// random-start, round-robin-failover behaviour.
 	priority []string
+
+	// priorityOverride is the runtime-configurable priority order that
+	// overrides the static priority. When set, effectivePriorityLocked()
+	// returns this instead of c.priority. nil means no override is in effect.
+	priorityOverride []string
+
+	// disabled maps member nicks to a disabled flag: a member in this map
+	// is unselectable regardless of its exhaustion state, until explicitly
+	// re-enabled via SetMemberDisabled. This is operator-set, never
+	// auto-cleared, and distinct from the exhausted map (which ages out
+	// on reset). Accessed only under c.mu.
+	disabled map[string]bool
 
 	// cur indexes nicks: nicks[cur] is the backend every request to this
 	// pool sticks to until it 429s.
@@ -332,6 +523,7 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		balanceGap:      reg.PoolBalanceGap(poolName),
 		balanceDwell:    reg.PoolBalanceDwell(poolName),
 		lastSelectedSeq: make(map[string]uint64),
+		disabled:        make(map[string]bool),
 	}
 	n := len(nicks)
 	if n == 0 {
@@ -392,6 +584,30 @@ func (c *Controller) indexOf(nick string) int {
 	return -1
 }
 
+// effectivePriorityLocked returns the effective priority order for this pool:
+// c.priorityOverride when set, otherwise c.priority. The override is the
+// runtime-configurable order; the base priority is the env-declared order.
+// Returns nil for a non-priority pool. Caller holds c.mu.
+func (c *Controller) effectivePriorityLocked() []string {
+	if c.priorityOverride != nil {
+		return c.priorityOverride
+	}
+	return c.priority
+}
+
+// isUnavailableLocked reports whether nick is currently unavailable for
+// selection, by either signal: exhausted (live 429 or store-driven) or
+// operator-disabled. This unifies the two blocking signals so the selection
+// path can ask one question. The disabled flag is never auto-cleared,
+// unlike exhausted marks which age out on reset. Caller holds c.mu.
+func (c *Controller) isUnavailableLocked(nick string) bool {
+	if c.disabled[nick] {
+		return true
+	}
+	_, ok := c.exhaustedUntilLocked(nick)
+	return ok
+}
+
 // ResolveAuto returns the backend a request to this pool should use now.
 // When the whole pool is exhausted it returns exhausted=true with the
 // soonest-resetting member and the wait until that reset; the caller
@@ -402,7 +618,7 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 
 	c.clearExpiredLocked()
 
-	if !c.isExhaustedLocked(c.nicks[c.cur]) {
+	if !c.isUnavailableLocked(c.nicks[c.cur]) {
 		if c.balanceGap > 0 {
 			if idx, ok := c.balanceSwitchLocked(); ok {
 				from := c.nicks[c.cur]
@@ -497,7 +713,9 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 	members := make([]MemberStatus, 0, len(c.nicks))
 	for _, nick := range c.nicks {
 		ms := MemberStatus{Nick: nick}
-		if nick == curNick {
+		if c.disabled[nick] {
+			ms.Status = "disabled"
+		} else if nick == curNick {
 			ms.Status = "active"
 		} else if reset, ok := c.exhaustedUntilLocked(nick); ok {
 			ms.Status = "exhausted"
@@ -607,6 +825,95 @@ func (c *Controller) persistState() PoolPersistState {
 		ps.LastSelectedSeq = seqs
 	}
 	return ps
+}
+
+// setPriorityOverrideLocked sets the runtime priority override for this pool.
+// The input order is expanded via effectiveOrder() to produce a total order,
+// matching the form env priority is stored in. This means a partial override
+// (e.g. ["b"] on a 3-member pool) yields the same total order live and after
+// restart. The override does NOT force-switch the active sticky member.
+// Caller holds c.mu.
+func (c *Controller) setPriorityOverrideLocked(order []string) {
+	if len(order) == 0 {
+		c.priorityOverride = nil
+	} else {
+		c.priorityOverride = effectiveOrder(order, c.nicks)
+	}
+	c.notifyMutate()
+}
+
+// setDisabledLocked sets the disabled flag for a member. When off is true,
+// the member is marked disabled and becomes unselectable. When off is false,
+// the member is re-enabled. The operation does NOT force-switch the active
+// sticky member. Caller holds c.mu.
+func (c *Controller) setDisabledLocked(nick string, off bool) {
+	if off {
+		c.disabled[nick] = true
+	} else {
+		delete(c.disabled, nick)
+	}
+	c.notifyMutate()
+}
+
+// runtimeConfig snapshots the runtime configuration for this pool:
+// the current priority override (if any) and the list of disabled members.
+// Caller must not hold c.mu.
+func (c *Controller) runtimeConfig() PoolRuntimeConfig {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var priOverride []string
+	if c.priorityOverride != nil {
+		priOverride = make([]string, len(c.priorityOverride))
+		copy(priOverride, c.priorityOverride)
+	}
+	disabled := make([]string, 0, len(c.disabled))
+	for nick := range c.disabled {
+		disabled = append(disabled, nick)
+	}
+	sort.Strings(disabled)
+	return PoolRuntimeConfig{
+		PriorityOverride: priOverride,
+		Disabled:         disabled,
+	}
+}
+
+// loadRuntimeConfig restores runtime configuration from persisted state.
+// Unknown pool/member references are dropped with a logged warning, never a
+// startup failure. The input priority override is expanded via effectiveOrder.
+// Caller must not hold c.mu.
+func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Restore priority override.
+	if len(cfg.PriorityOverride) > 0 {
+		// Validate that all nicks in the override are current members.
+		validOverride := make([]string, 0, len(cfg.PriorityOverride))
+		for _, nick := range cfg.PriorityOverride {
+			if c.indexOf(nick) >= 0 {
+				validOverride = append(validOverride, nick)
+			} else {
+				fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from priority override\n", c.pool, nick)
+			}
+		}
+		if len(validOverride) > 0 {
+			c.priorityOverride = effectiveOrder(validOverride, c.nicks)
+		} else {
+			c.priorityOverride = nil
+		}
+	} else {
+		c.priorityOverride = nil
+	}
+
+	// Restore disabled set.
+	c.disabled = make(map[string]bool)
+	for _, nick := range cfg.Disabled {
+		if c.indexOf(nick) >= 0 {
+			c.disabled[nick] = true
+		} else {
+			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from disabled list\n", c.pool, nick)
+		}
+	}
 }
 
 // ModifyResponse is the per-pool failover hook. It acts on two classes of
@@ -731,7 +1038,7 @@ func (c *Controller) record429(nick string, reset time.Time) record429Result {
 
 	// Another request may have already rotated off the failed backend; if
 	// the current sticky is healthy, keep it.
-	if !c.isExhaustedLocked(c.nicks[c.cur]) {
+	if !c.isUnavailableLocked(c.nicks[c.cur]) {
 		c.notifyMutate()
 		return record429Result{to: c.nicks[c.cur]}
 	}
@@ -906,7 +1213,7 @@ func (c *Controller) balanceSwitchLocked() (int, bool) {
 	bestLead := curOverall
 	var bestSeq uint64
 	for i, nick := range c.nicks {
-		if i == c.cur || c.isExhaustedLocked(nick) {
+		if i == c.cur || c.isUnavailableLocked(nick) {
 			continue
 		}
 		candOverall, _, _, _, _ := c.memberLeadsLocked(nick)
@@ -927,15 +1234,15 @@ func (c *Controller) balanceSwitchLocked() (int, bool) {
 }
 
 // firstHealthyLocked finds the backend to fail over to. For a priority
-// pool it returns the highest-priority non-exhausted member, so failover
-// always climbs toward the preferred backend. For a plain pool it scans
-// round-robin from just after cur so switches spread across the pool
-// rather than always hopping to the lexically-first nick. Caller holds
-// c.mu.
+// pool it returns the highest-priority available member (not exhausted,
+// not disabled), so failover always climbs toward the preferred backend.
+// For a plain pool it scans round-robin from just after cur so switches
+// spread across the pool rather than always hopping to the lexically-first
+// nick. Caller holds c.mu.
 func (c *Controller) firstHealthyLocked() (int, bool) {
-	if len(c.priority) > 0 {
-		for _, nick := range c.priority {
-			if c.isExhaustedLocked(nick) {
+	if pri := c.effectivePriorityLocked(); len(pri) > 0 {
+		for _, nick := range pri {
+			if c.isUnavailableLocked(nick) {
 				continue
 			}
 			if idx := c.indexOf(nick); idx >= 0 {
@@ -947,7 +1254,7 @@ func (c *Controller) firstHealthyLocked() (int, bool) {
 	n := len(c.nicks)
 	for off := 1; off <= n; off++ {
 		idx := (c.cur + off) % n
-		if !c.isExhaustedLocked(c.nicks[idx]) {
+		if !c.isUnavailableLocked(c.nicks[idx]) {
 			return idx, true
 		}
 	}

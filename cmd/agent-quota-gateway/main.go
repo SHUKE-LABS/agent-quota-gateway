@@ -102,12 +102,16 @@ func run(configFlag string) error {
 	// Expired exhausted entries are silently dropped by LoadPersistState.
 	pools.LoadPersistState(persisted.Pools)
 
+	// Restore runtime configuration (priority overrides, disabled members).
+	pools.LoadRuntimeConfig(persisted.Config)
+
 	// Wire up the persister so state mutations are coalesced and flushed
 	// atomically to disk. The persister goroutine is started below.
 	statePersister := persist.NewPersister(cfg.StateFile, func() persist.GatewayState {
 		return persist.GatewayState{
 			Pools:     pools.PersistState(),
 			Snapshots: store.Snapshot(),
+			Config:    pools.PersistRuntimeConfig(),
 		}
 	})
 	pools.SetOnMutate(statePersister.MarkDirty)
@@ -156,6 +160,10 @@ func run(configFlag string) error {
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
 	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
 	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
+	mux.HandleFunc("/_gateway/config", configHandler(pools))
+	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
 	handler := reqlog.Middleware(logging.Middleware(mux))

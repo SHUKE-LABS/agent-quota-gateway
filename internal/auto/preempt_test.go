@@ -350,3 +350,55 @@ func TestPreemptor_RunStopsOnContextCancel(t *testing.T) {
 		t.Fatal("Run did not return after context cancel")
 	}
 }
+
+// TestPreemptor_disabledMemberPreemptBack proves that when the highest-priority
+// member is disabled, preempt-back still reaches the next available preferred
+// member (decision 4a). Without this, the disabled member would appear in
+// preemptView with exhausted=false, causing tick() to target it and then
+// fail in PreemptTo, stopping the scan before reaching the next healthy member.
+func TestPreemptor_disabledMemberPreemptBack(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+
+	// Priority pool: c > b > a. The pool has fallen all the way down to the
+	// lowest member a. The top member c is then operator-disabled while the
+	// middle member b is healthy — so preempt-back must skip c (iterated
+	// first, highest priority) and climb to the next available preferred
+	// member b. The preemptor only ever climbs up, so the current member
+	// must start below the target for preempt-back to have anything to do.
+	c := newPriorityController(t, -1, clock, &logBuf, "c,b,a", "a", "b", "c")
+	c.setCur("a")
+
+	// Disable c (the highest-priority member).
+	c.mu.Lock()
+	c.setDisabledLocked("c", true)
+	c.mu.Unlock()
+
+	// Empty store: b reads healthy (no exhaustion snapshot).
+	store := quota.NewStore()
+	p := newPreemptor([]*Controller{c}, store, 0, clock.now, &logBuf)
+
+	// Tick should skip the disabled c (which, left in the view, would be
+	// targeted as !exhausted and then refused by PreemptTo, stalling the
+	// scan) and climb to the healthy b.
+	wait := p.tick()
+
+	// We should have switched up to b (not stalled on a, never landing on c).
+	if cur := c.Current(); cur != "b" {
+		t.Errorf("after tick: current=%q, want b (disabled c skipped, climb to healthy b)", cur)
+	}
+
+	// The wait should be the idle interval: the healthy b was switched to
+	// immediately, so there is no parked higher member to wait on.
+	if wait != 5*time.Minute {
+		t.Errorf("tick wait=%v, want 5m (idle interval)", wait)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "preempt[auto]:") {
+		t.Errorf("expected preempt-back log, got: %q", logs)
+	}
+	if strings.Contains(logs, "cred") {
+		t.Errorf("log leaked a credential: %q", logs)
+	}
+}

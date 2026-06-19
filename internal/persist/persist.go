@@ -32,6 +32,12 @@ const defaultDebounce = 200 * time.Millisecond
 type GatewayState struct {
 	Pools     map[string]auto.PoolPersistState `json:"pools"`
 	Snapshots map[string]quota.Snapshot        `json:"snapshots"`
+	// Config is the runtime configuration overlay: per-pool priority
+	// overrides and disabled members. nil when no runtime config is set.
+	// Stored separately from Pools because it's mutable at runtime via
+	// the /_gateway/config API, while Pools carries the sticky/exhausted
+	// routing state.
+	Config map[string]auto.PoolRuntimeConfig `json:"config,omitempty"`
 }
 
 // Load reads the state file at path. A missing file returns an empty

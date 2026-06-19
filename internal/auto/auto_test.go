@@ -937,7 +937,7 @@ func putSnap(store *quota.Store, c *Controller, nick string, util5h, util7d *flo
 	})
 }
 
-func fptr(f float64) *float64 { return &f }
+func fptr(f float64) *float64     { return &f }
 func tptr(t time.Time) *time.Time { return &t }
 
 // TestBalance_defaultPoolUnaffected verifies that a pool without BALANCE
@@ -1321,5 +1321,240 @@ func TestBalance_selectionRecencyPersistedAcrossRestart(t *testing.T) {
 	}
 	if b.Nick != "c" {
 		t.Fatalf("post-reload tiebreak: got %q, want c (seq 0 < a's seq 1)", b.Nick)
+	}
+}
+
+// TestRuntimeConfig_disabledMemberRemoval proves that disabling a member
+// removes it from selection, and re-enabling restores it.
+func TestRuntimeConfig_disabledMemberRemoval(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+
+	// Initially, a is active and healthy.
+	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "a" {
+		t.Fatalf("initial resolve: got %q, exhausted=%v, want a healthy", b.Nick, exhausted)
+	}
+
+	// Disable a.
+	c.mu.Lock()
+	c.setDisabledLocked("a", true)
+	c.mu.Unlock()
+
+	// Next resolve should skip a and pick b (round-robin from a).
+	b, _, exhausted := c.ResolveAuto()
+	if exhausted || b.Nick != "b" {
+		t.Fatalf("after disabling a: got %q, exhausted=%v, want b healthy", b.Nick, exhausted)
+	}
+
+	// Re-enable a.
+	c.mu.Lock()
+	c.setDisabledLocked("a", false)
+	c.mu.Unlock()
+
+	// After re-enable, a is still unselected (b is sticky) but a is
+	// available for failover again. Park b and c so a is the only healthy
+	// member: the switch must land on the re-enabled a, proving enable
+	// restored its selectability (round-robin would otherwise prefer c).
+	c.mu.Lock()
+	c.exhausted["b"] = clock.now().Add(time.Hour)
+	c.exhausted["c"] = clock.now().Add(time.Hour)
+	c.mu.Unlock()
+
+	b2, _, exhausted2 := c.ResolveAuto()
+	if exhausted2 || b2.Nick != "a" {
+		t.Fatalf("after re-enabling a and parking b,c: got %q, exhausted=%v, want a healthy", b2.Nick, exhausted2)
+	}
+}
+
+// TestRuntimeConfig_allDisabledYieldsExhausted proves that when every
+// member is disabled, ResolveAuto returns exhausted=true (same as all-exhausted).
+func TestRuntimeConfig_allDisabledYieldsExhausted(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a")
+
+	// Disable the only member.
+	c.mu.Lock()
+	c.setDisabledLocked("a", true)
+	c.mu.Unlock()
+
+	// Resolve should report exhausted (the pool has no selectable members).
+	b, wait, exhausted := c.ResolveAuto()
+	if !exhausted {
+		t.Fatal("all-disabled should report exhausted=true, got false")
+	}
+	// The wait should be near-zero (no reset to wait for).
+	if wait > time.Second {
+		t.Fatalf("all-disabled wait=%v, want ~0", wait)
+	}
+	// The backend should still be a (the only member).
+	if b.Nick != "a" {
+		t.Errorf("all-disabled backend=%q, want a (points at the disabled member)", b.Nick)
+	}
+}
+
+// TestRuntimeConfig_priorityOverrideFailover proves that a runtime priority
+// override changes the selection order, observable via failover (disable/exhaust
+// the current member, then ResolveAuto lands on the new effective priority[0]).
+func TestRuntimeConfig_priorityOverrideFailover(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+
+	// Start on a (random for plain pool, but deterministic here).
+	if got := c.Current(); got != "a" {
+		t.Fatalf("initial current=%q, want a", got)
+	}
+
+	// Set a runtime priority override: ["c", "b"] (expanded to [c,b,a]).
+	c.mu.Lock()
+	c.setPriorityOverrideLocked([]string{"c", "b"})
+	c.mu.Unlock()
+
+	// The active member should still be a (priority override does not
+	// force-switch). But after exhausting a, failover should go to c
+	// (the new highest-priority healthy member).
+	c.mu.Lock()
+	c.exhausted["a"] = clock.now().Add(time.Hour)
+	c.mu.Unlock()
+
+	b, _, exhausted := c.ResolveAuto()
+	if exhausted || b.Nick != "c" {
+		t.Fatalf("after priority override and exhausting a: got %q, exhausted=%v, want c healthy", b.Nick, exhausted)
+	}
+}
+
+// TestRuntimeConfig_partialOverrideRoundTrip proves that a partial override
+// (e.g. ["b"] on a 3-member pool) yields the same total order live and
+// after restart.
+func TestRuntimeConfig_partialOverrideRoundTrip(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+
+	// Set a partial override: only b is listed (a and c rank after in sorted order).
+	// Effective order should be [b, a, c].
+	c.mu.Lock()
+	c.setPriorityOverrideLocked([]string{"b"})
+	c.mu.Unlock()
+
+	// Snapshot the runtime config.
+	cfg := c.runtimeConfig()
+	if len(cfg.PriorityOverride) != 3 {
+		t.Fatalf("partial override expanded length=%d, want 3 (b,a,c)", len(cfg.PriorityOverride))
+	}
+	wantOrder := []string{"b", "a", "c"}
+	for i, got := range cfg.PriorityOverride {
+		if got != wantOrder[i] {
+			t.Errorf("expanded order[%d]=%q, want %q", i, got, wantOrder[i])
+		}
+	}
+
+	// Load the config into a fresh controller and verify the order is preserved.
+	c2 := newController(t, 0, clock, io.Discard, "a", "b", "c")
+	c2.loadRuntimeConfig(cfg)
+
+	c2.mu.Lock()
+	defer c2.mu.Unlock()
+	if len(c2.priorityOverride) != 3 {
+		t.Fatalf("after load: override length=%d, want 3", len(c2.priorityOverride))
+	}
+	for i, got := range c2.priorityOverride {
+		if got != wantOrder[i] {
+			t.Errorf("after load order[%d]=%q, want %q", i, got, wantOrder[i])
+		}
+	}
+}
+
+// TestRuntimeConfig_configRoundTrip proves that runtime config survives a
+// persist/load cycle.
+func TestRuntimeConfig_configRoundTrip(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+
+	// Set a priority override and disable b.
+	c.mu.Lock()
+	c.setPriorityOverrideLocked([]string{"c"})
+	c.setDisabledLocked("b", true)
+	c.mu.Unlock()
+
+	cfg := c.runtimeConfig()
+	if len(cfg.PriorityOverride) != 3 {
+		t.Errorf("priority override length=%d, want 3 (expanded)", len(cfg.PriorityOverride))
+	}
+	if len(cfg.Disabled) != 1 || cfg.Disabled[0] != "b" {
+		t.Errorf("disabled list=%v, want [b]", cfg.Disabled)
+	}
+
+	// Reload into a fresh controller.
+	c2 := newController(t, 0, clock, io.Discard, "a", "b", "c")
+	c2.loadRuntimeConfig(cfg)
+
+	// Verify the settings took effect.
+	c2.mu.Lock()
+	defer c2.mu.Unlock()
+	if len(c2.priorityOverride) != 3 {
+		t.Errorf("after load: override length=%d, want 3", len(c2.priorityOverride))
+	}
+	if !c2.disabled["b"] {
+		t.Error("after load: member b should be disabled")
+	}
+}
+
+// TestRuntimeConfig_loadDropsUnknownNick proves that loadRuntimeConfig drops
+// references to unknown nicks with a logged warning (not a crash).
+func TestRuntimeConfig_loadDropsUnknownNick(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := newController(t, 0, clock, &logBuf, "a", "b")
+
+	// Config contains unknown nicks and a valid nick.
+	cfg := PoolRuntimeConfig{
+		PriorityOverride: []string{"unknown", "b"},
+		Disabled:         []string{"a", "ghost"},
+	}
+
+	c.loadRuntimeConfig(cfg)
+
+	// The valid entries should be loaded; unknown ones dropped.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.priorityOverride) != 2 {
+		t.Errorf("override length after load=%d, want 2 (b,a)", len(c.priorityOverride))
+	}
+	if len(c.disabled) != 1 || !c.disabled["a"] {
+		t.Errorf("disabled after load=%v, want {a:true}", c.disabled)
+	}
+	// Verify warnings were logged.
+	logs := logBuf.String()
+	if !strings.Contains(logs, "unknown nick") && !strings.Contains(logs, "ghost") {
+		t.Error("expected warning log about unknown nicks, got none")
+	}
+}
+
+// TestRuntimeConfig_concurrentMutation proves that SetPriority and
+// SetMemberDisabled are safe under concurrent ResolveAuto (no races).
+func TestRuntimeConfig_concurrentMutation(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Resolve from one goroutine.
+			_, _, _ = c.ResolveAuto()
+
+			// Mutate from another.
+			c.mu.Lock()
+			c.setPriorityOverrideLocked([]string{"c", "b"})
+			c.setDisabledLocked("a", true)
+			c.mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	// Controller should still be in a valid state.
+	cur := c.Current()
+	if cur != "a" && cur != "b" && cur != "c" {
+		t.Errorf("Current()=%q, not a valid nick", cur)
 	}
 }

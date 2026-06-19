@@ -247,7 +247,8 @@ func (c *Controller) preemptView() preemptView {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.priority) == 0 {
+	pri := c.effectivePriorityLocked()
+	if len(pri) == 0 {
 		return preemptView{}
 	}
 	c.clearExpiredLocked()
@@ -255,12 +256,21 @@ func (c *Controller) preemptView() preemptView {
 	cur := c.nicks[c.cur]
 	curRank := c.rankLocked(cur)
 	v := preemptView{isPriority: true, current: cur}
-	for _, nick := range c.priority { // highest priority first
+	for _, nick := range pri { // highest priority first
 		if c.rankLocked(nick) >= curRank {
 			continue // only members strictly above the active one
 		}
 		idx := c.indexOf(nick)
 		if idx < 0 {
+			continue
+		}
+		// Skip only operator-disabled members: a disabled higher-priority
+		// member must not appear in the view, otherwise tick() reads it as
+		// healthy (!exhausted), targets it, and breaks before reaching the
+		// next available preferred member — while PreemptTo then refuses it.
+		// Exhausted members MUST remain in the view: tick() schedules the
+		// loop's wake on their reset, which is the whole point of preempt-back.
+		if c.disabled[nick] {
 			continue
 		}
 		ms := memberState{nick: nick, quotaKey: c.backendAt(idx).QuotaKey()}
@@ -279,14 +289,14 @@ func (c *Controller) preemptView() preemptView {
 // recovered preferred member. It refuses (returns false, leaving the
 // pointer put) for a pool with no declared priority, an unknown nick, a
 // nick that is not strictly higher priority than the current member, or a
-// nick that is still exhausted — so a preempt never lands on a member known
-// to be rate-limited, and never moves the pool away from its preference.
-// Atomic under c.mu.
+// nick that is still unavailable (exhausted or disabled) — so a preempt never
+// lands on a member known to be rate-limited or operator-disabled, and never
+// moves the pool away from its preference. Atomic under c.mu.
 func (c *Controller) PreemptTo(nick string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.priority) == 0 {
+	if len(c.effectivePriorityLocked()) == 0 {
 		return false
 	}
 	c.clearExpiredLocked()
@@ -298,7 +308,7 @@ func (c *Controller) PreemptTo(nick string) bool {
 	if c.rankLocked(nick) >= c.rankLocked(c.nicks[c.cur]) {
 		return false
 	}
-	if c.isExhaustedLocked(nick) {
+	if c.isUnavailableLocked(nick) {
 		return false
 	}
 	c.cur = idx
@@ -320,14 +330,14 @@ func (c *Controller) noteRecovered(nick string) {
 }
 
 // rankLocked returns nick's position in the pool's priority order (lower is
-// higher priority). effectiveOrder places every member in c.priority, so a
-// real member always has a rank; an unknown nick sorts last. Caller holds
-// c.mu.
+// higher priority). effectiveOrder places every member in the effective
+// priority, so a real member always has a rank; an unknown nick sorts last.
+// Caller holds c.mu.
 func (c *Controller) rankLocked(nick string) int {
-	for i, n := range c.priority {
+	for i, n := range c.effectivePriorityLocked() {
 		if n == nick {
 			return i
 		}
 	}
-	return len(c.priority)
+	return len(c.effectivePriorityLocked())
 }

@@ -537,6 +537,68 @@ probing would start a new session and consume quota.
 `?pool=<unknown>` returns HTTP 404. The endpoint is `GET`-only; non-GET
 returns `405` with `Allow: GET`.
 
+### Runtime pool configuration
+
+Priority order and per-member enable/disable can be changed at runtime,
+without a restart, through four endpoints. This is for operating a pool
+mid-incident — taking a draining account out of rotation, or reordering
+preference — when editing config and restarting is the wrong tool.
+
+| Method & path | Effect |
+|---------------|--------|
+| `GET /_gateway/config` | Effective configuration for every pool, **credentials redacted** |
+| `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first |
+| `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member out of selection and failover |
+| `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member to rotation |
+
+```bash
+curl http://127.0.0.1:8080/_gateway/config
+curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/priority -d '["b","a"]'
+curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/disable
+curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/enable
+```
+
+`GET /_gateway/config` returns one object per pool — balance settings, the
+effective priority order, and per-member `nick` / `base_url` / `disabled` /
+`status`. **No credential ever appears** in the response, a log, or an error.
+
+```json
+[
+  {
+    "pool": "auto",
+    "priority": ["b", "a", "c"],
+    "members": [
+      { "nick": "a", "base_url": "https://api.anthropic.com", "disabled": true,  "status": "disabled" },
+      { "nick": "b", "base_url": "https://api.anthropic.com", "disabled": false, "status": "active" }
+    ]
+  }
+]
+```
+
+**Overlay on an immutable base.** The static configuration (env vars or the
+config file) is never mutated — it stays immutable and lock-free on the hot
+path. Runtime changes are an *overlay* layered on top of it: a priority
+override replaces the declared order, and a disabled flag removes a member
+from selection (like an exhausted member, but operator-set and never
+auto-cleared). The overlay is persisted to the state file alongside routing
+state and re-applied on top of the static base at startup; a persisted
+reference to a member or pool that no longer exists in the base is dropped
+with a logged warning, not a startup failure. No credential is written to
+the state file.
+
+A priority reorder does **not** force the pool off a healthy active member
+(prompt-cache preservation is unchanged): the new order takes effect on the
+next failover and on reset-driven preempt-back. Validation: an unknown nick
+returns `400`, an unknown pool `404`, and a priority override on a
+balanced-mode pool returns `409` (priority and balance are mutually
+exclusive). All error bodies are credential-free.
+
+> **Shared mode:** these are **write** endpoints. In shared mode (see below)
+> any tailnet member that can reach the port can reorder priority or disable
+> members — a sharper exposure than the read-only quota view. The Tailscale
+> ACL restricting this port is the only gate; the gateway adds no auth of its
+> own.
+
 ## Layout
 
 - `cmd/agent-quota-gateway/` — service entrypoint and integration tests
