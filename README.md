@@ -195,8 +195,9 @@ The switch happens within one timer cycle of the reset. It uses the precise
 quota poller), falls back to the member's parked reset otherwise, and only
 idles on a 5-minute poll when neither is available. A member that resets but
 is immediately rate-limited again is not switched to repeatedly — reactive
-`429` failover keeps precedence. Pools **without** a `PRIORITY` declaration
-never preempt, so their prompt cache is never interrupted.
+`429` failover keeps precedence. Pools without a static `PRIORITY` declaration
+never preempt unless priority is set at runtime via `POST /_gateway/pool/{name}/priority`,
+so their prompt cache is never interrupted.
 
 ### Balanced routing within a pool
 
@@ -551,7 +552,7 @@ preference — when editing config and restarting is the wrong tool.
 | Method & path | Effect |
 |---------------|--------|
 | `GET /_gateway/config` | Effective configuration for every pool, **credentials redacted** |
-| `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first |
+| `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member to rotation |
 

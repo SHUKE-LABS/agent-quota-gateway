@@ -66,9 +66,7 @@ func NewPreemptor(p *Pools, store *quota.Store, interval time.Duration, now func
 	var ctrls []*Controller
 	for _, name := range sortedPoolNames(p) {
 		c := p.byPool[name]
-		if len(c.priority) > 0 {
-			ctrls = append(ctrls, c)
-		}
+		ctrls = append(ctrls, c)
 	}
 	return newPreemptor(ctrls, store, interval, now, logOut)
 }
@@ -168,8 +166,16 @@ func (p *Preemptor) tick() time.Duration {
 			// Anthropic via headers, for z-ai/MiniMaxi via the poller) is
 			// preferred over the controller's conservative park.
 			qReset := p.store.Get(m.quotaKey).Unified5hReset
+			// Also check if the store reports the member as exhausted (util at cap).
+			// This catches members that are store-exhausted but not yet parked,
+			// which can happen when priority is set at runtime (issue #70).
+			qUtil := p.store.Get(m.quotaKey).Unified5hUtilization
+			isStoreExhausted := qUtil != nil && *qUtil >= 1.0
 
-			if !m.exhausted {
+			// Determine if the member is truly available (not exhausted by either signal).
+			isAvailable := !m.exhausted && !isStoreExhausted
+
+			if isAvailable {
 				// A higher-priority member the controller already considers
 				// healthy is sitting unused — switch back to it now. Anchor the
 				// dedup on its store reset (whether past or still future) so
@@ -184,6 +190,7 @@ func (p *Preemptor) tick() time.Duration {
 				break
 			}
 
+			// Member is exhausted (by park, store, or both). Check if it has recovered.
 			if qReset != nil && !now.Before(*qReset) {
 				// The precise window has reset. Act once per distinct reset so a
 				// member that resets but is immediately re-limited does not flap
@@ -198,13 +205,18 @@ func (p *Preemptor) tick() time.Duration {
 				// the controller's fresh park instead.
 			}
 
-			// Still parked: wake at the soonest of the precise reset (when
-			// known and still ahead) or the controller's park reset.
+			// Still exhausted: wake at the soonest of the park reset or the
+			// precise store reset (when known and still ahead).
+			// When park reset is zero (member not parked), use the store reset.
 			next := m.reset
-			if qReset != nil && qReset.After(now) && qReset.Before(next) {
+			if next.IsZero() && qReset != nil && qReset.After(now) {
+				next = *qReset
+			} else if qReset != nil && qReset.After(now) && qReset.Before(next) {
 				next = *qReset
 			}
-			schedule(next)
+			if !next.IsZero() {
+				schedule(next)
+			}
 		}
 
 		if target != "" {

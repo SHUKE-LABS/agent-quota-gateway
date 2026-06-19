@@ -311,25 +311,30 @@ func TestPreempt_logsSwitchWithoutCredentials(t *testing.T) {
 	}
 }
 
-// TestNewPreemptor_skipsNonPriorityPools proves only priority pools are
-// collected, so equal-strength pools never preempt and Run is a no-op when
-// no pool declared a priority.
-func TestNewPreemptor_skipsNonPriorityPools(t *testing.T) {
+// TestNewPreemptor_tickSkipsNonPriorityPools proves that while NewPreemptor
+// collects all controllers, tick() skips non-priority ones — so equal-strength
+// pools never preempt, and Run stays idle at the default interval.
+func TestNewPreemptor_tickSkipsNonPriorityPools(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	// Single non-priority pool → no controllers collected → Run returns.
+	// Single non-priority pool → controller collected, but tick() skips it.
 	reg := testRegistry(t, "a", "b")
 	pools := NewPools(reg, nil, clock.now, io.Discard)
 	p := NewPreemptor(pools, quota.NewStore(), 0, clock.now, io.Discard)
-	if len(p.controllers) != 0 {
-		t.Fatalf("collected %d controllers, want 0 (no priority pool)", len(p.controllers))
+	if len(p.controllers) != 1 {
+		t.Fatalf("collected %d controllers, want 1 (all pools collected)", len(p.controllers))
 	}
 
-	done := make(chan struct{})
-	go func() { p.Run(context.Background()); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Run did not return immediately with no priority pools")
+	// tick() should skip the non-priority controller and return the idle interval.
+	if wait := p.tick(); wait != defaultPreemptInterval {
+		t.Fatalf("tick wait=%v, want %v (non-priority skipped, idle interval)", wait, defaultPreemptInterval)
+	}
+
+	// Run should stay idle (not spin) even with controllers collected.
+	// Verify tick() continues to return the idle interval.
+	for i := 0; i < 3; i++ {
+		if wait := p.tick(); wait != defaultPreemptInterval {
+			t.Fatalf("tick %d wait=%v, want %v (stays idle)", i, wait, defaultPreemptInterval)
+		}
 	}
 }
 
