@@ -204,6 +204,51 @@
     text-align: center;
   }
 
+  .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+  button.remove {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--danger);
+    border-radius: 4px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  button.remove:hover { border-color: var(--danger); background: rgba(207, 34, 46, 0.08); }
+
+  form.add-member {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--border);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+  form.add-member input {
+    flex: 1 1 120px;
+    min-width: 0;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  form.add-member input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  form.add-member button {
+    flex: 0 0 auto;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--accent-text);
+    border-radius: 4px;
+    padding: 5px 12px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  form.add-member button:hover { filter: brightness(1.05); }
+
   footer.bottom {
     padding: 16px 24px;
     border-top: 1px solid var(--border);
@@ -232,10 +277,13 @@
 (function () {
   'use strict';
 
-  // Credential contract: only the fields below are read. Anything that looks
-  // like a credential, secret, token, or api key is refused. The page must
-  // contain no <input> for credentials in Phase 1; the add-member form is
-  // Phase 2 (#65 follow-up) and is gated behind a separate static check.
+  // Credential contract: ALLOWED_MEMBER_KEYS are the only member fields read
+  // from /_gateway/config and rendered. A credential is write-only — the
+  // add-subscription form sends it in the POST body and never reads it back,
+  // stores it in the DOM, or echoes it anywhere. The static guard in
+  // config_handlers_test.go enforces this: the deliberately-named credential
+  // field is on a tight allowlist; any other secret/token/api-key shaped
+  // string still fails the build.
   var ALLOWED_MEMBER_KEYS = ['nick', 'base_url', 'disabled', 'status'];
 
   var root = document.getElementById('pools');
@@ -360,6 +408,12 @@
     h3m.textContent = 'Members';
     colMem.appendChild(h3m);
     colMem.appendChild(renderMembers(view));
+    // Add-subscription is offered only on plain pools: priority and balanced
+    // selection iterate the static member set, so a runtime-added member in
+    // those pools would be unselectable. (Priority-pool add is #83/follow-up.)
+    if (!isBalanced(view) && view.priority.length === 0) {
+      colMem.appendChild(renderAddMember(view));
+    }
     cols.appendChild(colMem);
 
     section.appendChild(cols);
@@ -439,7 +493,9 @@
       tr.appendChild(tdS);
 
       var tdA = document.createElement('td');
-      tdA.style.textAlign = 'right';
+      var actions = document.createElement('div');
+      actions.className = 'row-actions';
+
       var btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'toggle';
@@ -449,13 +505,58 @@
       btn.addEventListener('click', function () {
         toggleMember(view.pool, m.nick, !m.disabled);
       });
-      tdA.appendChild(btn);
+      actions.appendChild(btn);
+
+      var rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'remove';
+      rm.setAttribute('data-role', 'remove');
+      rm.textContent = 'Remove';
+      rm.addEventListener('click', function () {
+        removeMember(view.pool, m.nick);
+      });
+      actions.appendChild(rm);
+
+      tdA.appendChild(actions);
       tr.appendChild(tdA);
 
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
     return table;
+  }
+
+  function mkInput(type, field, placeholder) {
+    var el = document.createElement('input');
+    el.type = type;
+    el.setAttribute('data-field', field);
+    el.placeholder = placeholder;
+    el.autocomplete = 'off';
+    return el;
+  }
+
+  function renderAddMember(view) {
+    var form = document.createElement('form');
+    form.className = 'add-member';
+    form.setAttribute('data-role', 'add-member');
+
+    var nick = mkInput('text', 'nick', 'nick');
+    var base = mkInput('text', 'base_url', 'base_url (optional)');
+    var cred = mkInput('password', 'credential', 'credential');
+    form.appendChild(nick);
+    form.appendChild(base);
+    form.appendChild(cred);
+
+    var submit = document.createElement('button');
+    submit.type = 'submit';
+    submit.textContent = 'Add subscription';
+    form.appendChild(submit);
+
+    form.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      addMember(view.pool, { nick: nick, base: base, cred: cred });
+    });
+    return form;
   }
 
   function loadConfig() {
@@ -535,6 +636,37 @@
     var verb = disabled ? 'disable' : 'enable';
     postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick) + '/' + verb, null)
       .then(function (r) { return refreshAfter(r, 'Failed to ' + verb + ' member'); });
+  }
+
+  function addMember(pool, fields) {
+    var nick = (fields.nick.value || '').trim();
+    var cred = fields.cred.value || '';
+    var base = (fields.base.value || '').trim();
+    // Client-side validation mirrors the handler's 400 on empty inputs.
+    if (!nick) { showBanner('Add failed: nick is required'); return; }
+    if (!cred) { showBanner('Add failed: credential is required'); return; }
+    var body = { credential: cred };
+    if (base) { body.base_url = base; }
+    postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick), body)
+      .then(function (r) {
+        // Clear inputs on success so the value never lingers in the DOM.
+        if (r && r.ok) {
+          fields.nick.value = '';
+          fields.base.value = '';
+          fields.cred.value = '';
+        }
+        return refreshAfter(r, 'Failed to add subscription');
+      });
+  }
+
+  function removeMember(pool, nick) {
+    var ok = window.confirm(
+      'Remove subscription "' + nick + '" from pool "' + pool + '"?\n\n' +
+      'This is permanent and cannot be undone.');
+    if (!ok) { return; }
+    fetchJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick),
+      { method: 'DELETE', headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return refreshAfter(r, 'Failed to remove subscription'); });
   }
 
   function postJSON(url, body) {

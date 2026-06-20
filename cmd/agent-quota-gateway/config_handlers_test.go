@@ -356,23 +356,71 @@ func TestUIHandler_methodNotAllowed(t *testing.T) {
 	}
 }
 
+// allowedCredentialRefs are the exact, deliberately-named references to the
+// add-subscription form's write-only credential field. They are stripped
+// before the forbidden-substring scan so the guard permits the named field
+// while still catching any other secret/token/api-key shaped content. The
+// strings are matched case-sensitively, so a differently-cased reference
+// (e.g. "Credential:") still trips the case-insensitive regex.
+var allowedCredentialRefs = []string{
+	"'credential'",           // the add-form field name + placeholder (set via mkInput)
+	"credential:",            // the POST body key
+	"credential is required", // the client-side validation message naming the field
+}
+
+// scanForForbiddenSecret strips the JS contract comment and the allowlisted
+// credential references, then scans for any remaining credential/secret/token/
+// api-key shaped substring. It returns the offending token and true when the
+// guard should fail. Sharing this with the leak test keeps both honest.
+func scanForForbiddenSecret(html string) (string, bool) {
+	stripped := stripCredentialContractComment(html)
+	for _, ref := range allowedCredentialRefs {
+		stripped = strings.ReplaceAll(stripped, ref, "")
+	}
+	re := regexp.MustCompile(`(?i)credential|secret|token|api[_-]?key`)
+	if loc := re.FindStringIndex(stripped); loc != nil {
+		return stripped[loc[0]:loc[1]], true
+	}
+	return "", false
+}
+
 // TestUIHandler_noCredentialSubstring is the static guard that catches a
 // credential leak before the file is ever served. It scans the embedded
 // page for known credential substrings (sk-ant and a case-insensitive
 // match on credential|secret|token|api[_-]?key). The JS contract comment
-// is the only allowed exception; the regex strip below removes it from
-// the search space so a future copy that omits the comment does not break
-// the test silently.
+// and the deliberately-named credential field (allowedCredentialRefs) are
+// the only allowed exceptions; both are stripped before the scan so a future
+// copy that introduces an unrelated secret reference still fails.
 func TestUIHandler_noCredentialSubstring(t *testing.T) {
 	if strings.Contains(uiHTML, "sk-ant") {
 		t.Fatalf("UI HTML contains sk-ant credential substring")
 	}
-	// Strip the contract-comment block so its keyword prose doesn't trigger
-	// a false positive; the page is searched as a flat string after.
-	stripped := stripCredentialContractComment(uiHTML)
-	re := regexp.MustCompile(`(?i)credential|secret|token|api[_-]?key`)
-	if loc := re.FindStringIndex(stripped); loc != nil {
-		t.Fatalf("UI HTML contains forbidden credential substring %q at %d..%d", stripped[loc[0]:loc[1]], loc[0], loc[1])
+	if tok, found := scanForForbiddenSecret(uiHTML); found {
+		t.Fatalf("UI HTML contains forbidden credential substring %q", tok)
+	}
+}
+
+// TestCredentialGuard_stillCatchesLeaks proves relaxing the guard for the
+// named credential field did not blunt it: arbitrary secret/token/api-key
+// shaped content — and any credential reference outside the allowlist — is
+// still caught, while the allowlisted field references alone are permitted.
+func TestCredentialGuard_stillCatchesLeaks(t *testing.T) {
+	leaks := []string{
+		`var x = "secret-value";`,
+		`headers['x-api-key'] = k;`,
+		`var s = "token-abc";`,
+		`el.dataset.credential = m.credential;`, // a non-allowlisted credential ref
+		`{ Credential: c }`,                     // wrong case is not on the allowlist
+	}
+	for _, s := range leaks {
+		if _, found := scanForForbiddenSecret(s); !found {
+			t.Errorf("guard failed to catch leak-shaped content: %q", s)
+		}
+	}
+	// The allowlisted references alone must NOT trip the guard.
+	clean := `mkInput('password', 'credential', 'credential'); var body = { credential: cred };`
+	if tok, found := scanForForbiddenSecret(clean); found {
+		t.Errorf("guard tripped on allowlisted credential reference: %q", tok)
 	}
 }
 
