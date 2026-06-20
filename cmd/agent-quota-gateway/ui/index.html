@@ -474,7 +474,18 @@
     ol.className = 'priority';
     ol.setAttribute('data-role', 'priority');
 
-    view.priority.forEach(function (nick, idx) {
+    // When no priority is configured yet, seed the reorderable list from the
+    // pool's members so the operator can establish an initial order; the first
+    // reorder POSTs it to /priority and the pool becomes a priority pool. Only
+    // do this for pools with >=2 members — a single-member (or empty) pool gets
+    // no controls (nothing to order).
+    var order = view.priority.length > 0
+      ? view.priority
+      : (view.members.length >= 2
+          ? view.members.map(function (m) { return m.nick; })
+          : []);
+
+    order.forEach(function (nick, idx) {
       var li = document.createElement('li');
       li.setAttribute('data-nick', nick);
       var name = document.createElement('span');
@@ -496,7 +507,7 @@
       down.type = 'button';
       down.textContent = '↓';
       down.setAttribute('aria-label', 'Move ' + nick + ' down');
-      down.disabled = idx === view.priority.length - 1;
+      down.disabled = idx === order.length - 1;
       down.addEventListener('click', function () {
         movePriority(view.pool, idx, idx + 1);
       });
