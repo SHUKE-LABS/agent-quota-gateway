@@ -201,7 +201,8 @@ func TestAddRemoveEndpoints(t *testing.T) {
 	const secretC = "sk-ant-secret-c"
 	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
 	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
-	srv := configMux(t, loadPools(t))
+	pools := loadPools(t)
+	srv := configMux(t, pools)
 
 	// Add a runtime member.
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/c", `{"credential":"`+secretC+`"}`, http.StatusOK)
@@ -246,13 +247,45 @@ func TestAddRemoveEndpoints(t *testing.T) {
 	}
 
 	// Remove a static member: removal is permanent deletion, so it disappears
-	// from the config roster entirely (not merely flagged disabled).
+	// from the config roster entirely (not merely flagged disabled). The
+	// effective set drives both the view and the selection path, so omission
+	// from this roster also means the member is no longer selectable.
 	delete(t, srv.URL+"/_gateway/pool/auto/member/a", http.StatusOK)
 	view = fetchPool(t, srv.URL, "auto")
 	for _, m := range view.Members {
 		if m.Nick == "a" {
 			t.Error("removed static member a still appears in config view")
 		}
+	}
+
+	// Removal must survive a restart (#85). Exercise the full persist path —
+	// DELETE handler → PersistRuntimeConfig serialization → LoadRuntimeConfig →
+	// config view — by snapshotting the runtime config, reloading it into a
+	// fresh Pools (whose controllers start anchored on the now-removed "a"),
+	// and asserting the reloaded view still omits the removed members. A fresh
+	// Pools re-reads AQG_POOL_AUTO_BACKEND_A/B, so without persisted tombstones
+	// "a" would resurface — exactly the regression #85 fixed.
+	cfg := pools.PersistRuntimeConfig()
+	pools2 := loadPools(t)
+	pools2.LoadRuntimeConfig(cfg)
+	srv2 := configMux(t, pools2)
+	reloaded := fetchPool(t, srv2.URL, "auto")
+	sawSurvivor := false
+	for _, m := range reloaded.Members {
+		switch m.Nick {
+		case "a":
+			t.Error("removed static member a reappeared after restart")
+		case "c":
+			t.Error("removed runtime member c reappeared after restart")
+		case "b":
+			sawSurvivor = true
+			if m.Status == "disabled" {
+				t.Errorf("survivor b is %q after restart, want selectable", m.Status)
+			}
+		}
+	}
+	if !sawSurvivor {
+		t.Error("survivor member b missing from config view after restart")
 	}
 
 	// Error cases.
