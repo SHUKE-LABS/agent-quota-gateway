@@ -98,6 +98,12 @@ func run(configFlag string) error {
 	// backends (z.ai / MiniMaxi) ever produce.
 	pools := auto.NewPools(registry, store, nil, nil)
 
+	// Re-instantiate runtime-created pools (POST /_gateway/pool) before any
+	// per-pool state is restored, so LoadPersistState / LoadRuntimeConfig below
+	// can resolve them by name. Each is a clean slate (no members, no routing
+	// state); a name that collides with an env pool is dropped (env wins).
+	pools.LoadAddedPools(persisted.AddedPools)
+
 	// Restore sticky pointers and exhausted maps from the persisted state.
 	// Expired exhausted entries are silently dropped by LoadPersistState.
 	pools.LoadPersistState(persisted.Pools)
@@ -109,9 +115,10 @@ func run(configFlag string) error {
 	// atomically to disk. The persister goroutine is started below.
 	statePersister := persist.NewPersister(cfg.StateFile, func() persist.GatewayState {
 		return persist.GatewayState{
-			Pools:     pools.PersistState(),
-			Snapshots: store.Snapshot(),
-			Config:    pools.PersistRuntimeConfig(),
+			Pools:      pools.PersistState(),
+			Snapshots:  store.Snapshot(),
+			Config:     pools.PersistRuntimeConfig(),
+			AddedPools: pools.PersistAddedPools(),
 		}
 	})
 	pools.SetOnMutate(statePersister.MarkDirty)
@@ -159,6 +166,7 @@ func run(configFlag string) error {
 	mux.HandleFunc("/_gateway/health", healthHandler())
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
 	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
+	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
 	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
 	mux.HandleFunc("/_gateway/config", configHandler(pools))
 	mux.HandleFunc("/_gateway/ui", uiHandler())
