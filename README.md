@@ -544,10 +544,11 @@ returns `405` with `Allow: GET`.
 
 ### Runtime pool configuration
 
-Priority order and per-member enable/disable can be changed at runtime,
-without a restart, through four endpoints. This is for operating a pool
-mid-incident — taking a draining account out of rotation, or reordering
-preference — when editing config and restarting is the wrong tool.
+Priority order, per-member enable/disable, and pool membership can be changed
+at runtime, without a restart, through six endpoints. This is for operating a
+pool mid-incident — taking a draining account out of rotation, reordering
+preference, or adding a fresh account — when editing config and restarting is
+the wrong tool.
 
 | Method & path | Effect |
 |---------------|--------|
@@ -555,12 +556,17 @@ preference — when editing config and restarting is the wrong tool.
 | `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member to rotation |
+| `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "..."}` (`credential` required, `base_url` optional). Persisted with its credential. |
+| `DELETE /_gateway/pool/{name}/member/{nick}` | Remove a member (static or runtime-added) from selection |
 
 ```bash
 curl http://127.0.0.1:8080/_gateway/config
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/priority -d '["b","a"]'
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/disable
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/enable
+curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/d \
+  -d '{"credential": "sk-ant-...", "base_url": "https://api.anthropic.com"}'
+curl -X DELETE http://127.0.0.1:8080/_gateway/pool/auto/member/d
 ```
 
 `GET /_gateway/config` returns one object per pool — balance settings, the
@@ -598,11 +604,27 @@ returns `400`, an unknown pool `404`, and a priority override on a
 balanced-mode pool returns `409` (priority and balance are mutually
 exclusive). All error bodies are credential-free.
 
+**Adding and removing members.** `POST /_gateway/pool/{name}/member/{nick}`
+adds a runtime member. The JSON body is `{"credential": "...", "base_url":
+"..."}`: `credential` is required, and `base_url` is optional (it falls back to
+the pool's static members, so it is required only when the pool has no static
+member to inherit from). On success the member is persisted to the state file
+*with its credential* (file mode `0600`) and re-applied at startup. Status
+codes: `200` on success; `400` on a missing nick, invalid JSON body, missing
+credential, invalid `base_url`, or a missing `base_url` for a pool with no
+static members; `404` on an unknown pool; `409` when the nick already exists as
+a static or runtime-added member. `DELETE /_gateway/pool/{name}/member/{nick}`
+removes a member — static or runtime-added — from selection and returns `200`;
+`404` on an unknown pool and `400` on a missing nick or a nick not present in
+the pool. If the removed member was the active one, the pool force-switches to
+the next healthy member. All error bodies are credential-free.
+
 > **Shared mode:** these are **write** endpoints. In shared mode (see below)
-> any tailnet member that can reach the port can reorder priority or disable
-> members — a sharper exposure than the read-only quota view. The Tailscale
-> ACL restricting this port is the only gate; the gateway adds no auth of its
-> own.
+> any tailnet member that can reach the port can reorder priority, disable or
+> remove members, or **add** a member — injecting a credential and a new
+> upstream of their choosing. This is a sharper exposure than the read-only
+> quota view. The Tailscale ACL restricting this port is the only gate; the
+> gateway adds no auth of its own.
 
 A single-file management page is served at `GET /_gateway/ui`. Open it in a
 browser to view every pool, its priority order, the active member, and each
