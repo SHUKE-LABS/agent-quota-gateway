@@ -16,3 +16,6 @@ dist/
 coverage.out
 
 .playwright-mcp/
+
+# compiled binary (never commit build artifacts)
+/agent-quota-gateway
