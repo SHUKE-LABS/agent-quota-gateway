@@ -40,6 +40,10 @@ type GatewayState struct {
 	// the /_gateway/config API, while Pools carries the sticky/exhausted
 	// routing state.
 	Config map[string]auto.PoolRuntimeConfig `json:"config,omitempty"`
+	// AddedPools records pools created at runtime via POST /_gateway/pool, so
+	// they are re-instantiated on restart. Env-defined pools are excluded.
+	// Absent in older state files, which load as no runtime pools.
+	AddedPools map[string]auto.AddedPoolSpec `json:"added_pools,omitempty"`
 }
 
 // Load reads the state file at path. A missing file returns an empty

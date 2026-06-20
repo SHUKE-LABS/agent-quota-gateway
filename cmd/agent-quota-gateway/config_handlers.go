@@ -24,6 +24,36 @@ func configHandler(pools *auto.Pools) http.HandlerFunc {
 	}
 }
 
+// createPoolRequest is the JSON request body for creating a runtime pool.
+type createPoolRequest struct {
+	Name    string `json:"name"`     // required; normalized server-side
+	BaseURL string `json:"base_url"` // required; the pool's default upstream
+	Mode    string `json:"mode"`     // optional; defaults to "plain" (the only supported value)
+}
+
+// createPoolHandler serves POST /_gateway/pool — creates a plain pool at
+// runtime. On success it returns 201 with {"pool": "<normalized-name>"}.
+func createPoolHandler(pools *auto.Pools) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req createPoolRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
+			return
+		}
+
+		status, err := pools.AddPool(req.Name, req.BaseURL, req.Mode)
+		if err != nil {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]string{"pool": backend.NormalizeName(req.Name)})
+	}
+}
+
 // priorityHandler serves POST /_gateway/pool/{name}/priority — sets a
 // runtime priority override for the pool. The request body must be a JSON
 // array of nicks (highest priority first). The override is expanded to a

@@ -84,8 +84,22 @@ const (
 
 // Pools fronts each configured pool with its own Controller and routes a
 // request to the right one. It implements backend.PoolRouter.
+//
+// byPool is built once at startup from the env-defined pools, but is also
+// mutated at runtime by AddPool (the POST /_gateway/pool API) and at startup
+// by LoadAddedPools. Because the proxy hot path reads it concurrently with
+// those writes, every access goes through mu. The retained reg/store/now/
+// logOut/onMutate fields are the ingredients NewController needs, kept so a
+// runtime-created pool can be constructed identically to a startup one.
 type Pools struct {
+	mu     sync.RWMutex
 	byPool map[string]*Controller
+
+	reg      *backend.Registry
+	store    *quota.Store
+	now      func() time.Time
+	logOut   io.Writer
+	onMutate func()
 }
 
 // NewPools builds one Controller per pool in reg. Each controller starts
@@ -99,14 +113,43 @@ func NewPools(reg *backend.Registry, store *quota.Store, now func() time.Time, l
 	for _, name := range reg.PoolNames() {
 		byPool[name] = NewController(reg, name, -1, store, now, logOut)
 	}
-	return &Pools{byPool: byPool}
+	return &Pools{
+		byPool: byPool,
+		reg:    reg,
+		store:  store,
+		now:    now,
+		logOut: logOut,
+	}
+}
+
+// controller resolves a pool's controller under the read lock. The returned
+// *Controller carries its own mutex, so callers operate on it after the map
+// lookup without holding p.mu.
+func (p *Pools) controller(name string) (*Controller, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	c, ok := p.byPool[name]
+	return c, ok
+}
+
+// controllersSnapshot returns a name->controller copy taken under the read
+// lock, so a ranging caller iterates a stable set without holding p.mu while
+// it touches each controller.
+func (p *Pools) controllersSnapshot() map[string]*Controller {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string]*Controller, len(p.byPool))
+	for name, c := range p.byPool {
+		out[name] = c
+	}
+	return out
 }
 
 // Route implements backend.PoolRouter: it resolves the named pool's
 // controller and returns its current sticky backend. ok is false for an
 // unknown pool.
 func (p *Pools) Route(poolName string) (backend.Backend, time.Duration, bool, bool) {
-	c, ok := p.byPool[poolName]
+	c, ok := p.controller(poolName)
 	if !ok {
 		return backend.Backend{}, 0, false, false
 	}
@@ -125,7 +168,7 @@ func (p *Pools) ModifyResponse(resp *http.Response) error {
 	if !ok {
 		return nil
 	}
-	c, ok := p.byPool[b.Pool]
+	c, ok := p.controller(b.Pool)
 	if !ok {
 		return nil
 	}
@@ -135,7 +178,7 @@ func (p *Pools) ModifyResponse(resp *http.Response) error {
 // Current returns the active sticky backend of the named pool, for the
 // quota view's active_backend field. ok is false for an unknown pool.
 func (p *Pools) Current(poolName string) (backend.Backend, bool) {
-	c, ok := p.byPool[poolName]
+	c, ok := p.controller(poolName)
 	if !ok {
 		return backend.Backend{}, false
 	}
@@ -145,7 +188,7 @@ func (p *Pools) Current(poolName string) (backend.Backend, bool) {
 // ClearExhausted drops the named pool's live-429 parks (see
 // Controller.ClearExhausted). ok is false for an unknown pool.
 func (p *Pools) ClearExhausted(poolName string) (cleared []string, ok bool) {
-	c, ok := p.byPool[poolName]
+	c, ok := p.controller(poolName)
 	if !ok {
 		return nil, false
 	}
@@ -157,7 +200,7 @@ func (p *Pools) ClearExhausted(poolName string) (cleared []string, ok bool) {
 // omitted).
 func (p *Pools) ClearAllExhausted() map[string][]string {
 	out := make(map[string][]string)
-	for name, c := range p.byPool {
+	for name, c := range p.controllersSnapshot() {
 		if cleared := c.ClearExhausted(); len(cleared) > 0 {
 			out[name] = cleared
 		}
@@ -210,7 +253,7 @@ type PoolMemberConfigView struct {
 
 // PoolStatus returns the current status of the named pool, or ok=false for an unknown pool.
 func (p *Pools) PoolStatus(poolName string, store *quota.Store) (PoolStatus, bool) {
-	c, ok := p.byPool[poolName]
+	c, ok := p.controller(poolName)
 	if !ok {
 		return PoolStatus{}, false
 	}
@@ -219,14 +262,15 @@ func (p *Pools) PoolStatus(poolName string, store *quota.Store) (PoolStatus, boo
 
 // AllPoolStatuses returns status for every pool in sorted order.
 func (p *Pools) AllPoolStatuses(store *quota.Store) []PoolStatus {
-	names := make([]string, 0, len(p.byPool))
-	for name := range p.byPool {
+	snapshot := p.controllersSnapshot()
+	names := make([]string, 0, len(snapshot))
+	for name := range snapshot {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	out := make([]PoolStatus, 0, len(names))
 	for _, name := range names {
-		out = append(out, p.byPool[name].poolStatus(store))
+		out = append(out, snapshot[name].poolStatus(store))
 	}
 	return out
 }
@@ -278,11 +322,19 @@ type AddedMember struct {
 	BaseURL    string `json:"base_url,omitempty"` // optional; pool default when empty
 }
 
+// AddedPoolSpec is the persisted record of a runtime-created pool. It carries
+// only the pool's default base URL; members and routing state are persisted
+// separately (config / pools), so a re-instantiated pool is a clean slate.
+// It is exported so the persist package can embed it in GatewayState.
+type AddedPoolSpec struct {
+	BaseURL string `json:"base_url"`
+}
+
 // LoadPersistState applies previously persisted routing state to each pool's
 // controller. Called once at startup, before the server begins serving.
 func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 	for name, s := range states {
-		if c, ok := p.byPool[name]; ok {
+		if c, ok := p.controller(name); ok {
 			c.loadState(s.Sticky, s.Exhausted, s.LastBalanceSwitch, s.BalanceSeq, s.LastSelectedSeq)
 		}
 	}
@@ -293,7 +345,7 @@ func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 // no empty strings) and then expanded via effectiveOrder() to a total order.
 // Returns (httpStatus, error) with error containing a credential-free message.
 func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
-	c, ok := p.byPool[poolName]
+	c, ok := p.controller(poolName)
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
 	}
@@ -331,7 +383,7 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 // SetMemberDisabled sets or clears the disabled flag for a member in a pool.
 // Returns (httpStatus, error) with error containing a credential-free message.
 func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) {
-	c, ok := p.byPool[poolName]
+	c, ok := p.controller(poolName)
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
 	}
@@ -358,7 +410,7 @@ func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) 
 func (p *Pools) resolveAcrossPools(skipPool, nick string) (creds, baseURLs []string) {
 	credSeen := make(map[string]bool)
 	urlSeen := make(map[string]bool)
-	for name, c := range p.byPool {
+	for name, c := range p.controllersSnapshot() {
 		if name == skipPool {
 			continue
 		}
@@ -389,7 +441,7 @@ func (p *Pools) resolveAcrossPools(skipPool, nick string) (creds, baseURLs []str
 // resolved concrete base_url is persisted — never an empty string when one is
 // resolvable. Returns (httpStatus, error) with a credential-free message.
 func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement []string) (int, error) {
-	c, ok := p.byPool[poolName]
+	c, ok := p.controller(poolName)
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
 	}
@@ -443,11 +495,17 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 
 	// Resolve base_url to a concrete value: an unresolved (new-nick) base_url
 	// falls back to the pool default so the persisted record is self-describing.
+	// The pool default is the first static member's URL, or — for a runtime
+	// pool with no static members — the URL the pool was created with.
 	if resolvedURL == "" {
-		if len(c.nicks) == 0 {
+		switch {
+		case len(c.nicks) > 0:
+			resolvedURL = c.backendAt(0).BaseURL
+		case c.defaultBaseURL != "":
+			resolvedURL = c.defaultBaseURL
+		default:
 			return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no static members")
 		}
-		resolvedURL = c.backendAt(0).BaseURL
 	}
 
 	// Placement: a priority target needs an explicit order including nick; a
@@ -484,7 +542,7 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 // RemoveMember removes a member (static or runtime-added) from pool selection.
 // Returns (httpStatus, error) with error containing a credential-free message.
 func (p *Pools) RemoveMember(poolName, nick string) (int, error) {
-	c, ok := p.byPool[poolName]
+	c, ok := p.controller(poolName)
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
 	}
@@ -564,11 +622,11 @@ func (c *Controller) removeMemberLocked(nick string) {
 // No surprise re-anchor: the target's healthy active member is never force-
 // switched by the move; the new order applies on the next selection event.
 func (p *Pools) MoveMember(fromPool, nick, toPool string, placement []string, force bool) (int, error) {
-	src, ok := p.byPool[fromPool]
+	src, ok := p.controller(fromPool)
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("source pool not found")
 	}
-	dst, ok := p.byPool[toPool]
+	dst, ok := p.controller(toPool)
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("target pool not found")
 	}
@@ -714,15 +772,16 @@ func (c *Controller) validatePlacementLocked(nick string, placement []string) ([
 // settings, effective priority (runtime override when set, else env priority),
 // and per-member status including the disabled flag.
 func (p *Pools) EffectiveConfig() []PoolConfigView {
-	names := make([]string, 0, len(p.byPool))
-	for name := range p.byPool {
+	snapshot := p.controllersSnapshot()
+	names := make([]string, 0, len(snapshot))
+	for name := range snapshot {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	out := make([]PoolConfigView, 0, len(names))
 	for _, name := range names {
-		c := p.byPool[name]
+		c := snapshot[name]
 		c.mu.Lock()
 		view := PoolConfigView{Pool: name}
 
@@ -794,8 +853,9 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 
 // PersistRuntimeConfig snapshots the runtime configuration for all pools.
 func (p *Pools) PersistRuntimeConfig() map[string]PoolRuntimeConfig {
-	out := make(map[string]PoolRuntimeConfig, len(p.byPool))
-	for name, c := range p.byPool {
+	snapshot := p.controllersSnapshot()
+	out := make(map[string]PoolRuntimeConfig, len(snapshot))
+	for name, c := range snapshot {
 		out[name] = c.runtimeConfig()
 	}
 	return out
@@ -804,7 +864,7 @@ func (p *Pools) PersistRuntimeConfig() map[string]PoolRuntimeConfig {
 // LoadRuntimeConfig restores runtime configuration from persisted state.
 func (p *Pools) LoadRuntimeConfig(cfg map[string]PoolRuntimeConfig) {
 	for name, poolCfg := range cfg {
-		if c, ok := p.byPool[name]; ok {
+		if c, ok := p.controller(name); ok {
 			c.loadRuntimeConfig(poolCfg)
 		}
 	}
@@ -812,18 +872,122 @@ func (p *Pools) LoadRuntimeConfig(cfg map[string]PoolRuntimeConfig) {
 
 // PersistState snapshots the current routing state for all pools.
 func (p *Pools) PersistState() map[string]PoolPersistState {
-	out := make(map[string]PoolPersistState, len(p.byPool))
-	for name, c := range p.byPool {
+	snapshot := p.controllersSnapshot()
+	out := make(map[string]PoolPersistState, len(snapshot))
+	for name, c := range snapshot {
 		out[name] = c.persistState()
 	}
 	return out
 }
 
+// AddPool creates a new plain pool at runtime and inserts it so the proxy can
+// route to it immediately. name is normalized; baseURL is required and
+// validated; mode defaults to "plain" and only "plain" is supported. The pool
+// starts empty (no members, no routing state) — members are added afterward
+// via AddMember. Returns (httpStatus, error) with a credential-free message;
+// (http.StatusCreated, nil) on success.
+func (p *Pools) AddPool(name, baseURL, mode string) (int, error) {
+	normalized := backend.NormalizeName(name)
+	if normalized == "" {
+		return http.StatusBadRequest, fmt.Errorf("pool name is empty after normalization")
+	}
+	if mode == "" {
+		mode = "plain"
+	}
+	if mode != "plain" {
+		return http.StatusBadRequest, fmt.Errorf("unsupported mode %q: only \"plain\" is supported", mode)
+	}
+	if baseURL == "" {
+		return http.StatusBadRequest, fmt.Errorf("base_url is required")
+	}
+	validURL, err := backend.ValidateBaseURL(baseURL)
+	if err != nil {
+		return http.StatusBadRequest, fmt.Errorf("invalid base_url: %w", err)
+	}
+
+	// An env-defined pool name is authoritative and can never be shadowed by a
+	// runtime pool.
+	if p.reg.HasPool(normalized) {
+		return http.StatusConflict, fmt.Errorf("pool %s already exists (env-defined)", normalized)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, exists := p.byPool[normalized]; exists {
+		return http.StatusConflict, fmt.Errorf("pool %s already exists", normalized)
+	}
+
+	c := NewController(p.reg, normalized, -1, p.store, p.now, p.logOut)
+	c.defaultBaseURL = validURL
+	c.onMutate = p.onMutate
+	p.byPool[normalized] = c
+	c.notifyMutate() // persist the new pool (added_pools) promptly
+	if p.logOut != nil {
+		fmt.Fprintf(p.logOut, "auto: created runtime pool %s (base_url %s)\n", normalized, validURL)
+	}
+	return http.StatusCreated, nil
+}
+
+// PersistAddedPools snapshots the runtime-created pools for serialisation.
+// Env-defined pools are excluded — they are reconstructed from the environment,
+// not the state file — so only pools that exist solely at runtime are recorded.
+func (p *Pools) PersistAddedPools() map[string]AddedPoolSpec {
+	snapshot := p.controllersSnapshot()
+	out := make(map[string]AddedPoolSpec, len(snapshot))
+	for name, c := range snapshot {
+		if p.reg.HasPool(name) {
+			continue
+		}
+		c.mu.Lock()
+		out[name] = AddedPoolSpec{BaseURL: c.defaultBaseURL}
+		c.mu.Unlock()
+	}
+	return out
+}
+
+// LoadAddedPools re-instantiates runtime-created pools from persisted state.
+// Called once at startup, after NewPools and before LoadPersistState /
+// LoadRuntimeConfig so those can find the pool by name. A spec whose name
+// collides with an env-defined pool is dropped with a warning (env wins); the
+// pool is created as a clean slate (no members, no routing state).
+func (p *Pools) LoadAddedPools(specs map[string]AddedPoolSpec) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for rawName, spec := range specs {
+		name := backend.NormalizeName(rawName)
+		if name == "" {
+			continue
+		}
+		if p.reg.HasPool(name) {
+			if p.logOut != nil {
+				fmt.Fprintf(p.logOut, "auto: dropping runtime pool %s; name reappeared as env-defined (env wins)\n", name)
+			}
+			continue
+		}
+		if _, exists := p.byPool[name]; exists {
+			continue
+		}
+		c := NewController(p.reg, name, -1, p.store, p.now, p.logOut)
+		c.defaultBaseURL = spec.BaseURL
+		// onMutate is wired later by SetOnMutate, which fans out over byPool.
+		p.byPool[name] = c
+	}
+}
+
 // SetOnMutate installs a callback that every controller calls (non-blocking)
 // after any mutation to its sticky pointer or exhausted map. Used by the
-// persister to coalesce writes without importing this package.
+// persister to coalesce writes without importing this package. The callback
+// is retained on Pools so a runtime-created controller (AddPool) is wired to
+// the same persister.
 func (p *Pools) SetOnMutate(fn func()) {
+	p.mu.Lock()
+	p.onMutate = fn
+	controllers := make([]*Controller, 0, len(p.byPool))
 	for _, c := range p.byPool {
+		controllers = append(controllers, c)
+	}
+	p.mu.Unlock()
+	for _, c := range controllers {
 		c.onMutate = fn
 	}
 }
@@ -835,7 +999,14 @@ type Controller struct {
 
 	reg   *backend.Registry
 	pool  string
-	nicks []string // the pool's members, in stable sorted order; len >= 1
+	nicks []string // the pool's members, in stable sorted order; may be empty for a runtime-created pool
+
+	// defaultBaseURL is the pool-level default upstream for a runtime-created
+	// pool, which has no static member to borrow one from. It backs the
+	// credential-optional add path and added-member resolution when a member
+	// carries no explicit base_url. Empty for env-defined pools, which take
+	// their default from the first static member instead.
+	defaultBaseURL string
 
 	// store is the shared quota store. A member whose snapshot reports its
 	// unified window fully consumed (with a reset still ahead) is treated as
@@ -1075,16 +1246,20 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 
 	c.clearExpiredLocked()
 
-	// Determine the current member's nick.
+	// Determine the current member's nick. A member-less pool (a freshly
+	// created runtime pool) has no static nicks and no active added member;
+	// curNick stays empty so the healthy-current branch below is skipped
+	// entirely — falling through to the replacement/exhausted path, which
+	// returns an honest exhausted result rather than indexing empty nicks.
 	var curNick string
 	if c.curAddedNick != "" {
 		curNick = c.curAddedNick
-	} else {
+	} else if len(c.nicks) > 0 {
 		curNick = c.nicks[c.cur]
 	}
 
 	// If current is healthy, return it (with balance check for static).
-	if !c.isUnavailableLocked(curNick) {
+	if curNick != "" && !c.isUnavailableLocked(curNick) {
 		// For balanced mode with static members, check for a balance switch.
 		if c.balanceGap > 0 && c.curAddedNick == "" {
 			if idx, ok := c.balanceSwitchLocked(); ok {
@@ -1150,17 +1325,22 @@ func (c *Controller) ClearExhausted() []string {
 	return cleared
 }
 
-// Current returns the nick of the active sticky backend.
+// Current returns the nick of the active sticky backend, or "" for a
+// member-less pool (a freshly created runtime pool with nothing to route to).
 func (c *Controller) Current() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.curAddedNick != "" {
 		return c.curAddedNick
 	}
+	if len(c.nicks) == 0 {
+		return ""
+	}
 	return c.nicks[c.cur]
 }
 
-// CurrentBackend returns the active sticky backend, for the quota view.
+// CurrentBackend returns the active sticky backend, for the quota view. A
+// member-less pool returns the zero Backend.
 func (c *Controller) CurrentBackend() backend.Backend {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1169,7 +1349,9 @@ func (c *Controller) CurrentBackend() backend.Backend {
 			return b
 		}
 		// Fallback if something went wrong.
-		return c.backendAt(c.cur)
+	}
+	if len(c.nicks) == 0 {
+		return backend.Backend{}
 	}
 	return c.backendAt(c.cur)
 }
@@ -1310,8 +1492,14 @@ func (c *Controller) persistState() PoolPersistState {
 	for k, v := range c.exhausted {
 		ex[k] = v
 	}
+	// A member-less pool (freshly created runtime pool) has no static sticky
+	// member; persist an empty sticky, which loadState treats as a no-op.
+	sticky := ""
+	if len(c.nicks) > 0 {
+		sticky = c.nicks[c.cur]
+	}
 	ps := PoolPersistState{
-		Sticky:            c.nicks[c.cur],
+		Sticky:            sticky,
 		Exhausted:         ex,
 		LastBalanceSwitch: c.lastBalanceSwitch,
 	}
@@ -1927,9 +2115,14 @@ func (c *Controller) backendByNickLocked(nick string) (backend.Backend, bool) {
 	// Check if it's a runtime-added member first.
 	if am, ok := c.addedMembers[nick]; ok {
 		baseURL := am.BaseURL
-		if baseURL == "" && len(c.nicks) > 0 {
-			// Fall back to pool's default base URL (from the first static member).
-			baseURL = c.backendAt(0).BaseURL
+		if baseURL == "" {
+			// Fall back to the pool's default base URL: the first static
+			// member's, or the runtime pool's creation URL when there are none.
+			if len(c.nicks) > 0 {
+				baseURL = c.backendAt(0).BaseURL
+			} else {
+				baseURL = c.defaultBaseURL
+			}
 		}
 		return backend.Backend{
 			Pool:       c.pool,

@@ -21,6 +21,7 @@ func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/config", configHandler(pools))
+	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
@@ -83,6 +84,46 @@ func TestConfigEndpoint_redactsCredentials(t *testing.T) {
 	if !strings.Contains(string(body), `"nick":"a"`) {
 		t.Errorf("config response missing member nick a: %s", body)
 	}
+}
+
+// TestCreatePoolEndpoint drives POST /_gateway/pool: a valid request returns
+// 201 with the normalized pool name, the pool then surfaces in GET
+// /_gateway/config, and a duplicate name returns 409.
+func TestCreatePoolEndpoint(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	srv := configMux(t, loadPools(t))
+
+	resp, err := http.Post(srv.URL+"/_gateway/pool", "application/json",
+		strings.NewReader(`{"name":"New_Pool","base_url":"https://new.example"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create pool status=%d, want 201", resp.StatusCode)
+	}
+	var body struct {
+		Pool string `json:"pool"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Pool != "new-pool" {
+		t.Errorf("response pool=%q, want normalized new-pool", body.Pool)
+	}
+
+	// The pool now appears in the effective config view.
+	got := fetchPool(t, srv.URL, "new-pool")
+	if got.Pool != "new-pool" {
+		t.Errorf("new-pool not in config view: %+v", got)
+	}
+
+	// Duplicate name → 409.
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"new-pool","base_url":"https://x.example"}`, http.StatusConflict)
+	// Missing base_url → 400.
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"another"}`, http.StatusBadRequest)
+	// Collision with an env pool → 409.
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"auto","base_url":"https://x.example"}`, http.StatusConflict)
 }
 
 // TestDisableEnableEndpoints drives the disable/enable endpoints and verifies
