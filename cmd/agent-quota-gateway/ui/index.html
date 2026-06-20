@@ -165,10 +165,11 @@
   table.members tr:last-child td { border-bottom: none; }
   table.members td.nick { font-family: var(--mono); }
   table.members td.quota { min-width: 72px; }
+  table.members td.reset { color: var(--muted); white-space: nowrap; }
 
-  /* Compact quota bar: a track with a fill, plus a NN% label and an
-     optional reset hint. Falls back to a plain "-" text node when the
-     window has no utilization yet. */
+  /* Compact quota bar: a track with a fill, plus a NN% label. Falls back
+     to a plain "-" text node when the window has no utilization yet.
+     Reset times render in their own adjacent columns. */
   .quota-dash { color: var(--muted); }
   .quota-bar {
     display: flex;
@@ -525,7 +526,7 @@
 
     var thead = document.createElement('thead');
     var trh = document.createElement('tr');
-    ['Nick', 'Status', '5h', '7d', ''].forEach(function (h) {
+    ['Nick', 'Status', '5h', '5h reset', '7d', '7d reset', ''].forEach(function (h) {
       var th = document.createElement('th');
       th.textContent = h;
       trh.appendChild(th);
@@ -557,14 +558,26 @@
       var td5h = document.createElement('td');
       td5h.className = 'quota';
       td5h.setAttribute('data-role', 'quota-5h');
-      renderQuota(td5h, null, null);
+      renderQuota(td5h, null);
       tr.appendChild(td5h);
+
+      var td5hr = document.createElement('td');
+      td5hr.className = 'reset';
+      td5hr.setAttribute('data-role', 'reset-5h');
+      td5hr.textContent = '-';
+      tr.appendChild(td5hr);
 
       var td7d = document.createElement('td');
       td7d.className = 'quota';
       td7d.setAttribute('data-role', 'quota-7d');
-      renderQuota(td7d, null, null);
+      renderQuota(td7d, null);
       tr.appendChild(td7d);
+
+      var td7dr = document.createElement('td');
+      td7dr.className = 'reset';
+      td7dr.setAttribute('data-role', 'reset-7d');
+      td7dr.textContent = '-';
+      tr.appendChild(td7dr);
 
       var tdA = document.createElement('td');
       var actions = document.createElement('div');
@@ -611,17 +624,16 @@
   }
 
   // renderQuota paints one rolling-window cell. utilization is a 0..1
-  // fraction (null/undefined when the window has no data); reset is an
-  // RFC3339 string (optional, secondary). Missing data renders a muted
-  // "-"; present data renders a clamped progress bar with a NN% label.
-  function renderQuota(cell, utilization, reset) {
+  // fraction (null/undefined when the window has no data). Missing data
+  // renders a muted "-"; present data renders a clamped progress bar with
+  // a NN% label. Reset times live in their own columns (see formatReset).
+  function renderQuota(cell, utilization) {
     cell.textContent = '';
     if (utilization == null || typeof utilization !== 'number' || isNaN(utilization)) {
       var dash = document.createElement('span');
       dash.className = 'quota-dash';
       dash.textContent = '-';
       cell.appendChild(dash);
-      cell.removeAttribute('title');
       return;
     }
     var pct = Math.max(0, Math.min(100, utilization * 100));
@@ -644,19 +656,31 @@
     wrap.appendChild(pctLabel);
 
     cell.appendChild(wrap);
+  }
 
-    // Reset time is a secondary hint only: shown in the browser's local
-    // timezone as a tooltip, skipped silently if absent or unparseable.
-    if (reset) {
-      var d = new Date(reset);
-      if (!isNaN(d.getTime())) {
-        cell.setAttribute('title', 'resets ' + d.toLocaleString());
-      } else {
-        cell.removeAttribute('title');
-      }
-    } else {
-      cell.removeAttribute('title');
+  // formatReset renders an RFC3339 reset timestamp as a future-relative
+  // duration against the client clock. kind selects the per-window format
+  // (see issue #99). Returns "-" for missing, unparseable, or non-positive
+  // (already-elapsed) values; the next poll refreshes it naturally.
+  function formatReset(iso, kind) {
+    if (!iso) return '-';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '-';
+    var ms = d.getTime() - Date.now();
+    if (ms <= 0) return '-';
+    var totalMin = Math.floor(ms / 60000);
+    if (kind === '5h') {
+      var h5 = Math.floor(totalMin / 60);
+      var m5 = totalMin % 60;
+      return h5 > 0 ? 'in ' + h5 + 'hr ' + m5 + ' min' : 'in ' + m5 + ' min';
     }
+    // 7d window.
+    var days = Math.floor(totalMin / 1440);
+    var hrs = Math.floor((totalMin % 1440) / 60);
+    var mins = totalMin % 60;
+    return days > 0
+      ? 'in ' + days + 'd ' + hrs + ' hr ' + mins + ' min'
+      : 'in ' + hrs + ' hr ' + mins + ' min';
   }
 
   function mkInput(type, field, placeholder) {
@@ -740,15 +764,19 @@
         var snap = match.snapshot || null;
         var cell5h = tr.querySelector('[data-role="quota-5h"]');
         if (cell5h) {
-          renderQuota(cell5h,
-            snap ? snap.unified_5h_utilization : null,
-            snap ? snap.unified_5h_reset : null);
+          renderQuota(cell5h, snap ? snap.unified_5h_utilization : null);
+        }
+        var reset5h = tr.querySelector('[data-role="reset-5h"]');
+        if (reset5h) {
+          reset5h.textContent = formatReset(snap ? snap.unified_5h_reset : null, '5h');
         }
         var cell7d = tr.querySelector('[data-role="quota-7d"]');
         if (cell7d) {
-          renderQuota(cell7d,
-            snap ? snap.unified_7d_utilization : null,
-            snap ? snap.unified_7d_reset : null);
+          renderQuota(cell7d, snap ? snap.unified_7d_utilization : null);
+        }
+        var reset7d = tr.querySelector('[data-role="reset-7d"]');
+        if (reset7d) {
+          reset7d.textContent = formatReset(snap ? snap.unified_7d_reset : null, '7d');
         }
       });
     });
