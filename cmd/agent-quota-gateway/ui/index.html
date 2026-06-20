@@ -249,6 +249,16 @@
     font-size: 12px;
   }
   button.remove:hover { border-color: var(--danger); background: rgba(207, 34, 46, 0.08); }
+  button.move {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  button.move:hover { border-color: var(--accent); color: var(--accent); }
 
   form.add-member {
     margin-top: 12px;
@@ -323,6 +333,11 @@
   var root = document.getElementById('pools');
   var banner = document.getElementById('banner');
   var POLL_MS = 3000;
+
+  // currentViews holds the latest sanitized config views, so the move flow can
+  // enumerate candidate target pools and inspect a target's type/membership
+  // without re-fetching. Set on every renderAll().
+  var currentViews = [];
 
   function showBanner(msg) {
     banner.textContent = msg;
@@ -555,6 +570,16 @@
       });
       actions.appendChild(btn);
 
+      var mv = document.createElement('button');
+      mv.type = 'button';
+      mv.className = 'move';
+      mv.setAttribute('data-role', 'move');
+      mv.textContent = 'Move';
+      mv.addEventListener('click', function () {
+        moveMember(view.pool, m.nick);
+      });
+      actions.appendChild(mv);
+
       var rm = document.createElement('button');
       rm.type = 'button';
       rm.className = 'remove';
@@ -719,6 +744,7 @@
   }
 
   function renderAll(views) {
+    currentViews = views || [];
     if (!views.length) {
       renderEmpty('No pools configured.');
       return;
@@ -777,6 +803,74 @@
     fetchJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick),
       { method: 'DELETE', headers: { 'Accept': 'application/json' } })
       .then(function (r) { return refreshAfter(r, 'Failed to remove subscription'); });
+  }
+
+  function moveMember(fromPool, nick) {
+    var targets = currentViews
+      .map(function (v) { return v.pool; })
+      .filter(function (p) { return p !== fromPool; });
+    if (!targets.length) {
+      showBanner('Move failed: no other pool to move into');
+      return;
+    }
+    var to = window.prompt(
+      'Move subscription "' + nick + '" from "' + fromPool + '" to which pool?\n\n' +
+      'Available: ' + targets.join(', '), targets[0]);
+    if (to == null) { return; }
+    to = to.trim();
+    if (!to) { return; }
+
+    var target = null;
+    currentViews.forEach(function (v) { if (v.pool === to) target = v; });
+    if (!target) {
+      showBanner('Move failed: unknown target pool "' + to + '"');
+      return;
+    }
+
+    var body = { to: to };
+
+    // A priority target with no existing slot for this nick needs explicit
+    // placement; there is no implicit insertion. Plain/balanced targets, and
+    // overwriting an existing same-nick slot, need none.
+    var isPriorityTarget = !isBalanced(target) && target.priority.length > 0;
+    var existingSlot = false;
+    target.members.forEach(function (m) { if (m.nick === nick) existingSlot = true; });
+    if (isPriorityTarget && !existingSlot) {
+      var suggestion = target.priority.slice().concat([nick]).join(', ');
+      var placementStr = window.prompt(
+        'Target "' + to + '" is a priority pool. Enter the full priority order ' +
+        '(comma-separated, highest first). It must include "' + nick + '":',
+        suggestion);
+      if (placementStr == null) { return; }
+      var placement = placementStr.split(',')
+        .map(function (s) { return s.trim(); })
+        .filter(function (s) { return s.length > 0; });
+      if (placement.indexOf(nick) === -1) {
+        showBanner('Move failed: placement must include "' + nick + '"');
+        return;
+      }
+      body.placement = placement;
+    }
+
+    postMove(fromPool, nick, body, false);
+  }
+
+  function postMove(fromPool, nick, body, isRetry) {
+    var url = '/_gateway/pool/' + encodeURIComponent(fromPool) +
+      '/member/' + encodeURIComponent(nick) + '/move';
+    return postJSON(url, body).then(function (r) {
+      if (r && r.status === 409 && !isRetry) {
+        var ok = window.confirm(
+          'Target already has "' + nick + '" configured differently (key or base_url).\n\n' +
+          'Overwrite the target member?');
+        if (!ok) { return loadConfig().then(renderAll); }
+        var forced = {};
+        Object.keys(body).forEach(function (k) { forced[k] = body[k]; });
+        forced.force = true;
+        return postMove(fromPool, nick, forced, true);
+      }
+      return refreshAfter(r, 'Failed to move subscription');
+    });
   }
 
   function postJSON(url, body) {

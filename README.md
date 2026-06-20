@@ -557,6 +557,7 @@ the wrong tool.
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member to rotation |
 | `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "..."}` (`credential` required, `base_url` optional). Persisted with its credential. |
+| `POST /_gateway/pool/{name}/member/{nick}/move` | Move a subscription to another pool; body `{"to": "<pool>", "placement": [...], "force": false}`. |
 | `DELETE /_gateway/pool/{name}/member/{nick}` | Remove a member (static or runtime-added) from selection |
 
 ```bash
@@ -566,6 +567,8 @@ curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/disable
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/enable
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/d \
   -d '{"credential": "sk-ant-...", "base_url": "https://api.anthropic.com"}'
+curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/d/move \
+  -d '{"to": "spare"}'
 curl -X DELETE http://127.0.0.1:8080/_gateway/pool/auto/member/d
 ```
 
@@ -628,10 +631,38 @@ can be re-added with `POST .../member/{nick}` (which clears its tombstone); a
 removed *static* member stays out until its tombstone is cleared from the state
 file, since re-adding a still-declared static nick returns `409`.
 
+**Moving a subscription between pools.** `POST
+/_gateway/pool/{name}/member/{nick}/move` relocates a subscription from `{name}`
+to the pool named in the body. It is the same overlay machinery: a persistent
+remove from the source plus an add to the target carrying the source member's
+credential and resolved `base_url`, so the move survives restart. The JSON body
+is `{"to": "<pool>", "placement": [...], "force": false}`:
+
+- `to` (required) is the target pool. Moving to the same pool returns `400`.
+- `placement` is an explicit priority order (highest first, comma/array) that
+  **must include** the moved nick. It is **required** when the target is a
+  priority pool and has no existing slot for the nick — there is no implicit
+  top/bottom/sorted insertion. It is not accepted for a plain/balanced target
+  (`400`) and is unnecessary when overwriting an existing same-nick slot (the
+  slot is preserved).
+- `force` confirms an overwrite when the target already has a *runtime-added*
+  member with the same nick but a different credential or `base_url`.
+
+Conflict handling: a same-nick target whose credential **and** resolved
+`base_url` match is silently overwritten in place (the slot is preserved); a
+differing runtime-added target returns `409` until `force: true` is sent; a
+same-nick **static** target can only match (it is immutable here) — a differing
+one returns `409` that `force` cannot override. The move does **not** force the
+target off a healthy active member; the new order applies on the next selection
+event. Status codes: `200` on success; `400` on a missing/empty `to`, a
+same-pool move, a missing source member, or an invalid/absent placement; `404`
+on an unknown source or target pool; `409` on an unresolved same-nick conflict.
+All error bodies are credential-free.
+
 > **Shared mode:** these are **write** endpoints. In shared mode (see below)
-> any tailnet member that can reach the port can reorder priority, disable or
-> remove members, or **add** a member — injecting a credential and a new
-> upstream of their choosing. This is a sharper exposure than the read-only
+> any tailnet member that can reach the port can reorder priority, disable,
+> remove, or **move** members, or **add** a member — injecting a credential and a
+> new upstream of their choosing. This is a sharper exposure than the read-only
 > quota view. The Tailscale ACL restricting this port is the only gate; the
 > gateway adds no auth of its own.
 

@@ -422,35 +422,209 @@ func (p *Pools) RemoveMember(poolName, nick string) (int, error) {
 		return http.StatusBadRequest, fmt.Errorf("nick %s not found in pool", normalized)
 	}
 
+	c.removeMemberLocked(normalized)
+	return http.StatusOK, nil
+}
+
+// removeMemberLocked removes a member (static or runtime-added) from pool
+// selection: a runtime-added member is deleted entirely, a static member is
+// tombstoned so it stays out of selection. A tombstone is always set so the
+// removal is uniform and survives restart. If the removed member was the active
+// sticky pointer, the pointer force-switches to the next healthy member (as on
+// a 429). The caller is responsible for validating that the member exists.
+// Caller holds c.mu.
+func (c *Controller) removeMemberLocked(nick string) {
 	// If it's a runtime-added member, remove it entirely.
-	if isAdded {
-		delete(c.addedMembers, normalized)
-		fmt.Fprintf(c.logOut, "auto[%s]: removed runtime-added member %s\n", c.pool, normalized)
+	if _, isAdded := c.addedMembers[nick]; isAdded {
+		delete(c.addedMembers, nick)
+		fmt.Fprintf(c.logOut, "auto[%s]: removed runtime-added member %s\n", c.pool, nick)
 	}
 
 	// Mark as removed so it's hidden from selection.
 	// For static members, this is the only effect (they stay in static config).
 	// For added members, we already deleted them, but set removed flag anyway
 	// for consistency and in case of races.
-	c.removedMembers[normalized] = true
+	c.removedMembers[nick] = true
 
 	// If the removed member was the active sticky pointer, force-switch to
 	// the next healthy member. This is similar to what happens on a 429.
-	isActive := (c.curAddedNick == normalized) || (c.curAddedNick == "" && normalized == c.nicks[c.cur])
+	isActive := (c.curAddedNick == nick) || (c.curAddedNick == "" && len(c.nicks) > c.cur && nick == c.nicks[c.cur])
 	if isActive {
-		if nick, ok := c.firstHealthyNickLocked(); ok {
+		if next, ok := c.firstHealthyNickLocked(); ok {
 			// Determine "from" directly without calling Current() (we already hold the lock)
 			from := c.curAddedNick
 			if from == "" && len(c.nicks) > c.cur {
 				from = c.nicks[c.cur]
 			}
-			c.setActiveMemberLocked(nick)
-			fmt.Fprintf(c.logOut, "auto[%s]: switched %s -> %s (removed member %s)\n", c.pool, from, nick, normalized)
+			c.setActiveMemberLocked(next)
+			fmt.Fprintf(c.logOut, "auto[%s]: switched %s -> %s (removed member %s)\n", c.pool, from, next, nick)
 		}
 	}
 
 	c.notifyMutate()
+}
+
+// MoveMember relocates a subscription (nick) from one pool to another. It is
+// implemented as the bridge model: persistent remove from the source pool plus
+// an add to the target pool carrying the source member's credential and
+// resolved base URL. Returns (httpStatus, error) with a credential-free message.
+//
+// Placement: moving into a priority pool that has no existing slot for nick
+// requires an explicit placement order (which must include nick) — there is no
+// implicit insertion. Moving into a plain/balanced pool, or onto an existing
+// same-nick slot, needs no placement.
+//
+// Conflict: an existing same-nick member in the target whose credential and
+// resolved base URL match is silently overwritten in place (slot preserved); a
+// differing runtime-added member returns 409 unless force is set; a static
+// target member can never be overwritten by a move (it is immutable here).
+//
+// No surprise re-anchor: the target's healthy active member is never force-
+// switched by the move; the new order applies on the next selection event.
+func (p *Pools) MoveMember(fromPool, nick, toPool string, placement []string, force bool) (int, error) {
+	src, ok := p.byPool[fromPool]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("source pool not found")
+	}
+	dst, ok := p.byPool[toPool]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("target pool not found")
+	}
+	normalized := backend.NormalizeName(nick)
+	if normalized == "" {
+		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
+	}
+	if fromPool == toPool {
+		return http.StatusBadRequest, fmt.Errorf("source and target pools are the same")
+	}
+
+	// Phase 1: read the source member's resolved credential + base URL.
+	src.mu.Lock()
+	srcPresent := (src.indexOf(normalized) >= 0 || src.isAddedMemberLocked(normalized)) && !src.isRemovedLocked(normalized)
+	if !srcPresent {
+		src.mu.Unlock()
+		return http.StatusBadRequest, fmt.Errorf("nick %s not found in source pool", normalized)
+	}
+	srcBackend, _ := src.backendByNickLocked(normalized)
+	src.mu.Unlock()
+
+	// Phase 2: validate + commit on the target (single lock, no source held).
+	dst.mu.Lock()
+	status, err := dst.placeMovedMemberLocked(normalized, srcBackend.Credential, srcBackend.BaseURL, placement, force)
+	dst.mu.Unlock()
+	if err != nil {
+		return status, err
+	}
+
+	// Phase 3: persistent remove from the source. Committing the target first
+	// means the worst-case failure is "briefly present in both", never "lost
+	// from both".
+	src.mu.Lock()
+	src.removeMemberLocked(normalized)
+	src.mu.Unlock()
+
+	fmt.Fprintf(src.logOut, "auto: moved member %s from %s to %s\n", normalized, fromPool, toPool)
 	return http.StatusOK, nil
+}
+
+// placeMovedMemberLocked applies the target-side half of a move: it resolves the
+// same-nick conflict / placement rules and commits the add or in-place
+// overwrite. Returns (httpStatus, error). Caller holds c.mu (c is the target).
+func (c *Controller) placeMovedMemberLocked(nick, cred, baseURL string, placement []string, force bool) (int, error) {
+	// A static member with this nick reserves the slot. The bridge cannot mutate
+	// a static credential, so the move can only succeed when it is the same
+	// subscription (matching credential + resolved base URL); otherwise it is an
+	// unresolvable conflict that force cannot override.
+	if c.indexOf(nick) >= 0 {
+		tb, _ := c.backendByNickLocked(nick)
+		if !c.isRemovedLocked(nick) && tb.Credential == cred && tb.BaseURL == baseURL {
+			return http.StatusOK, nil // already present and identical: no-op
+		}
+		if c.isRemovedLocked(nick) && tb.Credential == cred && tb.BaseURL == baseURL {
+			delete(c.removedMembers, nick) // un-tombstone the identical static slot
+			c.notifyMutate()
+			return http.StatusOK, nil
+		}
+		return http.StatusConflict, fmt.Errorf("target nick %s is a static member and cannot be overwritten by a move", nick)
+	}
+
+	// Existing runtime-added slot (present, not removed): overwrite in place,
+	// preserving its priority slot. Matching is silent; differing needs force.
+	if _, isAdded := c.addedMembers[nick]; isAdded && !c.isRemovedLocked(nick) {
+		tb, _ := c.backendByNickLocked(nick)
+		if tb.Credential != cred || tb.BaseURL != baseURL {
+			if !force {
+				return http.StatusConflict, fmt.Errorf("target nick %s exists with a different credential or base_url; confirm to overwrite", nick)
+			}
+		}
+		c.addedMembers[nick] = AddedMember{Credential: cred, BaseURL: baseURL}
+		c.notifyMutate()
+		return http.StatusOK, nil
+	}
+
+	// No existing slot: add as a runtime-added member. A priority target needs
+	// explicit placement; a plain/balanced target must not carry one.
+	isPriorityTarget := c.balanceGap == 0 && len(c.effectivePriorityLocked()) > 0
+	var normPlacement []string
+	if isPriorityTarget {
+		var status int
+		var err error
+		normPlacement, status, err = c.validatePlacementLocked(nick, placement)
+		if err != nil {
+			return status, err
+		}
+	} else if len(placement) > 0 {
+		return http.StatusBadRequest, fmt.Errorf("placement is only applicable to a priority target pool")
+	}
+
+	delete(c.removedMembers, nick) // clear any stale tombstone
+	c.addedMembers[nick] = AddedMember{Credential: cred, BaseURL: baseURL}
+	if isPriorityTarget {
+		c.setPriorityOverrideEffectiveLocked(normPlacement)
+	}
+	c.notifyMutate()
+	return http.StatusOK, nil
+}
+
+// validatePlacementLocked checks an explicit placement order for a priority
+// target into which nick is being added: every entry must be a current target
+// member (or nick itself), with no empties or duplicates, and the order must
+// include nick (no implicit insertion). It returns the normalized placement on
+// success. Caller holds c.mu.
+func (c *Controller) validatePlacementLocked(nick string, placement []string) ([]string, int, error) {
+	if len(placement) == 0 {
+		return nil, http.StatusBadRequest, fmt.Errorf("explicit placement is required to move into priority pool %s", c.pool)
+	}
+	prospective := make(map[string]bool)
+	for _, m := range c.addedMembersLocked() {
+		prospective[m] = true
+	}
+	prospective[nick] = true
+
+	seen := make(map[string]bool, len(placement))
+	norm := make([]string, 0, len(placement))
+	hasNick := false
+	for _, raw := range placement {
+		pn := backend.NormalizeName(raw)
+		if pn == "" {
+			return nil, http.StatusBadRequest, fmt.Errorf("placement contains an empty nick")
+		}
+		if seen[pn] {
+			return nil, http.StatusBadRequest, fmt.Errorf("placement contains duplicate nick: %s", pn)
+		}
+		seen[pn] = true
+		if !prospective[pn] {
+			return nil, http.StatusBadRequest, fmt.Errorf("placement contains unknown nick: %s", pn)
+		}
+		if pn == nick {
+			hasNick = true
+		}
+		norm = append(norm, pn)
+	}
+	if !hasNick {
+		return nil, http.StatusBadRequest, fmt.Errorf("placement must include the moved nick %s", nick)
+	}
+	return norm, http.StatusOK, nil
 }
 
 // EffectiveConfig returns the effective configuration for all pools,
@@ -1085,6 +1259,20 @@ func (c *Controller) setPriorityOverrideLocked(order []string) {
 	c.notifyMutate()
 }
 
+// setPriorityOverrideEffectiveLocked is like setPriorityOverrideLocked but
+// expands the order over the effective member set (static + runtime-added −
+// removed) instead of static nicks only. It is used when placing a
+// runtime-added member into a priority pool's order (e.g. on a move), since
+// such a member is not part of c.nicks. Caller holds c.mu.
+func (c *Controller) setPriorityOverrideEffectiveLocked(order []string) {
+	if len(order) == 0 {
+		c.priorityOverride = nil
+	} else {
+		c.priorityOverride = effectiveOrder(order, c.addedMembersLocked())
+	}
+	c.notifyMutate()
+}
+
 // setDisabledLocked sets the disabled flag for a member. When off is true,
 // the member is marked disabled and becomes unselectable. When off is false,
 // the member is re-enabled. The operation does NOT force-switch the active
@@ -1147,37 +1335,9 @@ func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Restore priority override.
-	if len(cfg.PriorityOverride) > 0 {
-		// Validate that all nicks in the override are current members.
-		validOverride := make([]string, 0, len(cfg.PriorityOverride))
-		for _, nick := range cfg.PriorityOverride {
-			if c.indexOf(nick) >= 0 {
-				validOverride = append(validOverride, nick)
-			} else {
-				fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from priority override\n", c.pool, nick)
-			}
-		}
-		if len(validOverride) > 0 {
-			c.priorityOverride = effectiveOrder(validOverride, c.nicks)
-		} else {
-			c.priorityOverride = nil
-		}
-	} else {
-		c.priorityOverride = nil
-	}
-
-	// Restore disabled set.
-	c.disabled = make(map[string]bool)
-	for _, nick := range cfg.Disabled {
-		if c.indexOf(nick) >= 0 {
-			c.disabled[nick] = true
-		} else {
-			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from disabled list\n", c.pool, nick)
-		}
-	}
-
-	// Restore added members (including their credentials).
+	// Restore added members (including their credentials) BEFORE the priority
+	// override, so a runtime-added member placed into a priority order (e.g. by
+	// a move) is recognised as a current member when the override is validated.
 	c.addedMembers = make(map[string]AddedMember)
 	for nick, am := range cfg.AddedMembers {
 		// Validate that the nick doesn't collide with a static member.
@@ -1198,6 +1358,37 @@ func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
 	c.removedMembers = make(map[string]bool)
 	for _, nick := range cfg.RemovedMembers {
 		c.removedMembers[nick] = true
+	}
+
+	// Restore priority override. A nick is valid if it is a static or a
+	// runtime-added member; the override may legitimately order added members
+	// (placed by a move into a priority pool), so expand over the effective set.
+	if len(cfg.PriorityOverride) > 0 {
+		validOverride := make([]string, 0, len(cfg.PriorityOverride))
+		for _, nick := range cfg.PriorityOverride {
+			if c.indexOf(nick) >= 0 || c.isAddedMemberLocked(nick) {
+				validOverride = append(validOverride, nick)
+			} else {
+				fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from priority override\n", c.pool, nick)
+			}
+		}
+		if len(validOverride) > 0 {
+			c.priorityOverride = effectiveOrder(validOverride, c.addedMembersLocked())
+		} else {
+			c.priorityOverride = nil
+		}
+	} else {
+		c.priorityOverride = nil
+	}
+
+	// Restore disabled set.
+	c.disabled = make(map[string]bool)
+	for _, nick := range cfg.Disabled {
+		if c.indexOf(nick) >= 0 {
+			c.disabled[nick] = true
+		} else {
+			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from disabled list\n", c.pool, nick)
+		}
 	}
 
 	// loadState restored the sticky pointer before this runs, so the current

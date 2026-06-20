@@ -24,6 +24,7 @@ func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/move", moveMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools))
 	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools))
 	srv := httptest.NewServer(mux)
@@ -293,6 +294,59 @@ func TestAddRemoveEndpoints(t *testing.T) {
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{}`, http.StatusBadRequest)                                // empty credential
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{"credential":"x","base_url":"!"}`, http.StatusBadRequest) // invalid URL
 	delete(t, srv.URL+"/_gateway/pool/ghost/member/a", http.StatusNotFound)                                          // unknown pool
+}
+
+// TestMoveEndpoint exercises POST /_gateway/pool/{name}/member/{nick}/move:
+// the happy path between two plain pools, the validation errors, and the
+// 409 → force overwrite path for a conflicting same-nick target.
+func TestMoveEndpoint(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
+	t.Setenv("AQG_POOL_SPARE_BACKEND_X", "sk-ant-x")
+	pools := loadPools(t)
+	srv := configMux(t, pools)
+
+	// Happy path: move a from auto to spare.
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/a/move", `{"to":"spare"}`, http.StatusOK)
+
+	if memberPresent(t, srv.URL, "auto", "a") {
+		t.Error("a still present in auto after move")
+	}
+	if !memberPresent(t, srv.URL, "spare", "a") {
+		t.Error("a not present in spare after move")
+	}
+
+	// Validation errors.
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/b/move", `{"to":"auto"}`, http.StatusBadRequest)      // same pool
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/b/move", `{"to":"ghost"}`, http.StatusNotFound)       // unknown target
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/ghost/move", `{"to":"spare"}`, http.StatusBadRequest) // missing member
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/b/move", `{}`, http.StatusBadRequest)                 // missing target
+
+	// Conflict path: spare already has a different b → 409, then force overwrites.
+	addJSON(t, srv.URL+"/_gateway/pool/spare/member/b", `{"credential":"sk-ant-other"}`, http.StatusOK)
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/b/move", `{"to":"spare"}`, http.StatusConflict)
+	if !memberPresent(t, srv.URL, "auto", "b") {
+		t.Error("b vanished from auto after a rejected (409) move")
+	}
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/b/move", `{"to":"spare","force":true}`, http.StatusOK)
+	if memberPresent(t, srv.URL, "auto", "b") {
+		t.Error("b still in auto after forced move")
+	}
+	if !memberPresent(t, srv.URL, "spare", "b") {
+		t.Error("b not in spare after forced move")
+	}
+}
+
+// memberPresent reports whether nick appears in the pool's effective config view.
+func memberPresent(t *testing.T, baseURL, pool, nick string) bool {
+	t.Helper()
+	view := fetchPool(t, baseURL, pool)
+	for _, m := range view.Members {
+		if m.Nick == nick {
+			return true
+		}
+	}
+	return false
 }
 
 func addJSON(t *testing.T, url, body string, wantStatus int) {

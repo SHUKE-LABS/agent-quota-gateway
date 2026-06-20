@@ -141,6 +141,50 @@ func addMemberHandler(pools *auto.Pools) http.HandlerFunc {
 	}
 }
 
+// moveMemberRequest is the JSON request body for moving a pool member.
+type moveMemberRequest struct {
+	To        string   `json:"to"`        // required target pool
+	Placement []string `json:"placement"` // required for priority target with no existing slot
+	Force     bool     `json:"force"`     // confirm overwrite of a conflicting same-nick target
+}
+
+// moveMemberHandler serves POST /_gateway/pool/{name}/member/{nick}/move —
+// relocates a subscription from {name} to the target pool named in the body.
+func moveMemberHandler(pools *auto.Pools) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fromPool := backend.NormalizeName(r.PathValue("name"))
+		nick := backend.NormalizeName(r.PathValue("nick"))
+		if fromPool == "" || nick == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool name and nick are required"})
+			return
+		}
+
+		var req moveMemberRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
+			return
+		}
+		toPool := backend.NormalizeName(req.To)
+		if toPool == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "target pool (to) is required"})
+			return
+		}
+
+		status, err := pools.MoveMember(fromPool, nick, toPool, req.Placement, req.Force)
+		if err != nil {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	}
+}
+
 // removeMemberHandler serves DELETE /_gateway/pool/{name}/member/{nick} —
 // removes a member (static or runtime-added) from pool selection.
 func removeMemberHandler(pools *auto.Pools) http.HandlerFunc {
