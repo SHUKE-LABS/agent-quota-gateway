@@ -206,14 +206,15 @@ func TestAddRemoveEndpoints(t *testing.T) {
 	// Add a runtime member.
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/c", `{"credential":"`+secretC+`"}`, http.StatusOK)
 
-	// Verify the member appears in config with source: "runtime".
+	// Verify the runtime-added member appears in the config view, having
+	// inherited a base_url from the pool's static members.
 	view := fetchPool(t, srv.URL, "auto")
 	found := false
 	for _, m := range view.Members {
 		if m.Nick == "c" {
 			found = true
-			if m.Source != "runtime" {
-				t.Errorf("added member c has source=%q, want 'runtime'", m.Source)
+			if m.BaseURL == "" {
+				t.Errorf("added member c has empty base_url, want inherited pool default")
 			}
 			break
 		}

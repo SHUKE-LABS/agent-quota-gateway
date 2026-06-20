@@ -206,7 +206,6 @@ type PoolMemberConfigView struct {
 	BaseURL  string `json:"base_url"`
 	Disabled bool   `json:"disabled"`
 	Status   string `json:"status"` // "active", "idle", "exhausted", "disabled"
-	Source   string `json:"source"` // "static" or "runtime"
 }
 
 // PoolStatus returns the current status of the named pool, or ok=false for an unknown pool.
@@ -505,9 +504,9 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 				Nick:     nick,
 				Disabled: c.disabled[nick],
 			}
-			// Determine source and get BaseURL.
+			// Get BaseURL: runtime-added members carry their own (or inherit
+			// the pool default); static members read it from the backend.
 			if c.isAddedMemberLocked(nick) {
-				member.Source = "runtime"
 				if am, ok := c.addedMembers[nick]; ok {
 					if am.BaseURL != "" {
 						member.BaseURL = am.BaseURL
@@ -516,7 +515,6 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 					}
 				}
 			} else {
-				member.Source = "static"
 				member.BaseURL = c.backendAt(c.indexOf(nick)).BaseURL
 			}
 			// Determine status.
