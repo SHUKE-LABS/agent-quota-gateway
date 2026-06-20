@@ -164,6 +164,40 @@
   table.members th { font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
   table.members tr:last-child td { border-bottom: none; }
   table.members td.nick { font-family: var(--mono); }
+  table.members td.quota { min-width: 72px; }
+
+  /* Compact quota bar: a track with a fill, plus a NN% label and an
+     optional reset hint. Falls back to a plain "-" text node when the
+     window has no utilization yet. */
+  .quota-dash { color: var(--muted); }
+  .quota-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .quota-track {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 36px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .quota-fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    height: 100%;
+    background: var(--accent);
+    border-radius: 999px;
+  }
+  .quota-pct {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
 
   .status {
     display: inline-block;
@@ -465,7 +499,7 @@
 
     var thead = document.createElement('thead');
     var trh = document.createElement('tr');
-    ['Nick', 'Status', ''].forEach(function (h) {
+    ['Nick', 'Status', '5h', '7d', ''].forEach(function (h) {
       var th = document.createElement('th');
       th.textContent = h;
       trh.appendChild(th);
@@ -491,6 +525,20 @@
       status.textContent = m.status || 'idle';
       tdS.appendChild(status);
       tr.appendChild(tdS);
+
+      // Quota cells start as "-"; applyLiveStatus() fills them from
+      // /_gateway/pool once a snapshot exists (config carries no snapshot).
+      var td5h = document.createElement('td');
+      td5h.className = 'quota';
+      td5h.setAttribute('data-role', 'quota-5h');
+      renderQuota(td5h, null, null);
+      tr.appendChild(td5h);
+
+      var td7d = document.createElement('td');
+      td7d.className = 'quota';
+      td7d.setAttribute('data-role', 'quota-7d');
+      renderQuota(td7d, null, null);
+      tr.appendChild(td7d);
 
       var tdA = document.createElement('td');
       var actions = document.createElement('div');
@@ -524,6 +572,55 @@
     });
     table.appendChild(tbody);
     return table;
+  }
+
+  // renderQuota paints one rolling-window cell. utilization is a 0..1
+  // fraction (null/undefined when the window has no data); reset is an
+  // RFC3339 string (optional, secondary). Missing data renders a muted
+  // "-"; present data renders a clamped progress bar with a NN% label.
+  function renderQuota(cell, utilization, reset) {
+    cell.textContent = '';
+    if (utilization == null || typeof utilization !== 'number' || isNaN(utilization)) {
+      var dash = document.createElement('span');
+      dash.className = 'quota-dash';
+      dash.textContent = '-';
+      cell.appendChild(dash);
+      cell.removeAttribute('title');
+      return;
+    }
+    var pct = Math.max(0, Math.min(100, utilization * 100));
+    var label = Math.round(pct) + '%';
+
+    var wrap = document.createElement('div');
+    wrap.className = 'quota-bar';
+
+    var track = document.createElement('div');
+    track.className = 'quota-track';
+    var fill = document.createElement('div');
+    fill.className = 'quota-fill';
+    fill.style.width = pct + '%';
+    track.appendChild(fill);
+    wrap.appendChild(track);
+
+    var pctLabel = document.createElement('span');
+    pctLabel.className = 'quota-pct';
+    pctLabel.textContent = label;
+    wrap.appendChild(pctLabel);
+
+    cell.appendChild(wrap);
+
+    // Reset time is a secondary hint only: shown in the browser's local
+    // timezone as a tooltip, skipped silently if absent or unparseable.
+    if (reset) {
+      var d = new Date(reset);
+      if (!isNaN(d.getTime())) {
+        cell.setAttribute('title', 'resets ' + d.toLocaleString());
+      } else {
+        cell.removeAttribute('title');
+      }
+    } else {
+      cell.removeAttribute('title');
+    }
   }
 
   function mkInput(type, field, placeholder) {
@@ -603,6 +700,19 @@
         if (badge) {
           badge.setAttribute('data-status', match.status || 'idle');
           badge.textContent = match.status || 'idle';
+        }
+        var snap = match.snapshot || null;
+        var cell5h = tr.querySelector('[data-role="quota-5h"]');
+        if (cell5h) {
+          renderQuota(cell5h,
+            snap ? snap.unified_5h_utilization : null,
+            snap ? snap.unified_5h_reset : null);
+        }
+        var cell7d = tr.querySelector('[data-role="quota-7d"]');
+        if (cell7d) {
+          renderQuota(cell7d,
+            snap ? snap.unified_7d_utilization : null,
+            snap ? snap.unified_7d_reset : null);
         }
       });
     });
