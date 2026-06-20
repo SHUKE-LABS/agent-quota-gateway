@@ -150,6 +150,53 @@ func TestAddPool_persistRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRuntimePool_stickyPreservedAcrossRestart proves that the active
+// runtime-added member of a member-less pool survives a persist/reload cycle.
+// The reload follows the PRODUCTION order (LoadAddedPools -> LoadPersistState ->
+// LoadRuntimeConfig, per cmd/agent-quota-gateway/main.go), under which loadState
+// runs before added members exist; the deferred sticky must still re-anchor on
+// the pre-restart member rather than reanchorLocked's first-healthy pick (#109).
+func TestRuntimePool_stickyPreservedAcrossRestart(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
+	})
+	if status, err := p.AddPool("rt", "https://rt.example", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool: status=%d err=%v", status, err)
+	}
+	if status, err := p.AddMember("rt", "a", "cred-a", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember a: status=%d err=%v", status, err)
+	}
+	if _, _, known, _ := p.Route("rt"); !known {
+		t.Fatalf("Route(rt) after AddMember a: known=false")
+	}
+	if status, err := p.AddMember("rt", "b", "cred-b", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember b: status=%d err=%v", status, err)
+	}
+	// "a" is the active sticky; adding "b" must not switch it.
+	if cur, ok := p.Current("rt"); !ok || cur.Pool != "rt" || cur.Nick != "a" {
+		t.Fatalf("Current(rt) before restart: %+v ok=%v, want Pool=rt Nick=a", cur, ok)
+	}
+
+	addedPools := p.PersistAddedPools()
+	persistState := p.PersistState()
+	runtimeConfig := p.PersistRuntimeConfig()
+
+	// Re-instantiate in the production load order.
+	clock2 := newMoveClock()
+	p2 := loadMovePools(t, clock2, map[string]string{
+		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
+	})
+	p2.LoadAddedPools(addedPools)
+	p2.LoadPersistState(persistState)
+	p2.LoadRuntimeConfig(runtimeConfig)
+
+	// "a" must still be the active sticky after restart.
+	if cur, ok := p2.Current("rt"); !ok || cur.Pool != "rt" || cur.Nick != "a" {
+		t.Errorf("Current(rt) after restart: %+v ok=%v, want Pool=rt Nick=a — active added member lost", cur, ok)
+	}
+}
+
 // TestAddPool_loadAddedPoolsDropsEnvCollision proves a persisted runtime pool
 // whose name has since reappeared as an env pool is dropped (env wins).
 func TestAddPool_loadAddedPoolsDropsEnvCollision(t *testing.T) {

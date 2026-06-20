@@ -793,12 +793,19 @@ func TestController_loadState_additiveMembership(t *testing.T) {
 	}
 }
 
-// TestController_loadState_missingStickyLogs verifies a log line when the persisted sticky is gone.
+// TestController_loadState_missingStickyLogs verifies a log line when the persisted
+// sticky is gone. The judgment is deferred to loadRuntimeConfig (which can see
+// runtime-added members), so loadState stays silent and the warning is emitted
+// once addedMembers is restored (#109).
 func TestController_loadState_missingStickyLogs(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
 	c.loadState("old", map[string]time.Time{}, time.Time{}, 0, nil)
+	if out := logBuf.String(); out != "" {
+		t.Fatalf("loadState must stay silent for a deferred sticky, got: %q", out)
+	}
+	c.loadRuntimeConfig(PoolRuntimeConfig{})
 	out := logBuf.String()
 	if !strings.Contains(out, "persisted sticky=old") {
 		t.Fatalf("expected log about missing sticky, got: %q", out)

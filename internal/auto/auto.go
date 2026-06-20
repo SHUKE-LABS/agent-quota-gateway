@@ -1047,6 +1047,12 @@ type Controller struct {
 	// Accessed only under c.mu.
 	curAddedNick string
 
+	// pendingSticky carries a persisted sticky nick that loadState could not
+	// resolve to a static member, deferred until loadRuntimeConfig has restored
+	// runtime-added members and can tell an added member from a truly-gone one.
+	// Always "" outside the load sequence. Accessed only under c.mu.
+	pendingSticky string
+
 	// cur indexes nicks: nicks[cur] is the backend every request to this
 	// pool sticks to until it 429s.
 	cur int
@@ -1442,12 +1448,11 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, la
 	if idx := c.indexOf(sticky); idx >= 0 {
 		c.cur = idx
 	} else if sticky != "" {
-		reason := "random"
-		if len(c.priority) > 0 {
-			reason = "priority"
-		}
-		fmt.Fprintf(c.logOut, "loadState[%s]: persisted sticky=%s not in current pool members; falling back to %s (%s)\n",
-			c.pool, sticky, c.nicks[c.cur], reason)
+		// Not a current static member. It may name a runtime-added member that
+		// loadRuntimeConfig restores moments later (and which carries the active
+		// pointer for a member-less runtime pool), so defer the truly-gone
+		// judgment and fall-back logging there, where addedMembers is known.
+		c.pendingSticky = sticky
 	}
 	now := c.now()
 	for nick, reset := range exhausted {
@@ -1492,10 +1497,15 @@ func (c *Controller) persistState() PoolPersistState {
 	for k, v := range c.exhausted {
 		ex[k] = v
 	}
-	// A member-less pool (freshly created runtime pool) has no static sticky
-	// member; persist an empty sticky, which loadState treats as a no-op.
+	// Persist the active member nick. For a static pool it is nicks[cur]; for a
+	// member-less runtime pool the active member is a runtime-added one tracked
+	// by curAddedNick, which must be persisted too or the pool re-anchors on the
+	// first added member in iteration order across a restart (see #109).
 	sticky := ""
-	if len(c.nicks) > 0 {
+	switch {
+	case c.curAddedNick != "":
+		sticky = c.curAddedNick
+	case len(c.nicks) > 0:
 		sticky = c.nicks[c.cur]
 	}
 	ps := PoolPersistState{
@@ -1661,10 +1671,40 @@ func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
 		}
 	}
 
+	// Resolve a sticky that loadState deferred (it could not yet distinguish a
+	// runtime-added member from a truly-removed one). For a member-less runtime
+	// pool the persisted sticky IS the active added member; anchor on it — when
+	// healthy and nothing else is active yet — so the member that was active
+	// before restart stays active instead of being replaced by reanchorLocked's
+	// first-healthy pick.
+	sticky := c.pendingSticky
+	c.pendingSticky = ""
+	if sticky != "" && c.curAddedNick == "" && c.isAddedMemberLocked(sticky) && !c.isUnavailableLocked(sticky) {
+		c.setActiveMemberLocked(sticky)
+		sticky = ""
+	}
+
 	// loadState restored the sticky pointer before this runs, so the current
 	// member may now be removed (or otherwise unavailable). Re-anchor before
 	// serving traffic so Current() / pool.active never point at a removed member.
 	c.reanchorLocked()
+
+	// A deferred sticky that names neither a static nor a runtime-added member is
+	// truly gone; report the fall-back here (where addedMembers is known) rather
+	// than misleadingly at loadState time. An added member that was merely
+	// unavailable is handled by reanchorLocked above and needs no warning.
+	if sticky != "" && !c.isAddedMemberLocked(sticky) {
+		reason := "random"
+		if len(c.priority) > 0 {
+			reason = "priority"
+		}
+		curNick := c.curAddedNick
+		if curNick == "" && len(c.nicks) > 0 {
+			curNick = c.nicks[c.cur]
+		}
+		fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: persisted sticky=%s not in current pool members; falling back to %s (%s)\n",
+			c.pool, sticky, curNick, reason)
+	}
 }
 
 // reanchorLocked moves the active pointer off a current member that is now
