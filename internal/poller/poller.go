@@ -26,6 +26,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,6 +34,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
@@ -255,6 +257,106 @@ func providerFor(baseURL string) (provider, bool) {
 		}
 	}
 	return provider{}, false
+}
+
+// ProviderFor exposes the provider registry to other packages. The recovery
+// probe in internal/auto uses this to decide whether a parked member's base
+// URL has a probeable quota endpoint (issue #124).
+func ProviderFor(baseURL string) (provider, bool) {
+	return providerFor(baseURL)
+}
+
+// ErrNoProvider is returned by Probe when the backend's base URL does not
+// match any registered proprietary quota endpoint. Anthropic backends (and
+// any other untracked provider) yield this error; the caller is expected
+// to treat it as "no probe available, skip recovery" rather than a fault.
+var ErrNoProvider = errors.New("poller: no provider registered for base URL")
+
+// WithTestProviderForTest is the exported wrapper around the package-private
+// test-only provider hook. Tests outside the poller package (notably
+// internal/auto's recovery tests, see issue #124) use it to register a
+// provider whose matcher accepts an httptest server's URL. The provider
+// is removed via t.Cleanup. Production code must not call this.
+func WithTestProviderForTest(t *testing.T, matchFragment string, quotaURL func(string) (string, error), sign func(*http.Request, string) error, parse func([]byte, time.Time) (quota.Snapshot, error)) {
+	t.Helper()
+	orig := providers
+	providers = append([]provider{{
+		name:     "test",
+		matches:  func(u string) bool { return strings.Contains(u, matchFragment) },
+		quotaURL: quotaURL,
+		sign:     sign,
+		parse:    parse,
+	}}, providers...)
+	t.Cleanup(func() { providers = orig })
+}
+
+// HostURLForTest, RawAuthForTest, ParseZhipuForTest expose the
+// package-private builder helpers used by z.ai/zhipu's production provider
+// entry, so external tests (notably internal/auto's recovery tests, see
+// issue #124) can build a provider with the same behaviour against an
+// httptest server. Production code must not call these.
+func HostURLForTest(path string) func(string) (string, error) {
+	return hostURL(path)
+}
+
+func RawAuthForTest(req *http.Request, credential string) error {
+	return rawAuth(req, credential)
+}
+
+func ParseZhipuForTest(body []byte, now time.Time) (quota.Snapshot, error) {
+	return parseZhipu(body, now)
+}
+
+// Probe fetches one quota snapshot for backend b via the registered
+// proprietary endpoint (if any) and returns the parsed Snapshot. It mirrors
+// (*Poller).pollOne so callers outside the poller's goroutine lifecycle
+// (notably the recovery probe in internal/auto) can hit the same endpoint
+// without owning a Poller instance. The supplied client must have a tight
+// timeout — the recovery path expects probe latency to be bounded.
+//
+// Errors:
+//   - ErrNoProvider when no provider matches b.BaseURL (Anthropic, etc.).
+//   - The wrapped transport / non-200 / parse error from pollOne otherwise.
+//
+// As in pollOne, the parsed Snapshot is returned on a non-200 response only
+// when parsing succeeds; on error the caller receives an empty Snapshot.
+func Probe(ctx context.Context, b backend.Backend, client *http.Client, now func() time.Time) (quota.Snapshot, error) {
+	prov, ok := providerFor(b.BaseURL)
+	if !ok {
+		return quota.Snapshot{}, ErrNoProvider
+	}
+	target, err := prov.quotaURL(b.BaseURL)
+	if err != nil {
+		return quota.Snapshot{}, err
+	}
+	method := prov.method
+	if method == "" {
+		method = http.MethodGet
+	}
+	var bodyReader io.Reader
+	if prov.body != nil {
+		bodyReader = bytes.NewReader(prov.body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, bodyReader)
+	if err != nil {
+		return quota.Snapshot{}, err
+	}
+	if err := prov.sign(req, b.Credential); err != nil {
+		return quota.Snapshot{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return quota.Snapshot{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return quota.Snapshot{}, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return quota.Snapshot{}, err
+	}
+	return prov.parse(body, now())
 }
 
 // containsAny builds a matcher that reports whether the BaseURL contains

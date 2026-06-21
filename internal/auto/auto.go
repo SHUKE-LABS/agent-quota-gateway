@@ -19,6 +19,7 @@ package auto
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/poller"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
@@ -1140,6 +1142,27 @@ type Controller struct {
 	// lazily once now >= reset.
 	exhausted map[string]time.Time
 
+	// lastProbeAttempt records the most recent recovery-probe attempt time
+	// per quota key, used to rate-limit recovery probes to ≤1 per parked
+	// member per cooldown window (issue #124). The preemptor uses the same
+	// "act once per distinct reset" pattern via its own lastActed map; this
+	// field is a per-Controller variant keyed by quota key. Accessed only
+	// under c.mu.
+	lastProbeAttempt map[string]time.Time
+
+	// probeInFlight marks a quota key whose recovery probe is currently
+	// running on another goroutine; concurrent "all exhausted" requests
+	// see the flag and skip the probe for that member, coalescing to one
+	// probe per parked member. Accessed only under c.mu.
+	probeInFlight map[string]bool
+
+	// probeHTTPClient is the HTTP client used for recovery probes. Defaults
+	// to http.DefaultClient; tests inject a client backed by httptest to
+	// control probe responses. Accessed without a lock — set once at
+	// construction (or via SetProbeHTTPClient in tests) and never modified
+	// after.
+	probeHTTPClient *http.Client
+
 	now    func() time.Time
 	logOut io.Writer
 
@@ -1214,6 +1237,9 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		priority:           effectiveOrder(reg.PoolPriority(poolName), nicks),
 		store:              store,
 		exhausted:          make(map[string]time.Time),
+		lastProbeAttempt:   make(map[string]time.Time),
+		probeInFlight:      make(map[string]bool),
+		probeHTTPClient:    http.DefaultClient,
 		now:                now,
 		logOut:             logOut,
 		balanceGap:         reg.PoolBalanceGap(poolName),
@@ -1429,6 +1455,8 @@ func (c *Controller) ClearExhausted() []string {
 	}
 	sort.Strings(cleared)
 	c.exhausted = make(map[string]time.Time)
+	c.lastProbeAttempt = make(map[string]time.Time)
+	c.probeInFlight = make(map[string]bool)
 	c.notifyMutate()
 	return cleared
 }
@@ -2003,10 +2031,37 @@ func isCredentialRejected(code int) bool {
 // rewrites resp: a 503 "backend switching" when a healthy member remains, or
 // the honest upstream status with a precise Retry-After when the pool is dry.
 // reason is the log phrase describing why the backend was parked.
+//
+// When every member is parked (res.allExhausted), a recovery probe is fired
+// against each poller-recognised member before the upstream 429 is
+// forwarded: if a probe returns a snapshot that no longer satisfies the
+// freshness/exhaustion predicate (windowBlocks — the post-#125 rule), the
+// member's park mark is cleared and the pool retries selection. If any
+// member is now selectable, the response is rewritten to 503 (the normal
+// switch shape) and the request is effectively re-routed to the recovered
+// member. If the probe does not produce a healthy member, the existing
+// forward-upstream-429 path runs (issue #124).
 func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset time.Time, reason string) error {
 	res := c.record429(nick, reset)
 
 	if res.allExhausted {
+		if recovered := c.tryRecoverParked(); recovered != "" {
+			// Re-rotate sticky to the recovered member (it was moved off
+			// during record429, which already pinned c.cur to the soonest-
+			// reset member). Take the standard "switched" log + 503 rewrite.
+			from := nick
+			if idx := c.indexOf(recovered); idx >= 0 {
+				from = c.nicks[c.cur]
+				c.mu.Lock()
+				c.cur = idx
+				c.stampSelectionLocked(c.nicks[idx])
+				c.mu.Unlock()
+			}
+			fmt.Fprintf(c.logOut, "auto[%s]: %s -> %s (recovered %s via quota probe; upstream reset would have over-parked)\n",
+				c.pool, from, recovered, recovered)
+			rewriteTo503(resp)
+			return nil
+		}
 		secs := retryAfterSeconds(res.retryAfter)
 		setRetryAfter(resp.Header, secs)
 		fmt.Fprintf(c.logOut, "auto[%s]: all backends exhausted; forwarding upstream %d (retry after %ds)\n", c.pool, resp.StatusCode, secs)
@@ -2115,6 +2170,152 @@ func (c *Controller) record429(nick string, reset time.Time) record429Result {
 	c.cur = idx
 	c.notifyMutate()
 	return record429Result{to: c.nicks[idx], retryAfter: c.waitUntil(soonest), allExhausted: true}
+}
+
+// probeCooldown bounds how often the same parked member's quota endpoint
+// may be probed for recovery. 30s is the chosen default: probes are cheap
+// (z.ai / MiniMaxi / Ark return synchronously from their proprietary
+// quota endpoints, all non-billable), and this cadence is fast enough to
+// pick up a recovered member within one slot of operator-visible latency
+// while bounding worst-case probe storms on a flapping member. See
+// issue #124 for the design rationale.
+const probeCooldown = 30 * time.Second
+
+// probeTimeout caps the per-probe network call so a stalled upstream does
+// not block the all-exhausted response path indefinitely. The chosen 2s is
+// comfortably above the typical proprietary quota-endpoint latency
+// (sub-second) and well below the 5s default upstream fallback used by
+// resetFrom (issue #124).
+const probeTimeout = 2 * time.Second
+
+// SetProbeHTTPClient overrides the HTTP client used by tryRecoverParked.
+// Tests inject a client backed by httptest to control probe responses;
+// production never calls this. The client is replaced atomically — the
+// caller must not invoke tryRecoverParked concurrently with this setter.
+func (c *Controller) SetProbeHTTPClient(client *http.Client) {
+	c.probeHTTPClient = client
+}
+
+// tryRecoverParked fires one quota probe per parked, probe-eligible member
+// and unparks any whose upstream now serves. It returns the nick of the
+// first member recovered (or "" when no member recovered).
+//
+// "Probe-eligible" means: the member is parked, has a poller-recognised
+// base URL (Anthropic / unknown providers are skipped via
+// poller.ErrNoProvider), has not been probed within the last
+// probeCooldown, and has no in-flight probe. Concurrent all-exhausted
+// requests coalesce via c.probeInFlight.
+//
+// The recovery decision uses snapRejects (post-#125) so the freshness
+// predicate is shared between the park-decision path and the recovery
+// path — exactly what issue #124 asks for to avoid divergence.
+//
+// Caller does NOT hold c.mu. Internal locking is acquired and released
+// around each step (snapshot under lock → probe unlocked → result under
+// lock); the probe itself runs without c.mu so a stalled upstream does
+// not block other pool operations.
+func (c *Controller) tryRecoverParked() string {
+	type probeTarget struct {
+		nick      string
+		quotaKey  string
+	}
+	var targets []probeTarget
+	now := c.now()
+
+	c.mu.Lock()
+	if len(c.exhausted) == 0 {
+		c.mu.Unlock()
+		return ""
+	}
+	for nick := range c.exhausted {
+		// Skip disabled / removed members — they are unreachable regardless
+		// of upstream state.
+		if c.disabled[nick] || c.removedMembers[nick] {
+			continue
+		}
+		// Resolve the backend so we can detect the poller-recognised
+		// providers (z.ai / MiniMaxi / Ark) and probe them. Anthropic is
+		// intentionally skipped — its 429s already carry precise resets
+		// and organic traffic refreshes the store.
+		b, ok := c.backendByNickLocked(nick)
+		if !ok {
+			continue
+		}
+		if _, has := poller.ProviderFor(b.BaseURL); !has {
+			continue
+		}
+		quotaKey := b.QuotaKey()
+		if c.probeInFlight[quotaKey] {
+			continue
+		}
+		if last, ok := c.lastProbeAttempt[quotaKey]; ok && now.Sub(last) < probeCooldown {
+			continue
+		}
+		// Mark in-flight under the lock so concurrent all-exhausted paths
+		// skip this member until the probe returns.
+		c.probeInFlight[quotaKey] = true
+		c.lastProbeAttempt[quotaKey] = now
+		targets = append(targets, probeTarget{nick: nick, quotaKey: quotaKey})
+	}
+	c.mu.Unlock()
+
+	if len(targets) == 0 {
+		return ""
+	}
+
+	var recovered string
+	for _, t := range targets {
+		c.mu.Lock()
+		b, ok := c.backendByNickLocked(t.nick)
+		c.mu.Unlock()
+		if !ok {
+			c.clearProbeInFlight(t.quotaKey)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		client := c.probeHTTPClient
+		if client == nil {
+			client = http.DefaultClient
+		}
+		snap, err := poller.Probe(ctx, b, client, c.now)
+		cancel()
+		if err != nil {
+			// Includes ErrNoProvider (defensive — we already filtered by
+			// ProviderFor above, but a future provider change might slip
+			// through). Just clear the in-flight flag; do NOT extend the
+			// park — issue #124 contract: failed probe leaves the park alone.
+			c.clearProbeInFlight(t.quotaKey)
+			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s failed: %v (park retained)\n", c.pool, t.nick, err)
+			continue
+		}
+		// snapRejects (post-#125) shares the freshness predicate with the
+		// park-decision path. If the snapshot no longer rejects, the member
+		// is healthy — unmark and update lastActed to suppress re-probe
+		// thrash until the cooldown.
+		c.mu.Lock()
+		recoveredNow := c.now()
+		if !snapRejects(snap, recoveredNow) {
+			delete(c.exhausted, t.nick)
+			c.notifyMutate()
+			if recovered == "" {
+				recovered = t.nick
+			}
+			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s returned healthy; unparked\n", c.pool, t.nick)
+		} else {
+			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s still exhausted; park retained\n", c.pool, t.nick)
+		}
+		c.probeInFlight[t.quotaKey] = false
+		c.mu.Unlock()
+	}
+	return recovered
+}
+
+// clearProbeInFlight clears the in-flight flag for quotaKey under c.mu.
+// Used by the error path of tryRecoverParked.
+func (c *Controller) clearProbeInFlight(quotaKey string) {
+	c.mu.Lock()
+	c.probeInFlight[quotaKey] = false
+	c.mu.Unlock()
 }
 
 // clearExpiredLocked drops exhausted marks whose reset has passed, so a

@@ -1079,6 +1079,32 @@ How it behaves:
 The poller's reads are the only gateway-originated upstream traffic; see
 [Security model](#security-model).
 
+### Recovery probing for parked members
+
+A poller-tracked backend that hits a transient-overload 429 (z.ai /
+MiniMaxi / Ark servers are frequently overloaded, not actually quota-exhausted)
+gets parked for the conservative 5h fallback because the 429 carries no
+reset header. The poller's active-only tracking means a parked member's
+store entry is stale — it does not reflect the upstream's recovery. Without
+operator action (`POST /_gateway/clear`), the member would stay parked for
+the full 5h.
+
+The recovery probe closes that gap. When every member of a pool is parked
+(all-exhausted on the proxy path), the gateway re-probes each parked
+poller-tracked member through the same proprietary quota endpoint the
+poller uses (cheap, non-billable, returns utilization + precise reset). A
+member whose probe no longer satisfies the freshness/exhaustion predicate
+is unparked; the request is then routed to it (response rewritten to
+503 — the normal switch shape) instead of being forwarded as the
+upstream 429. Anthropic is intentionally not probed — its 429s already
+carry precise resets and organic traffic refreshes the store.
+
+Probes are rate-limited (≤ 1 per parked member per 30s) and coalesce
+across concurrent all-exhausted requests so a stalled upstream does not
+block the proxy path or trigger probe storms. The flush-on-unpark goes
+through the persister, so a restart cannot resurrect a stale park the
+recovery probe has cleared.
+
 ## Why a thin proxy
 
 The proxy is the trust boundary — it owns the credentials and resolves a
