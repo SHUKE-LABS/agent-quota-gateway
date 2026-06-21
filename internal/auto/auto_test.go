@@ -1808,15 +1808,9 @@ func TestPoolPersistState_localSnapshotNicksRoundTrip(t *testing.T) {
 	pools2 := &Pools{byPool: map[string]*Controller{"auto": c2}}
 	pools2.LoadPersistState(ps)
 
-	status, _ := pools2.PoolStatus("auto", quota.NewStore())
-	snaps := snapshotByNick(status)
 	// Static members are seeded at construction; the restored
 	// LocalSnapshotNicks adds the persisted b on top (a was already
 	// there) and drops ghost.
-	if snaps["a"] != nil || snaps["b"] != nil {
-		// No store data, so the snapshot itself is nil — but the gate
-		// must be open. We probe via the unexported field.
-	}
 	c2.mu.Lock()
 	_, aOK := c2.poolLocalSnapshots["a"]
 	_, bOK := c2.poolLocalSnapshots["b"]
@@ -1827,5 +1821,88 @@ func TestPoolPersistState_localSnapshotNicksRoundTrip(t *testing.T) {
 	}
 	if ghostOK {
 		t.Error("after restore: ghost survived, want dropped (non-member)")
+	}
+}
+
+// TestPoolPersistState_runtimeAddedMemberRoundTrip proves AC #4: a
+// runtime-added member for which the controller has observed traffic
+// survives a persist/reload cycle WITHOUT re-flashing "-" after the
+// restart. This is the only path that exercises
+// pendingLocalSnapshots -> applyPendingLocalSnapshotsLocked: runtime
+// members are restored by LoadRuntimeConfig (after LoadPersistState),
+// so the persisted LocalSnapshotNicks entries that name them cannot
+// be seeded at loadState time and must be applied at the end of
+// LoadRuntimeConfig.
+func TestPoolPersistState_runtimeAddedMemberRoundTrip(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "ONE_BACKEND_SHARED": "cred-shared",
+		backend.EnvPrefix + "TWO_BACKEND_X":      "cred-x",
+	})
+
+	// Create a runtime pool and runtime-add "shared" to it (the same
+	// shape the issue's UI scenario uses). "shared" already exists in
+	// pool ONE, so the credential resolves from there.
+	if status, err := p.AddPool("rt", "https://rt.example", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool rt: status=%d err=%v, want 201", status, err)
+	}
+	if status, err := p.AddMember("rt", "shared", "", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember rt shared: status=%d err=%v, want 200", status, err)
+	}
+
+	// Simulate the controller having observed traffic for "shared"
+	// (header observer or poller tick), so the gate opens for it.
+	p.MarkLocalSnapshot("rt", "shared")
+
+	// Capture the persisted state. The runtime pool, its added member,
+	// and the local-snapshot entry all need to round-trip.
+	addedPools := p.PersistAddedPools()
+	persistState := p.PersistState()
+	runtimeConfig := p.PersistRuntimeConfig()
+	if _, ok := persistState["rt"]; !ok {
+		t.Fatalf("PersistState missing rt entry: %+v", persistState)
+	}
+	if len(persistState["rt"].LocalSnapshotNicks) != 1 || persistState["rt"].LocalSnapshotNicks[0] != "shared" {
+		t.Fatalf("persist LocalSnapshotNicks=%v, want [shared]", persistState["rt"].LocalSnapshotNicks)
+	}
+
+	// Re-instantiate in the production load order: added pools first,
+	// then persist state, then runtime config. The deferred
+	// applyPendingLocalSnapshotsLocked runs at the end of
+	// LoadRuntimeConfig.
+	clock2 := newMoveClock()
+	p2 := loadMovePools(t, clock2, map[string]string{
+		backend.EnvPrefix + "ONE_BACKEND_SHARED": "cred-shared",
+		backend.EnvPrefix + "TWO_BACKEND_X":      "cred-x",
+	})
+	p2.LoadAddedPools(addedPools)
+	p2.LoadPersistState(persistState)
+	p2.LoadRuntimeConfig(runtimeConfig)
+
+	// The runtime member must be back in the controller's effective
+	// set AND its poolLocalSnapshots entry must be present (the gate
+	// is open — no "-" re-flash after restart).
+	c, ok := p2.controller("rt")
+	if !ok {
+		t.Fatal("rt pool missing after restart")
+	}
+	c.mu.Lock()
+	_, sharedOK := c.poolLocalSnapshots["shared"]
+	c.mu.Unlock()
+	if !sharedOK {
+		t.Errorf("after restart: poolLocalSnapshots[shared] missing, want true (deferred-apply regression)")
+	}
+
+	// Sanity: the runtime member is actually a member, and a fresh
+	// status view attaches the snapshot (gate open + data present).
+	store := quota.NewStore()
+	u := 0.42
+	store.Put("shared", quota.Snapshot{Unified5hUtilization: &u, AsOf: clock2.now()})
+	status, _ := p2.PoolStatus("rt", store)
+	snap := snapshotByNick(status)["shared"]
+	if snap == nil {
+		t.Error("after restart: snapshot=nil, want non-nil (gate should be open)")
+	} else if snap.Unified5hUtilization == nil || *snap.Unified5hUtilization != 0.42 {
+		t.Errorf("after restart: Unified5hUtilization=%v, want 0.42", snap.Unified5hUtilization)
 	}
 }

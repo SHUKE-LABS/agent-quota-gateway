@@ -1161,9 +1161,11 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 	// Seed poolLocalSnapshots with the static nicks so a pool that was live
 	// across a code upgrade (or that has always had a member) does not flash
 	// "-" for nicks that already have a snapshot in the shared store from
-	// the matching pool's traffic. Runtime-added members are NOT seeded here;
-	// they are added in loadRuntimeConfig after Pools.LoadAddedPools restores
-	// the persisted addedMembers map.
+	// the matching pool's traffic. Runtime-added members are NOT seeded
+	// here; they are added in loadRuntimeConfig, and any persisted
+	// LocalSnapshotNicks entries that name runtime-added members land via
+	// applyPendingLocalSnapshotsLocked at the end of LoadRuntimeConfig
+	// (issue #111).
 	local := make(map[string]struct{}, len(nicks))
 	for _, n := range nicks {
 		local[n] = struct{}{}
