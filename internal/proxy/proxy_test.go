@@ -380,8 +380,8 @@ func TestProxy_observerFiresWithResponse(t *testing.T) {
 	if seenHeader != "0.42" {
 		t.Errorf("observer saw unified-5h-utilization = %q, want 0.42", seenHeader)
 	}
-	if seenKey != "auto/mybackend" {
-		t.Errorf("observer saw quota key = %q, want auto/mybackend (resolved backend must reach ModifyResponse via context)", seenKey)
+	if seenKey != "mybackend" {
+		t.Errorf("observer saw quota key = %q, want mybackend (quota key is the nick alone)", seenKey)
 	}
 }
 

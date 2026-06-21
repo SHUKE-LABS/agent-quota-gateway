@@ -22,6 +22,21 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
+// scrubPoolEnv removes all ambient AQG_POOL_* variables from the process
+// environment for the duration of the test, mirroring the helper in
+// internal/auto so this test package is also independent of a developer's
+// shell settings.
+func scrubPoolEnv(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		k, _, ok := strings.Cut(kv, "=")
+		if ok && strings.HasPrefix(k, backend.EnvPrefix) {
+			t.Setenv(k, "")
+			os.Unsetenv(k) //nolint:errcheck // only fails on empty key
+		}
+	}
+}
+
 // poolView decodes a /_gateway/quota?backend=<pool> response: the active
 // member's snapshot plus the active_backend field.
 type poolView struct {
@@ -200,8 +215,8 @@ func TestIntegration_fullStack(t *testing.T) {
 	if view.ActiveBackend != "test-backend" {
 		t.Errorf("active_backend = %q, want test-backend", view.ActiveBackend)
 	}
-	if view.Backend != "auto/test-backend" {
-		t.Errorf("backend = %q, want auto/test-backend (pool-qualified quota key)", view.Backend)
+	if view.Backend != "test-backend" {
+		t.Errorf("backend = %q, want test-backend (quota key is the nick alone)", view.Backend)
 	}
 	if view.UnifiedStatus != "allowed" {
 		t.Errorf("unified_status = %q, want allowed", view.UnifiedStatus)
@@ -377,7 +392,7 @@ func TestQuotaHandler_poolViewAddsActiveBackend(t *testing.T) {
 
 	store := quota.NewStore()
 	util := 0.42
-	store.Put("auto/acct-one", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util})
+	store.Put("acct-one", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util})
 
 	srv := httptest.NewServer(quotaHandler(store, pools))
 	t.Cleanup(srv.Close)
@@ -398,8 +413,8 @@ func TestQuotaHandler_poolViewAddsActiveBackend(t *testing.T) {
 	if got["active_backend"] != "acct-one" {
 		t.Errorf("active_backend=%v, want acct-one", got["active_backend"])
 	}
-	if got["backend"] != "auto/acct-one" {
-		t.Errorf("backend=%v, want auto/acct-one (pool-qualified key promoted into the view)", got["backend"])
+	if got["backend"] != "acct-one" {
+		t.Errorf("backend=%v, want acct-one (quota key is the nick alone)", got["backend"])
 	}
 	if got["unified_status"] != "allowed" {
 		t.Errorf("unified_status=%v, want allowed", got["unified_status"])
@@ -693,6 +708,7 @@ func TestPersist_roundTrip(t *testing.T) {
 	dir := t.TempDir()
 	stateFile := dir + "/state.json"
 
+	scrubPoolEnv(t)
 	t.Setenv("AQG_POOL_AUTO_BACKEND_CCW", "sk-ant-ccw")
 	t.Setenv("AQG_POOL_AUTO_BACKEND_CCH", "sk-ant-cch")
 	registry, err := backend.Load("https://api.anthropic.com")
@@ -701,7 +717,7 @@ func TestPersist_roundTrip(t *testing.T) {
 	}
 	store := quota.NewStore()
 	util5h := 0.55
-	store.Put("auto/ccw", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util5h})
+	store.Put("ccw", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util5h})
 	pools := auto.NewPools(registry, nil, nil, io.Discard)
 
 	// Build and write persisted state with ccw as sticky.
