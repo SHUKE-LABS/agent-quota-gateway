@@ -600,8 +600,11 @@ func (p *Pools) RemoveMember(poolName, nick string) (int, error) {
 // tombstoned so it stays out of selection. A tombstone is always set so the
 // removal is uniform and survives restart. If the removed member was the active
 // sticky pointer, the pointer force-switches to the next healthy member (as on
-// a 429). The caller is responsible for validating that the member exists.
-// Caller holds c.mu.
+// a 429). If a runtime priority override is in effect, it is rebuilt over the
+// post-mutation effective member set so the override no longer references the
+// removed nick — making the post-fix live behaviour match the post-restart
+// behaviour that loadRuntimeConfig already implements (issue #120). The caller
+// is responsible for validating that the member exists. Caller holds c.mu.
 func (c *Controller) removeMemberLocked(nick string) {
 	// If it's a runtime-added member, remove it entirely.
 	if _, isAdded := c.addedMembers[nick]; isAdded {
@@ -614,6 +617,34 @@ func (c *Controller) removeMemberLocked(nick string) {
 	// For added members, we already deleted them, but set removed flag anyway
 	// for consistency and in case of races.
 	c.removedMembers[nick] = true
+
+	// If the pool currently has a runtime priority override, prune it of any
+	// nick no longer in the effective member set (the removed nick plus any
+	// other stale nick). addedMembersLocked already filters out nicks present
+	// in c.removedMembers, so the just-removed nick falls out automatically.
+	// An empty filtered list drops the override entirely (the pool becomes a
+	// plain pool; the UI hides the priority column). Otherwise re-expand via
+	// effectiveOrder so a partial override still yields a total order over the
+	// current effective set — symmetric with setPriorityOverrideEffective /
+	// loadRuntimeConfig (issue #120).
+	if c.priorityOverride != nil {
+		effective := c.addedMembersLocked()
+		keep := make(map[string]bool, len(effective))
+		for _, m := range effective {
+			keep[m] = true
+		}
+		filtered := make([]string, 0, len(c.priorityOverride))
+		for _, n := range c.priorityOverride {
+			if keep[n] {
+				filtered = append(filtered, n)
+			}
+		}
+		if len(filtered) == 0 {
+			c.priorityOverride = nil
+		} else {
+			c.priorityOverride = effectiveOrder(filtered, effective)
+		}
+	}
 
 	// If the removed member was the active sticky pointer, force-switch to
 	// the next healthy member. This is similar to what happens on a 429.
