@@ -144,6 +144,10 @@ func run(configFlag string) error {
 		if resp.Request != nil {
 			if b, ok := backend.FromContext(resp.Request.Context()); ok {
 				key = b.QuotaKey()
+				// Mark this controller as having observed a snapshot for
+				// the nick, so the pool status view does not flash another
+				// pool's data for a runtime-added member (issue #111).
+				pools.MarkLocalSnapshot(b.Pool, b.Nick)
 			}
 		}
 		store.Put(key, snap)
@@ -202,7 +206,7 @@ func run(configFlag string) error {
 	// each provider's proprietary quota API for the active member of each
 	// pool. It is a no-op for Anthropic and any other untracked backend.
 	// It shares the shutdown context, so it stops when the process does.
-	qp := poller.New(registry.PoolNames(), pools.Current, store, nil, 0, nil, nil)
+	qp := poller.New(registry.PoolNames(), pools.Current, pools.MarkLocalSnapshot, store, nil, 0, nil, nil)
 	go qp.Run(ctx)
 
 	// The preemptor returns a priority pool to a higher-priority member once

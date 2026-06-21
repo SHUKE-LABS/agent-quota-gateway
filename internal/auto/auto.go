@@ -175,6 +175,22 @@ func (p *Pools) ModifyResponse(resp *http.Response) error {
 	return c.ModifyResponse(resp)
 }
 
+// MarkLocalSnapshot records that the controller for poolName has itself
+// observed a quota snapshot for nick. Called by the upstream-response
+// observer and the quota poller to gate poolStatus' snapshot attach so a
+// runtime-added nick does not briefly render another pool's data. Unknown
+// poolName or an empty nick are no-ops.
+func (p *Pools) MarkLocalSnapshot(poolName, nick string) {
+	if poolName == "" || nick == "" {
+		return
+	}
+	c, ok := p.controller(poolName)
+	if !ok {
+		return
+	}
+	c.MarkLocalSnapshot(nick)
+}
+
 // Current returns the active sticky backend of the named pool, for the
 // quota view's active_backend field. ok is false for an unknown pool.
 func (p *Pools) Current(poolName string) (backend.Backend, bool) {
@@ -286,6 +302,13 @@ type PoolPersistState struct {
 	// never-selected on load (backward-compatible).
 	BalanceSeq      uint64            `json:"balance_seq,omitempty"`
 	LastSelectedSeq map[string]uint64 `json:"last_selected_seq,omitempty"`
+	// LocalSnapshotNicks lists members for which this controller has
+	// observed a snapshot since the last restart. Persisted unconditionally
+	// (not gated on balanceGap) so a non-balanced pool does not lose the
+	// "this pool has seen traffic" signal across a restart. Empty/absent
+	// in older state files; treated as "no observed snapshots" on load,
+	// which is the same as the pre-fix behaviour for the first observation.
+	LocalSnapshotNicks []string `json:"local_snapshot_nicks,omitempty"`
 }
 
 // PoolRuntimeConfig is the serializable runtime configuration for one pool.
@@ -335,7 +358,7 @@ type AddedPoolSpec struct {
 func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 	for name, s := range states {
 		if c, ok := p.controller(name); ok {
-			c.loadState(s.Sticky, s.Exhausted, s.LastBalanceSwitch, s.BalanceSeq, s.LastSelectedSeq)
+			c.loadState(s.Sticky, s.Exhausted, s.LastBalanceSwitch, s.BalanceSeq, s.LastSelectedSeq, s.LocalSnapshotNicks)
 		}
 	}
 }
@@ -868,6 +891,15 @@ func (p *Pools) LoadRuntimeConfig(cfg map[string]PoolRuntimeConfig) {
 			c.loadRuntimeConfig(poolCfg)
 		}
 	}
+	// After every controller has its runtime members back, seed the
+	// local-snapshot set for the persisted entries loadState had to defer
+	// (runtime-added members are not visible to backendByNickLocked until
+	// now). Apply per controller under its own lock.
+	for _, c := range p.controllersSnapshot() {
+		c.mu.Lock()
+		c.applyPendingLocalSnapshotsLocked()
+		c.mu.Unlock()
+	}
 }
 
 // PersistState snapshots the current routing state for all pools.
@@ -1053,6 +1085,15 @@ type Controller struct {
 	// Always "" outside the load sequence. Accessed only under c.mu.
 	pendingSticky string
 
+	// pendingLocalSnapshots carries LocalSnapshotNicks that loadState could
+	// not apply because they name a runtime-added member not yet restored
+	// (LoadRuntimeConfig runs after LoadPersistState in main.go). Applied by
+	// applyPendingLocalSnapshotsLocked once runtime members are in place;
+	// nicks that still do not resolve are dropped (mirroring the
+	// sticky-pointer drop for non-members). Always nil outside the load
+	// sequence. Accessed only under c.mu.
+	pendingLocalSnapshots []string
+
 	// cur indexes nicks: nicks[cur] is the backend every request to this
 	// pool sticks to until it 429s.
 	cur int
@@ -1090,6 +1131,17 @@ type Controller struct {
 	// became the active member in a balanced pool. 0 (absent) means the
 	// member has never been selected.
 	lastSelectedSeq map[string]uint64
+
+	// poolLocalSnapshots records the nicks for which this controller has
+	// itself observed a quota snapshot (header observer or poller tick) since
+	// the controller was created. A member is only attached a snapshot in
+	// poolStatus when its nick is in this set; otherwise the cell renders
+	// "-" to avoid a brief cross-pool flash when a nick already used by
+	// another pool is runtime-added here (issue #111). Static members are
+	// seeded at construction; runtime-added members are NOT seeded and must
+	// wait for the first observation before their cell shows data. Accessed
+	// only under c.mu.
+	poolLocalSnapshots map[string]struct{}
 }
 
 // NewController builds the sticky selector over the members of poolName
@@ -1106,21 +1158,34 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		logOut = os.Stderr
 	}
 	nicks := reg.PoolNicks(poolName) // sorted; Load guarantees at least one per pool
+	// Seed poolLocalSnapshots with the static nicks so a pool that was live
+	// across a code upgrade (or that has always had a member) does not flash
+	// "-" for nicks that already have a snapshot in the shared store from
+	// the matching pool's traffic. Runtime-added members are NOT seeded
+	// here; they are added in loadRuntimeConfig, and any persisted
+	// LocalSnapshotNicks entries that name runtime-added members land via
+	// applyPendingLocalSnapshotsLocked at the end of LoadRuntimeConfig
+	// (issue #111).
+	local := make(map[string]struct{}, len(nicks))
+	for _, n := range nicks {
+		local[n] = struct{}{}
+	}
 	c := &Controller{
-		reg:             reg,
-		pool:            poolName,
-		nicks:           nicks,
-		priority:        effectiveOrder(reg.PoolPriority(poolName), nicks),
-		store:           store,
-		exhausted:       make(map[string]time.Time),
-		now:             now,
-		logOut:          logOut,
-		balanceGap:      reg.PoolBalanceGap(poolName),
-		balanceDwell:    reg.PoolBalanceDwell(poolName),
-		lastSelectedSeq: make(map[string]uint64),
-		disabled:        make(map[string]bool),
-		addedMembers:    make(map[string]AddedMember),
-		removedMembers:  make(map[string]bool),
+		reg:                reg,
+		pool:               poolName,
+		nicks:              nicks,
+		priority:           effectiveOrder(reg.PoolPriority(poolName), nicks),
+		store:              store,
+		exhausted:          make(map[string]time.Time),
+		now:                now,
+		logOut:             logOut,
+		balanceGap:         reg.PoolBalanceGap(poolName),
+		balanceDwell:       reg.PoolBalanceDwell(poolName),
+		lastSelectedSeq:    make(map[string]uint64),
+		disabled:           make(map[string]bool),
+		addedMembers:       make(map[string]AddedMember),
+		removedMembers:     make(map[string]bool),
+		poolLocalSnapshots: local,
 	}
 	n := len(nicks)
 	if n == 0 {
@@ -1370,6 +1435,50 @@ func (c *Controller) notifyMutate() {
 	}
 }
 
+// MarkLocalSnapshot records that this controller has itself observed a
+// quota snapshot for nick — either from a real upstream response the
+// observer captured, or from a poller tick for a tracked backend. The
+// first observation flips the nick into poolLocalSnapshots, after which
+// poolStatus attaches snapshots for it; without an observation, the
+// cell renders "-" so a runtime-added nick does not flash another pool's
+// data (issue #111). No-op for nicks that are not a member of this pool.
+// The controller's own persister is not poked: the new state is durable
+// via the next persistState call and a "-"-only state has no user-visible
+// cost if it does not survive a crash.
+func (c *Controller) MarkLocalSnapshot(nick string) {
+	if nick == "" {
+		return
+	}
+	normalized := backend.NormalizeName(nick)
+	if normalized == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.backendByNickLocked(normalized); !ok {
+		return
+	}
+	if _, ok := c.poolLocalSnapshots[normalized]; ok {
+		return
+	}
+	c.poolLocalSnapshots[normalized] = struct{}{}
+}
+
+// seedLocalSnapshotLocked adds nick to poolLocalSnapshots without going
+// through the public MarkLocalSnapshot gating. Used at restore time by
+// loadRuntimeConfig / loadState so a runtime-added member that already
+// saw traffic before a restart does not re-flash "-" after recovery.
+// Caller holds c.mu.
+func (c *Controller) seedLocalSnapshotLocked(nick string) {
+	if nick == "" {
+		return
+	}
+	if c.poolLocalSnapshots == nil {
+		c.poolLocalSnapshots = make(map[string]struct{})
+	}
+	c.poolLocalSnapshots[nick] = struct{}{}
+}
+
 // stampSelectionLocked records that nick just became the active member in a
 // balanced pool. It increments the pool-level sequence counter and stores the
 // new value for nick. No-op for non-balanced pools. Caller holds c.mu.
@@ -1412,10 +1521,18 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 			ms.Status = "idle"
 		}
 		if b, ok := c.backendByNickLocked(nick); ok {
-			snap := store.Get(b.QuotaKey())
-			if snap.HasData() {
-				snapCopy := snap
-				ms.Snapshot = &snapCopy
+			// Only attach a snapshot when this controller has itself observed
+			// traffic (or polled) for this nick. PR #113 makes the store key
+			// the same across pools, so a nick already used in another pool
+			// would otherwise show that pool's data the moment the runtime
+			// add-member UI re-renders. Suppress until the first local
+			// observation so the cell renders "-" instead of a stale 100%.
+			if _, local := c.poolLocalSnapshots[nick]; local {
+				snap := store.Get(b.QuotaKey())
+				if snap.HasData() {
+					snapCopy := snap
+					ms.Snapshot = &snapCopy
+				}
 			}
 		}
 		if c.balanceGap > 0 {
@@ -1442,7 +1559,7 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 // has already passed are silently dropped. Persisted nicks absent from the
 // current pool membership are logged and skipped. Called once at startup
 // before the server begins serving; does not call onMutate.
-func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, lastBalanceSwitch time.Time, balanceSeq uint64, lastSelectedSeq map[string]uint64) {
+func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, lastBalanceSwitch time.Time, balanceSeq uint64, lastSelectedSeq map[string]uint64, localSnapshots []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if idx := c.indexOf(sticky); idx >= 0 {
@@ -1487,6 +1604,43 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, la
 			c.stampSelectionLocked(c.nicks[c.cur])
 		}
 	}
+	// Restore the per-pool "we have seen traffic for this nick" set, dropping
+	// entries that no longer name a current member (mirroring the
+	// sticky-pointer drop above). Unconditional — applies to balanced and
+	// non-balanced pools alike.
+	//
+	// For static members this is a direct seed. For runtime-added members
+	// addedMembers has not been restored yet (LoadRuntimeConfig runs after
+	// LoadPersistState), so we defer them on pendingLocalSnapshots and
+	// apply them in applyPendingLocalSnapshotsLocked, invoked at the end
+	// of LoadRuntimeConfig.
+	for _, nick := range localSnapshots {
+		if nick == "" {
+			continue
+		}
+		if _, ok := c.backendByNickLocked(nick); ok {
+			c.seedLocalSnapshotLocked(nick)
+			continue
+		}
+		c.pendingLocalSnapshots = append(c.pendingLocalSnapshots, nick)
+	}
+}
+
+// applyPendingLocalSnapshotsLocked seeds the local-snapshot set for every
+// persisted entry that loadState could not resolve at the time because
+// runtime-added members had not yet been restored. Entries that still
+// name a non-member are dropped (the runtime member was removed between
+// runs and there is nothing to attach a snapshot to). Caller holds c.mu.
+func (c *Controller) applyPendingLocalSnapshotsLocked() {
+	if len(c.pendingLocalSnapshots) == 0 {
+		return
+	}
+	for _, nick := range c.pendingLocalSnapshots {
+		if _, ok := c.backendByNickLocked(nick); ok {
+			c.seedLocalSnapshotLocked(nick)
+		}
+	}
+	c.pendingLocalSnapshots = nil
 }
 
 // persistState snapshots the controller's routing state for serialisation.
@@ -1520,6 +1674,23 @@ func (c *Controller) persistState() PoolPersistState {
 			seqs[k] = v
 		}
 		ps.LastSelectedSeq = seqs
+	}
+	if len(c.poolLocalSnapshots) > 0 {
+		nicks := make([]string, 0, len(c.poolLocalSnapshots))
+		for nick := range c.poolLocalSnapshots {
+			// Only persist entries that still name a current member of
+			// the pool. Stale entries (e.g. a member that was removed
+			// between snapshots) cannot be resolved on load and would
+			// just be dropped there; filtering at write time keeps the
+			// on-disk set bounded.
+			if _, ok := c.backendByNickLocked(nick); ok {
+				nicks = append(nicks, nick)
+			}
+		}
+		sort.Strings(nicks)
+		if len(nicks) > 0 {
+			ps.LocalSnapshotNicks = nicks
+		}
 	}
 	return ps
 }

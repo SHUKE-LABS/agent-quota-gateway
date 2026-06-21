@@ -300,7 +300,7 @@ func TestPollAll_zaiPopulatesStoreWithCorrectAuth(t *testing.T) {
 	// matches the httptest host and reuses the Zhipu builders.
 	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
 	store := quota.NewStore()
-	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
+	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), nil, store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
 
 	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
 
@@ -326,7 +326,7 @@ func TestPollAll_skipsUntrackedBackend(t *testing.T) {
 	// poller must not touch it. (No test provider registered.)
 	b := backend.Backend{Pool: "us", Nick: "acct-a", Credential: "sk-ant", BaseURL: "https://api.anthropic.com"}
 	store := quota.NewStore()
-	p := New([]string{"us"}, stubCurrent(map[string]backend.Backend{"us": b}), store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
+	p := New([]string{"us"}, stubCurrent(map[string]backend.Backend{"us": b}), nil, store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
 
 	p.pollAll(context.Background())
 
@@ -350,7 +350,7 @@ func TestPollAll_non200LeavesPriorSnapshot(t *testing.T) {
 	prior := 0.42
 	store.Put(b.QuotaKey(), quota.Snapshot{Unified5hUtilization: &prior, AsOf: fixedNow})
 
-	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
+	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), nil, store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
 	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
 
 	p.pollAll(context.Background())
@@ -366,7 +366,7 @@ func TestPollAll_logsFailure(t *testing.T) {
 
 	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
 	var logBuf strings.Builder
-	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), quota.NewStore(), srv.Client(), time.Hour, func() time.Time { return fixedNow }, &logBuf)
+	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), nil, quota.NewStore(), srv.Client(), time.Hour, func() time.Time { return fixedNow }, &logBuf)
 	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
 
 	p.pollAll(context.Background())
@@ -394,7 +394,7 @@ func TestPollAll_volcenginePopulatesStore(t *testing.T) {
 
 	b := backend.Backend{Pool: "ark", Nick: "key-a", Credential: "", BaseURL: srv.URL}
 	store := quota.NewStore()
-	p := New([]string{"ark"}, stubCurrent(map[string]backend.Backend{"ark": b}), store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
+	p := New([]string{"ark"}, stubCurrent(map[string]backend.Backend{"ark": b}), nil, store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
 
 	// Register a test provider matching the httptest server with POST + volcengine sign.
 	orig := providers
@@ -442,7 +442,7 @@ func TestRun_pollsImmediatelyThenStopsOnContextCancel(t *testing.T) {
 	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
 	store := quota.NewStore()
 	// Long interval so only the immediate startup pass runs within the test.
-	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
+	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), nil, store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
 	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -476,6 +476,86 @@ func TestRun_pollsImmediatelyThenStopsOnContextCancel(t *testing.T) {
 	defer mu.Unlock()
 	if calls < 1 {
 		t.Errorf("calls = %d, want at least the immediate startup poll", calls)
+	}
+}
+
+// TestPoller_marksLocalSnapshot proves that a successful poll calls the
+// MarkLocalSnapshot callback so the originating pool's controller can
+// stop suppressing cross-pool snapshot sharing for that nick (issue
+// #111). The callback records the (poolName, nick) pair; the test
+// asserts both the invocation and the argument values.
+func TestPoller_marksLocalSnapshot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":5,"nextResetTime":1781418024826}]}}`)
+	}))
+	defer srv.Close()
+
+	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
+	store := quota.NewStore()
+
+	var (
+		mu          sync.Mutex
+		calls       int
+		gotPool     string
+		gotNick     string
+		gotAfterPut bool
+	)
+	markLocal := func(poolName, nick string) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		gotPool = poolName
+		gotNick = nick
+		// markLocal must run AFTER store.Put: the contract is "the store
+		// already has the snapshot, now lift the suppression". Probing
+		// the store here is a fast white-box check of that ordering.
+		gotAfterPut = store.Get(b.QuotaKey()).HasData()
+	}
+
+	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), markLocal, store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
+	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
+
+	// Wait for the immediate startup poll to land and propagate the
+	// markLocal callback.
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		count := calls
+		mu.Unlock()
+		if count >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("markLocal not called within deadline")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after context cancel")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotPool != "chn" {
+		t.Errorf("markLocal poolName=%q, want chn", gotPool)
+	}
+	if gotNick != "key-a" {
+		t.Errorf("markLocal nick=%q, want key-a", gotNick)
+	}
+	if !gotAfterPut {
+		t.Error("markLocal ran before store.Put had data (ordering regression)")
 	}
 }
 

@@ -58,23 +58,34 @@ const maxBodyBytes = 1 << 20 // 1 MiB
 // import package auto (which would create a cycle through backend/quota).
 type CurrentFunc func(poolName string) (backend.Backend, bool)
 
+// MarkLocalSnapshotFunc is the poller's "I just filed a snapshot for
+// this pool/nick" callback. The poller takes a function so it does not
+// import package auto; the caller (cmd/agent-quota-gateway) wires it to
+// auto.Pools.MarkLocalSnapshot. issue #111.
+type MarkLocalSnapshotFunc func(poolName, nick string)
+
 // Poller refreshes the quota store for proprietary-API backends. The zero
 // value is not usable; call New.
 type Poller struct {
-	poolNames []string
-	current   CurrentFunc
-	store     *quota.Store
-	client    *http.Client
-	interval  time.Duration
-	now       func() time.Time
-	logOut    io.Writer
+	poolNames   []string
+	current     CurrentFunc
+	markLocal   MarkLocalSnapshotFunc
+	store       *quota.Store
+	client      *http.Client
+	interval    time.Duration
+	now         func() time.Time
+	logOut      io.Writer
 }
 
 // New builds a Poller over the given pool names. current resolves a pool's
-// active backend; store is where snapshots are filed. client defaults to a
-// 10s-timeout client, interval to 2 minutes, now to time.Now, and logOut
-// to os.Stderr when their zero value is passed.
-func New(poolNames []string, current CurrentFunc, store *quota.Store, client *http.Client, interval time.Duration, now func() time.Time, logOut io.Writer) *Poller {
+// active backend; store is where snapshots are filed; markLocal is called
+// after every successful poll so the originating pool's controller can
+// stop suppressing the cross-pool snapshot for that nick (issue #111).
+// markLocal may be nil for tests that do not care about the
+// per-pool-snapshot signal. client defaults to a 10s-timeout client,
+// interval to 2 minutes, now to time.Now, and logOut to os.Stderr when
+// their zero value is passed.
+func New(poolNames []string, current CurrentFunc, markLocal MarkLocalSnapshotFunc, store *quota.Store, client *http.Client, interval time.Duration, now func() time.Time, logOut io.Writer) *Poller {
 	if client == nil {
 		client = &http.Client{Timeout: defaultTimeout}
 	}
@@ -90,6 +101,7 @@ func New(poolNames []string, current CurrentFunc, store *quota.Store, client *ht
 	return &Poller{
 		poolNames: poolNames,
 		current:   current,
+		markLocal: markLocal,
 		store:     store,
 		client:    client,
 		interval:  interval,
@@ -137,6 +149,12 @@ func (p *Poller) pollAll(ctx context.Context) {
 			continue
 		}
 		p.store.Put(b.QuotaKey(), snap)
+		// Mirror the observer path: a successful poll is the first local
+		// evidence this pool has traffic-shaped state for the nick, so
+		// un-suppress the cross-pool snapshot for it (issue #111).
+		if p.markLocal != nil {
+			p.markLocal(name, b.Nick)
+		}
 	}
 }
 

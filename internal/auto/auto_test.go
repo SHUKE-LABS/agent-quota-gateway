@@ -688,7 +688,7 @@ func TestController_loadState(t *testing.T) {
 
 	// Load persisted state: sticky = c, b exhausted for 1h.
 	reset := clock.now().Add(time.Hour)
-	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{}, 0, nil)
+	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{}, 0, nil, nil)
 
 	if got := c.Current(); got != "c" {
 		t.Fatalf("after loadState sticky=c, Current=%q, want c", got)
@@ -752,7 +752,7 @@ func TestController_loadState_expiredExhaustedDropped(t *testing.T) {
 	c := newController(t, 0, clock, io.Discard, "a", "b")
 
 	pastReset := clock.now().Add(-time.Hour) // already expired
-	c.loadState("a", map[string]time.Time{"b": pastReset}, time.Time{}, 0, nil)
+	c.loadState("a", map[string]time.Time{"b": pastReset}, time.Time{}, 0, nil, nil)
 
 	// b's reset is in the past; resolve should reach b without exhaustion.
 	c.setCur("b")
@@ -768,7 +768,7 @@ func TestController_loadState_unchangedMembership(t *testing.T) {
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b", "c")
 	reset := clock.now().Add(time.Hour)
-	c.loadState("b", map[string]time.Time{"a": reset}, time.Time{}, 0, nil)
+	c.loadState("b", map[string]time.Time{"a": reset}, time.Time{}, 0, nil, nil)
 	if logBuf.Len() != 0 {
 		t.Fatalf("expected no log output for unchanged membership, got: %q", logBuf.String())
 	}
@@ -784,7 +784,7 @@ func TestController_loadState_additiveMembership(t *testing.T) {
 	// Pool now has a, b, c, d but persisted state only knew a, b, c.
 	c := newController(t, 0, clock, &logBuf, "a", "b", "c", "d")
 	reset := clock.now().Add(time.Hour)
-	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{}, 0, nil)
+	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{}, 0, nil, nil)
 	if logBuf.Len() != 0 {
 		t.Fatalf("expected no log output for additive membership, got: %q", logBuf.String())
 	}
@@ -801,7 +801,7 @@ func TestController_loadState_missingStickyLogs(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
-	c.loadState("old", map[string]time.Time{}, time.Time{}, 0, nil)
+	c.loadState("old", map[string]time.Time{}, time.Time{}, 0, nil, nil)
 	if out := logBuf.String(); out != "" {
 		t.Fatalf("loadState must stay silent for a deferred sticky, got: %q", out)
 	}
@@ -821,7 +821,7 @@ func TestController_loadState_staleExhaustedEntryLogged(t *testing.T) {
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
 	reset := clock.now().Add(time.Hour)
-	c.loadState("a", map[string]time.Time{"old": reset}, time.Time{}, 0, nil)
+	c.loadState("a", map[string]time.Time{"old": reset}, time.Time{}, 0, nil, nil)
 	out := logBuf.String()
 	if !strings.Contains(out, "dropping persisted exhausted entry old") {
 		t.Fatalf("expected log about stale exhausted entry, got: %q", out)
@@ -1688,5 +1688,221 @@ func TestRecord429_soonestFallbackExcludesRemoved(t *testing.T) {
 	}
 	if rb.Nick != "b" {
 		t.Errorf("ResolveAuto nick=%q, want b (removed a must never be surfaced)", rb.Nick)
+	}
+}
+
+// snapshotByNick returns a nick -> snapshot map for a PoolStatus.
+func snapshotByNick(s PoolStatus) map[string]*quota.Snapshot {
+	out := make(map[string]*quota.Snapshot, len(s.Members))
+	for i := range s.Members {
+		m := &s.Members[i]
+		out[m.Nick] = m.Snapshot
+	}
+	return out
+}
+
+// TestPoolStatus_runtimeAddedNickSuppressesUntilObservation is the
+// concrete UI scenario from issue #111: nick "shared" lives in pool ONE
+// with a 100% snapshot, and an operator runtime-adds it to pool TWO via
+// the management API. Until pool TWO's first observation (an upstream
+// response or a poller tick) the cell must render "-".
+func TestPoolStatus_runtimeAddedNickSuppressesUntilObservation(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	scrubPoolEnv(t)
+	t.Setenv(backend.EnvPrefix+"ONE_BACKEND_SHARED", "cred-shared")
+	t.Setenv(backend.EnvPrefix+"TWO_BACKEND_X", "cred-x")
+	reg, err := backend.Load(testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	store := quota.NewStore()
+	pools := NewPools(reg, store, nil, io.Discard)
+
+	// Pool ONE carries a 100% snapshot for "shared".
+	u := 1.0
+	store.Put("shared", quota.Snapshot{Unified5hUtilization: &u, AsOf: clock.now()})
+
+	// Operator runtime-adds "shared" to pool TWO. The credential
+	// resolves from pool ONE (it's the only declaration).
+	if status, err := pools.AddMember("two", "shared", "", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember: status=%d err=%v, want 200", status, err)
+	}
+
+	// Fresh render: snapshot must be nil (cell is "-"), not pool ONE's
+	// 100% — the bug we are fixing.
+	status, _ := pools.PoolStatus("two", store)
+	if got := snapshotByNick(status)["shared"]; got != nil {
+		t.Errorf("right after AddMember: snapshot=%+v, want nil (no cross-pool flash)", got)
+	}
+
+	// Simulate the first upstream response landing: the observer calls
+	// MarkLocalSnapshot for the resolved backend, then the next render
+	// surfaces the snapshot.
+	pools.MarkLocalSnapshot("two", "shared")
+	statusAfter, _ := pools.PoolStatus("two", store)
+	got := snapshotByNick(statusAfter)["shared"]
+	if got == nil {
+		t.Fatal("after MarkLocalSnapshot: snapshot=nil, want non-nil")
+	}
+	if got.Unified5hUtilization == nil || *got.Unified5hUtilization != 1.0 {
+		t.Errorf("after MarkLocalSnapshot: Unified5hUtilization=%v, want 1.0", got.Unified5hUtilization)
+	}
+}
+
+// TestController_MarkLocalSnapshot_unknownNickIgnored proves that
+// MarkLocalSnapshot is a no-op for nicks that are not a member of the
+// target pool, and for empty pool/nick inputs.
+func TestController_MarkLocalSnapshot_unknownNickIgnored(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+
+	pools.MarkLocalSnapshot("", "a")  // empty pool
+	pools.MarkLocalSnapshot("auto", "") // empty nick
+	pools.MarkLocalSnapshot("auto", "ghost") // not a member
+	pools.MarkLocalSnapshot("missing-pool", "a") // unknown pool
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.poolLocalSnapshots["ghost"]; ok {
+		t.Error("MarkLocalSnapshot seeded non-member ghost")
+	}
+	if _, ok := c.poolLocalSnapshots["a"]; !ok {
+		// "a" is a static member — it was seeded at construction, so it
+		// should be present regardless of the no-op calls above.
+		t.Error("static member a missing from poolLocalSnapshots (seed regression)")
+	}
+}
+
+// TestPoolPersistState_localSnapshotNicksRoundTrip proves that the
+// "we have seen traffic for this nick" set survives a persist+restart
+// cycle, but entries that no longer name a current member are dropped
+// (mirroring the sticky-pointer drop for non-members).
+func TestPoolPersistState_localSnapshotNicksRoundTrip(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+
+	// Mark b and a local-snapshot (mimics the controller having observed
+	// traffic for them). Add a stale entry for "ghost" that no longer
+	// names a member.
+	c.poolLocalSnapshots["a"] = struct{}{}
+	c.poolLocalSnapshots["b"] = struct{}{}
+	c.poolLocalSnapshots["ghost"] = struct{}{}
+
+	ps := pools.PersistState()
+	locals := ps["auto"].LocalSnapshotNicks
+	if len(locals) != 3 {
+		t.Fatalf("persist LocalSnapshotNicks=%v, want [a b c] (the three static members; ghost filtered because it is non-member)", locals)
+	}
+	want := map[string]bool{"a": true, "b": true, "c": true}
+	for _, n := range locals {
+		if !want[n] {
+			t.Errorf("unexpected persisted nick %q", n)
+		}
+	}
+
+	// Fresh controller, same members, restore. The "ghost" entry is in
+	// the persisted set and must be silently dropped on load.
+	c2 := newController(t, 1, clock, io.Discard, "a", "b", "c")
+	pools2 := &Pools{byPool: map[string]*Controller{"auto": c2}}
+	pools2.LoadPersistState(ps)
+
+	// Static members are seeded at construction; the restored
+	// LocalSnapshotNicks adds the persisted b on top (a was already
+	// there) and drops ghost.
+	c2.mu.Lock()
+	_, aOK := c2.poolLocalSnapshots["a"]
+	_, bOK := c2.poolLocalSnapshots["b"]
+	_, ghostOK := c2.poolLocalSnapshots["ghost"]
+	c2.mu.Unlock()
+	if !aOK || !bOK {
+		t.Errorf("after restore: aOK=%v bOK=%v, want both true", aOK, bOK)
+	}
+	if ghostOK {
+		t.Error("after restore: ghost survived, want dropped (non-member)")
+	}
+}
+
+// TestPoolPersistState_runtimeAddedMemberRoundTrip proves AC #4: a
+// runtime-added member for which the controller has observed traffic
+// survives a persist/reload cycle WITHOUT re-flashing "-" after the
+// restart. This is the only path that exercises
+// pendingLocalSnapshots -> applyPendingLocalSnapshotsLocked: runtime
+// members are restored by LoadRuntimeConfig (after LoadPersistState),
+// so the persisted LocalSnapshotNicks entries that name them cannot
+// be seeded at loadState time and must be applied at the end of
+// LoadRuntimeConfig.
+func TestPoolPersistState_runtimeAddedMemberRoundTrip(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "ONE_BACKEND_SHARED": "cred-shared",
+		backend.EnvPrefix + "TWO_BACKEND_X":      "cred-x",
+	})
+
+	// Create a runtime pool and runtime-add "shared" to it (the same
+	// shape the issue's UI scenario uses). "shared" already exists in
+	// pool ONE, so the credential resolves from there.
+	if status, err := p.AddPool("rt", "https://rt.example", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool rt: status=%d err=%v, want 201", status, err)
+	}
+	if status, err := p.AddMember("rt", "shared", "", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember rt shared: status=%d err=%v, want 200", status, err)
+	}
+
+	// Simulate the controller having observed traffic for "shared"
+	// (header observer or poller tick), so the gate opens for it.
+	p.MarkLocalSnapshot("rt", "shared")
+
+	// Capture the persisted state. The runtime pool, its added member,
+	// and the local-snapshot entry all need to round-trip.
+	addedPools := p.PersistAddedPools()
+	persistState := p.PersistState()
+	runtimeConfig := p.PersistRuntimeConfig()
+	if _, ok := persistState["rt"]; !ok {
+		t.Fatalf("PersistState missing rt entry: %+v", persistState)
+	}
+	if len(persistState["rt"].LocalSnapshotNicks) != 1 || persistState["rt"].LocalSnapshotNicks[0] != "shared" {
+		t.Fatalf("persist LocalSnapshotNicks=%v, want [shared]", persistState["rt"].LocalSnapshotNicks)
+	}
+
+	// Re-instantiate in the production load order: added pools first,
+	// then persist state, then runtime config. The deferred
+	// applyPendingLocalSnapshotsLocked runs at the end of
+	// LoadRuntimeConfig.
+	clock2 := newMoveClock()
+	p2 := loadMovePools(t, clock2, map[string]string{
+		backend.EnvPrefix + "ONE_BACKEND_SHARED": "cred-shared",
+		backend.EnvPrefix + "TWO_BACKEND_X":      "cred-x",
+	})
+	p2.LoadAddedPools(addedPools)
+	p2.LoadPersistState(persistState)
+	p2.LoadRuntimeConfig(runtimeConfig)
+
+	// The runtime member must be back in the controller's effective
+	// set AND its poolLocalSnapshots entry must be present (the gate
+	// is open — no "-" re-flash after restart).
+	c, ok := p2.controller("rt")
+	if !ok {
+		t.Fatal("rt pool missing after restart")
+	}
+	c.mu.Lock()
+	_, sharedOK := c.poolLocalSnapshots["shared"]
+	c.mu.Unlock()
+	if !sharedOK {
+		t.Errorf("after restart: poolLocalSnapshots[shared] missing, want true (deferred-apply regression)")
+	}
+
+	// Sanity: the runtime member is actually a member, and a fresh
+	// status view attaches the snapshot (gate open + data present).
+	store := quota.NewStore()
+	u := 0.42
+	store.Put("shared", quota.Snapshot{Unified5hUtilization: &u, AsOf: clock2.now()})
+	status, _ := p2.PoolStatus("rt", store)
+	snap := snapshotByNick(status)["shared"]
+	if snap == nil {
+		t.Error("after restart: snapshot=nil, want non-nil (gate should be open)")
+	} else if snap.Unified5hUtilization == nil || *snap.Unified5hUtilization != 0.42 {
+		t.Errorf("after restart: Unified5hUtilization=%v, want 0.42", snap.Unified5hUtilization)
 	}
 }
