@@ -47,14 +47,27 @@ func TestAdd_resolvesKnownCredentialAndBaseURL(t *testing.T) {
 
 // TestAdd_ambiguousCredentialRejected proves that an omitted credential for a
 // nick that exists with differing credentials across pools is rejected.
+//
+// The static-config bijection (a nick must carry the same credential
+// everywhere) forbids the same nick in two pools at load time, so the
+// cross-pool state is seeded here via the runtime add path — the only
+// remaining way the same nick can land in two pools. The runtime ambiguity
+// guard under test is unchanged.
 func TestAdd_ambiguousCredentialRejected(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "ONE_BACKEND_SHARED": "cred-1",
-		backend.EnvPrefix + "TWO_BACKEND_SHARED": "cred-2",
+		backend.EnvPrefix + "TWO_BACKEND_OTHER":  "cred-other",
 		backend.EnvPrefix + "DST_BACKEND_X":      "cred-x",
 	})
 
+	// Seed "shared" in a second pool with a differing credential.
+	if status, err := p.AddMember("two", "shared", "cred-2", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("seed AddMember two shared: status=%d err=%v, want 200", status, err)
+	}
+
+	// Adding "shared" to dst with the credential omitted is now ambiguous:
+	// ONE holds cred-1, TWO holds cred-2.
 	if status, err := p.AddMember("dst", "shared", "", "", nil); status != http.StatusBadRequest || err == nil {
 		t.Fatalf("ambiguous credential: status=%d err=%v, want 400", status, err)
 	}
@@ -79,16 +92,28 @@ func TestAdd_unknownNickRequiresCredential(t *testing.T) {
 // TestAdd_ambiguousBaseURLRejected proves credential and base_url resolve
 // independently: a consistent credential resolves, but a base_url that differs
 // across pools is rejected (rather than silently picking one).
+//
+// As above, the static bijection forbids the same nick in two pools with
+// different credentials (or with the same credential but different base_urls
+// is also a non-issue since the credential matches and resolves), so the
+// second occurrence is seeded via the runtime add path.
 func TestAdd_ambiguousBaseURLRejected(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "ONE_BACKEND_SHARED": "cred-same",
 		backend.EnvPrefix + "ONE_BASE_URL":       "https://a.example",
-		backend.EnvPrefix + "TWO_BACKEND_SHARED": "cred-same",
-		backend.EnvPrefix + "TWO_BASE_URL":       "https://b.example",
+		backend.EnvPrefix + "TWO_BACKEND_OTHER":  "cred-other",
 		backend.EnvPrefix + "DST_BACKEND_X":      "cred-x",
 	})
 
+	// Seed "shared" in a second pool with the same credential but a differing
+	// base_url.
+	if status, err := p.AddMember("two", "shared", "cred-same", "https://b.example", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("seed AddMember two shared: status=%d err=%v, want 200", status, err)
+	}
+
+	// Credential resolves consistently to cred-same, but base_url is ambiguous
+	// (a.example vs b.example), so the add is rejected.
 	if status, err := p.AddMember("dst", "shared", "", "", nil); status != http.StatusBadRequest || err == nil {
 		t.Fatalf("ambiguous base_url: status=%d err=%v, want 400", status, err)
 	}

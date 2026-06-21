@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,8 +36,8 @@ func TestLoadFrom_collectsAndNormalizes(t *testing.T) {
 	if b != want {
 		t.Errorf("ResolveIn(auto, claude-a) = %+v, want %+v", b, want)
 	}
-	if b.QuotaKey() != "auto/claude-a" {
-		t.Errorf("QuotaKey() = %q, want auto/claude-a", b.QuotaKey())
+	if b.QuotaKey() != "claude-a" {
+		t.Errorf("QuotaKey() = %q, want claude-a", b.QuotaKey())
 	}
 }
 
@@ -149,12 +150,23 @@ func TestLoadFrom_collisionRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected collision error for two keys mapping to auto/claude-a")
 	}
-	// Same nick in *different* pools is fine — they are distinct identities.
+	// Same nick across two pools with the *identical* credential is the
+	// sharing shape (one physical account present in two routing contexts);
+	// nick is the global quota identity, so this is allowed.
+	if _, err := loadFrom([]string{
+		"AQG_POOL_AUTO_BACKEND_A=cred-shared",
+		"AQG_POOL_API_BACKEND_A=cred-shared",
+	}, testDefaultBaseURL); err != nil {
+		t.Fatalf("same nick + identical credential across pools should be allowed: %v", err)
+	}
+	// Same nick across two pools with *different* credentials is rejected:
+	// the two declarations would point the same quota key at two distinct
+	// credentials, reintroducing the cross-pool staleness bug.
 	if _, err := loadFrom([]string{
 		"AQG_POOL_AUTO_BACKEND_A=cred-1",
 		"AQG_POOL_API_BACKEND_A=cred-2",
-	}, testDefaultBaseURL); err != nil {
-		t.Fatalf("same nick in different pools should be allowed: %v", err)
+	}, testDefaultBaseURL); err == nil {
+		t.Fatal("expected error for the same nick with different credentials across pools")
 	}
 }
 
@@ -444,8 +456,8 @@ func TestBuildFromSpec_parityWithEnv(t *testing.T) {
 	if b != want {
 		t.Errorf("ResolveIn(auto, claude-a) = %+v, want %+v", b, want)
 	}
-	if b.QuotaKey() != "auto/claude-a" {
-		t.Errorf("QuotaKey() = %q, want auto/claude-a", b.QuotaKey())
+	if b.QuotaKey() != "claude-a" {
+		t.Errorf("QuotaKey() = %q, want claude-a", b.QuotaKey())
 	}
 }
 
@@ -781,5 +793,105 @@ func TestBuildFromSpec_emptyPriorityEntry(t *testing.T) {
 	_, err := BuildFromSpec(spec, testDefaultBaseURL)
 	if err == nil {
 		t.Error("expected error for empty priority entry")
+	}
+}
+
+// TestBuildFromSpec_sameNickAcrossPoolsSharesQuotaKey proves the intended
+// sharing shape: a high-volume subscription declared by the same nick in two
+// pools, with the identical credential, builds, and both pool members resolve
+// to the same QuotaKey() — so the shared quota store becomes the cross-pool
+// sharing path by construction.
+func TestBuildFromSpec_sameNickAcrossPoolsSharesQuotaKey(t *testing.T) {
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"P1": {Members: map[string]MemberSpec{"shared": {Credential: "cred-1"}}},
+			"P2": {Members: map[string]MemberSpec{"shared": {Credential: "cred-1"}}},
+		},
+	}
+	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	b1, ok := reg.ResolveIn("p1", "shared")
+	if !ok {
+		t.Fatal("shared not found in p1")
+	}
+	b2, ok := reg.ResolveIn("p2", "shared")
+	if !ok {
+		t.Fatal("shared not found in p2")
+	}
+	if b1.QuotaKey() != b2.QuotaKey() {
+		t.Errorf("QuotaKey() differs across pools: %q vs %q (want identical)", b1.QuotaKey(), b2.QuotaKey())
+	}
+	if b1.QuotaKey() != "shared" {
+		t.Errorf("QuotaKey() = %q, want shared (nick alone)", b1.QuotaKey())
+	}
+}
+
+// TestBuildFromSpec_sameNickDifferentCredentialsRejected proves the
+// nick⇒one-credential half of the bijection: a nick reappearing across pools
+// must carry the identical credential, otherwise the same quota key would
+// alias two distinct credentials and the per-nick snapshot becomes ambiguous.
+func TestBuildFromSpec_sameNickDifferentCredentialsRejected(t *testing.T) {
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"P1": {Members: map[string]MemberSpec{"shared": {Credential: "cred-1"}}},
+			"P2": {Members: map[string]MemberSpec{"shared": {Credential: "cred-2"}}},
+		},
+	}
+	_, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err == nil {
+		t.Fatal("expected error for the same nick with different credentials")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "redeclares nick") || !strings.Contains(msg, "different credential") {
+		t.Errorf("error should mention the redeclared nick and credential mismatch: %q", msg)
+	}
+	// Both occurrences must be named.
+	if !strings.Contains(msg, "pools.P1.members.shared") || !strings.Contains(msg, "pools.P2.members.shared") {
+		t.Errorf("error should name both origins: %q", msg)
+	}
+	// The credential values must never leak into the error.
+	if strings.Contains(msg, "cred-1") || strings.Contains(msg, "cred-2") {
+		t.Errorf("error must not contain a credential value: %q", msg)
+	}
+}
+
+// TestBuildFromSpec_sameCredentialDifferentNicksRejected proves the
+// credential⇒one-nick half of the bijection: a credential bound under two
+// different nicks would still alias one physical account across two quota
+// keys, reproducing the cross-pool staleness under a different shape.
+func TestBuildFromSpec_sameCredentialDifferentNicksRejected(t *testing.T) {
+	cases := map[string]Spec{
+		"across pools": {
+			Pools: map[string]PoolSpec{
+				"P1": {Members: map[string]MemberSpec{"a": {Credential: "shared"}}},
+				"P2": {Members: map[string]MemberSpec{"b": {Credential: "shared"}}},
+			},
+		},
+		"within one pool": {
+			Pools: map[string]PoolSpec{
+				"P1": {Members: map[string]MemberSpec{
+					"a": {Credential: "shared"},
+					"b": {Credential: "shared"},
+				}},
+			},
+		},
+	}
+	for name, spec := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := BuildFromSpec(spec, testDefaultBaseURL)
+			if err == nil {
+				t.Fatal("expected error for a credential bound under two nicks")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "redeclares credential") {
+				t.Errorf("error should mention the redeclared credential: %q", msg)
+			}
+			// The credential value must never leak into the error.
+			if strings.Contains(msg, "shared") {
+				t.Errorf("error must not contain a credential value: %q", msg)
+			}
+		})
 	}
 }

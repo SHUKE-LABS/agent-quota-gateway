@@ -226,12 +226,18 @@ func TestMove_overwriteMatchSilent(t *testing.T) {
 }
 
 // TestMove_staticTarget covers moving onto a same-nick static target: a match
-// is a silent no-op (slot preserved); a differing static target is an
-// unresolvable conflict that force cannot override.
+// is a silent no-op (slot preserved). The legacy "differing static target"
+// sub-case is gone: the static-config nick↔credential bijection forbids two
+// pools from declaring the same nick with different credentials, so a static
+// same-nick target with a different credential cannot exist. The "differing"
+// conflict is now reachable only via a runtime-added target slot, which
+// TestMove_runtimeAddedTarget exercises.
 func TestMove_staticTarget(t *testing.T) {
 	clock := newMoveClock()
 
 	// Matching static target: both pools declare a with the same credential.
+	// The new design treats this as the sharing shape — one account present
+	// in two routing contexts — and MoveMember is a silent no-op.
 	pMatch := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_A": "cred-a",
 		backend.EnvPrefix + "DST_BACKEND_A": "cred-a",
@@ -245,17 +251,30 @@ func TestMove_staticTarget(t *testing.T) {
 	if !poolMembers(t, pMatch, "dst")["a"] {
 		t.Errorf("a missing from dst after matching static move")
 	}
+}
 
-	// Differing static target: force cannot override an immutable static member.
-	pDiff := loadMovePools(t, clock, map[string]string{
+// TestMove_runtimeAddedTarget covers moving onto a same-nick target whose
+// existing slot is a runtime-added member with a different credential: the
+// move needs force=true to overwrite, and a plain call returns 409.
+func TestMove_runtimeAddedTarget(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_A": "cred-a",
-		backend.EnvPrefix + "DST_BACKEND_A": "cred-different",
+		backend.EnvPrefix + "DST_BACKEND_X": "cred-x",
 	})
-	if status, _ := pDiff.MoveMember("src", "a", "dst", nil, false); status != http.StatusConflict {
-		t.Errorf("differing static move (no force): status=%d, want 409", status)
+
+	// Seed a runtime-added "a" in dst with a differing credential. The
+	// static bijection does not cover runtime adds, so the only way to
+	// reach this conflict is via the management API.
+	if status, err := p.AddMember("dst", "a", "cred-different", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("seed AddMember dst a: status=%d err=%v, want 200", status, err)
 	}
-	if status, _ := pDiff.MoveMember("src", "a", "dst", nil, true); status != http.StatusConflict {
-		t.Errorf("differing static move (force): status=%d, want 409 (static is immutable)", status)
+
+	if status, _ := p.MoveMember("src", "a", "dst", nil, false); status != http.StatusConflict {
+		t.Errorf("differing runtime-added target (no force): status=%d, want 409", status)
+	}
+	if status, _ := p.MoveMember("src", "a", "dst", nil, true); status != http.StatusOK {
+		t.Errorf("differing runtime-added target (force): status=%d, want 200", status)
 	}
 }
 

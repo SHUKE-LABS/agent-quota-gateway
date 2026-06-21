@@ -98,10 +98,13 @@ type Backend struct {
 }
 
 // QuotaKey is the stable key the quota store files this backend's
-// snapshots under. Nicks are unique only within a pool, so the key is
-// qualified by pool to stay globally unique.
+// snapshots under. Nick is the global identity for a physical account: the
+// same nick declared in any number of pools resolves to one key here, so the
+// shared quota store becomes the cross-pool sharing path by construction. A
+// high-volume subscription added to several pools has its exhaustion recorded
+// once under that nick and read by every pool that selects it.
 func (b Backend) QuotaKey() string {
-	return b.Pool + "/" + b.Nick
+	return b.Nick
 }
 
 // Registry maps pool names to their members. It is immutable after Load
@@ -528,6 +531,38 @@ func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
 	for i := range p.members {
 		if p.members[i].cred == "" {
 			return nil, fmt.Errorf("backend: %s has an empty credential", p.members[i].originKey)
+		}
+	}
+
+	// Enforce the nick↔credential bijection. Nick is the quota primary key
+	// (see QuotaKey): the same physical account is intended to be referenced
+	// by the same nick across multiple pools, so a nick legitimately reappears
+	// — but only when every declaration carries the identical credential. The
+	// credential is likewise bound to exactly one nick, otherwise two quota
+	// keys would still alias one physical account. The same-pool duplicate
+	// nick case is already caught by the syntactic originKey dedup in
+	// loadFrom / BuildFromSpec, so this loop only governs the cross-pool
+	// pairing. No credential value is emitted in either error.
+	nickCred := make(map[string]string, len(p.members))  // nick -> cred
+	nickOrigin := make(map[string]string, len(p.members)) // nick -> originKey (for error path)
+	credNick := make(map[string]string, len(p.members))   // cred -> nick
+	credOrigin := make(map[string]string, len(p.members)) // cred -> originKey
+	for _, m := range p.members {
+		if prevCred, seen := nickCred[m.nick]; seen {
+			if prevCred != m.cred {
+				return nil, fmt.Errorf("backend: %s redeclares nick %q with a different credential than %s", m.originKey, m.nick, nickOrigin[m.nick])
+			}
+		} else {
+			nickCred[m.nick] = m.cred
+			nickOrigin[m.nick] = m.originKey
+		}
+		if prevNick, seen := credNick[m.cred]; seen {
+			if prevNick != m.nick {
+				return nil, fmt.Errorf("backend: %s redeclares credential (nick %q) already bound to nick %q at %s", m.originKey, m.nick, prevNick, credOrigin[m.cred])
+			}
+		} else {
+			credNick[m.cred] = m.nick
+			credOrigin[m.cred] = m.originKey
 		}
 	}
 

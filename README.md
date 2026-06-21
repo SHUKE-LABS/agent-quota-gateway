@@ -115,6 +115,31 @@ normalized: `AQG_POOL_AUTO_BACKEND_A` declares pool `auto`, member `a`
 (lowercase, `_`→`-`), and the client selects it by sending `auto` in any
 case.
 
+A **member name (nick) is the global identity for a physical account.** The
+gateway keys quota state by `QuotaKey()` (see `internal/backend`), and
+`QuotaKey()` is the nick alone — not `pool/nick`. This is deliberate: a
+high-volume subscription added to several pools has its exhaustion recorded
+once under that nick and read by every pool that selects it, so the same
+account can be shared across pools without the cross-pool staleness where one
+pool's "fresh-looking" copy gets picked after the other has already exhausted
+it.
+
+Two corollaries keep that sharing honest:
+
+- **The same nick may appear in multiple pools** to share a single
+  subscription. It is the intended way to add the same account to a second
+  routing context.
+- **The nick↔credential mapping is one-to-one.** A credential is bound to
+  exactly one nick, and every declaration of a nick must use the identical
+  credential. A different credential for the same nick (or the same
+  credential under a different nick) is a load error that names both
+  occurrences. Without this bijection, two quota keys would still alias one
+  physical account.
+
+The runtime add-member API (see [Runtime pool configuration](#runtime-pool-configuration))
+is unaffected — it resolves a known subscription's credential and base URL
+across pools and keeps its own same-nick-slot overwrite/conflict rules.
+
 ### Auth schemes
 
 The gateway picks the outbound auth scheme per credential, by prefix:
