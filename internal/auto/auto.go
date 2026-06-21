@@ -2004,13 +2004,23 @@ func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset tim
 // kept only as a secondary positive signal, and is the sole signal for
 // poller-tracked backends (z.ai / MiniMaxi / Ark) that report no status.
 // It checks the 429 response first, then the most recent store snapshot.
+//
+// Snapshot freshness matters for both paths: a poller-tracked member whose
+// window reset has already passed but whose stored utilization is still
+// frozen at 1.0 (the poller only tracks the active member, so a failed-off
+// member's entry freezes at its last good reset) must read *not* blocking —
+// otherwise a transient overload 429 on a recovered member is falsely
+// parked. The reset-freshness guard lives in windowBlocks for the no-status
+// branch, mirroring storeExhaustedUntilLocked's behaviour on the recovery
+// side (#125).
 func (c *Controller) isGenuineExhaustionSignal(nick string, respSnap quota.Snapshot) bool {
-	if snapRejects(respSnap) {
+	now := c.now()
+	if snapRejects(respSnap, now) {
 		return true
 	}
 	if c.store != nil {
 		if idx := c.indexOf(nick); idx >= 0 {
-			if snapRejects(c.store.Get(c.backendAt(idx).QuotaKey())) {
+			if snapRejects(c.store.Get(c.backendAt(idx).QuotaKey()), now) {
 				return true
 			}
 		}
@@ -2021,11 +2031,16 @@ func (c *Controller) isGenuineExhaustionSignal(nick string, respSnap quota.Snaps
 // snapRejects reports whether snap shows the backend actually rate-limited:
 // an overall "rejected" unified status, or either unified window blocking
 // (see windowBlocks — a per-window "rejected", or, absent a status, a
-// utilization at the cap).
-func snapRejects(snap quota.Snapshot) bool {
+// utilization at the cap with a reset still in the future).
+//
+// now is the controller's clock reading; it gates the no-status util-only
+// branch so a frozen at-cap snapshot whose reset has already passed reads
+// not blocking. The status branch ignores now — an explicit "rejected" is
+// authoritative regardless of reset arithmetic.
+func snapRejects(snap quota.Snapshot, now time.Time) bool {
 	return snap.UnifiedStatus == unifiedStatusRejected ||
-		windowBlocks(snap.Unified5hUtilization, snap.Unified5hStatus) ||
-		windowBlocks(snap.Unified7dUtilization, snap.Unified7dStatus)
+		windowBlocks(snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset, now) ||
+		windowBlocks(snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset, now)
 }
 
 // record429Result reports the outcome of recording an upstream 429.
@@ -2137,6 +2152,7 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	snap := c.store.Get(c.backendAt(idx).QuotaKey())
+	now := c.now()
 	reset, ok := time.Time{}, false
 	for _, w := range [...]struct {
 		util   *float64
@@ -2146,10 +2162,18 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 		{snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset},
 		{snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset},
 	} {
-		if !windowBlocks(w.util, w.status) {
+		// windowBlocks is the single source of truth for the freshness
+		// contract: the no-status branch requires reset != nil AND
+		// now.Before(*reset), so a frozen at-cap snapshot whose reset has
+		// already passed reads as not blocking here. The status branch
+		// returns true regardless of reset (an explicit "rejected" is
+		// authoritative and refreshed on every response), so w.reset may
+		// still be nil past the gate — skip those windows since we have no
+		// future reset to anchor.
+		if !windowBlocks(w.util, w.status, w.reset, now) {
 			continue
 		}
-		if w.reset == nil || !c.now().Before(*w.reset) {
+		if w.reset == nil {
 			continue
 		}
 		if !ok || w.reset.After(reset) {
@@ -2167,14 +2191,23 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 //     utilization 1.0 with status "allowed"/"allowed_warning" while still
 //     serving it (the soft-cap / overage / fallback zone). Treating 1.0 as
 //     exhausted there wrongly parks a member Anthropic would happily serve,
-//     which can lock an entire pool out as "all exhausted".
+//     which can lock an entire pool out as "all exhausted". The status path
+//     is refreshed on every response, so reset and now are intentionally
+//     ignored here — no freshness window exists for an explicit "rejected".
 //   - When the window has no status (poller-tracked z.ai / MiniMaxi / Ark,
-//     which report only a utilization fraction), fall back to the cap.
-func windowBlocks(util *float64, status string) bool {
+//     which report only a utilization fraction), fall back to the cap, but
+//     ONLY while the window's reset is still in the future. The poller
+//     only tracks the active member, so a failed-off member's entry freezes
+//     at its last good reset; once that reset passes the entry is stale and
+//     must read not blocking — otherwise a transient overload 429 on a
+//     recovered member is falsely parked. This freshness guard is the same
+//     one storeExhaustedUntilLocked applies on the recovery side (#125).
+func windowBlocks(util *float64, status string, reset *time.Time, now time.Time) bool {
 	if status != "" {
 		return status == unifiedStatusRejected
 	}
-	return util != nil && *util >= exhaustionUtilizationThreshold
+	return util != nil && *util >= exhaustionUtilizationThreshold &&
+		reset != nil && now.Before(*reset)
 }
 
 // memberLeadsLocked computes the routing pressure for nick from the quota

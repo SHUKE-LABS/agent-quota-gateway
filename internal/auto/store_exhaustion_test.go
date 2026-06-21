@@ -282,6 +282,122 @@ func TestStoreExhausted_pastResetOn7dNotExhausted(t *testing.T) {
 	}
 }
 
+// TestSnapRejects_* — regression coverage for the #125 freshness guard.
+// The park-decision path (`snapRejects` → `isGenuineExhaustionSignal`) must
+// read a frozen at-cap snapshot as *not* blocking once its reset has passed,
+// so a transient overload 429 on a recovered poller-tracked member is
+// forwarded rather than parked. The status-driven branch is unaffected —
+// an explicit "rejected" is authoritative regardless of reset arithmetic.
+
+// TestSnapRejects_staleAtCapWithPastResetIsNotBlocking proves the core #125
+// fix: a poller-tracked member whose stored utilization is frozen at 1.0
+// but whose window reset has already passed reads as not blocking. The
+// frozen-at-cap shape is exactly what the poller leaves behind for a
+// failed-off member until the poller resumes tracking it.
+func TestSnapRejects_staleAtCapWithPastResetIsNotBlocking(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	util := 1.0
+	past := clock.now().Add(-time.Minute)
+	snap := quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hReset:       &past,
+		AsOf:                 past.Add(-time.Hour),
+	}
+
+	if snapRejects(snap, clock.now()) {
+		t.Errorf("snapRejects(stale at-cap) = true, want false (window reset has passed)")
+	}
+}
+
+// TestSnapRejects_freshAtCapIsBlocking proves the genuine-exhaustion path
+// still parks: the same at-cap snapshot with a reset still in the future
+// reads as blocking, so the live 429 takes the park + failover branch
+// instead of being forwarded as a policy 429.
+func TestSnapRejects_freshAtCapIsBlocking(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	util := 1.0
+	future := clock.now().Add(time.Hour)
+	snap := quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hReset:       &future,
+		AsOf:                 clock.now(),
+	}
+
+	if !snapRejects(snap, clock.now()) {
+		t.Errorf("snapRejects(fresh at-cap) = false, want true (window still blocking)")
+	}
+}
+
+// TestSnapRejects_rejectedStatusStillBlocksRegardlessOfReset proves the
+// Anthropic status-driven branch is unaffected by the #125 change: an
+// explicit "rejected" status parks even when the window reset has already
+// passed. The status is refreshed on every response, so there is no
+// freshness window to apply to it.
+func TestSnapRejects_rejectedStatusStillBlocksRegardlessOfReset(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	util := 0.4 // below the cap — status alone blocks
+	past := clock.now().Add(-time.Minute)
+	snap := quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		Unified5hReset:       &past,
+		AsOf:                 clock.now(),
+	}
+
+	if !snapRejects(snap, clock.now()) {
+		t.Errorf("snapRejects(rejected status, past reset) = false, want true (status is authoritative)")
+	}
+
+	// And the overall rejected status blocks even with no per-window reset at all.
+	if !snapRejects(quota.Snapshot{UnifiedStatus: unifiedStatusRejected}, clock.now()) {
+		t.Errorf("snapRejects(overall rejected) = false, want true")
+	}
+}
+
+// TestSnapRejects_7dStaleAtCapMirrors5h proves the same freshness guard
+// applies to the 7d (weekly) window. A poller-tracked z.ai member whose
+// weekly cap is frozen at 1.0 with a passed reset must also read not
+// blocking — a transient overload 429 on it must not park for a week.
+func TestSnapRejects_7dStaleAtCapMirrors5h(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	util := 1.0
+	past := clock.now().Add(-time.Minute)
+	snap := quota.Snapshot{
+		Unified7dUtilization: &util,
+		Unified7dReset:       &past,
+		AsOf:                 past.Add(-24*time.Hour),
+	}
+
+	if snapRejects(snap, clock.now()) {
+		t.Errorf("snapRejects(stale 7d at-cap) = true, want false (weekly reset has passed)")
+	}
+}
+
+// TestStoreExhaustedUntil_rejectedStatusWithNilResetSkipsWindow locks in
+// the edge-case behaviour carried over from the pre-#125 implementation:
+// when a window reports status="rejected" but carries no captured reset,
+// there is no future reset to anchor, so the window contributes nothing.
+// The fresh-redundant reset (the explicit `w.reset == nil` skip past the
+// windowBlocks gate in storeExhaustedUntilLocked) preserves this.
+func TestStoreExhaustedUntil_rejectedStatusWithNilResetSkipsWindow(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	util := 0.4
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		// Unified5hReset deliberately nil — the captured 429 carried no
+		// reset header, so there is no future anchor.
+		AsOf: clock.now(),
+	})
+
+	if got, ok := c.exhaustedUntil("a"); ok {
+		t.Errorf("exhaustedUntil = %v,true, want false (no captured reset → no contribution)", got)
+	}
+}
+
 // TestStoreExhaustion_runtimePriorityPreemptsBack proves that a pool with
 // no static PRIORITY declaration, given a runtime priority via SetPriority,
 // correctly preempts back to a recovered higher-priority member. This is the
