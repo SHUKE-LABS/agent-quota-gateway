@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -797,4 +798,213 @@ func TestPersist_corruptFileStartsFresh(t *testing.T) {
 	if len(state.Pools) != 0 || len(state.Snapshots) != 0 {
 		t.Errorf("expected empty state for corrupt file, got %+v", state)
 	}
+}
+
+// migrateTestRegistry returns an env-declared Registry with a single pool
+// "auto" containing the listed nicks, used by the migration unit tests.
+func migrateTestRegistry(t *testing.T, nicks ...string) *backend.Registry {
+	t.Helper()
+	scrubPoolEnv(t)
+	for _, n := range nicks {
+		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
+	}
+	reg, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	return reg
+}
+
+// TestMigrateSnapshotKeys_oldFormatRewrites is the core #116 regression: a
+// state file written under the pre-#115 "<pool>/<nick>" key shape must be
+// rewritten to "<nick>" so the snapshot is reachable via Store.Get("<nick>")
+// on restart. Without the migration, Store.Get returns the zero Snapshot
+// until the next quota-bearing response lands (issue #116, Problem section).
+func TestMigrateSnapshotKeys_oldFormatRewrites(t *testing.T) {
+	reg := migrateTestRegistry(t, "ccw", "cch")
+	util := 0.55
+	state := persist.GatewayState{
+		Snapshots: map[string]quota.Snapshot{
+			"auto/ccw": {UnifiedStatus: "allowed", Unified5hUtilization: &util},
+		},
+	}
+
+	migrated, dropped := migrateSnapshotKeys(state, reg)
+
+	if got, want := len(migrated), 1; got != want {
+		t.Fatalf("len(migrated) = %d, want %d (got %+v)", got, want, migrated)
+	}
+	if _, ok := migrated["ccw"]; !ok {
+		t.Errorf("migrated map missing %q (got keys %v)", "ccw", keysOf(migrated))
+	}
+	if len(dropped) != 0 {
+		t.Errorf("dropped = %v, want []", dropped)
+	}
+}
+
+// TestMigrateSnapshotKeys_newFormatPassthrough proves the migration is
+// idempotent: a state file already in the new shape is returned unchanged,
+// so an upgrade-then-restart-then-restart sequence never disturbs the data.
+func TestMigrateSnapshotKeys_newFormatPassthrough(t *testing.T) {
+	reg := migrateTestRegistry(t, "ccw")
+	util := 0.7
+	state := persist.GatewayState{
+		Snapshots: map[string]quota.Snapshot{
+			"ccw": {UnifiedStatus: "allowed", Unified5hUtilization: &util},
+		},
+	}
+
+	migrated, dropped := migrateSnapshotKeys(state, reg)
+
+	if got, want := len(migrated), 1; got != want {
+		t.Fatalf("len(migrated) = %d, want %d", got, want)
+	}
+	if _, ok := migrated["ccw"]; !ok {
+		t.Errorf("migrated map missing %q (got keys %v)", "ccw", keysOf(migrated))
+	}
+	if len(dropped) != 0 {
+		t.Errorf("dropped = %v, want []", dropped)
+	}
+}
+
+// TestMigrateSnapshotKeys_orphanedOldKeyDropped proves the conservative drop:
+// a key whose nick is not in any current pool (env-declared or runtime-added)
+// is excluded from the migrated map and reported in the dropped list so the
+// caller can log the loss for an operator audit. A kept-but-unreachable
+// snapshot is a permanent orphan and would linger in the store across
+// restarts (issue #116, Conclusion).
+func TestMigrateSnapshotKeys_orphanedOldKeyDropped(t *testing.T) {
+	reg := migrateTestRegistry(t, "ccw") // "orphan" not known
+	util := 0.4
+	state := persist.GatewayState{
+		Snapshots: map[string]quota.Snapshot{
+			"auto/orphan": {UnifiedStatus: "allowed", Unified5hUtilization: &util},
+		},
+	}
+
+	migrated, dropped := migrateSnapshotKeys(state, reg)
+
+	if len(migrated) != 0 {
+		t.Errorf("migrated = %v, want empty (orphan nick has no current pool)", keysOf(migrated))
+	}
+	if len(dropped) != 1 || dropped[0] != "orphan" {
+		t.Errorf("dropped = %v, want [orphan]", dropped)
+	}
+}
+
+// TestMigrateSnapshotKeys_runtimeAddedMemberKnown proves the migration
+// recognises runtime-added pool members (persisted in
+// Config[name].AddedMembers) as known nicks. A snapshot keyed under such
+// a member's nick must NOT be dropped — the runtime-added pool itself has
+// not been re-instantiated by LoadAddedPools yet at this point in run(),
+// but the persisted Config already carries the member list.
+func TestMigrateSnapshotKeys_runtimeAddedMemberKnown(t *testing.T) {
+	// Env-declared "auto" pool lists only "cch" — "ccw" is NOT in the
+	// registry, so a snapshot keyed "auto/ccw" would be dropped unless
+	// the runtime-added source is consulted.
+	reg := migrateTestRegistry(t, "cch")
+	util := 0.3
+	state := persist.GatewayState{
+		Config: map[string]auto.PoolRuntimeConfig{
+			"auto": {AddedMembers: map[string]auto.AddedMember{
+				"ccw": {Credential: "sk-ant-ccw"},
+			}},
+		},
+		Snapshots: map[string]quota.Snapshot{
+			"auto/ccw": {UnifiedStatus: "allowed", Unified5hUtilization: &util},
+		},
+	}
+
+	migrated, dropped := migrateSnapshotKeys(state, reg)
+
+	if _, ok := migrated["ccw"]; !ok {
+		t.Errorf("migrated map missing %q (runtime-added member should be known; got keys %v)", "ccw", keysOf(migrated))
+	}
+	if len(dropped) != 0 {
+		t.Errorf("dropped = %v, want [] (runtime-added nick is known)", dropped)
+	}
+}
+
+// TestMigrateSnapshotKeys_oldAndNewCollide_prefersNew locks in the
+// "prefer the new key" guarantee from issue #116's AC: when both an old-
+// shape "<pool>/<nick>" key and a new-shape "<nick>" key exist for the
+// same nick, the new-shape value wins. The two-pass rewrite implements
+// this — Pass 2 (no-slash keys only) runs after Pass 1 and overwrites
+// any collision.
+func TestMigrateSnapshotKeys_oldAndNewCollide_prefersNew(t *testing.T) {
+	reg := migrateTestRegistry(t, "ccw")
+	oldUtil := 0.1
+	newUtil := 0.9
+	state := persist.GatewayState{
+		Snapshots: map[string]quota.Snapshot{
+			"auto/ccw": {UnifiedStatus: "allowed", Unified5hUtilization: &oldUtil},
+			"ccw":      {UnifiedStatus: "allowed", Unified5hUtilization: &newUtil},
+		},
+	}
+
+	migrated, dropped := migrateSnapshotKeys(state, reg)
+
+	if len(migrated) != 1 {
+		t.Fatalf("len(migrated) = %d, want 1 (one nick after collision merge); got %v", len(migrated), keysOf(migrated))
+	}
+	got := migrated["ccw"].Unified5hUtilization
+	if got == nil || *got != newUtil {
+		t.Errorf("migrated[ccw].Unified5hUtilization = %v, want %v (new key should win)", got, newUtil)
+	}
+	if len(dropped) != 0 {
+		t.Errorf("dropped = %v, want []", dropped)
+	}
+}
+
+// TestPersist_oldFormatKeysMigrateOnLoad is the integration regression: a
+// state file persisted under the old "<pool>/<nick>" key shape loads
+// through persist.Load + migrateSnapshotKeys + store.Put, and the
+// migrated snapshot is then reachable via store.Get("<nick>"). Mirrors
+// TestPersist_roundTrip's fixture-write → load → query shape.
+func TestPersist_oldFormatKeysMigrateOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := dir + "/state.json"
+
+	reg := migrateTestRegistry(t, "ccw")
+	util := 0.55
+	state := persist.GatewayState{
+		Snapshots: map[string]quota.Snapshot{
+			"auto/ccw": {UnifiedStatus: "allowed", Unified5hUtilization: &util},
+		},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(stateFile, data, 0600); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	loaded, err := persist.Load(stateFile)
+	if err != nil {
+		t.Fatalf("persist.Load: %v", err)
+	}
+	migrated, _ := migrateSnapshotKeys(loaded, reg)
+	store := quota.NewStore()
+	for key, snap := range migrated {
+		store.Put(key, snap)
+	}
+
+	got := store.Get("ccw")
+	if got.Unified5hUtilization == nil || *got.Unified5hUtilization != util {
+		t.Errorf("store.Get(ccw).Unified5hUtilization = %v, want %v (old-format key should be migrated and reachable)", got.Unified5hUtilization, util)
+	}
+	if store.Get("auto/ccw").Unified5hUtilization != nil {
+		t.Errorf("store.Get(auto/ccw) returned a populated snapshot; the migration should have left no old-shape keys in the store")
+	}
+}
+
+// keysOf returns the keys of m as a sorted slice for stable error messages.
+func keysOf(m map[string]quota.Snapshot) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

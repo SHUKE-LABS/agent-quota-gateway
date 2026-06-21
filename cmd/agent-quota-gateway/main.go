@@ -85,7 +85,20 @@ func run(configFlag string) error {
 
 	// Restore quota snapshots first so controllers can read them when
 	// deciding the initial exhaustion state from the store.
-	for key, snap := range persisted.Snapshots {
+	//
+	// PR #115 changed Backend.QuotaKey() from "<pool>/<nick>" to "<nick>",
+	// but the on-disk state file carries no version field and no migration
+	// was added at the time. On restart, snapshots persisted under the old
+	// shape are unreachable by any current lookup (Store.Get("<nick>")
+	// returns the zero Snapshot until the next quota-bearing response
+	// overwrites it). migrateSnapshotKeys rewrites them in place; nicks
+	// not referenced by any current pool (env-declared or runtime-added)
+	// are dropped with a logged warning so an operator can audit the loss.
+	migrated, dropped := migrateSnapshotKeys(persisted, registry)
+	for _, nick := range dropped {
+		fmt.Fprintf(os.Stderr, "agent-quota-gateway: dropping orphaned quota snapshot for nick %q (no current pool references it)\n", nick)
+	}
+	for key, snap := range migrated {
 		store.Put(key, snap)
 	}
 
@@ -253,6 +266,77 @@ func run(configFlag string) error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	return nil
+}
+
+// migrateSnapshotKeys rewrites persisted quota snapshots from the
+// pre-#115 "<pool>/<nick>" key shape to the current "<nick>" shape, and
+// drops any nick not referenced by any current pool (env-declared or
+// runtime-added). When both old and new keys exist for the same nick,
+// the new key wins (a two-pass rewrite where Pass 2 overwrites Pass 1).
+//
+// The known-nicks set is built from two sources: the live env-declared
+// Registry (PoolNicks for each PoolNames entry) and the runtime-added
+// members persisted in state.Config[name].AddedMembers (issue #116). The
+// runtime-added source is consulted here — before pools.LoadAddedPools
+// runs in run() — because persisted.Config is already in scope at this
+// point and avoids a second registry walk.
+//
+// The function returns the rewritten map and the de-duplicated list of
+// dropped nicks (first-seen order) so the caller can log the loss.
+func migrateSnapshotKeys(state persist.GatewayState, registry *backend.Registry) (map[string]quota.Snapshot, []string) {
+	knownNicks := make(map[string]bool)
+	for _, name := range registry.PoolNames() {
+		for _, nick := range registry.PoolNicks(name) {
+			knownNicks[nick] = true
+		}
+	}
+	for _, cfg := range state.Config {
+		for nick := range cfg.AddedMembers {
+			knownNicks[nick] = true
+		}
+	}
+
+	// nickFromKey returns the nick portion of a snapshot key — the suffix
+	// after the last "/" if the key carries a pool prefix, otherwise the
+	// key itself. Used to translate old-shape "<pool>/<nick>" keys into
+	// the current nick-only shape.
+	nickFromKey := func(key string) string {
+		if i := strings.LastIndex(key, "/"); i >= 0 {
+			return key[i+1:]
+		}
+		return key
+	}
+
+	// Pass 1: rewrite every key into nick form, dropping unknown nicks.
+	migrated := make(map[string]quota.Snapshot, len(state.Snapshots))
+	droppedSet := make(map[string]bool)
+	var dropped []string
+	for key, snap := range state.Snapshots {
+		nick := nickFromKey(key)
+		if !knownNicks[nick] {
+			if !droppedSet[nick] {
+				droppedSet[nick] = true
+				dropped = append(dropped, nick)
+			}
+			continue
+		}
+		migrated[nick] = snap
+	}
+	// Pass 2: re-walk new-shape (no-slash) keys so a collisional pair
+	// (e.g. {"auto/ccw": old, "ccw": new}) resolves to the new-key value.
+	// Pass 1 already wrote the old-key value under "ccw"; Pass 2 overwrites
+	// it only when a new-shape key is present, which is exactly the
+	// "prefer the new key" guarantee from issue #116's AC.
+	for key, snap := range state.Snapshots {
+		if strings.Contains(key, "/") {
+			continue
+		}
+		if !knownNicks[key] {
+			continue
+		}
+		migrated[key] = snap
+	}
+	return migrated, dropped
 }
 
 // healthHandler returns a fixed {"status":"ok"} body. It is a loopback-
