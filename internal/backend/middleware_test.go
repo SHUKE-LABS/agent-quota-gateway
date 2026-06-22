@@ -113,6 +113,48 @@ func TestMiddleware_exhaustedReturns429(t *testing.T) {
 	}
 }
 
+// TestMiddleware_halfOpenForwards is the issue #134 boundary test: when
+// the router returns a backend with exhausted=false (the half-open
+// signal from ResolveAuto on an all-parked pool), the middleware must
+// forward the request to that backend — not emit a 429. The half-open
+// forward is the only path that breaks the deadlock where an all-parked
+// pool never sees a forwarded request and never refreshes its quota
+// store. The downstream next handler is the contract: it must be called
+// with the backend injected on the context, and no Retry-After header
+// must be written.
+func TestMiddleware_halfOpenForwards(t *testing.T) {
+	want := Backend{Pool: "auto", Nick: "claude-a", Credential: "cred-a", BaseURL: testDefaultBaseURL}
+	var seen Backend
+	var called int
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		called++
+		seen, _ = FromContext(r.Context())
+	})
+	// Half-open: router returns a real backend, exhausted=false,
+	// retryAfter=0. The middleware must NOT treat this as an exhausted
+	// pool and must NOT short-circuit to writeRateLimited.
+	router := &stubRouter{b: want, retryAfter: 0, ok: true, exhausted: false}
+	h := Middleware(router, next)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Header.Set("Authorization", "Bearer auto")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if called != 1 {
+		t.Fatalf("next called %d times, want 1 (half-open must forward)", called)
+	}
+	if seen.Nick != want.Nick {
+		t.Errorf("next saw nick=%q, want %q (half-open backend must be injected)", seen.Nick, want.Nick)
+	}
+	if rec.Code == http.StatusTooManyRequests {
+		t.Errorf("status=%d, half-open path must not return 429", rec.Code)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "" {
+		t.Errorf("Retry-After=%q, half-open path must not advertise a Retry-After", ra)
+	}
+}
+
 // poolAwareRouter routes only the single named pool, rejecting everything else.
 type poolAwareRouter struct {
 	pool string

@@ -161,26 +161,67 @@ func TestResolveAuto_storePastResetStaysSticky(t *testing.T) {
 	}
 }
 
-// TestResolveAuto_allStoreExhaustedForwardsPreciseWait proves the all-dry
-// path uses store resets for the honest 429 Retry-After, picking the soonest
-// to free up.
-func TestResolveAuto_allStoreExhaustedForwardsPreciseWait(t *testing.T) {
+// TestResolveAuto_allStoreExhaustedHalfOpenProbes codifies the issue #134
+// half-open contract for the all-parked path. Pre-#134 this case returned
+// exhausted=true with the soonest store reset so the middleware could
+// emit an honest 429; post-#134 the pool would deadlock forever (no
+// forwarded request, no store refresh). The half-open path picks a parked
+// member, returns it with exhausted=false / retryAfter=0, and lets the
+// middleware forward one request. The live response refreshes the store
+// via the normal record429 / store-write path; if the upstream still
+// 429s, the next request gets a fresh exhausted=true.
+//
+// The pick is round-robin from the current sticky position. With
+// cur=0 and a two-member pool {a, b}, the half-open scan starts at
+// idx=(0+1)%2=1 (b) — but b has no record429 history either, and the
+// helper accepts any member without a future-reset park entry. So the
+// pick is deterministic on cur: it picks the next member past cur.
+func TestResolveAuto_allStoreExhaustedHalfOpenProbes(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
 	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
 
 	putUtil(t, store, c, "a", 1.0, clock.now().Add(2*time.Hour))
-	putUtil(t, store, c, "b", 1.0, clock.now().Add(30*time.Minute)) // soonest
+	putUtil(t, store, c, "b", 1.0, clock.now().Add(30*time.Minute))
+
+	b, retry, exhausted := c.ResolveAuto()
+	if exhausted {
+		t.Fatalf("ResolveAuto exhausted=true, want false (issue #134: half-open forwards to break the deadlock)")
+	}
+	if retry != 0 {
+		t.Errorf("ResolveAuto retry=%v, want 0 (half-open path), not the soonest store reset", retry)
+	}
+	if b.Nick != "a" && b.Nick != "b" {
+		t.Errorf("ResolveAuto pointed at %q, want one of {a, b} (the half-open scan must pick a real member)", b.Nick)
+	}
+}
+
+// TestResolveAuto_allLiveParkedFutureResetsStillExhausted protects the
+// regression for actively-rejecting backends: a pool where every
+// member's live-429 reset is still in the future must still return
+// exhausted=true honestly. Forwarding through an actively-rejected
+// member would just produce another 429 and a fresh park; the honest
+// 429 with the precise wait is the right answer until at least one
+// reset has elapsed.
+func TestResolveAuto_allLiveParkedFutureResetsStillExhausted(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	// Live-429 parks: a in 2h, b in 30m. No store signal — the pool
+	// is parked purely by record429 history.
+	c.record429("a", clock.now().Add(2*time.Hour))
+	c.record429("b", clock.now().Add(30*time.Minute))
 
 	b, retry, exhausted := c.ResolveAuto()
 	if !exhausted {
-		t.Fatalf("ResolveAuto exhausted=false, want true (both members store-exhausted)")
+		t.Fatalf("ResolveAuto exhausted=false, want true (all live-429 resets still in the future)")
 	}
 	if b.Nick != "b" {
-		t.Errorf("ResolveAuto pointed at %q, want b (soonest reset)", b.Nick)
+		t.Errorf("ResolveAuto pointed at %q, want b (soonest live-429 reset)", b.Nick)
 	}
 	if retry != 30*time.Minute {
-		t.Errorf("ResolveAuto retry=%v, want 30m (precise wait to soonest reset)", retry)
+		t.Errorf("ResolveAuto retry=%v, want 30m (precise wait to soonest live-429 reset)", retry)
 	}
 }
 
@@ -328,27 +369,54 @@ func TestSnapRejects_freshAtCapIsBlocking(t *testing.T) {
 	}
 }
 
-// TestSnapRejects_rejectedStatusStillBlocksRegardlessOfReset proves the
-// Anthropic status-driven branch is unaffected by the #125 change: an
-// explicit "rejected" status parks even when the window reset has already
-// passed. The status is refreshed on every response, so there is no
-// freshness window to apply to it.
-func TestSnapRejects_rejectedStatusStillBlocksRegardlessOfReset(t *testing.T) {
+// TestSnapRejects_rejectedStatusRespectsReset codifies the issue #134
+// contract change for snapRejects: an explicit "rejected" status still
+// authoritatively parks when the window's reset is in the future, but
+// reads as not blocking once that reset has elapsed — the same
+// freshness guard the no-status util branch has applied since #125.
+// The "no reset" case is the surviving authoritative-without-freshness
+// exception: a rejected status with no reset is genuinely authoritative
+// and we have no reset to bound its freshness.
+func TestSnapRejects_rejectedStatusRespectsReset(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	util := 0.4 // below the cap — status alone blocks
+	util := 0.4 // below the cap — status alone is the signal
+	future := clock.now().Add(time.Hour)
 	past := clock.now().Add(-time.Minute)
-	snap := quota.Snapshot{
+
+	// "rejected" + future reset → still blocking (the live 429 contract).
+	if !snapRejects(quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		Unified5hReset:       &future,
+		AsOf:                 clock.now(),
+	}, clock.now()) {
+		t.Errorf("snapRejects(rejected, future reset) = false, want true (window still blocking)")
+	}
+
+	// "rejected" + past reset → not blocking (issue #134: the snapshot
+	// has aged out, the half-open path will forward a request to
+	// refresh the store).
+	if snapRejects(quota.Snapshot{
 		Unified5hUtilization: &util,
 		Unified5hStatus:      unifiedStatusRejected,
 		Unified5hReset:       &past,
 		AsOf:                 clock.now(),
+	}, clock.now()) {
+		t.Errorf("snapRejects(rejected, past reset) = true, want false (snapshot aged out)")
 	}
 
-	if !snapRejects(snap, clock.now()) {
-		t.Errorf("snapRejects(rejected status, past reset) = false, want true (status is authoritative)")
+	// "rejected" + nil reset → still authoritative (no reset to bound).
+	if !snapRejects(quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		AsOf:                 clock.now(),
+	}, clock.now()) {
+		t.Errorf("snapRejects(rejected, nil reset) = false, want true (no reset to bound)")
 	}
 
-	// And the overall rejected status blocks even with no per-window reset at all.
+	// Overall rejected status (UnifiedStatus, the wrapper field) still
+	// blocks via the first OR clause of snapRejects — that path does
+	// not go through windowBlocks and is intentionally unchanged.
 	if !snapRejects(quota.Snapshot{UnifiedStatus: unifiedStatusRejected}, clock.now()) {
 		t.Errorf("snapRejects(overall rejected) = false, want true")
 	}

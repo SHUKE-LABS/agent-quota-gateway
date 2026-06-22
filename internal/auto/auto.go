@@ -1426,6 +1426,23 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 		}
 	}
 
+	// All-parked half-open (issue #134): when firstHealthyNickLocked
+	// returned false, no member is strictly healthy. But the pool can
+	// still be in a recoverable state — every member's live-429 reset
+	// may have elapsed while the quota store still reports "rejected"
+	// with a future reset. Forwarding one request through to such a
+	// member refreshes the store via the normal record429 / store-write
+	// path, breaking the deadlock where a pool of all-parked members
+	// never sees a forwarded request and never self-heals. We pick
+	// round-robin from the current position and return it with
+	// exhausted=false so the middleware forwards.
+	if nick, ok := c.nextParkedButResetPassedLocked(); ok {
+		c.setActiveMemberLocked(nick)
+		if b, ok := c.backendByNickLocked(nick); ok {
+			return b, 0, false
+		}
+	}
+
 	// All exhausted: point at the soonest to free up.
 	nick, reset := c.soonestNickLocked()
 	c.setActiveMemberLocked(nick)
@@ -2423,9 +2440,13 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 //     utilization 1.0 with status "allowed"/"allowed_warning" while still
 //     serving it (the soft-cap / overage / fallback zone). Treating 1.0 as
 //     exhausted there wrongly parks a member Anthropic would happily serve,
-//     which can lock an entire pool out as "all exhausted". The status path
-//     is refreshed on every response, so reset and now are intentionally
-//     ignored here — no freshness window exists for an explicit "rejected".
+//     which can lock an entire pool out as "all exhausted". A "rejected"
+//     status whose reset has already passed reads as not blocking — the
+//     same freshness guard the no-status util branch applies, so a frozen
+//     post-#134 snapshot can't keep a recovered backend parked forever
+//     (issue #134 deadlock). A "rejected" status with a nil reset still
+//     blocks: the snapshot is genuinely authoritative about the window
+//     state and we have no reset to bound its freshness.
 //   - When the window has no status (poller-tracked z.ai / MiniMaxi / Ark,
 //     which report only a utilization fraction), fall back to the cap, but
 //     ONLY while the window's reset is still in the future. The poller
@@ -2436,7 +2457,14 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 //     one storeExhaustedUntilLocked applies on the recovery side (#125).
 func windowBlocks(util *float64, status string, reset *time.Time, now time.Time) bool {
 	if status != "" {
-		return status == unifiedStatusRejected
+		if status != unifiedStatusRejected {
+			return false
+		}
+		// "rejected" with no reset is authoritative (snapshot has no
+		// freshness bound). "rejected" with a reset respects it — once the
+		// reset has passed the snapshot is stale and reads as not blocking
+		// (issue #134).
+		return reset == nil || now.Before(*reset)
 	}
 	return util != nil && *util >= exhaustionUtilizationThreshold &&
 		reset != nil && now.Before(*reset)
@@ -2666,6 +2694,62 @@ func (c *Controller) firstHealthyNickLocked() (string, bool) {
 		if !c.isUnavailableLocked(effectiveNicks[idx]) {
 			return effectiveNicks[idx], true
 		}
+	}
+	return "", false
+}
+
+// nextParkedButResetPassedLocked returns the nick of a parked member whose
+// live-429 reset has already elapsed — i.e. a member that the exhaustion
+// map no longer actively blocks but which the quota store may still be
+// flagging. Forwarding one request through to such a member lets the live
+// response refresh the store via the normal record429 / store-write path
+// and break the issue #134 deadlock where a pool of all-parked members
+// never sees a forwarded request.
+//
+// The pick is round-robin from the current sticky position, matching
+// firstHealthyNickLocked's scan order, so a flapping pool doesn't
+// repeatedly hammer the same member.
+//
+// "Reset has elapsed" here means: the live-429 map entry (c.exhausted)
+// either is absent or carries a past reset. Disabled / removed members
+// are skipped — they are unreachable regardless of upstream state.
+//
+// Caller holds c.mu.
+func (c *Controller) nextParkedButResetPassedLocked() (string, bool) {
+	effectiveNicks := c.addedMembersLocked()
+	if len(effectiveNicks) == 0 {
+		return "", false
+	}
+
+	curNick := c.curAddedNick
+	if curNick == "" && len(c.nicks) > 0 {
+		curNick = c.nicks[c.cur]
+	}
+	startIdx := 0
+	for i, nick := range effectiveNicks {
+		if nick == curNick {
+			startIdx = i
+			break
+		}
+	}
+
+	now := c.now()
+	n := len(effectiveNicks)
+	for off := 1; off <= n; off++ {
+		idx := (startIdx + off) % n
+		nick := effectiveNicks[idx]
+		if c.disabled[nick] || c.removedMembers[nick] {
+			continue
+		}
+		// Look only at the live-429 park (c.exhausted). If it has a
+		// future reset, the upstream is still actively rejecting — the
+		// half-open probe is for a member whose live signal has
+		// actually cleared. The store side is intentionally ignored
+		// here: that's the signal the probe is meant to refresh.
+		if reset, ok := c.exhausted[nick]; ok && now.Before(reset) {
+			continue
+		}
+		return nick, true
 	}
 	return "", false
 }

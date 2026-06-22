@@ -1906,3 +1906,106 @@ func TestPoolPersistState_runtimeAddedMemberRoundTrip(t *testing.T) {
 		t.Errorf("after restart: Unified5hUtilization=%v, want 0.42", snap.Unified5hUtilization)
 	}
 }
+
+// TestWindowBlocks_rejectedRespectsReset is the unit-level regression for
+// the issue #134 contract change. The status branch used to return true
+// for any "rejected" status regardless of reset; it now respects the
+// same freshness guard the no-status util branch has applied since #125.
+//
+// Cases:
+//
+//   - "rejected" + future reset → still blocks (live 429 contract intact).
+//   - "rejected" + past reset   → does not block (issue #134 self-clear).
+//   - "rejected" + nil reset    → still blocks (no reset to bound —
+//     preserves the "no reset, no escape" semantic for snapshots the
+//     upstream tagged rejected without a precise reset).
+//   - non-"rejected" status     → never blocks (the status branch only
+//     fires on "rejected"; "allowed" / "allowed_warning" are not
+//     exhaust signals).
+func TestWindowBlocks_rejectedRespectsReset(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	now := clock.now()
+	future := now.Add(time.Hour)
+	past := now.Add(-time.Minute)
+	util := 0.4
+
+	// future reset — still blocking
+	if !windowBlocks(&util, unifiedStatusRejected, &future, now) {
+		t.Errorf("windowBlocks(rejected, future reset) = false, want true")
+	}
+	// past reset — no longer blocking (issue #134)
+	if windowBlocks(&util, unifiedStatusRejected, &past, now) {
+		t.Errorf("windowBlocks(rejected, past reset) = true, want false")
+	}
+	// nil reset — still blocking (no reset to bound)
+	if !windowBlocks(&util, unifiedStatusRejected, nil, now) {
+		t.Errorf("windowBlocks(rejected, nil reset) = false, want true")
+	}
+	// non-rejected status — never blocking
+	if windowBlocks(&util, "allowed", &future, now) {
+		t.Errorf("windowBlocks(allowed, future reset) = true, want false")
+	}
+	if windowBlocks(&util, "allowed_warning", &future, now) {
+		t.Errorf("windowBlocks(allowed_warning, future reset) = true, want false")
+	}
+}
+
+// TestResolveAuto_allParkedLivePastStoreFutureHalfOpen is the focused
+// issue #134 deadlock regression: a pool where every member's live-429
+// reset has already elapsed (so the exhaustion map no longer parks them)
+// but the quota store still reports a future "rejected" reset for each.
+// Pre-#134 this case deadlocked: the local 429 was emitted without
+// forwarding, the store never refreshed, the pool stayed down past the
+// real recovery. Post-#134 the half-open path picks one of the parked
+// members, returns it with exhausted=false / retryAfter=0, and lets
+// the middleware forward so the live response refreshes the store.
+//
+// Distinct from the all-store-exhausted case in store_exhaustion_test.go
+// because that one has no live-429 history at all (pure poller-tracked
+// providers) — this one is the Anthropic-shaped scenario the production
+// e6420 report described: every member has a real live-429 history, the
+// resets have all elapsed, the store is still frozen at "rejected".
+func TestResolveAuto_allParkedLivePastStoreFutureHalfOpen(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	// Store says both members are "rejected" with future resets — the
+	// frozen-snapshot shape that drove the original deadlock.
+	rejected := unifiedStatusRejected
+	futureA := clock.now().Add(2 * time.Hour)
+	futureB := clock.now().Add(30 * time.Minute)
+	util := 1.0
+	store.Put("a", quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      rejected,
+		Unified5hReset:       &futureA,
+		AsOf:                 clock.now().Add(-time.Hour),
+	})
+	store.Put("b", quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      rejected,
+		Unified5hReset:       &futureB,
+		AsOf:                 clock.now().Add(-time.Hour),
+	})
+
+	// Live-429 resets have already elapsed — the exhaustion map should
+	// not block any member. Pre-#134 the half-open path did not exist
+	// and the pool would have read as fully exhausted (store signal
+	// authoritative regardless of reset); post-#134 the windowBlocks
+	// relaxation still has the store blocking (future reset), so the
+	// half-open path takes over and forwards.
+	c.record429("a", clock.now().Add(-time.Hour)) // past
+	c.record429("b", clock.now().Add(-time.Hour)) // past
+
+	b, retry, exhausted := c.ResolveAuto()
+	if exhausted {
+		t.Fatalf("ResolveAuto exhausted=true, want false (issue #134 half-open should forward)")
+	}
+	if retry != 0 {
+		t.Errorf("ResolveAuto retry=%v, want 0 (half-open path), not the store reset wait", retry)
+	}
+	if b.Nick != "a" && b.Nick != "b" {
+		t.Errorf("ResolveAuto pointed at %q, want one of {a, b}", b.Nick)
+	}
+}
