@@ -386,6 +386,32 @@ func healthHandler() http.HandlerFunc {
 	}
 }
 
+// WindowLabels describes how the UI should label the two rolling-window
+// columns in the pool table. Most providers label the long window "7d",
+// but Z.AI's long window is monthly (see issue #138) — the snapshot
+// struct still uses the 5h/7d field names (right data shape for any long
+// window), but the column header has to be honest about what the upstream
+// actually returned.
+type WindowLabels struct {
+	Short string `json:"short"` // e.g. "5h"
+	Long  string `json:"long"`  // e.g. "7d" or "monthly"
+}
+
+// WindowLabelsFor returns the per-pool window-label hint the UI consumes
+// to render the second rolling-window column. The default is the
+// Anthropic-style "5h" / "7d". Z.AI's long window is monthly (issue
+// #138), so a Z.AI backend gets "5h" / "monthly". Unknown providers fall
+// back to the default; an empty base URL is treated as no provider.
+func WindowLabelsFor(baseURL string) WindowLabels {
+	if p, ok := poller.ProviderFor(baseURL); ok {
+		switch p.Name() {
+		case "z.ai/zhipu":
+			return WindowLabels{Short: "5h", Long: "monthly"}
+		}
+	}
+	return WindowLabels{Short: "5h", Long: "7d"}
+}
+
 // poolQuotaView is the /_gateway/quota?backend=<pool> response: the
 // pool's active sticky member's snapshot with an added active_backend
 // field naming the member nick. The embedded Snapshot promotes its
@@ -393,9 +419,16 @@ func healthHandler() http.HandlerFunc {
 // gets the active member's snapshot plus the member's name — it needs
 // zero knowledge of pool membership, and the 99%->5% jump on a switch is
 // self-explained because active_backend changes alongside it.
+//
+// WindowLabels is per-pool because the long-window column means different
+// things for different providers: a 7-day rolling window for Anthropic
+// and MiniMaxi, a monthly window for Z.AI (issue #138). The snapshot
+// struct's 5h/7d field names stay — they are the right data shape; only
+// the human-facing label changes.
 type poolQuotaView struct {
 	quota.Snapshot
-	ActiveBackend string `json:"active_backend"`
+	ActiveBackend string        `json:"active_backend"`
+	WindowLabels  WindowLabels  `json:"window_labels"`
 }
 
 // quotaHandler returns the JSON snapshot for the requested pool.
@@ -423,6 +456,7 @@ func quotaHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
 				_ = json.NewEncoder(w).Encode(poolQuotaView{
 					Snapshot:      store.Get(b.QuotaKey()),
 					ActiveBackend: b.Nick,
+					WindowLabels:  WindowLabelsFor(b.BaseURL),
 				})
 				return
 			}

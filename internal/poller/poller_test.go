@@ -73,6 +73,87 @@ func TestParseZhipu_emptyLimitsIsError(t *testing.T) {
 	}
 }
 
+// TestParseZhipu_timeLimitOnlyProducesSnapshot covers issue #138: a Z.AI
+// response that contains only TIME_LIMIT (no TOKENS_LIMIT) must still
+// produce a usable snapshot — the monthly limit alone is enough data, and
+// returning an error would make the poller hold the prior snapshot in a
+// place where the user can no longer see when the monthly window resets.
+func TestParseZhipu_timeLimitOnlyProducesSnapshot(t *testing.T) {
+	body := []byte(`{
+		"data": {
+			"limits": [
+				{ "type": "TIME_LIMIT", "percentage": 22, "nextResetTime": 1783536777977 }
+			]
+		}
+	}`)
+
+	snap, err := parseZhipu(body, fixedNow)
+	if err != nil {
+		t.Fatalf("parseZhipu: TIME_LIMIT-only response should not error, got %v", err)
+	}
+	if !snap.HasData() {
+		t.Fatal("HasData() = false; want true (TIME_LIMIT populated Unified7d*)")
+	}
+	if snap.Unified5hUtilization != nil || snap.Unified5hReset != nil {
+		t.Errorf("5h fields populated for TIME_LIMIT-only response: util=%v reset=%v",
+			snap.Unified5hUtilization, snap.Unified5hReset)
+	}
+	wantFloatPtr(t, "Unified7dUtilization", snap.Unified7dUtilization, 0.22)
+	wantTimePtr(t, "Unified7dReset", snap.Unified7dReset, 1783536777977)
+}
+
+// TestParseZhipu_exhausted5hWithHealthyMonthly covers the user-visible bug
+// from issue #138: a real 5h-exhausted account with a healthy monthly
+// limit must surface the monthly reset in Unified7dReset, not lose it. The
+// upstream nextResetTime for an exhausted TOKENS_LIMIT can be in the past;
+// the 5h reset field will already be non-nil but stale, and that's the
+// parser's faithful representation of what Z.AI returned.
+func TestParseZhipu_exhausted5hWithHealthyMonthly(t *testing.T) {
+	body := []byte(`{
+		"data": {
+			"limits": [
+				{ "type": "TOKENS_LIMIT", "percentage": 100, "nextResetTime": 1750000000000 },
+				{ "type": "TIME_LIMIT",   "percentage": 16,  "nextResetTime": 1783536777977 }
+			]
+		}
+	}`)
+
+	snap, err := parseZhipu(body, fixedNow)
+	if err != nil {
+		t.Fatalf("parseZhipu: %v", err)
+	}
+	wantFloatPtr(t, "Unified5hUtilization", snap.Unified5hUtilization, 1.0)
+	wantFloatPtr(t, "Unified7dUtilization", snap.Unified7dUtilization, 0.16)
+	wantTimePtr(t, "Unified7dReset", snap.Unified7dReset, 1783536777977)
+	if snap.Unified7dReset == nil {
+		t.Fatal("Unified7dReset: nil; the monthly reset must survive even when 5h is exhausted")
+	}
+}
+
+// TestParseZhipu_unknownLimitTypeFallsIntoLongWindow is the defensive
+// fallback for issue #138: if Z.AI ever ships a new limit type string
+// (e.g. MONTHLY_LIMIT, MONTH_LIMIT), it should land in the long-window
+// snapshot slot rather than be silently dropped, so the table still
+// shows monthly data when the upstream changes.
+func TestParseZhipu_unknownLimitTypeFallsIntoLongWindow(t *testing.T) {
+	body := []byte(`{
+		"data": {
+			"limits": [
+				{ "type": "TOKENS_LIMIT", "percentage": 5, "nextResetTime": 1781418024826 },
+				{ "type": "MONTHLY_LIMIT", "percentage": 30, "nextResetTime": 1783536777977 }
+			]
+		}
+	}`)
+
+	snap, err := parseZhipu(body, fixedNow)
+	if err != nil {
+		t.Fatalf("parseZhipu: %v", err)
+	}
+	wantFloatPtr(t, "Unified5hUtilization", snap.Unified5hUtilization, 0.05)
+	wantFloatPtr(t, "Unified7dUtilization", snap.Unified7dUtilization, 0.30)
+	wantTimePtr(t, "Unified7dReset", snap.Unified7dReset, 1783536777977)
+}
+
 func TestParseMinimaxi_remainingInvertedToUsed(t *testing.T) {
 	// MiniMaxi reports *remaining* percentages (100 = full quota), so the
 	// parser must invert them to utilization (used).

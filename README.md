@@ -1066,6 +1066,16 @@ How it behaves:
   percentages; its `session` window maps to 5h and `weekly` to 7d (reset
   timestamps are epoch seconds, not milliseconds). All three map onto the
   unified 5h / 7d utilization and reset fields.
+- **Long-window labels are provider-aware.** The members table renders the
+  long-window column with a header the gateway supplies per pool. For
+  Anthropic, MiniMaxi, and Volcengine Ark it reads "7d" / "7d reset".
+  For Z.ai / Zhipu it reads "monthly" / "monthly reset", because the
+  upstream `TIME_LIMIT` entry is the **monthly** quota, not a 7-day
+  rolling window (the snapshot's `unified_7d_*` fields are still the
+  right data shape — only the human label is monthly). Any Z.AI
+  response that contains only one of `TOKENS_LIMIT` / `TIME_LIMIT` still
+  produces a usable snapshot, so an exhausted 5h window no longer hides
+  the monthly reset from the operator.
 - **Failure is silent and non-destructive.** A network error, non-`200`, or
   unparseable body is logged and skipped; the last good snapshot survives.
   For Volcengine, absent `VOLC_ACCESSKEY` or `VOLC_SECRETKEY` is treated the

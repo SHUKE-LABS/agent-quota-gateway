@@ -1138,3 +1138,94 @@ func TestObserver_overageStatusOnlyResponseUpdatesSnapshot(t *testing.T) {
 		t.Errorf("store.UnifiedOverageStatus = %q, want %q", got.UnifiedOverageStatus, "active")
 	}
 }
+
+func TestWindowLabelsFor(t *testing.T) {
+	// Z.AI's long window is monthly (issue #138); the rest stay "7d".
+	cases := []struct {
+		name     string
+		baseURL  string
+		wantLong string
+	}{
+		{"z.ai explicit", "https://api.z.ai/anthropic", "monthly"},
+		{"zhipu bigmodel", "https://open.bigmodel.cn/api/anthropic", "monthly"},
+		{"anthropic default", "https://api.anthropic.com", "7d"},
+		{"unknown provider falls back", "https://example.com/v1", "7d"},
+		{"empty base url", "", "7d"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := WindowLabelsFor(tc.baseURL)
+			if got.Short != "5h" {
+				t.Errorf("Short = %q, want %q", got.Short, "5h")
+			}
+			if got.Long != tc.wantLong {
+				t.Errorf("Long = %q, want %q (baseURL=%q)", got.Long, tc.wantLong, tc.baseURL)
+			}
+		})
+	}
+}
+
+// TestConfigEndpoint_includesWindowLabels proves the /_gateway/config
+// response carries the per-pool window_labels hint the UI consumes to
+// render the long-window column (issue #138). Anthropic pools get
+// "5h"/"7d"; a Z.AI pool gets "5h"/"monthly".
+func TestConfigEndpoint_includesWindowLabels(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	srv := configMux(t, loadPools(t))
+
+	addResp, err := http.Post(srv.URL+"/_gateway/pool", "application/json",
+		strings.NewReader(`{"name":"zai","base_url":"https://api.z.ai/anthropic","mode":"plain"}`))
+	if err != nil {
+		t.Fatalf("add zai pool: %v", err)
+	}
+	addResp.Body.Close()
+	addJSON(t, srv.URL+"/_gateway/pool/zai/member/z", `{"credential":"sk-zai-z","base_url":"https://api.z.ai/anthropic"}`, http.StatusOK)
+	if addResp.StatusCode != http.StatusCreated {
+		t.Fatalf("add zai pool status=%d, want 201", addResp.StatusCode)
+	}
+
+	resp, err := http.Get(srv.URL + "/_gateway/config")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	var views []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&views); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var autoView, zaiView map[string]any
+	for _, v := range views {
+		switch v["pool"] {
+		case "auto":
+			autoView = v
+		case "zai":
+			zaiView = v
+		}
+	}
+	if autoView == nil {
+		t.Fatal("auto pool not present in /_gateway/config")
+	}
+	if zaiView == nil {
+		t.Fatal("zai pool not present in /_gateway/config")
+	}
+
+	autoLabels, _ := autoView["window_labels"].(map[string]any)
+	if autoLabels == nil {
+		t.Fatalf("auto pool missing window_labels: %+v", autoView)
+	}
+	if autoLabels["short"] != "5h" || autoLabels["long"] != "7d" {
+		t.Errorf("auto window_labels = %+v, want {short:5h, long:7d}", autoLabels)
+	}
+
+	zaiLabels, _ := zaiView["window_labels"].(map[string]any)
+	if zaiLabels == nil {
+		t.Fatalf("zai pool missing window_labels: %+v", zaiView)
+	}
+	if zaiLabels["short"] != "5h" || zaiLabels["long"] != "monthly" {
+		t.Errorf("zai window_labels = %+v, want {short:5h, long:monthly}", zaiLabels)
+	}
+}

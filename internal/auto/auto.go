@@ -259,6 +259,21 @@ type PoolConfigView struct {
 	BalanceDwell string                 `json:"balance_dwell,omitempty"`
 	Priority     []string               `json:"priority,omitempty"`
 	Members      []PoolMemberConfigView `json:"members"`
+	// WindowLabels is the per-pool column-header hint the UI consumes to
+	// render the second rolling-window cell. Anthropic and MiniMaxi label
+	// it "7d"; Z.AI labels it "monthly" because its long window is monthly
+	// (issue #138). The label is derived from the first member's BaseURL
+	// because every member in a pool shares the same upstream provider.
+	WindowLabels *PoolWindowLabels `json:"window_labels,omitempty"`
+}
+
+// PoolWindowLabels describes how the UI should label the two
+// rolling-window columns in the members table. The values are populated
+// at config-build time by main.WindowLabelsFor(baseURL), keeping the
+// provider→label mapping in one place.
+type PoolWindowLabels struct {
+	Short string `json:"short"` // e.g. "5h"
+	Long  string `json:"long"`  // e.g. "7d" or "monthly"
 }
 
 // PoolMemberConfigView describes one pool member in the config view.
@@ -870,6 +885,17 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 		curNick := c.curAddedNick
 		if curNick == "" && len(c.nicks) > 0 {
 			curNick = c.nicks[c.cur]
+		}
+
+		// Per-pool window-label hint (issue #138). Every member in a pool
+		// shares the same upstream provider, so the first member's
+		// BaseURL is the right input. An empty pool leaves the field
+		// nil, in which case the UI falls back to "5h"/"7d".
+		if len(allMembers) > 0 {
+			if b, ok := c.backendByNickLocked(allMembers[0]); ok {
+				labels := poolWindowLabelsFor(b.BaseURL)
+				view.WindowLabels = &labels
+			}
 		}
 
 		for _, nick := range allMembers {
@@ -2905,4 +2931,25 @@ func randIndex(n int) int {
 		return 0
 	}
 	return rand.Intn(n)
+}
+
+// poolWindowLabelsFor returns the per-pool rolling-window label hint the
+// UI consumes to render the long-window column. The default is the
+// Anthropic-style "5h" / "7d". Z.AI's long window is monthly (issue
+// #138), so a Z.AI backend gets "5h" / "monthly". Unknown providers fall
+// back to the default; an empty base URL is treated as no provider.
+//
+// This is duplicated with main.WindowLabelsFor so the auto package does
+// not have to import the main package. The two mappings are intentionally
+// identical: they are both a one-line switch on the provider name, and
+// adding a new provider touches both at once. A test in
+// cmd/agent-quota-gateway/main_test.go covers the consumer side.
+func poolWindowLabelsFor(baseURL string) PoolWindowLabels {
+	if p, ok := poller.ProviderFor(baseURL); ok {
+		switch p.Name() {
+		case "z.ai/zhipu":
+			return PoolWindowLabels{Short: "5h", Long: "monthly"}
+		}
+	}
+	return PoolWindowLabels{Short: "5h", Long: "7d"}
 }
