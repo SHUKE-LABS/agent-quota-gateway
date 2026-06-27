@@ -217,6 +217,43 @@ type WindowLabels struct {
 	Long  string // "7d" or "monthly"
 }
 
+const (
+	// longWindow7d is the default long-window length: the Anthropic-style
+	// 7-day rolling window.
+	longWindow7d = 7 * 24 * time.Hour
+	// longWindowMonthly is the fixed ~30-day approximation of Z.AI's
+	// monthly TIME_LIMIT window (issue #140). A fixed constant keeps the
+	// mapping a one-line switch and matches how the codebase already
+	// approximates windows; it is faithful enough that the lead math no
+	// longer collapses a monthly reset into a 7-day elapsed fraction.
+	longWindowMonthly = 30 * 24 * time.Hour
+)
+
+// longWindowSpec bundles the per-provider long-window label and length so
+// the two cannot drift: both are produced by the single switch in
+// longWindowSpecFor. The label feeds the UI column header; the length
+// feeds the lead-routing elapsed-fraction math (issue #140).
+type longWindowSpec struct {
+	label  string
+	length time.Duration
+}
+
+// longWindowSpecFor is the single provider switch behind both
+// WindowLabelsFor and LongWindowFor. The default is the Anthropic-style
+// "7d" / 7-day window. Z.AI's long window is monthly (issues #138/#140),
+// so a Z.AI backend gets "monthly" / ~30-day. Adding a new provider with
+// a non-7d long window is a one-line change here — the only switch on
+// provider name for window shape.
+func longWindowSpecFor(baseURL string) longWindowSpec {
+	if p, ok := ProviderFor(baseURL); ok {
+		switch p.Name() {
+		case "z.ai/zhipu":
+			return longWindowSpec{label: "monthly", length: longWindowMonthly}
+		}
+	}
+	return longWindowSpec{label: "7d", length: longWindow7d}
+}
+
 // WindowLabelsFor returns the per-pool rolling-window label hint the UI
 // consumes to render the long-window column. The default is the
 // Anthropic-style "5h" / "7d". Z.AI's long window is monthly (issue
@@ -224,17 +261,18 @@ type WindowLabels struct {
 // an empty base URL fall back to the default.
 //
 // Centralised here so both the auto package (building PoolConfigView)
-// and the main package (building poolQuotaView) can share one mapping:
-// adding a new provider with a non-7d long window is a one-line change
-// at the only switch on provider name.
+// and the main package (building poolQuotaView) can share one mapping.
 func WindowLabelsFor(baseURL string) WindowLabels {
-	if p, ok := ProviderFor(baseURL); ok {
-		switch p.Name() {
-		case "z.ai/zhipu":
-			return WindowLabels{Short: "5h", Long: "monthly"}
-		}
-	}
-	return WindowLabels{Short: "5h", Long: "7d"}
+	return WindowLabels{Short: "5h", Long: longWindowSpecFor(baseURL).label}
+}
+
+// LongWindowFor returns the per-pool long-window length used for the
+// lead-routing elapsed-fraction (issue #140). It shares the single
+// provider switch with WindowLabelsFor so the routing math and the UI
+// label always agree on which window a pool's long slot represents:
+// ~30-day for Z.AI/Zhipu (its monthly TIME_LIMIT), 7-day otherwise.
+func LongWindowFor(baseURL string) time.Duration {
+	return longWindowSpecFor(baseURL).length
 }
 
 // provider describes how to poll one proprietary quota API. The set is a

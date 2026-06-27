@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -981,6 +982,69 @@ func putSnap(store *quota.Store, c *Controller, nick string, util5h, util7d *flo
 
 func fptr(f float64) *float64     { return &f }
 func tptr(t time.Time) *time.Time { return &t }
+
+// TestMemberLeads_longWindowProviderAware verifies the long-window
+// elapsed-fraction divides by the provider-aware window length: ~30-day
+// monthly for Z.AI/Zhipu, 7-day for everyone else (issue #140). Without
+// the provider-aware length, a Z.AI monthly reset weeks out makes
+// time_until_reset/window exceed 1, clamps elapsed to 0, and collapses
+// the long lead to raw utilization.
+func TestMemberLeads_longWindowProviderAware(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+
+	// Worked example from #140: 0.50 long-window utilization, monthly
+	// reset ~20 days out.
+	const util = 0.50
+	reset := clock.now().Add(20 * 24 * time.Hour)
+
+	newCtl := func(baseURL string) *Controller {
+		scrubPoolEnv(t)
+		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_A", "cred-a")
+		reg, err := backend.Load(baseURL)
+		if err != nil {
+			t.Fatalf("backend.Load(%q): %v", baseURL, err)
+		}
+		store := quota.NewStore()
+		c := NewController(reg, "auto", 0, store, clock.now, io.Discard)
+		putSnap(store, c, "a", nil, fptr(util), nil, tptr(reset))
+		return c
+	}
+
+	leadOf := func(c *Controller) (float64, bool) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		_, _, lead7d, _, has7d := c.memberLeadsLocked("a")
+		return lead7d, has7d
+	}
+
+	// Z.AI: long length ~30 days → elapsed = 1 − 480h/720h = 0.333,
+	// lead7d = 0.50 − 0.333 ≈ 0.167.
+	zaiLead, zaiHas := leadOf(newCtl("https://api.z.ai"))
+	if !zaiHas {
+		t.Fatal("z.ai: has7d=false, want true")
+	}
+	wantZai := util - (1.0 - float64(reset.Sub(clock.now()))/float64(longWindowMonthlyTest))
+	if math.Abs(zaiLead-wantZai) > 1e-9 {
+		t.Errorf("z.ai lead7d=%v, want %v (monthly window)", zaiLead, wantZai)
+	}
+	if zaiLead > 0.30 {
+		t.Errorf("z.ai lead7d=%v collapsed toward raw utilization; monthly window not applied", zaiLead)
+	}
+
+	// Anthropic default: 7-day length → 480h/168h > 1, elapsed clamps to 0,
+	// lead7d = utilization = 0.50 (unchanged pre-#140 behavior).
+	antLead, antHas := leadOf(newCtl(testDefaultBaseURL))
+	if !antHas {
+		t.Fatal("anthropic: has7d=false, want true")
+	}
+	if math.Abs(antLead-util) > 1e-9 {
+		t.Errorf("anthropic lead7d=%v, want %v (7d window, elapsed clamps to 0)", antLead, util)
+	}
+}
+
+// longWindowMonthlyTest mirrors poller.longWindowMonthly (unexported); the
+// test asserts the lead math against the same ~30-day approximation.
+const longWindowMonthlyTest = 30 * 24 * time.Hour
 
 // TestBalance_defaultPoolUnaffected verifies that a pool without BALANCE
 // configured is unaffected by the feature and retains sticky behaviour.
