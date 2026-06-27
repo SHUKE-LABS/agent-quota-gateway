@@ -1,13 +1,14 @@
 // Package proxy implements the Anthropic Messages reverse proxy.
 //
-// The proxy is intentionally thin: it forwards every POST through Go's
+// The proxy is intentionally thin: it forwards every request through Go's
 // standard httputil.ReverseProxy, derives the upstream and stamps the
 // auth header from the backend the resolver middleware stored on the
 // request context, and disables response buffering so server-sent events
 // stream as they arrive. Nothing about request or response bodies is
-// inspected. Paths are not whitelisted — any path reaches the upstream,
-// which is the authority on what it serves. The loopback-only bind
-// (enforced at config load) is the security boundary, not a route table.
+// inspected. Neither paths nor methods are whitelisted — any method on
+// any path reaches the upstream, which is the authority on what it
+// serves. The loopback-only bind (enforced at config load) plus the
+// resolver's selector check are the security boundary, not a route table.
 //
 // Each backend carries its own upstream URL, so one proxy serves every
 // pool: the director reads the resolved backend per request rather than
@@ -31,14 +32,6 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/reqlog"
 )
-
-// allowedMethods is the HTTP method set the proxy forwards. Anthropic's
-// API surface is POST-only; a GET reaching the upstream with the API key
-// attached is unnecessary exposure, so non-POST requests are rejected
-// here with 405 before any upstream round-trip.
-var allowedMethods = map[string]bool{
-	http.MethodPost: true,
-}
 
 // ResponseObserver is invoked once per successful upstream round-trip,
 // after the response status and headers are known and before the proxy
@@ -144,14 +137,7 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 	}
 	rp.Transport = reqlog.WrapTransport(base)
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !allowedMethods[r.Method] {
-			w.Header().Set("Allow", http.MethodPost)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		rp.ServeHTTP(w, r)
-	}), nil
+	return rp, nil
 }
 
 // stampAuth replaces any inbound credential with the resolved backend's,

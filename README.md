@@ -35,11 +35,13 @@ across vendors loses the prompt cache, and quota semantics differ).
 - Anthropic protocol only. No OpenAI / Google / other protocols. Pools
   may point at non-Anthropic *hosts* as long as they speak the Anthropic
   Messages API (e.g. a Claude-compatible vendor).
-- POST-only. Any path is forwarded to the upstream — the upstream is the
-  authority on what it serves, so new or compatible-API endpoints pass
-  through instead of hitting a gateway 404. Non-POST methods are rejected
-  with `405` (carrying the standard `Allow: POST` response header) before any
-  upstream round-trip.
+- Full method + path passthrough. Any method on any path is forwarded to
+  the upstream — the upstream is the authority on what it serves, so new
+  or compatible-API endpoints (e.g. `GET /v1/models`, batch polling, the
+  Files API) pass through instead of hitting a gateway 404 or 405. What
+  gates a request is the selector/auth boundary, not its method: an
+  unknown or missing selector still fails closed with `403` for every
+  method.
 - Streaming (SSE) is forwarded without buffering — the first event
   reaches the client as soon as the upstream writes it.
 - Error responses from upstream propagate to the client with the original

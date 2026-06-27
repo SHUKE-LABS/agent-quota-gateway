@@ -313,22 +313,35 @@ func TestProxy_perBackendBaseURLAndPathPrefix(t *testing.T) {
 	}
 }
 
-func TestProxy_disallowedMethodReturns405(t *testing.T) {
+// TestProxy_nonPOSTMethodReachesUpstream confirms the proxy forwards
+// non-POST methods (the POST-only gate was lifted in #141): a GET with a
+// valid selector reaches the upstream, carrying the backend's stamped
+// credential, instead of being rejected with 405. The upstream — not the
+// gateway — is the authority on which methods a path serves.
+func TestProxy_nonPOSTMethodReachesUpstream(t *testing.T) {
+	var gotMethod, gotKey string
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("upstream should not have been called for non-POST; got %s", r.Method)
+		gotMethod = r.Method
+		gotKey = r.Header.Get("x-api-key")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(w, strings.NewReader(`{"ok":true}`))
 	})
 	gw, _ := newGateway(t, upstream)
 
-	resp, err := http.Get(gw.URL + "/v1/messages")
+	resp, err := http.Get(gw.URL + "/v1/models")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want 405", resp.StatusCode)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (GET must reach upstream)", resp.StatusCode)
 	}
-	if allow := resp.Header.Get("Allow"); allow != http.MethodPost {
-		t.Errorf("Allow header = %q, want %q", allow, http.MethodPost)
+	if gotMethod != http.MethodGet {
+		t.Errorf("upstream saw method %q, want GET", gotMethod)
+	}
+	if gotKey != testAPIKey {
+		t.Errorf("upstream x-api-key = %q, want %q (credential must be stamped on GET)", gotKey, testAPIKey)
 	}
 }
 
@@ -382,37 +395,6 @@ func TestProxy_observerFiresWithResponse(t *testing.T) {
 	}
 	if seenKey != "mybackend" {
 		t.Errorf("observer saw quota key = %q, want mybackend (quota key is the nick alone)", seenKey)
-	}
-}
-
-// TestProxy_observerNotCalledForRejectedRequests proves the hook does
-// not fire for requests the proxy rejects before they reach the
-// upstream. A non-POST method → no observer call, since there is no
-// upstream response to inspect.
-func TestProxy_observerNotCalledForRejectedRequests(t *testing.T) {
-	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("upstream must not be hit; got %s %s", r.Method, r.URL.Path)
-	})
-	upSrv := httptest.NewServer(upstream)
-	t.Cleanup(upSrv.Close)
-
-	var calls atomic.Int32
-	gw, err := proxy.New(func(*http.Response) { calls.Add(1) }, nil)
-	if err != nil {
-		t.Fatalf("proxy.New: %v", err)
-	}
-	b := backend.Backend{Pool: "api", Nick: "default", Credential: testAPIKey, BaseURL: upSrv.URL}
-	gwSrv := httptest.NewServer(injectBackend(b, gw))
-	t.Cleanup(gwSrv.Close)
-
-	resp, err := http.Get(gwSrv.URL + "/v1/messages")
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	resp.Body.Close()
-
-	if got := calls.Load(); got != 0 {
-		t.Errorf("observer call count = %d, want 0 (rejected requests must not invoke observer)", got)
 	}
 }
 

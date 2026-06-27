@@ -58,14 +58,19 @@ func TestMiddleware_resolvesAndInjects(t *testing.T) {
 
 func TestMiddleware_unknownPoolFailsClosed(t *testing.T) {
 	cases := []struct {
-		name string
-		auth string // Authorization header; "" means unset
+		name   string
+		method string
+		auth   string // Authorization header; "" means unset
 	}{
-		{"unknown pool", "Bearer claude-z"},
-		{"missing header", ""},
-		{"empty bearer", "Bearer "},
-		{"non-bearer scheme", "Basic claude-a"},
-		{"raw token no scheme", "claude-a"},
+		{"unknown pool", http.MethodPost, "Bearer claude-z"},
+		{"missing header", http.MethodPost, ""},
+		{"empty bearer", http.MethodPost, "Bearer "},
+		{"non-bearer scheme", http.MethodPost, "Basic claude-a"},
+		{"raw token no scheme", http.MethodPost, "claude-a"},
+		// The gate is method-agnostic: a GET with an unknown selector
+		// fails closed exactly like a POST (#141 lifted the proxy's
+		// POST-only check; the selector boundary must still hold).
+		{"unknown pool via GET", http.MethodGet, "Bearer claude-z"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -75,7 +80,7 @@ func TestMiddleware_unknownPoolFailsClosed(t *testing.T) {
 			// ok=false → the router does not recognise the pool.
 			h := Middleware(&stubRouter{ok: false}, next)
 
-			req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			req := httptest.NewRequest(tc.method, "/v1/models", nil)
 			if tc.auth != "" {
 				req.Header.Set("Authorization", tc.auth)
 			}
