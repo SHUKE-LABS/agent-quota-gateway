@@ -70,8 +70,8 @@ const unifiedStatusRejected = "rejected"
 // immediately and rebuild its cache on the new backend.
 const switchRetryAfterSeconds = 1
 
-// window5h and window7d are the lengths of the Anthropic unified
-// rate-limit windows. They are used by the lead calculation:
+// window5h is the length of the Anthropic unified short window, used by
+// the lead calculation:
 //
 //	elapsed_fraction = 1 - (time_until_reset / window_length)
 //	lead = utilization - elapsed_fraction
@@ -79,10 +79,11 @@ const switchRetryAfterSeconds = 1
 // A positive lead means the member is consuming faster than its window
 // is depleting and should be cooled down; near-zero is on pace; negative
 // is under pace.
-const (
-	window5h = 5 * time.Hour
-	window7d = 7 * 24 * time.Hour
-)
+//
+// The long-window length is provider-aware and resolved per member via
+// poller.LongWindowFor (7-day default, ~30-day monthly for Z.AI/Zhipu;
+// issue #140), so there is no fixed long-window constant here.
+const window5h = 5 * time.Hour
 
 // Pools fronts each configured pool with its own Controller and routes a
 // request to the right one. It implements backend.PoolRouter.
@@ -2514,7 +2515,8 @@ func (c *Controller) memberLeadsLocked(nick string) (overall, lead5h, lead7d flo
 	if idx < 0 {
 		return 0, 0, 0, false, false
 	}
-	snap := c.store.Get(c.backendAt(idx).QuotaKey())
+	b := c.backendAt(idx)
+	snap := c.store.Get(b.QuotaKey())
 	now := c.now()
 
 	computeLead := func(util *float64, reset *time.Time, windowLen time.Duration) (float64, bool) {
@@ -2530,8 +2532,13 @@ func (c *Controller) memberLeadsLocked(nick string) (overall, lead5h, lead7d flo
 		return *util - elapsed, true
 	}
 
+	// The long window's length is provider-aware: Z.AI/Zhipu's long slot
+	// carries a monthly TIME_LIMIT window, so dividing its reset by 7 days
+	// would clamp the elapsed fraction to 0 and collapse the lead to raw
+	// utilization (issue #140). Resolve the length from the same provider
+	// mapping that supplies the column label.
 	lead5h, has5h = computeLead(snap.Unified5hUtilization, snap.Unified5hReset, window5h)
-	lead7d, has7d = computeLead(snap.Unified7dUtilization, snap.Unified7dReset, window7d)
+	lead7d, has7d = computeLead(snap.Unified7dUtilization, snap.Unified7dReset, poller.LongWindowFor(b.BaseURL))
 
 	switch {
 	case has5h && has7d:

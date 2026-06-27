@@ -248,6 +248,14 @@ utilization and reset are known, and switches when the active member's lead
 exceeds the best non-exhausted candidate's lead by at least the configured
 gap. A dwell timer prevents churn immediately after a switch.
 
+`window_length` for the long window is **provider-aware**: it is ~30 days
+for Z.AI / Zhipu (whose long slot carries the monthly `TIME_LIMIT` quota)
+and 7 days for everyone else, resolved from the same provider mapping that
+labels the column (see the provider-aware window note below). Using the
+fixed 7-day length for a monthly reset weeks out would push
+`time_until_reset / window_length` above 1, clamp `elapsed_fraction` to 0,
+and collapse the long lead to raw utilization (issue #140).
+
 Enable it with `AQG_POOL_<POOL>_BALANCE=lead`:
 
 ```
@@ -1066,13 +1074,17 @@ How it behaves:
   percentages; its `session` window maps to 5h and `weekly` to 7d (reset
   timestamps are epoch seconds, not milliseconds). All three map onto the
   unified 5h / 7d utilization and reset fields.
-- **Long-window labels are provider-aware.** The members table renders the
-  long-window column with a header the gateway supplies per pool. For
-  Anthropic, MiniMaxi, and Volcengine Ark it reads "7d" / "7d reset".
-  For Z.ai / Zhipu it reads "monthly" / "monthly reset", because the
-  upstream `TIME_LIMIT` entry is the **monthly** quota, not a 7-day
-  rolling window (the snapshot's `unified_7d_*` fields are still the
-  right data shape — only the human label is monthly). Any Z.AI
+- **The long window is provider-aware — label *and* length.** The members
+  table renders the long-window column with a header the gateway supplies
+  per pool. For Anthropic, MiniMaxi, and Volcengine Ark it reads "7d" /
+  "7d reset"; for Z.ai / Zhipu it reads "monthly" / "monthly reset",
+  because the upstream `TIME_LIMIT` entry is the **monthly** quota, not a
+  7-day rolling window (the snapshot's `unified_7d_*` fields are still the
+  right data shape — only the human label moves). The lead-routing
+  elapsed-fraction divides by the matching **length** from the same
+  mapping (~30 days for Z.AI/Zhipu, 7 days otherwise; issue #140), so the
+  long-window lead reflects the monthly schedule rather than collapsing to
+  raw utilization. Any Z.AI
   response that contains only one of `TOKENS_LIMIT` / `TIME_LIMIT` still
   produces a usable snapshot, so an exhausted 5h window no longer hides
   the monthly reset from the operator.
