@@ -1,7 +1,6 @@
 package auto
 
 import (
-	"encoding/json"
 	"net/http"
 	"sync"
 	"testing"
