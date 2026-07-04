@@ -12,4 +12,4 @@ ROOT="$(cd -P -- "$(dirname -- "${SCRIPT_PATH}")/.." && pwd)"
 # shellcheck source=../lib/release.sh
 source "${ROOT}/lib/release.sh"
 
-release_create_beta_tag
+release_create_tag

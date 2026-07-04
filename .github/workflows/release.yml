@@ -1,15 +1,15 @@
-name: Beta Release
+name: Release
 
 on:
   push:
     branches: [main, master]
 
 concurrency:
-  group: beta-release-${{ github.ref_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  beta-tag:
+  tag:
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: write
@@ -19,13 +19,13 @@ jobs:
           fetch-depth: 0
       - name: Fetch tags
         run: git fetch --force --tags origin
-      - name: Create beta tag
-        id: beta_tag
+      - name: Create tag
+        id: tag
         run: |
-          tag="$(bash scripts/beta-tag)"
+          tag="$(bash scripts/release-tag)"
           printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
-      - name: Push beta tag
-        run: git push origin "refs/tags/${{ steps.beta_tag.outputs.tag }}"
+      - name: Push tag
+        run: git push origin "refs/tags/${{ steps.tag.outputs.tag }}"
       - name: Generate changelog
         run: bash scripts/generate-changelog CHANGELOG.md
       - name: Commit changelog

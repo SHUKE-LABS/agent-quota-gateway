@@ -1,41 +1,45 @@
-# Release helpers for beta tags and changelog generation.
-
-release_beta_tag_regex() {
-    printf '^v([0-9]+)\\.([0-9]+)\\.([0-9]+)-beta$'
+# Release helpers for tags and changelog generation.
+#
+# release_tag_regex intentionally matches both the legacy `-beta` suffix
+# and the bare form: pre-existing v*-beta tags must still be found by
+# "latest tag" lookups so version numbering continues unbroken, even
+# though release_next_tag only ever produces the bare form going forward.
+release_tag_regex() {
+    printf '^v([0-9]+)\\.([0-9]+)\\.([0-9]+)(-beta)?$'
 }
 
 
-release_beta_tags_desc() {
+release_tags_desc() {
     local tag="" regex=""
-    regex="$(release_beta_tag_regex)"
+    regex="$(release_tag_regex)"
 
     while IFS= read -r tag; do
         [[ "${tag}" =~ ${regex} ]] || continue
         printf '%s\n' "${tag}"
-    done < <(git tag --list 'v*-beta' --sort=-version:refname)
+    done < <(git tag --list 'v*' --sort=-version:refname)
 }
 
 
-release_latest_beta_tag() {
+release_latest_tag() {
     local tag=""
 
     while IFS= read -r tag; do
         [[ -n "${tag}" ]] || continue
         printf '%s\n' "${tag}"
         return 0
-    done < <(release_beta_tags_desc)
+    done < <(release_tags_desc)
 }
 
 
-release_head_beta_tag() {
+release_head_tag() {
     local tag="" regex=""
-    regex="$(release_beta_tag_regex)"
+    regex="$(release_tag_regex)"
 
     while IFS= read -r tag; do
         [[ "${tag}" =~ ${regex} ]] || continue
         printf '%s\n' "${tag}"
         return 0
-    done < <(git tag --points-at HEAD --list 'v*-beta' --sort=-version:refname)
+    done < <(git tag --points-at HEAD --list 'v*' --sort=-version:refname)
 }
 
 
@@ -72,13 +76,13 @@ release_bump_kind_for_subject() {
 }
 
 
-release_next_beta_tag() {
+release_next_tag() {
     local latest_tag="${1:-}" bump_kind="${2:-patch}" major=0 minor=0 patch=0 regex=""
-    regex="$(release_beta_tag_regex)"
+    regex="$(release_tag_regex)"
 
     if [[ -n "${latest_tag}" ]]; then
         [[ "${latest_tag}" =~ ${regex} ]] || {
-            printf "release_next_beta_tag: invalid beta tag '%s'\n" "${latest_tag}" >&2
+            printf "release_next_tag: invalid tag '%s'\n" "${latest_tag}" >&2
             return 1
         }
         major="${BASH_REMATCH[1]}"
@@ -95,28 +99,28 @@ release_next_beta_tag() {
             patch=$((patch + 1))
             ;;
         *)
-            printf "release_next_beta_tag: unsupported bump kind '%s'\n" "${bump_kind}" >&2
+            printf "release_next_tag: unsupported bump kind '%s'\n" "${bump_kind}" >&2
             return 1
             ;;
     esac
 
-    printf 'v%s.%s.%s-beta\n' "${major}" "${minor}" "${patch}"
+    printf 'v%s.%s.%s\n' "${major}" "${minor}" "${patch}"
 }
 
 
-release_create_beta_tag() {
+release_create_tag() {
     local current_tag="" latest_tag="" subject="" bump_kind="" next_tag=""
 
-    current_tag="$(release_head_beta_tag || true)"
+    current_tag="$(release_head_tag || true)"
     if [[ -n "${current_tag}" ]]; then
         printf '%s\n' "${current_tag}"
         return 0
     fi
 
-    latest_tag="$(release_latest_beta_tag || true)"
+    latest_tag="$(release_latest_tag || true)"
     subject="$(release_head_subject)"
     bump_kind="$(release_bump_kind_for_subject "${subject}")"
-    next_tag="$(release_next_beta_tag "${latest_tag}" "${bump_kind}")"
+    next_tag="$(release_next_tag "${latest_tag}" "${bump_kind}")"
 
     git tag "${next_tag}" HEAD
     printf '%s\n' "${next_tag}"
@@ -211,14 +215,14 @@ release_generate_changelog() {
         tmp_output="${output_path}.tmp"
     fi
 
-    mapfile -t tags < <(release_beta_tags_desc)
+    mapfile -t tags < <(release_tags_desc)
 
     {
         printf '# Changelog\n\n'
-        printf '_Generated from beta tags with `bash scripts/generate-changelog`._\n\n'
+        printf '_Generated from release tags with `bash scripts/generate-changelog`._\n\n'
 
         if (( ${#tags[@]} == 0 )); then
-            printf 'No beta tags yet.\n'
+            printf 'No release tags yet.\n'
         else
             local -a current_group=()
             local current_group_date="" tag="" tag_date=""
