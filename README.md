@@ -788,6 +788,13 @@ contains no auth and no build step — it inherits the gateway's trust boundary.
 write controls to any tailnet member that can reach the port; a Tailscale
 ACL restricting the port is the only gate.
 
+A rolling-window utilization cell (5h or long) renders `-` once its reset has
+already elapsed, mirroring what the adjacent reset cell and status badge
+already show. Recovery from `exhausted` to `idle` happens by wall-clock; the
+quota store keeps the frozen at-cap snapshot until the next real response
+rewrites it, so a stale `100%` would otherwise read as live load. The next
+request that carries a fresh utilization header repopulates the cell.
+
 ```bash
 curl http://127.0.0.1:8080/_gateway/ui
 ```
