@@ -847,6 +847,21 @@
       : hrs + 'h ' + mins + 'm';
   }
 
+  // resetLive is the freshness guard the routing layer (windowBlocks,
+  // internal/auto/auto.go:2647) and formatReset already apply: a window's
+  // snapshot is current only while its reset is still in the future. Once
+  // the reset has elapsed the frozen utilization is stale — recovery to
+  // idle happens by wall-clock and the quota store is not rewritten until
+  // the next real response (#134/#176). Returns false for missing /
+  // unparseable / elapsed ISO, so a renderQuota cell paired with the
+  // matching formatReset cell gets the same gate (both columns read '-').
+  function resetLive(iso) {
+    if (!iso) return false;
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return false;
+    return d.getTime() - Date.now() > 0;
+  }
+
   // formatResetAbsolute returns the local yyyy-mm-dd hh:mm:ss for a reset ISO
   // string, surfaced via the reset cell's native title tooltip so the absolute
   // time is reachable even though the cell shows only a relative countdown
@@ -1025,13 +1040,19 @@
           clr.style.display = match.parked ? '' : 'none';
         }
         var snap = match.snapshot || null;
+        // Pull each window's reset ISO once so the quota cell and its
+        // adjacent reset cell share one parse and apply the same freshness
+        // gate (resetLive, issue #176). When the reset has elapsed the
+        // snapshot is stale — renderQuota gets null so the cell reads '-'
+        // instead of the frozen at-cap value the quota store still holds.
+        var iso5h = snap ? snap.unified_5h_reset : null;
+        var isoLong = snap ? snap.unified_7d_reset : null;
         var cell5h = tr.querySelector('[data-role="quota-5h"]');
         if (cell5h) {
-          renderQuota(cell5h, snap ? snap.unified_5h_utilization : null);
+          renderQuota(cell5h, (snap && resetLive(iso5h)) ? snap.unified_5h_utilization : null);
         }
         var reset5h = tr.querySelector('[data-role="reset-5h"]');
         if (reset5h) {
-          var iso5h = snap ? snap.unified_5h_reset : null;
           reset5h.textContent = formatReset(iso5h, '5h');
           // Absolute local time via native title; '' when there is no live
           // reset, so a dropped snapshot clears any stale tooltip.
@@ -1039,7 +1060,7 @@
         }
         var cellLong = tr.querySelector('[data-role="quota-long"]');
         if (cellLong) {
-          renderQuota(cellLong, snap ? snap.unified_7d_utilization : null);
+          renderQuota(cellLong, (snap && resetLive(isoLong)) ? snap.unified_7d_utilization : null);
         }
         var resetLong = tr.querySelector('[data-role="reset-long"]');
         if (resetLong) {
@@ -1047,7 +1068,6 @@
           // any long window); only the human label is monthly for Z.AI.
           // formatReset('7d') returns the Xd/Yhr/Zmin branch, which is
           // what a monthly reset needs.
-          var isoLong = snap ? snap.unified_7d_reset : null;
           resetLong.textContent = formatReset(isoLong, '7d');
           resetLong.title = formatResetAbsolute(isoLong);
         }
