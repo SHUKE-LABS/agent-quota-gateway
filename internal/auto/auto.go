@@ -443,7 +443,17 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
 	}
 
-	// Normalize and validate the input order.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Reject priority override on a balanced pool (mutually exclusive modes).
+	if c.balanceGap > 0 {
+		return http.StatusConflict, fmt.Errorf("balanced pools do not support priority override")
+	}
+
+	// Normalize and validate the input order. Accept static members (indexOf)
+	// and runtime-added members (isAddedMemberLocked) — matching the membership
+	// check used by SetMemberDisabled, MoveMember, and loadRuntimeConfig.
 	seen := make(map[string]bool)
 	validOrder := make([]string, 0, len(order))
 	for _, raw := range order {
@@ -455,21 +465,17 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 			return http.StatusBadRequest, fmt.Errorf("priority list contains duplicate nick: %s", nick)
 		}
 		seen[nick] = true
-		if c.indexOf(nick) < 0 {
+		if c.indexOf(nick) < 0 && !c.isAddedMemberLocked(nick) {
 			return http.StatusBadRequest, fmt.Errorf("unknown nick: %s", nick)
 		}
 		validOrder = append(validOrder, nick)
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Reject priority override on a balanced pool (mutually exclusive modes).
-	if c.balanceGap > 0 {
-		return http.StatusConflict, fmt.Errorf("balanced pools do not support priority override")
-	}
-
-	c.setPriorityOverrideLocked(validOrder)
+	// Expand via the effective set (static ∪ added − removed) so unlisted
+	// runtime-added members rank last, matching the documented behavior for
+	// unlisted static members. setPriorityOverrideEffectiveLocked is already
+	// used by MoveMember and loadRuntimeConfig for the same reason.
+	c.setPriorityOverrideEffectiveLocked(validOrder)
 	return http.StatusOK, nil
 }
 
