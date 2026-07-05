@@ -1057,7 +1057,7 @@ retries until `tailscaled` brings it up.
 
 The gateway watches the `anthropic-ratelimit-unified-*` and
 `anthropic-organization-id` response headers on every forwarded request
-and keeps the latest snapshot per backend key (`<pool>/<member>`) in an
+and keeps the latest snapshot per backend key (the member nick) in an
 in-process cache. Reads go through a small loopback endpoint, keyed by
 pool:
 
@@ -1110,13 +1110,14 @@ the header on the most recent response, omitted otherwise — so a consumer
 can surface which organization a pool member is using, which matters when a
 pool mixes accounts from different orgs.
 
-### Pool keying
+### Snapshot keying
 
-Snapshots are filed under `<pool>/<member>`, and the read endpoint takes a
-**pool** name: it returns the pool's active member with an
-`active_backend` field naming the member (see
-[Reading a pool's quota](#reading-a-pools-quota)). Per-member historical
-snapshots are kept internally but not yet exposed individually.
+Snapshots are filed under the member nick alone (not `pool/nick`) — one
+account shared across multiple pools has a single exhaustion record read by
+every pool that selects it (see `QuotaKey()` in `internal/backend` and the
+invariant at the top of this file). The read endpoint takes a **pool** name:
+it returns the pool's active member with an `active_backend` field naming
+the member (see [Reading a pool's quota](#reading-a-pools-quota)).
 
 `GET /_gateway/quota?backend=<pool>` always returns `200`; if no traffic
 has flowed (or the pool is unknown), the body carries no `unified_*`
