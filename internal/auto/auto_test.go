@@ -2463,6 +2463,82 @@ func TestRecord429_runtimeAddedActiveMember(t *testing.T) {
 	}
 }
 
+// TestRecord429_zeroStaticMembersPoolDry proves that a pool created via
+// AddPool (zero static members) with one runtime-added member does not panic
+// when that member returns a 429, and correctly reports the pool-dry state
+// (allExhausted) with a valid retryAfter. The old index-based path crashed
+// on c.nicks[0] with an empty nicks slice (issue #188).
+func TestRecord429_zeroStaticMembersPoolDry(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	// loadMovePools requires at least one env-defined backend; use a throwaway
+	// pool "dummy" so backend.Load succeeds. The "solo" pool is created at
+	// runtime with zero static members via AddPool.
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "DUMMY_BACKEND_X": "cred-dummy",
+	})
+	if status, err := p.AddPool("solo", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool solo: status=%d err=%v, want 201", status, err)
+	}
+	if status, err := p.AddMember("solo", "x", "cred-x", "https://x.example", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember x: status=%d err=%v, want 200", status, err)
+	}
+	c := p.byPool["solo"]
+	b, _, exhausted := c.ResolveAuto()
+	if exhausted {
+		t.Fatal("pool with one healthy member reported exhausted before any 429")
+	}
+	if b.Nick != "x" {
+		t.Fatalf("ResolveAuto nick=%q, want x (only member)", b.Nick)
+	}
+
+	reset := clock.now().Add(time.Hour)
+	res := c.record429("x", reset)
+	if !res.allExhausted {
+		t.Errorf("allExhausted=false, want true (sole member exhausted)")
+	}
+	if res.retryAfter <= 0 {
+		t.Errorf("retryAfter=%v, want > 0 (wait until x's reset)", res.retryAfter)
+	}
+}
+
+// TestParkAndFailover_addedActiveMemberFailsOverToHealthyAdded proves that when
+// a pool's active member is a runtime-added one, all static members are parked,
+// and another runtime-added member is healthy, parkAndFailover rewrites the
+// response to 503 (failover) rather than forwarding an honest 429. The old
+// static-only firstHealthyLocked scan ignored the healthy added member and
+// incorrectly reported allExhausted (issue #188).
+func TestParkAndFailover_addedActiveMemberFailsOverToHealthyAdded(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	// One static member "a" (will be parked), active = runtime-added "extra1",
+	// healthy = runtime-added "extra2".
+	c := newController(t, 0, clock, io.Discard, "a")
+	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+	if status, err := p.AddMember("auto", "extra1", "cred-extra1", "https://extra1.example", nil); status != 200 || err != nil {
+		t.Fatalf("AddMember extra1: status=%d err=%v, want 200", status, err)
+	}
+	if status, err := p.AddMember("auto", "extra2", "cred-extra2", "https://extra2.example", nil); status != 200 || err != nil {
+		t.Fatalf("AddMember extra2: status=%d err=%v, want 200", status, err)
+	}
+	c.park("a", clock.now().Add(time.Hour))
+	c.setCur("extra1")
+
+	// 429 on extra1: static "a" already parked, "extra2" is healthy.
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("upstream 429")),
+	}
+	if err := c.parkAndFailover(resp, "extra1", clock.now().Add(time.Hour), "hit 429"); err != nil {
+		t.Fatalf("parkAndFailover: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503 (failover to extra2, not honest 429)", resp.StatusCode)
+	}
+	if got := c.Current(); got != "extra2" {
+		t.Errorf("Current()=%q, want extra2 (switched to healthy runtime-added member)", got)
+	}
+}
+
 // TestBalance_runtimeAddedMemberParticipates proves that a runtime-added
 // member participates in the balance lead comparison and can be selected
 // by a balance switch (issue #185: the old balanceSwitchLocked gated on
