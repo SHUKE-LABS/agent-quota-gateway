@@ -1936,6 +1936,42 @@ func TestRuntimeConfig_loadDropsAddedMemberWithEmptyBaseURL(t *testing.T) {
 	}
 }
 
+// TestRuntimeConfig_mixedPoolStickyRoundTrip proves that a mixed pool (config
+// + runtime-added members) correctly restores the active sticky when the
+// active member before shutdown was a runtime-added one (issue #185 regression:
+// the old curNick == "" guard in loadRuntimeConfig silently dropped the
+// pendingSticky for any pool that had config members, because NewController
+// always set curNick to a config nick first).
+func TestRuntimeConfig_mixedPoolStickyRoundTrip(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+
+	// Add a runtime member "extra" and make it the active sticky.
+	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {
+		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
+	}
+	c.setCur("extra")
+	if got := c.Current(); got != "extra" {
+		t.Fatalf("pre-persist: current=%q, want extra", got)
+	}
+
+	// Persist runtime config and routing state into a round-trip.
+	rtCfg := c.runtimeConfig()
+	persistState := (&Pools{byPool: map[string]*Controller{"auto": c}}).PersistState()
+
+	// Reload into a fresh controller (simulates restart: config members a,b are
+	// re-seeded by NewController; extra is absent until loadRuntimeConfig).
+	c2 := newController(t, 0, clock, io.Discard, "a", "b")
+	c2p := &Pools{byPool: map[string]*Controller{"auto": c2}}
+	c2p.LoadPersistState(persistState) // sets pendingSticky = "extra" (not yet in members)
+	c2.loadRuntimeConfig(rtCfg)        // restores extra into members, then applies pendingSticky
+
+	if got := c2.Current(); got != "extra" {
+		t.Fatalf("after restart: current=%q, want extra (active sticky should survive round-trip)", got)
+	}
+}
+
 // TestAddMember_newNickBrandNewPoolRequiresBaseURL proves the acceptance
 // criterion (issue #172): a brand-new pool with no static members and a
 // genuinely new nick added without an explicit base_url returns 400 with the

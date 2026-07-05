@@ -1986,7 +1986,13 @@ func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
 	// first-healthy pick.
 	sticky := c.pendingSticky
 	c.pendingSticky = ""
-	if sticky != "" && c.curNick == "" && c.indexOf(sticky) >= 0 && !c.isUnavailableLocked(sticky) {
+	// Apply unconditionally once the member is present: the curNick == ""
+	// guard from before the unification was a no-op sentinel (loadState never
+	// set curAddedNick for config members) but it silently dropped the sticky
+	// for mixed pools (config + added) where curNick is already set by
+	// NewController. Drop the guard so the member that was active before
+	// restart stays active regardless of pool origin mix (issue #185 fixup).
+	if sticky != "" && c.indexOf(sticky) >= 0 && !c.isUnavailableLocked(sticky) {
 		c.setActiveMemberLocked(sticky)
 		sticky = ""
 	}
