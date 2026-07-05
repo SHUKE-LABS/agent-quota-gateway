@@ -709,10 +709,8 @@ adds a runtime member. The JSON body is `{"credential": "...", "base_url": "..."
   (equivalent to omitting it in a static config). Required only when the pool has
   no static members and no other pool resolves a URL for this nick.
 - `placement` — a JSON array of nicks, highest priority first; **must include**
-  the added nick. Required when the target pool is in priority mode and has no
-  existing slot for the nick — there is no implicit insertion position. Rejected
-  with `400` for plain/balanced-mode targets. Unnecessary when the nick already
-  has a slot in the target pool's priority order (the existing slot is preserved).
+  the added nick. Required when the target pool is in priority mode — there is no
+  implicit insertion position. Rejected with `400` for plain/balanced-mode targets.
 
 On success the member is persisted to the state file *with its credential* (file
 mode `0600`) and re-applied at startup. Status codes: `200` on success; `400` on
