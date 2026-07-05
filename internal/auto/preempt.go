@@ -265,7 +265,7 @@ func (c *Controller) preemptView() preemptView {
 	}
 	c.clearExpiredLocked()
 
-	cur := c.nicks[c.cur]
+	cur := c.curNick
 	curRank := c.rankLocked(cur)
 	v := preemptView{isPriority: true, current: cur}
 	for _, nick := range pri { // highest priority first
@@ -313,18 +313,16 @@ func (c *Controller) PreemptTo(nick string) bool {
 	}
 	c.clearExpiredLocked()
 
-	idx := c.indexOf(nick)
-	if idx < 0 {
+	if c.indexOf(nick) < 0 {
 		return false
 	}
-	if c.rankLocked(nick) >= c.rankLocked(c.nicks[c.cur]) {
+	if c.rankLocked(nick) >= c.rankLocked(c.curNick) {
 		return false
 	}
 	if c.isUnavailableLocked(nick) {
 		return false
 	}
-	c.cur = idx
-	c.notifyMutate()
+	c.setActiveMemberLocked(nick)
 	return true
 }
 

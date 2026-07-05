@@ -7,16 +7,21 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 )
 
-// addedMember reads a runtime-added member's persisted spec directly (bypassing
-// the display-time base_url fallback in backendByNickLocked) so tests can prove
-// what was actually stored.
+// addedMember reads a member's stored spec directly (bypassing the
+// display-time base_url fallback in backendByNickLocked) so tests can prove
+// what was actually stored in the unified c.members collection.
 func addedMember(t *testing.T, p *Pools, pool, nick string) (AddedMember, bool) {
 	t.Helper()
 	c := p.byPool[pool]
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	am, ok := c.addedMembers[backend.NormalizeName(nick)]
-	return am, ok
+	normalized := backend.NormalizeName(nick)
+	for _, m := range c.members {
+		if m.Nick == normalized {
+			return AddedMember{Credential: m.Credential, BaseURL: m.BaseURL}, true
+		}
+	}
+	return AddedMember{}, false
 }
 
 // TestAdd_resolvesKnownCredentialAndBaseURL proves that adding a known
@@ -184,5 +189,36 @@ func TestAdd_placementRejectedOnPlainPool(t *testing.T) {
 	})
 	if status, err := p.AddMember("dst", "a", "cred-a", "https://u.example", []string{"a", "x"}); status != http.StatusBadRequest || err == nil {
 		t.Fatalf("placement on plain pool: status=%d err=%v, want 400", status, err)
+	}
+}
+
+// TestAdd_configNickReAddAfterRemove proves that a config-derived nick that was
+// removed can always be re-added without 409 (issue #185: no more static-nick
+// duplicate block). The tombstone is cleared and the member rejoins with the
+// supplied credential.
+func TestAdd_configNickReAddAfterRemove(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "DST_BACKEND_X": "cred-x",
+		backend.EnvPrefix + "DST_BACKEND_Y": "cred-y",
+	})
+
+	// Remove the config-derived nick "x" from dst.
+	if status, err := p.RemoveMember("dst", "x"); status != http.StatusOK || err != nil {
+		t.Fatalf("RemoveMember dst x: status=%d err=%v, want 200", status, err)
+	}
+
+	// Re-adding "x" must succeed (was removed → tombstone cleared).
+	if status, err := p.AddMember("dst", "x", "cred-x", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember dst x (re-add after remove): status=%d err=%v, want 200", status, err)
+	}
+
+	// The member should be present again and selectable.
+	am, ok := addedMember(t, p, "dst", "x")
+	if !ok {
+		t.Fatalf("re-added nick x not found in dst members")
+	}
+	if am.Credential != "cred-x" {
+		t.Errorf("credential=%q, want cred-x", am.Credential)
 	}
 }

@@ -408,8 +408,12 @@ func TestAddRemoveEndpoints(t *testing.T) {
 		t.Error("survivor member b missing from config view after restart")
 	}
 
+	// Re-adding a previously removed config-derived nick succeeds (issue #185:
+	// no more static-nick 409; tombstone is cleared and member rejoins).
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/a", `{"credential":"sk-ant-a"}`, http.StatusOK)
+
 	// Error cases.
-	addJSON(t, srv.URL+"/_gateway/pool/auto/member/a", `{"credential":"sk-ant-x"}`, http.StatusConflict)             // duplicate nick
+	addJSON(t, srv.URL+"/_gateway/pool/auto/member/b", `{"credential":"sk-ant-x"}`, http.StatusConflict)             // duplicate nick (b is still live)
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{}`, http.StatusBadRequest)                                // empty credential
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{"credential":"x","base_url":"!"}`, http.StatusBadRequest) // invalid URL
 	delete(t, srv.URL+"/_gateway/pool/ghost/member/a", http.StatusNotFound)                                          // unknown pool

@@ -1572,7 +1572,7 @@ func TestBalance_equalLeadPrefersLeastRecentlySelected(t *testing.T) {
 	c.balanceSeq = 2
 	c.lastSelectedSeq["b"] = 2
 	// Point the sticky at B.
-	c.cur = c.indexOf("b")
+	c.curNick = "b"
 	c.mu.Unlock()
 
 	// B is over-budget (high lead); A and C have no data (lead = 0).
@@ -1602,7 +1602,7 @@ func TestBalance_equalLeadFallsBackWhenPreferredIsExhausted(t *testing.T) {
 	c.mu.Lock()
 	c.balanceSeq = 2
 	c.lastSelectedSeq["b"] = 2
-	c.cur = c.indexOf("b")
+	c.curNick = "b"
 	// Park C for one hour.
 	c.exhausted["c"] = clock.now().Add(time.Hour)
 	c.mu.Unlock()
@@ -1631,7 +1631,7 @@ func TestBalance_selectionRecencyPersistedAcrossRestart(t *testing.T) {
 	c.mu.Lock()
 	c.balanceSeq = 2
 	c.lastSelectedSeq["b"] = 2
-	c.cur = c.indexOf("b")
+	c.curNick = "b"
 	c.mu.Unlock()
 
 	// Persist and reload into a fresh controller.
@@ -1779,7 +1779,7 @@ func TestRuntimeConfig_priorityOverrideFailover(t *testing.T) {
 
 	// Set a runtime priority override: ["c", "b"] (expanded to [c,b,a]).
 	c.mu.Lock()
-	c.setPriorityOverrideLocked([]string{"c", "b"})
+	c.setPriorityOverrideEffectiveLocked([]string{"c", "b"})
 	c.mu.Unlock()
 
 	// The active member should still be a (priority override does not
@@ -1805,7 +1805,7 @@ func TestRuntimeConfig_partialOverrideRoundTrip(t *testing.T) {
 	// Set a partial override: only b is listed (a and c rank after in sorted order).
 	// Effective order should be [b, a, c].
 	c.mu.Lock()
-	c.setPriorityOverrideLocked([]string{"b"})
+	c.setPriorityOverrideEffectiveLocked([]string{"b"})
 	c.mu.Unlock()
 
 	// Snapshot the runtime config.
@@ -1844,7 +1844,7 @@ func TestRuntimeConfig_configRoundTrip(t *testing.T) {
 
 	// Set a priority override and disable b.
 	c.mu.Lock()
-	c.setPriorityOverrideLocked([]string{"c"})
+	c.setPriorityOverrideEffectiveLocked([]string{"c"})
 	c.setDisabledLocked("b", true)
 	c.mu.Unlock()
 
@@ -1921,16 +1921,54 @@ func TestRuntimeConfig_loadDropsAddedMemberWithEmptyBaseURL(t *testing.T) {
 	c.loadRuntimeConfig(cfg)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.addedMembers["good"]; !ok {
-		t.Errorf("good member not restored: addedMembers=%v", c.addedMembers)
+	goodPresent := c.indexOf("good") >= 0
+	badPresent := c.indexOf("bad") >= 0
+	c.mu.Unlock()
+	if !goodPresent {
+		t.Errorf("good member not restored")
 	}
-	if _, ok := c.addedMembers["bad"]; ok {
+	if badPresent {
 		t.Errorf("bad member (empty base_url) was restored; want dropped")
 	}
 	logs := logBuf.String()
 	if !strings.Contains(logs, "refusing to restore") || !strings.Contains(logs, "bad") {
 		t.Errorf("expected loud log about dropped bad member, got: %q", logs)
+	}
+}
+
+// TestRuntimeConfig_mixedPoolStickyRoundTrip proves that a mixed pool (config
+// + runtime-added members) correctly restores the active sticky when the
+// active member before shutdown was a runtime-added one (issue #185 regression:
+// the old curNick == "" guard in loadRuntimeConfig silently dropped the
+// pendingSticky for any pool that had config members, because NewController
+// always set curNick to a config nick first).
+func TestRuntimeConfig_mixedPoolStickyRoundTrip(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+
+	// Add a runtime member "extra" and make it the active sticky.
+	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {
+		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
+	}
+	c.setCur("extra")
+	if got := c.Current(); got != "extra" {
+		t.Fatalf("pre-persist: current=%q, want extra", got)
+	}
+
+	// Persist runtime config and routing state into a round-trip.
+	rtCfg := c.runtimeConfig()
+	persistState := (&Pools{byPool: map[string]*Controller{"auto": c}}).PersistState()
+
+	// Reload into a fresh controller (simulates restart: config members a,b are
+	// re-seeded by NewController; extra is absent until loadRuntimeConfig).
+	c2 := newController(t, 0, clock, io.Discard, "a", "b")
+	c2p := &Pools{byPool: map[string]*Controller{"auto": c2}}
+	c2p.LoadPersistState(persistState) // sets pendingSticky = "extra" (not yet in members)
+	c2.loadRuntimeConfig(rtCfg)        // restores extra into members, then applies pendingSticky
+
+	if got := c2.Current(); got != "extra" {
+		t.Fatalf("after restart: current=%q, want extra (active sticky should survive round-trip)", got)
 	}
 }
 
@@ -1952,8 +1990,8 @@ func TestAddMember_newNickBrandNewPoolRequiresBaseURL(t *testing.T) {
 	if status != http.StatusBadRequest || err == nil {
 		t.Fatalf("AddMember(new-nick, no-baseurl) on brand-new pool: status=%d err=%v, want 400", status, err)
 	}
-	if !strings.Contains(err.Error(), "base_url is required when pool has no static members") {
-		t.Errorf("error text=%q, want it to contain %q", err.Error(), "base_url is required when pool has no static members")
+	if !strings.Contains(err.Error(), "base_url is required when pool has no members") {
+		t.Errorf("error text=%q, want it to contain %q", err.Error(), "base_url is required when pool has no members")
 	}
 }
 
@@ -1973,7 +2011,7 @@ func TestRuntimeConfig_concurrentMutation(t *testing.T) {
 
 			// Mutate from another.
 			c.mu.Lock()
-			c.setPriorityOverrideLocked([]string{"c", "b"})
+			c.setPriorityOverrideEffectiveLocked([]string{"c", "b"})
 			c.setDisabledLocked("a", true)
 			c.mu.Unlock()
 		}()
@@ -2393,5 +2431,68 @@ func TestResolveAuto_allParkedLivePastStoreFutureHalfOpen(t *testing.T) {
 	}
 	if b.Nick != "a" && b.Nick != "b" {
 		t.Errorf("ResolveAuto pointed at %q, want one of {a, b}", b.Nick)
+	}
+}
+
+// TestRecord429_runtimeAddedActiveMember proves that record429 does not panic
+// when the currently active member is a runtime-added one (issue #185: the
+// old index-based implementation used c.nicks[c.cur] which was out of range
+// for an active runtime-added member whose index lay in addedMembers, not
+// nicks; after the collapse c.curNick is used directly).
+func TestRecord429_runtimeAddedActiveMember(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	p := &Pools{byPool: map[string]*Controller{
+		"auto": newController(t, 0, clock, io.Discard, "a"),
+	}}
+
+	// Add a runtime member "extra" and make it the active one.
+	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {
+		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
+	}
+	c := p.byPool["auto"]
+	c.setCur("extra") // simulate pool having failed over to the runtime-added member
+
+	// Trigger a 429 on "extra" — must not panic and must switch to the healthy "a".
+	reset := clock.now().Add(time.Hour)
+	res := c.record429("extra", reset)
+	if res.to == "extra" {
+		t.Errorf("record429 stayed on exhausted extra, want failover to a static member")
+	}
+	if res.to == "" {
+		t.Errorf("record429 returned empty to-nick, want a healthy member")
+	}
+}
+
+// TestBalance_runtimeAddedMemberParticipates proves that a runtime-added
+// member participates in the balance lead comparison and can be selected
+// by a balance switch (issue #185: the old balanceSwitchLocked gated on
+// curAddedNick == "" and skipped consideration of added members entirely).
+func TestBalance_runtimeAddedMemberParticipates(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	// Balance pool with members a, b.  a is active; b has a high lead so the
+	// balance switch should fire.
+	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
+	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+
+	// Add a runtime member "extra" with a low lead (no snapshot → util=0).
+	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {
+		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
+	}
+
+	// Give "a" (currently active) a high lead; "b" and "extra" have no data (lead=0).
+	reset := clock.now().Add(window5h / 2)
+	putSnap(store, c, "a", fptr(0.9), nil, tptr(reset), nil)
+
+	// Force "a" to be active so the balance switch can observe it is over budget.
+	c.setCur("a")
+
+	// ResolveAuto should switch away from a (over-budget) to either b or extra.
+	b, _, exhausted := c.ResolveAuto()
+	if exhausted {
+		t.Fatal("ResolveAuto: pool reported exhausted, want healthy")
+	}
+	if b.Nick == "a" {
+		t.Fatalf("balance switch stayed on over-budget a, want b or extra")
 	}
 }
