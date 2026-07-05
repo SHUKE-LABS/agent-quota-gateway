@@ -637,7 +637,7 @@ the wrong tool.
 | `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
-| `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "..."}` (`credential` required, `base_url` optional). Persisted with its credential. |
+| `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "...", "placement": [...]}`. `credential` and `base_url` are each optional when the nick is already a known subscription in another pool (resolved independently; ambiguous → `400`). `placement` is a JSON array of nicks (highest priority first, must include the added nick) and is **required** when the target is a priority pool with no existing slot for that nick; rejected (`400`) for plain/balanced targets. Persisted with its credential. |
 | `POST /_gateway/pool/{name}/member/{nick}/move` | Move a subscription to another pool; body `{"to": "<pool>", "placement": [...], "force": false}`. |
 | `DELETE /_gateway/pool/{name}/member/{nick}` | Remove a member (static or runtime-added) from selection |
 
@@ -650,6 +650,9 @@ curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/disable
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/enable
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/d \
   -d '{"credential": "sk-ant-...", "base_url": "https://api.anthropic.com"}'
+# add into a priority pool — placement is required when the nick has no existing slot
+curl -X POST http://127.0.0.1:8080/_gateway/pool/priority/member/d \
+  -d '{"credential": "sk-ant-...", "placement": ["d", "a", "b"]}'
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/d/move \
   -d '{"to": "spare"}'
 curl -X DELETE http://127.0.0.1:8080/_gateway/pool/auto/member/d
@@ -691,19 +694,40 @@ balanced-mode pool returns `409` (priority and balance are mutually
 exclusive). All error bodies are credential-free.
 
 **Adding and removing members.** `POST /_gateway/pool/{name}/member/{nick}`
-adds a runtime member. The JSON body is `{"credential": "...", "base_url":
-"..."}`: `credential` is required, and `base_url` is optional (it falls back to
-the pool's static members, so it is required only when the pool has no static
-member to inherit from). On success the member is persisted to the state file
-*with its credential* (file mode `0600`) and re-applied at startup. Status
-codes: `200` on success; `400` on a missing nick, invalid JSON body, missing
-credential, invalid `base_url`, or a missing `base_url` for a pool with no
-static members; `404` on an unknown pool; `409` when the nick already exists as
-a static or runtime-added member. `DELETE /_gateway/pool/{name}/member/{nick}`
-removes a member — static or runtime-added — from selection and returns `200`;
-`404` on an unknown pool and `400` on a missing nick or a nick not present in
-the pool. If the removed member was the active one, the pool force-switches to
-the next healthy member. All error bodies are credential-free.
+adds a runtime member. The JSON body is `{"credential": "...", "base_url": "...",
+"placement": [...]}`:
+
+- `credential` — optional when the nick is already a known subscription in
+  another pool; the gateway resolves it by scanning all other pools for the same
+  nick. Required when the nick is new (not found in any other pool). Returns `400`
+  if the nick's credential is ambiguous (found under different credentials in two
+  or more pools); supply it explicitly to disambiguate.
+- `base_url` — optional with the same fallback chain as before: omitting it falls
+  back to the other-pool resolution (same logic), then to the pool's first static
+  member's URL. Returns `400` if the base_url is ambiguous across other pools;
+  falls back to the pool default when no other pool has a URL for this nick
+  (equivalent to omitting it in a static config). Required only when the pool has
+  no static members and no other pool resolves a URL for this nick.
+- `placement` — a JSON array of nicks, highest priority first; **must include**
+  the added nick. Required when the target pool is in priority mode and has no
+  existing slot for the nick — there is no implicit insertion position. Rejected
+  with `400` for plain/balanced-mode targets. Unnecessary when the nick already
+  has a slot in the target pool's priority order (the existing slot is preserved).
+
+On success the member is persisted to the state file *with its credential* (file
+mode `0600`) and re-applied at startup. Status codes: `200` on success; `400` on
+a missing or empty nick, invalid JSON body, missing credential (nick not in any
+other pool), ambiguous credential across pools, invalid `base_url`, ambiguous
+`base_url` across pools, missing `base_url` for a pool with no static members and
+no resolvable URL, missing `placement` for a priority target with no existing
+slot, unknown nick in `placement`, `placement` not containing the added nick,
+duplicate nick in `placement`, or `placement` supplied for a non-priority target;
+`404` on an unknown pool; `409` when the nick already exists as a static or
+runtime-added member. `DELETE /_gateway/pool/{name}/member/{nick}` removes a
+member — static or runtime-added — from selection and returns `200`; `404` on an
+unknown pool and `400` on a missing nick or a nick not present in the pool. If
+the removed member was the active one, the pool force-switches to the next
+healthy member. All error bodies are credential-free.
 
 Removal is **permanent and survives restart**: the tombstone is persisted to
 the state file, so a removed static member stays removed across a restart
