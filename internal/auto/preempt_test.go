@@ -25,7 +25,7 @@ func (c *Controller) park(nick string, reset time.Time) {
 func (c *Controller) setCur(nick string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.cur = c.indexOf(nick)
+	c.curNick = nick
 }
 
 func TestPreemptTo_switchesToHealthyHigher(t *testing.T) {
@@ -405,5 +405,42 @@ func TestPreemptor_disabledMemberPreemptBack(t *testing.T) {
 	}
 	if strings.Contains(logs, "cred") {
 		t.Errorf("log leaked a credential: %q", logs)
+	}
+}
+
+// TestPreemptor_runtimeAddedMemberPreemptBack proves that a priority pool
+// whose current active member is a runtime-added one can still be preempted
+// back to a higher-priority static member once that member recovers (issue
+// #185: the old index-based preemptView used c.nicks[c.cur] which panicked
+// for a runtime-added active member).
+func TestPreemptor_runtimeAddedMemberPreemptBack(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+
+	// Priority pool: a > b > c (static). The pool has a runtime-added member
+	// "extra" which is currently active (pool fell all the way to extra after
+	// the static members were exhausted). "a" has since recovered.
+	c := newPriorityController(t, -1, clock, &logBuf, "a,b,c", "a", "b", "c")
+
+	// Add "extra" as a runtime member and make it the active one.
+	if status, err := (&Pools{byPool: map[string]*Controller{"auto": c}}).AddMember(
+		"auto", "extra", "cred-extra", "https://extra.example", []string{"a", "b", "c", "extra"},
+	); status != 200 || err != nil {
+		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
+	}
+	c.setCur("extra")
+
+	// a is healthy (no park, no snapshot).
+	store := quota.NewStore()
+	p := newPreemptor([]*Controller{c}, store, 0, clock.now, &logBuf)
+
+	wait := p.tick()
+
+	// Should have preempted up to "a" (highest-priority healthy member).
+	if cur := c.Current(); cur != "a" {
+		t.Errorf("after tick: current=%q, want a (preempt-back from runtime-added extra)", cur)
+	}
+	if wait != 5*time.Minute {
+		t.Errorf("tick wait=%v, want 5m (idle interval, a selected immediately)", wait)
 	}
 }

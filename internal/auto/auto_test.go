@@ -1572,7 +1572,7 @@ func TestBalance_equalLeadPrefersLeastRecentlySelected(t *testing.T) {
 	c.balanceSeq = 2
 	c.lastSelectedSeq["b"] = 2
 	// Point the sticky at B.
-	c.cur = c.indexOf("b")
+	c.curNick = "b"
 	c.mu.Unlock()
 
 	// B is over-budget (high lead); A and C have no data (lead = 0).
@@ -1602,7 +1602,7 @@ func TestBalance_equalLeadFallsBackWhenPreferredIsExhausted(t *testing.T) {
 	c.mu.Lock()
 	c.balanceSeq = 2
 	c.lastSelectedSeq["b"] = 2
-	c.cur = c.indexOf("b")
+	c.curNick = "b"
 	// Park C for one hour.
 	c.exhausted["c"] = clock.now().Add(time.Hour)
 	c.mu.Unlock()
@@ -1631,7 +1631,7 @@ func TestBalance_selectionRecencyPersistedAcrossRestart(t *testing.T) {
 	c.mu.Lock()
 	c.balanceSeq = 2
 	c.lastSelectedSeq["b"] = 2
-	c.cur = c.indexOf("b")
+	c.curNick = "b"
 	c.mu.Unlock()
 
 	// Persist and reload into a fresh controller.
@@ -1779,7 +1779,7 @@ func TestRuntimeConfig_priorityOverrideFailover(t *testing.T) {
 
 	// Set a runtime priority override: ["c", "b"] (expanded to [c,b,a]).
 	c.mu.Lock()
-	c.setPriorityOverrideLocked([]string{"c", "b"})
+	c.setPriorityOverrideEffectiveLocked([]string{"c", "b"})
 	c.mu.Unlock()
 
 	// The active member should still be a (priority override does not
@@ -1805,7 +1805,7 @@ func TestRuntimeConfig_partialOverrideRoundTrip(t *testing.T) {
 	// Set a partial override: only b is listed (a and c rank after in sorted order).
 	// Effective order should be [b, a, c].
 	c.mu.Lock()
-	c.setPriorityOverrideLocked([]string{"b"})
+	c.setPriorityOverrideEffectiveLocked([]string{"b"})
 	c.mu.Unlock()
 
 	// Snapshot the runtime config.
@@ -1844,7 +1844,7 @@ func TestRuntimeConfig_configRoundTrip(t *testing.T) {
 
 	// Set a priority override and disable b.
 	c.mu.Lock()
-	c.setPriorityOverrideLocked([]string{"c"})
+	c.setPriorityOverrideEffectiveLocked([]string{"c"})
 	c.setDisabledLocked("b", true)
 	c.mu.Unlock()
 
@@ -1921,11 +1921,13 @@ func TestRuntimeConfig_loadDropsAddedMemberWithEmptyBaseURL(t *testing.T) {
 	c.loadRuntimeConfig(cfg)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.addedMembers["good"]; !ok {
-		t.Errorf("good member not restored: addedMembers=%v", c.addedMembers)
+	goodPresent := c.indexOf("good") >= 0
+	badPresent := c.indexOf("bad") >= 0
+	c.mu.Unlock()
+	if !goodPresent {
+		t.Errorf("good member not restored")
 	}
-	if _, ok := c.addedMembers["bad"]; ok {
+	if badPresent {
 		t.Errorf("bad member (empty base_url) was restored; want dropped")
 	}
 	logs := logBuf.String()
@@ -1952,8 +1954,8 @@ func TestAddMember_newNickBrandNewPoolRequiresBaseURL(t *testing.T) {
 	if status != http.StatusBadRequest || err == nil {
 		t.Fatalf("AddMember(new-nick, no-baseurl) on brand-new pool: status=%d err=%v, want 400", status, err)
 	}
-	if !strings.Contains(err.Error(), "base_url is required when pool has no static members") {
-		t.Errorf("error text=%q, want it to contain %q", err.Error(), "base_url is required when pool has no static members")
+	if !strings.Contains(err.Error(), "base_url is required when pool has no members") {
+		t.Errorf("error text=%q, want it to contain %q", err.Error(), "base_url is required when pool has no members")
 	}
 }
 
@@ -1973,7 +1975,7 @@ func TestRuntimeConfig_concurrentMutation(t *testing.T) {
 
 			// Mutate from another.
 			c.mu.Lock()
-			c.setPriorityOverrideLocked([]string{"c", "b"})
+			c.setPriorityOverrideEffectiveLocked([]string{"c", "b"})
 			c.setDisabledLocked("a", true)
 			c.mu.Unlock()
 		}()
