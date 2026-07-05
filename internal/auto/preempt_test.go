@@ -408,6 +408,50 @@ func TestPreemptor_disabledMemberPreemptBack(t *testing.T) {
 	}
 }
 
+// TestPreemptor_preemptToRuntimeAddedMember proves that a priority pool whose
+// active member is a static one is preempted to a runtime-added member that
+// has been placed above it via a priority override, once that added member's
+// park mark clears. The old indexOf-based preemptView dropped runtime-added
+// nicks from v.higher, and PreemptTo rejected them via indexOf<0 (issue #188).
+func TestPreemptor_preemptToRuntimeAddedMember(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+
+	// Priority pool: a > b (static). "extra" will be placed at rank 0 (above a).
+	c := newPriorityController(t, -1, clock, &logBuf, "a,b", "a", "b")
+	// AddMember with placement "extra,a,b" installs a runtime priority override.
+	if status, err := (&Pools{byPool: map[string]*Controller{"auto": c}}).AddMember(
+		"auto", "extra", "cred-extra", "https://extra.example", []string{"extra", "a", "b"},
+	); status != 200 || err != nil {
+		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
+	}
+	// Pool started on "a"; park "extra" for 30 minutes.
+	c.park("extra", clock.now().Add(30*time.Minute))
+
+	store := quota.NewStore()
+	p := newPreemptor([]*Controller{c}, store, 0, clock.now, &logBuf)
+
+	// Before the park reset: preemptor schedules a wake, no switch yet.
+	wait := p.tick()
+	if cur := c.Current(); cur != "a" {
+		t.Errorf("before reset: current=%q, want a (extra still parked)", cur)
+	}
+	if wait > 30*time.Minute {
+		t.Errorf("tick wait=%v, want ≤30m (scheduled on extra's park reset)", wait)
+	}
+
+	// Past the park reset: preemptor switches the pool to "extra".
+	clock.advance(31 * time.Minute)
+	p.tick()
+	if cur := c.Current(); cur != "extra" {
+		t.Errorf("after reset: current=%q, want extra (preempt-forward to higher-priority runtime-added member)", cur)
+	}
+	_, _, exhausted := c.ResolveAuto()
+	if exhausted {
+		t.Errorf("ResolveAuto after preempt: exhausted=true, want false")
+	}
+}
+
 // TestPreemptor_runtimeAddedMemberPreemptBack proves that a priority pool
 // whose current active member is a runtime-added one can still be preempted
 // back to a higher-priority static member once that member recovers (issue

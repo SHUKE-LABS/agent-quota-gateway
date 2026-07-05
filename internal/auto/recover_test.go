@@ -255,6 +255,73 @@ func TestRecover_integrationAllExhaustedRewritesResponse(t *testing.T) {
 	}
 }
 
+// TestRecover_runtimeAddedMemberSetsActiveOnRecovery proves that when
+// tryRecoverParked unparks a runtime-added member via a quota probe,
+// parkAndFailover's re-rotate correctly installs it as the active member —
+// Current() reflects the runtime-added nick, not a stale static index. The old
+// path used c.indexOf(recovered)+c.cur=idx, which returned -1 for an added
+// member and left the pool in an inconsistent state (issue #188).
+func TestRecover_runtimeAddedMemberSetsActiveOnRecovery(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	// httptest server: returns a healthy probe response.
+	probeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":{"limits":[
+			{"type":"TOKENS_LIMIT","percentage":50,"nextResetTime":4102444800000}
+		]}}`)
+	}))
+	t.Cleanup(probeSrv.Close)
+	// Register a poller provider for the probe server's URL only.
+	poller.WithTestProviderForTest(t,
+		probeSrv.URL,
+		poller.HostURLForTest("/api/monitor/usage/quota/limit"),
+		poller.RawAuthForTest,
+		poller.ParseZhipuForTest,
+	)
+
+	// Static member "a" on Anthropic URL (ProviderFor returns false → no probe).
+	// "extra" will be runtime-added on probeSrv.URL (ProviderFor returns true).
+	scrubPoolEnv(t)
+	t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_A", "cred-a")
+	reg, err := backend.Load(testDefaultBaseURL) // Anthropic base for "a"
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	c := NewController(reg, "auto", 0, nil, clock.now, io.Discard)
+	c.SetProbeHTTPClient(probeSrv.Client())
+
+	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+	if status, err := p.AddMember("auto", "extra", "cred-extra", probeSrv.URL, nil); status != 200 || err != nil {
+		t.Fatalf("AddMember extra: status=%d err=%v, want 200", status, err)
+	}
+
+	// Park both "a" and "extra"; make "a" the current sticky.
+	c.park("a", clock.now().Add(5*time.Hour))
+	c.park("extra", clock.now().Add(5*time.Hour))
+	c.setCur("a")
+
+	if _, _, exhausted := c.ResolveAuto(); !exhausted {
+		t.Fatal("setup: pool not all-exhausted")
+	}
+
+	// parkAndFailover on "a" (all-exhausted path): tryRecoverParked probes
+	// "extra" (Anthropic "a" is skipped by ProviderFor). The probe returns
+	// healthy, so "extra" is unparked and the re-rotate sets it as active.
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("upstream 429")),
+	}
+	if err := c.parkAndFailover(resp, "a", clock.now().Add(5*time.Hour), "hit 429"); err != nil {
+		t.Fatalf("parkAndFailover: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503 (probe recovered extra; switched not forwarded)", resp.StatusCode)
+	}
+	if got := c.Current(); got != "extra" {
+		t.Errorf("Current()=%q, want extra (re-rotate to recovered runtime-added member)", got)
+	}
+}
+
 // ---- helpers ----
 
 // newRecoverFixture builds a controller "auto" with two members whose
