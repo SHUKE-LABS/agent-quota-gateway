@@ -2397,3 +2397,66 @@ func TestResolveAuto_allParkedLivePastStoreFutureHalfOpen(t *testing.T) {
 		t.Errorf("ResolveAuto pointed at %q, want one of {a, b}", b.Nick)
 	}
 }
+
+// TestRecord429_runtimeAddedActiveMember proves that record429 does not panic
+// when the currently active member is a runtime-added one (issue #185: the
+// old index-based implementation used c.nicks[c.cur] which was out of range
+// for an active runtime-added member whose index lay in addedMembers, not
+// nicks; after the collapse c.curNick is used directly).
+func TestRecord429_runtimeAddedActiveMember(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	p := &Pools{byPool: map[string]*Controller{
+		"auto": newController(t, 0, clock, io.Discard, "a"),
+	}}
+
+	// Add a runtime member "extra" and make it the active one.
+	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {
+		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
+	}
+	c := p.byPool["auto"]
+	c.setCur("extra") // simulate pool having failed over to the runtime-added member
+
+	// Trigger a 429 on "extra" — must not panic and must switch to the healthy "a".
+	reset := clock.now().Add(time.Hour)
+	res := c.record429("extra", reset)
+	if res.to == "extra" {
+		t.Errorf("record429 stayed on exhausted extra, want failover to a static member")
+	}
+	if res.to == "" {
+		t.Errorf("record429 returned empty to-nick, want a healthy member")
+	}
+}
+
+// TestBalance_runtimeAddedMemberParticipates proves that a runtime-added
+// member participates in the balance lead comparison and can be selected
+// by a balance switch (issue #185: the old balanceSwitchLocked gated on
+// curAddedNick == "" and skipped consideration of added members entirely).
+func TestBalance_runtimeAddedMemberParticipates(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	// Balance pool with members a, b.  a is active; b has a high lead so the
+	// balance switch should fire.
+	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
+	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+
+	// Add a runtime member "extra" with a low lead (no snapshot → util=0).
+	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {
+		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
+	}
+
+	// Give "a" (currently active) a high lead; "b" and "extra" have no data (lead=0).
+	reset := clock.now().Add(window5h / 2)
+	putSnap(store, c, "a", fptr(0.9), nil, tptr(reset), nil)
+
+	// Force "a" to be active so the balance switch can observe it is over budget.
+	c.setCur("a")
+
+	// ResolveAuto should switch away from a (over-budget) to either b or extra.
+	b, _, exhausted := c.ResolveAuto()
+	if exhausted {
+		t.Fatal("ResolveAuto: pool reported exhausted, want healthy")
+	}
+	if b.Nick == "a" {
+		t.Fatalf("balance switch stayed on over-budget a, want b or extra")
+	}
+}

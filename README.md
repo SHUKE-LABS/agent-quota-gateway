@@ -707,7 +707,7 @@ adds a runtime member. The JSON body is `{"credential": "...", "base_url": "..."
   member's URL. Returns `400` if the base_url is ambiguous across other pools;
   falls back to the pool default when no other pool has a URL for this nick
   (equivalent to omitting it in a static config). Required only when the pool has
-  no static members and no other pool resolves a URL for this nick.
+  no members and no other pool resolves a URL for this nick.
 - `placement` — a JSON array of nicks, highest priority first; **must include**
   the added nick. Required when the target pool is in priority mode — there is no
   implicit insertion position. Rejected with `400` for plain/balanced-mode targets.
@@ -716,25 +716,23 @@ On success the member is persisted to the state file *with its credential* (file
 mode `0600`) and re-applied at startup. Status codes: `200` on success; `400` on
 a missing or empty nick, invalid JSON body, missing credential (nick not in any
 other pool), ambiguous credential across pools, invalid `base_url`, ambiguous
-`base_url` across pools, missing `base_url` for a pool with no static members and
-no resolvable URL, missing `placement` for a priority target with no existing
-slot, unknown nick in `placement`, `placement` not containing the added nick,
-duplicate nick in `placement`, or `placement` supplied for a non-priority target;
-`404` on an unknown pool; `409` when the nick already exists as a static or
-runtime-added member. `DELETE /_gateway/pool/{name}/member/{nick}` removes a
-member — static or runtime-added — from selection and returns `200`; `404` on an
-unknown pool and `400` on a missing nick or a nick not present in the pool. If
-the removed member was the active one, the pool force-switches to the next
-healthy member. All error bodies are credential-free.
+`base_url` across pools, missing `base_url` for a pool with no members and no
+resolvable URL, missing `placement` for a priority target with no existing slot,
+unknown nick in `placement`, `placement` not containing the added nick, duplicate
+nick in `placement`, or `placement` supplied for a non-priority target; `404` on
+an unknown pool; `409` when the nick is already an active (non-removed) member.
+`DELETE /_gateway/pool/{name}/member/{nick}` removes a member from selection and
+returns `200`; `404` on an unknown pool and `400` on a missing nick or a nick not
+present in the pool. If the removed member was the active one, the pool
+force-switches to the next healthy member. All error bodies are credential-free.
 
 Removal is **permanent and survives restart**: the tombstone is persisted to
-the state file, so a removed static member stays removed across a restart
-instead of resurfacing. A removed member — static or runtime-added — is omitted
-entirely from both `/_gateway/config` and `/_gateway/pool`, not merely flagged
-disabled, and is never selected for routing. A removed *runtime-added* member
-can be re-added with `POST .../member/{nick}` (which clears its tombstone); a
-removed *static* member stays out until its tombstone is cleared from the state
-file, since re-adding a still-declared static nick returns `409`.
+the state file so a removed member stays removed across a restart instead of
+resurfacing. A removed member is omitted entirely from both `/_gateway/config`
+and `/_gateway/pool`, not merely flagged disabled, and is never selected for
+routing. Any removed member — regardless of origin — can be re-added with
+`POST .../member/{nick}`, which clears its tombstone and restores it to
+rotation.
 
 **Moving a subscription between pools.** `POST
 /_gateway/pool/{name}/member/{nick}/move` relocates a subscription from `{name}`
@@ -750,14 +748,12 @@ is `{"to": "<pool>", "placement": [...], "force": false}`:
   top/bottom/sorted insertion. It is not accepted for a plain/balanced target
   (`400`) and is unnecessary when overwriting an existing same-nick slot (the
   slot is preserved).
-- `force` confirms an overwrite when the target already has a *runtime-added*
-  member with the same nick but a different credential or `base_url`.
+- `force` confirms an overwrite when the target already has a member with the
+  same nick but a different credential or `base_url`.
 
 Conflict handling: a same-nick target whose credential **and** resolved
 `base_url` match is silently overwritten in place (the slot is preserved); a
-differing runtime-added target returns `409` until `force: true` is sent; a
-same-nick **static** target can only match (it is immutable here) — a differing
-one returns `409` that `force` cannot override. The move does **not** force the
+differing target returns `409` until `force: true` is sent. The move does **not** force the
 target off a healthy active member; the new order applies on the next selection
 event. Status codes: `200` on success; `400` on a missing/empty `to`, a
 same-pool move, a missing source member, or an invalid/absent placement; `404`
