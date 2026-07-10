@@ -113,6 +113,33 @@ func resp429Policy(b backend.Backend) *http.Response {
 	}
 }
 
+// resp429RateLimit builds a transient Anthropic per-minute rate-limit 429 for
+// backend b. It carries no unified-window rejection (so it is not genuine
+// exhaustion) but does carry the rate-limit signature: an optional upstream
+// retry-after and, when withLegacy is set, the legacy per-minute
+// anthropic-ratelimit-requests-* headers (issue #191).
+func resp429RateLimit(b backend.Backend, retryAfter string, withLegacy bool) *http.Response {
+	ctx := backend.WithBackend(context.Background(), b)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	if retryAfter != "" {
+		h.Set("Retry-After", retryAfter)
+	}
+	if withLegacy {
+		h.Set("anthropic-ratelimit-requests-limit", "50")
+		h.Set("anthropic-ratelimit-requests-remaining", "0")
+	}
+	body := `{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}`
+	return &http.Response{
+		StatusCode:    http.StatusTooManyRequests,
+		Header:        h,
+		Request:       req,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+}
+
 // respAuth builds an upstream credential-rejection response (401/403) for
 // backend b — what a pulled/revoked account returns instead of a 429.
 func respAuth(b backend.Backend, code int) *http.Response {
@@ -346,6 +373,11 @@ func TestModifyResponse_policy429NotParked(t *testing.T) {
 	if string(gotBody) != string(origBody) {
 		t.Errorf("body=%q, want upstream body %q", gotBody, origBody)
 	}
+	// Retry-After stays the fixed 1s switch default — the policy path does not
+	// honour any upstream retry-after (a policy 429 carries none).
+	if ra := resp.Header.Get("Retry-After"); ra != "1" {
+		t.Errorf("Retry-After=%q, want 1 (policy path fixed default)", ra)
+	}
 	// Backend must NOT be parked — still at "a".
 	if got := c.Current(); got != "a" {
 		t.Errorf("Current()=%q, want a (no failover on policy 429)", got)
@@ -416,6 +448,97 @@ func TestModifyResponse_zaiThrottleAbsorbed(t *testing.T) {
 	}
 	if log := logBuf.String(); !strings.Contains(log, "z.ai 429 concurrency throttle") {
 		t.Errorf("z.ai throttle not logged; got %q", log)
+	}
+}
+
+// TestModifyResponse_rateLimit429HonoursUpstreamRetryAfter proves a transient
+// Anthropic per-minute rate-limit 429 (an upstream retry-after, no
+// unified-window rejection) is rewritten to a 503 that honours the upstream
+// retry-after within the 1–3s band, never parks or switches the member, and
+// never leaks the upstream body (issue #191).
+func TestModifyResponse_rateLimit429HonoursUpstreamRetryAfter(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := newController(t, 0, clock, &logBuf, "a", "b")
+	before := c.Current()
+
+	resp := resp429RateLimit(c.resolve(t, "a"), "2", false)
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503", resp.StatusCode)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "2" {
+		t.Errorf("Retry-After=%q, want 2 (honour upstream, within band)", ra)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "rate_limit_error") {
+		t.Errorf("503 body leaked the upstream rate-limit body: %q", body)
+	}
+	if got := resp.Header.Get("anthropic-ratelimit-requests-remaining"); got != "" {
+		t.Errorf("legacy rate-limit header not stripped: %q", got)
+	}
+	if got := c.Current(); got != before {
+		t.Errorf("Current()=%q, want %q (rate-limit 429 must not park/switch)", got, before)
+	}
+	if _, _, exhausted := c.ResolveAuto(); exhausted {
+		t.Errorf("ResolveAuto exhausted=true after rate-limit 429, want false")
+	}
+	if log := logBuf.String(); !strings.Contains(log, "transient throttle") {
+		t.Errorf("rate-limit 429 not logged as transient throttle; got %q", log)
+	}
+}
+
+// TestModifyResponse_rateLimit429ClampsHighUpstreamRetryAfter proves an
+// upstream retry-after above the band is clamped down to the 3s ceiling — the
+// gateway never advertises a multi-second/minute wait for a per-minute
+// throttle that clears in seconds (issue #191).
+func TestModifyResponse_rateLimit429ClampsHighUpstreamRetryAfter(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := newController(t, 0, clock, &logBuf, "a", "b")
+
+	resp := resp429RateLimit(c.resolve(t, "a"), "30", false)
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != strconv.Itoa(rateLimitBackoffMaxSeconds) {
+		t.Errorf("Retry-After=%q, want %d (clamped to band ceiling)", ra, rateLimitBackoffMaxSeconds)
+	}
+	if got := c.Current(); got != "a" {
+		t.Errorf("Current()=%q, want a (not switched)", got)
+	}
+}
+
+// TestModifyResponse_rateLimit429LegacyHeaderNoRetryAfter proves a rate-limit
+// 429 identified only by the legacy per-minute headers (no upstream
+// retry-after) is still absorbed as a transient back-off, defaulting to the top
+// of the band, without parking (issue #191).
+func TestModifyResponse_rateLimit429LegacyHeaderNoRetryAfter(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := newController(t, 0, clock, &logBuf, "a", "b")
+
+	resp := resp429RateLimit(c.resolve(t, "a"), "", true)
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503", resp.StatusCode)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != strconv.Itoa(rateLimitBackoffMaxSeconds) {
+		t.Errorf("Retry-After=%q, want %d (band default when no upstream retry-after)", ra, rateLimitBackoffMaxSeconds)
+	}
+	if got := c.Current(); got != "a" {
+		t.Errorf("Current()=%q, want a (not parked)", got)
+	}
+	if _, _, exhausted := c.ResolveAuto(); exhausted {
+		t.Errorf("ResolveAuto exhausted=true after rate-limit 429, want false")
+	}
+	if log := logBuf.String(); !strings.Contains(log, "transient throttle") {
+		t.Errorf("rate-limit 429 not logged as transient throttle; got %q", log)
 	}
 }
 
