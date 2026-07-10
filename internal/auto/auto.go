@@ -114,7 +114,10 @@ const (
 //
 // The long-window length is provider-aware and resolved per member via
 // poller.LongWindowFor (7-day default, ~30-day monthly for Z.AI/Zhipu;
-// issue #140), so there is no fixed long-window constant here.
+// issue #140), so there is no fixed long-window constant here. Whether the
+// long window feeds the lead at all is also provider-aware: for Z.AI/Zhipu
+// it is dropped, because its monthly slot is a web-search/reader/zread tool
+// quota, not chat throughput (poller.LongWindowBlocksExhaustion; issue #192).
 const window5h = 5 * time.Hour
 
 // Pools fronts each configured pool with its own Controller and routes a
@@ -2276,14 +2279,21 @@ func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset tim
 // side (#125).
 func (c *Controller) isGenuineExhaustionSignal(nick string, respSnap quota.Snapshot) bool {
 	now := c.now()
-	if snapRejects(respSnap, now) {
+	// Resolve the backend once to key the long-window predicate. Fail closed
+	// (longBlocks=true) when the nick can't be resolved — a runtime-removed
+	// member should still honour a genuine 7d rejection rather than have it
+	// silently dropped (issue #192).
+	longBlocks := true
+	idx := c.indexOf(nick)
+	if idx >= 0 {
+		longBlocks = poller.LongWindowBlocksExhaustion(c.backendAt(idx).BaseURL)
+	}
+	if snapRejects(respSnap, now, longBlocks) {
 		return true
 	}
-	if c.store != nil {
-		if idx := c.indexOf(nick); idx >= 0 {
-			if snapRejects(c.store.Get(c.backendAt(idx).QuotaKey()), now) {
-				return true
-			}
+	if c.store != nil && idx >= 0 {
+		if snapRejects(c.store.Get(c.backendAt(idx).QuotaKey()), now, longBlocks) {
+			return true
 		}
 	}
 	return false
@@ -2298,10 +2308,17 @@ func (c *Controller) isGenuineExhaustionSignal(nick string, respSnap quota.Snaps
 // branch so a frozen at-cap snapshot whose reset has already passed reads
 // not blocking. The status branch ignores now — an explicit "rejected" is
 // authoritative regardless of reset arithmetic.
-func snapRejects(snap quota.Snapshot, now time.Time) bool {
+//
+// longBlocks reports whether the backend's long (7d/monthly) window is a
+// genuine chat-blocking signal (poller.LongWindowBlocksExhaustion). When
+// false — Z.AI/Zhipu, whose monthly slot is a web-search/reader/zread tool
+// quota, not chat throughput (issue #192) — the 7d term is dropped so a
+// filled tool quota can't park a chat-healthy member. Callers fail closed
+// (pass true) when the backend can't be resolved.
+func snapRejects(snap quota.Snapshot, now time.Time, longBlocks bool) bool {
 	return snap.UnifiedStatus == unifiedStatusRejected ||
 		windowBlocks(snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset, now) ||
-		windowBlocks(snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset, now)
+		(longBlocks && windowBlocks(snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset, now))
 }
 
 // record429Result reports the outcome of recording an upstream 429.
@@ -2464,7 +2481,7 @@ func (c *Controller) tryRecoverParked() string {
 		// thrash until the cooldown.
 		c.mu.Lock()
 		recoveredNow := c.now()
-		if !snapRejects(snap, recoveredNow) {
+		if !snapRejects(snap, recoveredNow, poller.LongWindowBlocksExhaustion(b.BaseURL)) {
 			delete(c.exhausted, t.nick)
 			c.notifyMutate()
 			if recovered == "" {
@@ -2575,7 +2592,8 @@ func (c *Controller) storeReconcilesParkLocked(nick string) bool {
 	if idx < 0 {
 		return false
 	}
-	snap := c.store.Get(c.backendAt(idx).QuotaKey())
+	b := c.backendAt(idx)
+	snap := c.store.Get(b.QuotaKey())
 	if !snap.HasData() {
 		return false
 	}
@@ -2583,21 +2601,25 @@ func (c *Controller) storeReconcilesParkLocked(nick string) bool {
 	if now.Sub(snap.AsOf) > storeSnapshotFreshness {
 		return false // frozen / stale snapshot — do not second-guess the park
 	}
-	return !snapRejects(snap, now)
+	return !snapRejects(snap, now, poller.LongWindowBlocksExhaustion(b.BaseURL))
 }
 
 // storeExhaustedUntilLocked reports nick's window reset when the quota store
 // shows a unified window actually blocking (see windowBlocks: a "rejected"
 // status, or — absent a status — utilization at the cap) with a reset still
-// in the future. It considers BOTH the 5h and 7d windows: each contributes
-// only when its own window blocks and its own reset is ahead, and when both
-// qualify the later reset wins, so the returned time is always anchored to
-// the window that actually flagged the member — never the 7d reset for a
-// 5h-only exhaustion or vice versa.
-// Checking 7d matters for poller-tracked backends (z.ai / MiniMaxi), which
+// in the future. It considers the 5h window always, and the 7d/long window
+// only when that window is a genuine chat-blocking signal
+// (poller.LongWindowBlocksExhaustion). Each contributes only when its own
+// window blocks and its own reset is ahead, and when both qualify the later
+// reset wins, so the returned time is always anchored to the window that
+// actually flagged the member — never the 7d reset for a 5h-only exhaustion
+// or vice versa.
+// Checking 7d matters for poller-tracked backends (MiniMaxi / Ark), which
 // report a weekly cap through the dashboard API and emit no clean
 // proxy-path 429 to catch a 7d-exhausted-but-5h-healthy member the reactive
-// way.
+// way. Z.AI/Zhipu is the exception: its monthly slot is a web-search/reader/
+// zread tool quota, not chat throughput, so its long window is skipped here
+// (issue #192).
 //
 // ok is false when no window qualifies — no store, no snapshot, every
 // utilization below threshold, or a missing/past reset. Requiring a future
@@ -2613,17 +2635,29 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 	if idx < 0 {
 		return time.Time{}, false
 	}
-	snap := c.store.Get(c.backendAt(idx).QuotaKey())
+	b := c.backendAt(idx)
+	snap := c.store.Get(b.QuotaKey())
 	now := c.now()
 	reset, ok := time.Time{}, false
-	for _, w := range [...]struct {
+	// The long window contributes only when it is a genuine chat-blocking
+	// signal. For Z.AI/Zhipu its monthly slot is a web-search/reader/zread
+	// tool quota (issue #192), so drop it here — a filled tool quota must
+	// not proactively park a chat-healthy member. The 5h window always
+	// participates.
+	longBlocks := poller.LongWindowBlocksExhaustion(b.BaseURL)
+	windows := [...]struct {
 		util   *float64
 		status string
 		reset  *time.Time
+		use    bool
 	}{
-		{snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset},
-		{snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset},
-	} {
+		{snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset, true},
+		{snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset, longBlocks},
+	}
+	for _, w := range windows {
+		if !w.use {
+			continue
+		}
 		// windowBlocks is the single source of truth for the freshness
 		// contract: the no-status branch requires reset != nil AND
 		// now.Before(*reset), so a frozen at-cap snapshot whose reset has
@@ -2721,7 +2755,14 @@ func (c *Controller) memberLeadsLocked(nick string) (overall, lead5h, lead7d flo
 	// utilization (issue #140). Resolve the length from the same provider
 	// mapping that supplies the column label.
 	lead5h, has5h = computeLead(snap.Unified5hUtilization, snap.Unified5hReset, window5h)
-	lead7d, has7d = computeLead(snap.Unified7dUtilization, snap.Unified7dReset, poller.LongWindowFor(b.BaseURL))
+	// The long window feeds routing pressure only when it is a genuine
+	// chat-blocking signal. For Z.AI/Zhipu the monthly slot is a
+	// web-search/reader/zread tool quota (issue #192), so leave has7d false
+	// and drive balance-mode pressure from the 5h window alone — a filled
+	// tool quota must not skew chat routing.
+	if poller.LongWindowBlocksExhaustion(b.BaseURL) {
+		lead7d, has7d = computeLead(snap.Unified7dUtilization, snap.Unified7dReset, poller.LongWindowFor(b.BaseURL))
+	}
 
 	switch {
 	case has5h && has7d:

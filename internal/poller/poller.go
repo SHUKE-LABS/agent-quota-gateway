@@ -232,29 +232,43 @@ const (
 	longWindowMonthly = 30 * 24 * time.Hour
 )
 
-// longWindowSpec bundles the per-provider long-window label and length so
-// the two cannot drift: both are produced by the single switch in
-// longWindowSpecFor. The label feeds the UI column header; the length
-// feeds the lead-routing elapsed-fraction math (issue #140).
+// longWindowSpec bundles the per-provider long-window label, length, and
+// whether the window is a genuine chat-blocking signal, so the three cannot
+// drift: all are produced by the single switch in longWindowSpecFor. The
+// label feeds the UI column header; the length feeds the lead-routing
+// elapsed-fraction math (issue #140); blocksExhaustion feeds the auto
+// package's exhaustion/failover/balance decisions (issue #192).
+//
+// blocksExhaustion is true for the default 7d window (Anthropic's real
+// weekly window, and MiniMaxi's / Ark's weekly caps, are genuine chat
+// quotas). It is false for Z.AI/Zhipu: its long slot carries the monthly
+// TIME_LIMIT value, which is Z.AI's Total Monthly Web Search / Reader /
+// Zread tool quota — Z.AI has no weekly/monthly *chat* quota at all — so
+// letting it park a member would pull a chat-healthy backend out of
+// rotation for a reason unrelated to chat throughput (issue #192). The
+// snapshot/UI data path is unaffected: parseZhipu still fills the
+// unified_7d_* slot and the column is still labeled "monthly".
 type longWindowSpec struct {
-	label  string
-	length time.Duration
+	label            string
+	length           time.Duration
+	blocksExhaustion bool
 }
 
-// longWindowSpecFor is the single provider switch behind both
-// WindowLabelsFor and LongWindowFor. The default is the Anthropic-style
-// "7d" / 7-day window. Z.AI's long window is monthly (issues #138/#140),
-// so a Z.AI backend gets "monthly" / ~30-day. Adding a new provider with
-// a non-7d long window is a one-line change here — the only switch on
-// provider name for window shape.
+// longWindowSpecFor is the single provider switch behind WindowLabelsFor,
+// LongWindowFor, and LongWindowBlocksExhaustion. The default is the
+// Anthropic-style "7d" / 7-day / chat-blocking window. Z.AI's long window
+// is monthly (issues #138/#140) and is NOT a chat-blocking signal (issue
+// #192), so a Z.AI backend gets "monthly" / ~30-day / non-blocking. Adding
+// a new provider with a non-default long window is a one-line change here —
+// the only switch on provider name for window shape.
 func longWindowSpecFor(baseURL string) longWindowSpec {
 	if p, ok := ProviderFor(baseURL); ok {
 		switch p.Name() {
 		case "z.ai/zhipu":
-			return longWindowSpec{label: "monthly", length: longWindowMonthly}
+			return longWindowSpec{label: "monthly", length: longWindowMonthly, blocksExhaustion: false}
 		}
 	}
-	return longWindowSpec{label: "7d", length: longWindow7d}
+	return longWindowSpec{label: "7d", length: longWindow7d, blocksExhaustion: true}
 }
 
 // WindowLabelsFor returns the per-pool rolling-window label hint the UI
@@ -276,6 +290,19 @@ func WindowLabelsFor(baseURL string) WindowLabels {
 // ~30-day for Z.AI/Zhipu (its monthly TIME_LIMIT), 7-day otherwise.
 func LongWindowFor(baseURL string) time.Duration {
 	return longWindowSpecFor(baseURL).length
+}
+
+// LongWindowBlocksExhaustion reports whether a pool's long (7d/monthly)
+// window is a genuine chat-blocking signal that the auto package should let
+// drive exhaustion/failover/balance decisions. It shares the single
+// provider switch with LongWindowFor / WindowLabelsFor. True for the
+// default 7-day window (Anthropic/MiniMaxi/Ark weekly caps are real chat
+// quotas); false for Z.AI/Zhipu, whose monthly TIME_LIMIT slot is a
+// web-search/reader/zread tool quota, not chat throughput (issue #192).
+// Unknown providers and an empty base URL fall back to the blocking
+// default — fail closed rather than silently drop a real cap.
+func LongWindowBlocksExhaustion(baseURL string) bool {
+	return longWindowSpecFor(baseURL).blocksExhaustion
 }
 
 // provider describes how to poll one proprietary quota API. The set is a

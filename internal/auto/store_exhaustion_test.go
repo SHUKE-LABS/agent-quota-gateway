@@ -282,6 +282,122 @@ func TestResolveAuto_failsOffOn7dStoreExhaustion(t *testing.T) {
 	}
 }
 
+// newZaiControllerWithStore builds a controller whose pool default upstream
+// is Z.AI, so every member's BaseURL matches the z.ai/zhipu provider and its
+// long (monthly TIME_LIMIT) window is a non-blocking web-search/reader/zread
+// tool quota (issue #192), not a chat window.
+func newZaiControllerWithStore(t *testing.T, start int, clock *fixedClock, store *quota.Store, nicks ...string) *Controller {
+	t.Helper()
+	scrubPoolEnv(t)
+	for _, n := range nicks {
+		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
+	}
+	reg, err := backend.Load("https://api.z.ai")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	return NewController(reg, "auto", start, store, clock.now, io.Discard)
+}
+
+// TestResolveAuto_zaiLongWindowDoesNotExhaust is the core issue #192
+// regression: a Z.AI member whose monthly TIME_LIMIT slot (mapped to the 7d
+// window) is at the cap with a fresh reset — its search/reader/zread tool
+// quota is spent — but whose 5h (TOKENS_LIMIT) chat window is healthy must
+// stay selectable. It is not parked and never triggers allExhausted, because
+// the monthly slot is a tool quota, not chat throughput. Contrast
+// TestResolveAuto_failsOffOn7dStoreExhaustion, where the same 7d shape on an
+// Anthropic member (a genuine weekly chat cap) DOES fail the member off.
+func TestResolveAuto_zaiLongWindowDoesNotExhaust(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newZaiControllerWithStore(t, 0, clock, store, "a", "b") // sticky on a
+
+	util7d, util5h := 1.0, 0.10
+	reset := clock.now().Add(time.Hour)
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util5h,
+		Unified5hReset:       &reset,
+		Unified7dUtilization: &util7d, // monthly tool quota spent — must not block chat
+		Unified7dReset:       &reset,
+		AsOf:                 clock.now(),
+	})
+
+	b, retry, exhausted := c.ResolveAuto()
+	if exhausted || retry != 0 {
+		t.Fatalf("ResolveAuto exhausted=%v retry=%v, want false / 0 (z.ai monthly slot is a tool quota)", exhausted, retry)
+	}
+	if b.Nick != "a" {
+		t.Errorf("ResolveAuto picked %q, want a (stays sticky; long window not chat-blocking)", b.Nick)
+	}
+	if until, ok := c.exhaustedUntil("a"); ok {
+		t.Errorf("exhaustedUntil(a) = %v, true; want not-exhausted (z.ai monthly slot must not park)", until)
+	}
+}
+
+// TestResolveAuto_zaiFifthHourStillParks proves the fix is surgical: the 5h
+// (TOKENS_LIMIT) chat window still parks a Z.AI member. With both windows at
+// the cap, the member is failed off — but on the 5h signal, which is the real
+// chat quota, not the monthly tool quota.
+func TestResolveAuto_zaiFifthHourStillParks(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newZaiControllerWithStore(t, 0, clock, store, "a", "b") // sticky on a
+
+	util := 1.0
+	reset5h := clock.now().Add(time.Hour)
+	reset7d := clock.now().Add(20 * 24 * time.Hour)
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hReset:       &reset5h,
+		Unified7dUtilization: &util,
+		Unified7dReset:       &reset7d,
+		AsOf:                 clock.now(),
+	})
+
+	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "b" {
+		t.Errorf("ResolveAuto picked %q exhausted=%v, want b / false (a's 5h chat window is spent)", b.Nick, exhausted)
+	}
+	until, ok := c.exhaustedUntil("a")
+	if !ok {
+		t.Fatal("exhaustedUntil(a) = not-exhausted; want exhausted on the 5h window")
+	}
+	if !until.Equal(reset5h) {
+		t.Errorf("exhaustedUntil(a) = %v, want %v (anchored to the 5h reset, not the monthly slot)", until, reset5h)
+	}
+}
+
+// TestIsGenuineExhaustionSignal_zaiLongWindowIsNotGenuine proves a transient
+// 429 on a Z.AI member whose only "reject" signal is the monthly TIME_LIMIT
+// slot is treated as a policy 429 (forward the body), not genuine exhaustion
+// (park + failover) — issue #192. The same at-cap shape on the 5h window
+// remains genuine.
+func TestIsGenuineExhaustionSignal_zaiLongWindowIsNotGenuine(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newZaiControllerWithStore(t, 0, clock, store, "a", "b")
+
+	util := 1.0
+	reset := clock.now().Add(time.Hour)
+
+	long7dOnly := quota.Snapshot{
+		Unified7dUtilization: &util,
+		Unified7dReset:       &reset,
+		AsOf:                 clock.now(),
+	}
+	if c.isGenuineExhaustionSignal("a", long7dOnly) {
+		t.Error("z.ai 7d-only reject treated as genuine exhaustion; want false (monthly slot is a tool quota)")
+	}
+
+	fifthHour := quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hReset:       &reset,
+		AsOf:                 clock.now(),
+	}
+	if !c.isGenuineExhaustionSignal("a", fifthHour) {
+		t.Error("z.ai 5h at-cap not treated as genuine exhaustion; want true (real chat quota)")
+	}
+}
+
 // TestExhaustedUntil_mergesLiveParkAndStore proves the unified signal returns
 // the later of the live-429 park and the store window, regardless of which is
 // later — so a member is never re-selected while either signal still blocks
@@ -345,7 +461,7 @@ func TestSnapRejects_staleAtCapWithPastResetIsNotBlocking(t *testing.T) {
 		AsOf:                 past.Add(-time.Hour),
 	}
 
-	if snapRejects(snap, clock.now()) {
+	if snapRejects(snap, clock.now(), true) {
 		t.Errorf("snapRejects(stale at-cap) = true, want false (window reset has passed)")
 	}
 }
@@ -364,7 +480,7 @@ func TestSnapRejects_freshAtCapIsBlocking(t *testing.T) {
 		AsOf:                 clock.now(),
 	}
 
-	if !snapRejects(snap, clock.now()) {
+	if !snapRejects(snap, clock.now(), true) {
 		t.Errorf("snapRejects(fresh at-cap) = false, want true (window still blocking)")
 	}
 }
@@ -389,7 +505,7 @@ func TestSnapRejects_rejectedStatusRespectsReset(t *testing.T) {
 		Unified5hStatus:      unifiedStatusRejected,
 		Unified5hReset:       &future,
 		AsOf:                 clock.now(),
-	}, clock.now()) {
+	}, clock.now(), true) {
 		t.Errorf("snapRejects(rejected, future reset) = false, want true (window still blocking)")
 	}
 
@@ -401,7 +517,7 @@ func TestSnapRejects_rejectedStatusRespectsReset(t *testing.T) {
 		Unified5hStatus:      unifiedStatusRejected,
 		Unified5hReset:       &past,
 		AsOf:                 clock.now(),
-	}, clock.now()) {
+	}, clock.now(), true) {
 		t.Errorf("snapRejects(rejected, past reset) = true, want false (snapshot aged out)")
 	}
 
@@ -410,14 +526,14 @@ func TestSnapRejects_rejectedStatusRespectsReset(t *testing.T) {
 		Unified5hUtilization: &util,
 		Unified5hStatus:      unifiedStatusRejected,
 		AsOf:                 clock.now(),
-	}, clock.now()) {
+	}, clock.now(), true) {
 		t.Errorf("snapRejects(rejected, nil reset) = false, want true (no reset to bound)")
 	}
 
 	// Overall rejected status (UnifiedStatus, the wrapper field) still
 	// blocks via the first OR clause of snapRejects — that path does
 	// not go through windowBlocks and is intentionally unchanged.
-	if !snapRejects(quota.Snapshot{UnifiedStatus: unifiedStatusRejected}, clock.now()) {
+	if !snapRejects(quota.Snapshot{UnifiedStatus: unifiedStatusRejected}, clock.now(), true) {
 		t.Errorf("snapRejects(overall rejected) = false, want true")
 	}
 }
@@ -436,7 +552,7 @@ func TestSnapRejects_7dStaleAtCapMirrors5h(t *testing.T) {
 		AsOf:                 past.Add(-24*time.Hour),
 	}
 
-	if snapRejects(snap, clock.now()) {
+	if snapRejects(snap, clock.now(), true) {
 		t.Errorf("snapRejects(stale 7d at-cap) = true, want false (weekly reset has passed)")
 	}
 }
