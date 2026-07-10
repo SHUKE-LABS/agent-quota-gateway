@@ -524,6 +524,21 @@ its own body:
   concurrency window free up), leaves the member in rotation, and never lets
   the upstream `1302` message reach the client. Claude Code retries the `503`
   transparently instead of stopping on the passed-through `429`.
+- **An Anthropic member hits a per-minute rate-limit `429`** (a
+  `rate_limit_error` for the RPM/ITPM/OTPM throughput limit, distinct from the
+  5h/7d quota window) **→** this is transient and clears in seconds, and the
+  *same* member serves again, so the gateway backs off without switching or
+  parking: it rewrites to `503` with `Retry-After` taken from the upstream
+  `retry-after` header clamped to a 1–3 s band (defaulting to 3 s when the
+  header is absent), and leaves the member in rotation. It is identified by the
+  rate-limit signature — an upstream `retry-after` and/or the legacy
+  `anthropic-ratelimit-requests-*` / `-tokens-*` per-minute headers — which
+  separates it from a genuine quota-window `429` (`unified-status: rejected`,
+  which parks) and from a policy `429` (no rate-limit headers, e.g. an
+  "unsupported third-party client" rejection, which forwards the body on a
+  `503` with the fixed 1 s hint). The per-minute headers are read only to
+  classify the response; they are never stored (they are a throughput rate, not
+  the subscription budget).
 
 Each switch is logged server-side as one line — `auto[auto]: a -> b (a hit
 429)`, prefixed with the pool name — naming members only, never

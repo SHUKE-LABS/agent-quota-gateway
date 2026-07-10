@@ -89,6 +89,19 @@ const switchRetryAfterSeconds = 1
 // being short enough for a transparent client retry (issue #153).
 const zaiThrottleRetryAfterSeconds = 3
 
+// rateLimitBackoffMinSeconds / rateLimitBackoffMaxSeconds bound the Retry-After
+// the gateway advertises when it absorbs a transient Anthropic per-minute
+// rate-limit 429 (RPM/ITPM/OTPM) as a 503 back-off. The band is deliberately
+// short: the per-minute limit clears in seconds and the SAME member serves
+// again, so the client should retry almost immediately — but not so fast it
+// re-hits the throttle on the next tick. The upstream retry-after is honoured
+// when present, clamped into this band; a rate-limit 429 with no usable
+// retry-after defaults to the top of the band (issue #191).
+const (
+	rateLimitBackoffMinSeconds = 1
+	rateLimitBackoffMaxSeconds = 3
+)
+
 // window5h is the length of the Anthropic unified short window, used by
 // the lead calculation:
 //
@@ -2082,6 +2095,21 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 		}
 		respSnap := quota.Extract(resp)
 		if !c.isGenuineExhaustionSignal(b.Nick, respSnap) {
+			// Not genuine exhaustion. Split the two remaining cases by the
+			// rate-limit signature: a transient per-minute throttle
+			// (RPM/ITPM/OTPM) carries an upstream retry-after and/or the legacy
+			// anthropic-ratelimit-requests/tokens headers and clears in seconds
+			// — absorb it as a short 503 back-off on the SAME member, never
+			// parking or switching (issue #191). Everything else is a
+			// policy/punishment 429 (e.g. "unsupported third-party client",
+			// which carries no rate-limit headers): forward the body on a 503,
+			// also without parking.
+			if secs, ok := transientRateLimit429(resp); ok {
+				fmt.Fprintf(c.logOut, "auto[%s]: %s rate-limit 429 (transient throttle) — backing off %ds, not parking\n", c.pool, b.Nick, secs)
+				rewriteTo503(resp)
+				setRetryAfter(resp.Header, secs)
+				return nil
+			}
 			fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.pool, b.Nick)
 			rewriteTo503WithBody(resp)
 			return nil
@@ -2117,6 +2145,65 @@ func isCredentialRejected(code int) bool {
 func isZaiBackend(b backend.Backend) bool {
 	prov, ok := poller.ProviderFor(b.BaseURL)
 	return ok && prov.Name() == "z.ai/zhipu"
+}
+
+// transientRateLimit429 reports whether a non-genuine, non-z.ai 429 is a
+// transient Anthropic per-minute rate-limit throttle (RPM/ITPM/OTPM) rather
+// than a policy/punishment 429, and returns the Retry-After (seconds) the
+// gateway should advertise for it.
+//
+// The discriminator is the rate-limit signature: a per-minute rate_limit_error
+// 429 carries an upstream retry-after header and/or the legacy
+// anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-* headers.
+// A policy 429 ("unsupported third-party client") carries none of these, so it
+// stays on the policy path; genuine quota exhaustion (unified-status rejected)
+// is classified earlier and never reaches here.
+//
+// secs honours the upstream retry-after clamped to [rateLimitBackoffMinSeconds,
+// rateLimitBackoffMaxSeconds]; when the header is absent or unparseable it
+// defaults to the top of the band (the per-minute window is seconds-scale, so a
+// short wait is safe). The legacy headers are read only to identify the 429 —
+// never stored: they are a throughput rate, not the subscription budget
+// (issue #191 non-goal; internal/quota deliberately ignores them).
+func transientRateLimit429(resp *http.Response) (secs int, ok bool) {
+	raw := resp.Header.Get("Retry-After")
+	if raw == "" && !hasLegacyRateLimitHeader(resp.Header) {
+		return 0, false
+	}
+	secs = rateLimitBackoffMaxSeconds
+	if raw != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
+			secs = clampRetryAfter(n)
+		}
+	}
+	return secs, true
+}
+
+// clampRetryAfter clamps n into the transient rate-limit back-off band.
+func clampRetryAfter(n int) int {
+	if n < rateLimitBackoffMinSeconds {
+		return rateLimitBackoffMinSeconds
+	}
+	if n > rateLimitBackoffMaxSeconds {
+		return rateLimitBackoffMaxSeconds
+	}
+	return n
+}
+
+// hasLegacyRateLimitHeader reports whether h carries any legacy per-minute
+// anthropic-ratelimit-* header (requests/tokens/input-tokens/output-tokens),
+// excluding the unified-window headers that track the subscription budget. It
+// mirrors rewriteTo503's lower-cased prefix scan so a raw-mapped or upstream
+// header key matches regardless of canonicalisation.
+func hasLegacyRateLimitHeader(h http.Header) bool {
+	for k := range h {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "anthropic-ratelimit-") &&
+			!strings.HasPrefix(lk, "anthropic-ratelimit-unified-") {
+			return true
+		}
+	}
+	return false
 }
 
 // parkAndFailover parks nick until reset, advances the sticky pointer, and
