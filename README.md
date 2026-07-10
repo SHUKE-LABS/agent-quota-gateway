@@ -1271,3 +1271,18 @@ pool name to a member per request, and its logs are safe to share with any
 local tool. Quota observation piggy-backs on the same boundary: rate-limit
 headers come down on every response, so we capture them per backend with
 zero extra upstream load.
+
+## License
+
+`agent-quota-gateway` is **source-available** under the
+[Business Source License 1.1](LICENSE) (BSL 1.1), copyright SHUKE LABS LTD.
+
+You may read, modify, and run it — including in production — with one
+carve-out: you may not offer the gateway (or a substantially similar work) to
+third parties as a hosted or managed commercial service that competes with a
+paid SHUKE LABS offering. Running your own instance for your own workloads,
+at home or at work, is exactly the use it is built for and is permitted.
+
+Each released version converts to the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+four years after its release date. See [`LICENSE`](LICENSE) for the
+authoritative terms.
