@@ -1339,17 +1339,18 @@ func putSnap(store *quota.Store, c *Controller, nick string, util5h, util7d *flo
 func fptr(f float64) *float64     { return &f }
 func tptr(t time.Time) *time.Time { return &t }
 
-// TestMemberLeads_longWindowProviderAware verifies the long-window
-// elapsed-fraction divides by the provider-aware window length: ~30-day
-// monthly for Z.AI/Zhipu, 7-day for everyone else (issue #140). Without
-// the provider-aware length, a Z.AI monthly reset weeks out makes
-// time_until_reset/window exceed 1, clamps elapsed to 0, and collapses
-// the long lead to raw utilization.
+// TestMemberLeads_longWindowProviderAware verifies the provider-aware long
+// window in balance-mode lead computation. Post-#192 the two providers
+// diverge: Anthropic's 7d window still feeds the long lead (a genuine chat
+// quota), but Z.AI/Zhipu's long slot is dropped entirely — its monthly
+// TIME_LIMIT is a web-search/reader/zread tool quota, not chat throughput,
+// so it must not skew chat routing (has7d=false, lead7d=0). This supersedes
+// the pre-#192 #140 behavior, where Z.AI's monthly length divided the
+// elapsed fraction to keep its long lead from collapsing to raw
+// utilization; now that window contributes nothing regardless of length.
 func TestMemberLeads_longWindowProviderAware(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 
-	// Worked example from #140: 0.50 long-window utilization, monthly
-	// reset ~20 days out.
 	const util = 0.50
 	reset := clock.now().Add(20 * 24 * time.Hour)
 
@@ -1373,18 +1374,14 @@ func TestMemberLeads_longWindowProviderAware(t *testing.T) {
 		return lead7d, has7d
 	}
 
-	// Z.AI: long length ~30 days → elapsed = 1 − 480h/720h = 0.333,
-	// lead7d = 0.50 − 0.333 ≈ 0.167.
+	// Z.AI: long window does not block chat (issue #192), so it is dropped
+	// from the lead — has7d=false, lead7d=0 — even with a filled monthly slot.
 	zaiLead, zaiHas := leadOf(newCtl("https://api.z.ai"))
-	if !zaiHas {
-		t.Fatal("z.ai: has7d=false, want true")
+	if zaiHas {
+		t.Errorf("z.ai: has7d=true, want false (monthly slot is a tool quota, not chat — issue #192)")
 	}
-	wantZai := util - (1.0 - float64(reset.Sub(clock.now()))/float64(longWindowMonthlyTest))
-	if math.Abs(zaiLead-wantZai) > 1e-9 {
-		t.Errorf("z.ai lead7d=%v, want %v (monthly window)", zaiLead, wantZai)
-	}
-	if zaiLead > 0.30 {
-		t.Errorf("z.ai lead7d=%v collapsed toward raw utilization; monthly window not applied", zaiLead)
+	if zaiLead != 0 {
+		t.Errorf("z.ai lead7d=%v, want 0 (long window dropped from lead)", zaiLead)
 	}
 
 	// Anthropic default: 7-day length → 480h/168h > 1, elapsed clamps to 0,
@@ -1397,10 +1394,6 @@ func TestMemberLeads_longWindowProviderAware(t *testing.T) {
 		t.Errorf("anthropic lead7d=%v, want %v (7d window, elapsed clamps to 0)", antLead, util)
 	}
 }
-
-// longWindowMonthlyTest mirrors poller.longWindowMonthly (unexported); the
-// test asserts the lead math against the same ~30-day approximation.
-const longWindowMonthlyTest = 30 * 24 * time.Hour
 
 // TestBalance_defaultPoolUnaffected verifies that a pool without BALANCE
 // configured is unaffected by the feature and retains sticky behaviour.
