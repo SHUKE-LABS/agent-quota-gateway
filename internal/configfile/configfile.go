@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
@@ -107,6 +109,7 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 			poolSpec.Members[nickKey] = backend.MemberSpec{
 				Credential: memberDTO.Credential,
 				BaseURL:    memberDTO.BaseURL,
+				Disabled:   memberDTO.Disabled,
 			}
 		}
 		spec.Pools[poolKey] = poolSpec
@@ -118,6 +121,193 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 	}
 
 	return cfg, registry, nil
+}
+
+// Marshal serializes the effective gateway config plus registry back to the
+// aqg.json wire shape. Config is the single source of truth for operator
+// intent (issue #198), so every UI mutation round-trips to disk through this.
+//
+// Credentials are written in full: the config file IS the credential store,
+// protected at 0600 (see the Writer). View redaction on /_gateway/config is a
+// separate concern. A pool whose effective base_url equals the gateway default
+// is written with an empty base_url (inherits), and a member that inherited
+// its pool's default carries an empty per-member base_url, keeping the file
+// shape clean.
+func Marshal(cfg config.Config, reg *backend.Registry) ([]byte, error) {
+	dto := fileDTO{
+		BaseURL:   cfg.AnthropicBaseURL,
+		StateFile: cfg.StateFile,
+		Pools:     make(map[string]poolDTO),
+	}
+	// cfg.ListenAddr holds the Tailscale address when shared mode is active,
+	// otherwise the loopback bind. Route it to the matching field so the file
+	// round-trips through config.Build's mutual-exclusivity check.
+	if cfg.Shared {
+		dto.SharedListenAddr = cfg.ListenAddr
+	} else {
+		dto.ListenAddr = cfg.ListenAddr
+	}
+
+	spec := reg.Spec()
+	for name, ps := range spec.Pools {
+		pd := poolDTO{
+			Members:      make(map[string]memberDTO, len(ps.Members)),
+			Priority:     ps.Priority,
+			Balance:      ps.Balance,
+			BalanceGap:   ps.BalanceGap,
+			BalanceDwell: backend.Duration{D: ps.BalanceDwell.D},
+		}
+		if ps.BaseURL != cfg.AnthropicBaseURL {
+			pd.BaseURL = ps.BaseURL
+		}
+		for nick, m := range ps.Members {
+			pd.Members[nick] = memberDTO{
+				Credential: m.Credential,
+				BaseURL:    m.BaseURL,
+				Disabled:   m.Disabled,
+			}
+		}
+		dto.Pools[name] = pd
+	}
+	return json.MarshalIndent(&dto, "", "  ")
+}
+
+// defaultDebounce bounds the config-file write rate, mirroring persist.
+const defaultDebounce = 200 * time.Millisecond
+
+// Writer coalesces config-file writes with a debounce window and writes
+// atomically (temp-file + rename at 0600), mirroring persist.Persister. An
+// operator mutation calls MarkDirty; the Run loop re-serializes the whole
+// config from snapFn and flushes. When path is empty (pure env-mode local
+// dev, no config file) the Writer is a no-op — nothing is written to disk.
+//
+// Write-failure semantics (issue #198, decision 3): a failed flush does not
+// roll back the in-memory mutation (which already took effect). It logs
+// loudly and sets Unsaved so /_gateway/health and /_gateway/config can
+// surface that on-disk config lags memory until the next successful flush.
+type Writer struct {
+	path     string
+	snapFn   func() ([]byte, error)
+	dirty    chan struct{}
+	debounce time.Duration
+
+	mu      sync.Mutex
+	unsaved bool
+}
+
+// NewWriter returns a Writer that serializes to path via snapFn. snapFn is
+// called from the Run goroutine, so it must be safe for concurrent use with
+// the registry it reads. An empty path makes the Writer a no-op.
+func NewWriter(path string, snapFn func() ([]byte, error)) *Writer {
+	return &Writer{
+		path:     path,
+		snapFn:   snapFn,
+		dirty:    make(chan struct{}, 1),
+		debounce: defaultDebounce,
+	}
+}
+
+// MarkDirty signals that operator intent changed. Non-blocking: a pending
+// flush absorbs it. No-op when path is empty.
+func (w *Writer) MarkDirty() {
+	if w.path == "" {
+		return
+	}
+	select {
+	case w.dirty <- struct{}{}:
+	default:
+	}
+}
+
+// Unsaved reports whether the last flush failed and on-disk config is behind
+// the in-memory registry.
+func (w *Writer) Unsaved() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.unsaved
+}
+
+// Run drives the debounced flush loop until ctx is done, then performs one
+// final flush so the last mutation before shutdown is persisted.
+func (w *Writer) Run(ctx interface{ Done() <-chan struct{} }) {
+	if w.path == "" {
+		return
+	}
+	var pending bool
+	var deadline time.Time
+
+	for {
+		var waitCh <-chan time.Time
+		if pending {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				w.flush()
+				pending = false
+				continue
+			}
+			waitCh = time.After(remaining)
+		}
+
+		select {
+		case <-ctx.Done():
+			if pending {
+				w.flush()
+			}
+			return
+		case <-w.dirty:
+			if !pending {
+				deadline = time.Now().Add(w.debounce)
+				pending = true
+			}
+		case <-waitCh:
+			w.flush()
+			pending = false
+		}
+	}
+}
+
+// flush atomically writes the current config to disk at 0600.
+func (w *Writer) flush() {
+	data, err := w.snapFn()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configfile: marshal: %v\n", err)
+		w.setUnsaved(true)
+		return
+	}
+	tmp := w.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		fmt.Fprintf(os.Stderr, "configfile: write %q: %v\n", tmp, err)
+		w.setUnsaved(true)
+		return
+	}
+	if err := os.Rename(tmp, w.path); err != nil {
+		fmt.Fprintf(os.Stderr, "configfile: rename %q -> %q: %v\n", tmp, w.path, err)
+		_ = os.Remove(tmp)
+		w.setUnsaved(true)
+		return
+	}
+	w.setUnsaved(false)
+}
+
+func (w *Writer) setUnsaved(v bool) {
+	w.mu.Lock()
+	w.unsaved = v
+	w.mu.Unlock()
+}
+
+// WriteAtomic writes data to path atomically at 0600 (temp-file + rename).
+// Used by the one-time bootstrap that generates aqg.json from env + state on
+// first deploy (issue #198), before the Writer/Run loop exists.
+func WriteAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // fileDTO is the JSON shape of a config file. All fields are optional
@@ -153,5 +343,9 @@ type poolDTO struct {
 // memberDTO is one backend's credential and optional base URL override.
 type memberDTO struct {
 	Credential string `json:"credential"`
-	BaseURL    string `json:"base_url"`
+	BaseURL    string `json:"base_url,omitempty"`
+	// Disabled is operator intent (issue #198): a disabled member stays in
+	// the config but is never selected until re-enabled. Persisted here, not
+	// in a state-file overlay.
+	Disabled bool `json:"disabled,omitempty"`
 }

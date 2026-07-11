@@ -167,6 +167,16 @@ type Duration struct {
 	D time.Duration
 }
 
+// MarshalJSON emits the duration as a string (e.g. "5m0s"), or "" when zero,
+// so a config file round-trips symmetrically through UnmarshalJSON (which
+// treats "" as zero). Used by the configfile writer (issue #198).
+func (d Duration) MarshalJSON() ([]byte, error) {
+	if d.D == 0 {
+		return []byte(`""`), nil
+	}
+	return []byte(`"` + d.D.String() + `"`), nil
+}
+
 // UnmarshalJSON parses a duration string (e.g. "5m", "10s") into a Duration.
 func (d *Duration) UnmarshalJSON(b []byte) error {
 	s := string(b)
