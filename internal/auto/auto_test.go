@@ -3,7 +3,6 @@ package auto
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -1089,19 +1088,15 @@ func TestController_loadState_additiveMembership(t *testing.T) {
 	}
 }
 
-// TestController_loadState_missingStickyLogs verifies a log line when the persisted
-// sticky is gone. The judgment is deferred to loadRuntimeConfig (which can see
-// runtime-added members), so loadState stays silent and the warning is emitted
-// once addedMembers is restored (#109).
+// TestController_loadState_missingStickyLogs verifies a log line when the
+// persisted sticky is gone. Under issue #198 every member is present at
+// loadState time (config is the single source), so the judgment is no longer
+// deferred — loadState logs the fall-back immediately.
 func TestController_loadState_missingStickyLogs(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
 	c.loadState("old", map[string]time.Time{}, time.Time{}, 0, nil, nil)
-	if out := logBuf.String(); out != "" {
-		t.Fatalf("loadState must stay silent for a deferred sticky, got: %q", out)
-	}
-	c.loadRuntimeConfig(PoolRuntimeConfig{})
 	out := logBuf.String()
 	if !strings.Contains(out, "persisted sticky=old") {
 		t.Fatalf("expected log about missing sticky, got: %q", out)
@@ -1134,7 +1129,7 @@ func TestPools_poolStatus(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	// Two-member pool starting at index 0 (a).
 	c := newController(t, 0, clock, io.Discard, "a", "b")
-	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 	store := quota.NewStore()
 
 	status, ok := pools.PoolStatus("auto", store)
@@ -1199,7 +1194,7 @@ func TestPools_stickyParkedReportsExhausted(t *testing.T) {
 	// sticky pointer stays on the parked member a — exactly the sticky+parked
 	// case the old "active"-before-"exhausted" ordering misreported.
 	c := newController(t, 0, clock, io.Discard, "a")
-	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 	store := quota.NewStore()
 
 	if err := c.ModifyResponse(resp429(c.resolve(t, "a"), clock, time.Hour)); err != nil {
@@ -1263,7 +1258,7 @@ func TestPools_poolStatus_unknownReturnsNotFound(t *testing.T) {
 func TestPools_persistState_loadPersistState(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "a", "b")
-	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 
 	// Start at a; park b for 1h.
 	reset := clock.now().Add(time.Hour)
@@ -1281,7 +1276,7 @@ func TestPools_persistState_loadPersistState(t *testing.T) {
 
 	// Fresh pool, load state.
 	c2 := newController(t, 1, clock, io.Discard, "a", "b") // starts at b
-	pools2 := &Pools{byPool: map[string]*Controller{"auto": c2}}
+	pools2 := &Pools{byPool: map[string]*Controller{"auto": c2}, reg: c2.reg}
 	pools2.LoadPersistState(saved)
 
 	if got := c2.Current(); got != "a" {
@@ -1599,14 +1594,14 @@ func TestBalance_persistsLastSwitch(t *testing.T) {
 	putSnap(store, c, "b", fptr(0.1), nil, tptr(reset), nil)
 	c.ResolveAuto() // should switch to b
 
-	saved := (&Pools{byPool: map[string]*Controller{"auto": c}}).PersistState()
+	saved := (&Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}).PersistState()
 	if saved["auto"].LastBalanceSwitch.IsZero() {
 		t.Fatal("PersistState: LastBalanceSwitch not recorded after switch")
 	}
 
 	// Fresh controller starting at a; load the persisted state.
 	c2 := newBalanceController(t, 0, clock, 0.15, dwell, store, "a", "b")
-	(&Pools{byPool: map[string]*Controller{"auto": c2}}).LoadPersistState(saved)
+	(&Pools{byPool: map[string]*Controller{"auto": c2}, reg: c2.reg}).LoadPersistState(saved)
 
 	// Dwell should still be active: even though b now appears over-budget,
 	// the fresh controller should not switch because it restored last-switch.
@@ -1638,7 +1633,7 @@ func TestBalance_poolStatusExposesLead(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
 	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 
 	// a: half elapsed, util=0.7 → lead5h = 0.2; b: no data
 	reset := clock.now().Add(window5h / 2)
@@ -1751,7 +1746,7 @@ func TestBalance_selectionRecencyPersistedAcrossRestart(t *testing.T) {
 	c.mu.Unlock()
 
 	// Persist and reload into a fresh controller.
-	saved := (&Pools{byPool: map[string]*Controller{"auto": c}}).PersistState()
+	saved := (&Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}).PersistState()
 	if saved["auto"].BalanceSeq != 2 {
 		t.Fatalf("PersistState: BalanceSeq=%d, want 2", saved["auto"].BalanceSeq)
 	}
@@ -1760,7 +1755,7 @@ func TestBalance_selectionRecencyPersistedAcrossRestart(t *testing.T) {
 	}
 
 	c2 := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b", "c")
-	(&Pools{byPool: map[string]*Controller{"auto": c2}}).LoadPersistState(saved)
+	(&Pools{byPool: map[string]*Controller{"auto": c2}, reg: c2.reg}).LoadPersistState(saved)
 
 	if c2.Current() != "b" {
 		t.Fatalf("after LoadPersistState: Current=%q, want b", c2.Current())
@@ -1911,157 +1906,53 @@ func TestRuntimeConfig_priorityOverrideFailover(t *testing.T) {
 	}
 }
 
-// TestRuntimeConfig_partialOverrideRoundTrip proves that a partial override
-// (e.g. ["b"] on a 3-member pool) yields the same total order live and
-// after restart.
-func TestRuntimeConfig_partialOverrideRoundTrip(t *testing.T) {
+// TestRuntimeConfig_priorityRoundTrip proves a priority order (including a
+// partial one, expanded to a total order) survives a config round-trip along
+// with a disabled member. Under issue #198 operator intent lives in the config
+// registry, so a fresh Pools built from that config reflects it.
+func TestRuntimeConfig_priorityRoundTrip(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
+	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg, store: quota.NewStore()}
 
-	// Set a partial override: only b is listed (a and c rank after in sorted order).
-	// Effective order should be [b, a, c].
-	c.mu.Lock()
-	c.setPriorityOverrideEffectiveLocked([]string{"b"})
-	c.mu.Unlock()
-
-	// Snapshot the runtime config.
-	cfg := c.runtimeConfig()
-	if len(cfg.PriorityOverride) != 3 {
-		t.Fatalf("partial override expanded length=%d, want 3 (b,a,c)", len(cfg.PriorityOverride))
+	// Partial priority ["b"] expands to [b,a,c]; disable c.
+	if status, err := p.SetPriority("auto", []string{"b"}); status != 200 || err != nil {
+		t.Fatalf("SetPriority: status=%d err=%v", status, err)
 	}
-	wantOrder := []string{"b", "a", "c"}
-	for i, got := range cfg.PriorityOverride {
-		if got != wantOrder[i] {
-			t.Errorf("expanded order[%d]=%q, want %q", i, got, wantOrder[i])
+	if status, err := p.SetMemberDisabled("auto", "c", true); status != 200 || err != nil {
+		t.Fatalf("SetMemberDisabled: status=%d err=%v", status, err)
+	}
+
+	want := []string{"b", "a", "c"}
+	check := func(label string, pp *Pools) {
+		cc, _ := pp.controller("auto")
+		cc.mu.Lock()
+		defer cc.mu.Unlock()
+		if len(cc.priority) != 3 {
+			t.Fatalf("%s: priority length=%d, want 3", label, len(cc.priority))
+		}
+		for i, got := range cc.priority {
+			if got != want[i] {
+				t.Errorf("%s: priority[%d]=%q, want %q", label, i, got, want[i])
+			}
+		}
+		if !cc.disabled["c"] {
+			t.Errorf("%s: member c should be disabled", label)
 		}
 	}
-
-	// Load the config into a fresh controller and verify the order is preserved.
-	c2 := newController(t, 0, clock, io.Discard, "a", "b", "c")
-	c2.loadRuntimeConfig(cfg)
-
-	c2.mu.Lock()
-	defer c2.mu.Unlock()
-	if len(c2.priorityOverride) != 3 {
-		t.Fatalf("after load: override length=%d, want 3", len(c2.priorityOverride))
-	}
-	for i, got := range c2.priorityOverride {
-		if got != wantOrder[i] {
-			t.Errorf("after load order[%d]=%q, want %q", i, got, wantOrder[i])
-		}
-	}
+	check("live", p)
+	check("after reload", reloadViaConfig(t, p))
 }
 
-// TestRuntimeConfig_configRoundTrip proves that runtime config survives a
-// persist/load cycle.
-func TestRuntimeConfig_configRoundTrip(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
-
-	// Set a priority override and disable b.
-	c.mu.Lock()
-	c.setPriorityOverrideEffectiveLocked([]string{"c"})
-	c.setDisabledLocked("b", true)
-	c.mu.Unlock()
-
-	cfg := c.runtimeConfig()
-	if len(cfg.PriorityOverride) != 3 {
-		t.Errorf("priority override length=%d, want 3 (expanded)", len(cfg.PriorityOverride))
-	}
-	if len(cfg.Disabled) != 1 || cfg.Disabled[0] != "b" {
-		t.Errorf("disabled list=%v, want [b]", cfg.Disabled)
-	}
-
-	// Reload into a fresh controller.
-	c2 := newController(t, 0, clock, io.Discard, "a", "b", "c")
-	c2.loadRuntimeConfig(cfg)
-
-	// Verify the settings took effect.
-	c2.mu.Lock()
-	defer c2.mu.Unlock()
-	if len(c2.priorityOverride) != 3 {
-		t.Errorf("after load: override length=%d, want 3", len(c2.priorityOverride))
-	}
-	if !c2.disabled["b"] {
-		t.Error("after load: member b should be disabled")
-	}
-}
-
-// TestRuntimeConfig_loadDropsUnknownNick proves that loadRuntimeConfig drops
-// references to unknown nicks with a logged warning (not a crash).
-func TestRuntimeConfig_loadDropsUnknownNick(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	var logBuf bytes.Buffer
-	c := newController(t, 0, clock, &logBuf, "a", "b")
-
-	// Config contains unknown nicks and a valid nick.
-	cfg := PoolRuntimeConfig{
-		PriorityOverride: []string{"unknown", "b"},
-		Disabled:         []string{"a", "ghost"},
-	}
-
-	c.loadRuntimeConfig(cfg)
-
-	// The valid entries should be loaded; unknown ones dropped.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.priorityOverride) != 2 {
-		t.Errorf("override length after load=%d, want 2 (b,a)", len(c.priorityOverride))
-	}
-	if len(c.disabled) != 1 || !c.disabled["a"] {
-		t.Errorf("disabled after load=%v, want {a:true}", c.disabled)
-	}
-	// Verify warnings were logged.
-	logs := logBuf.String()
-	if !strings.Contains(logs, "unknown nick") && !strings.Contains(logs, "ghost") {
-		t.Error("expected warning log about unknown nicks, got none")
-	}
-}
-
-// TestRuntimeConfig_loadDropsAddedMemberWithEmptyBaseURL proves that
-// loadRuntimeConfig refuses to restore an added member whose persisted
-// BaseURL is empty, with a clear logged error — the safety net that replaces
-// Controller.defaultBaseURL's removal (issue #172). The member is dropped
-// (not silently misrouted); the controller continues to boot.
-func TestRuntimeConfig_loadDropsAddedMemberWithEmptyBaseURL(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	var logBuf bytes.Buffer
-	c := newController(t, 0, clock, &logBuf, "a", "b")
-
-	cfg := PoolRuntimeConfig{
-		AddedMembers: map[string]AddedMember{
-			"good": {Credential: "cred-good", BaseURL: "https://good.example"},
-			"bad":  {Credential: "cred-bad", BaseURL: ""}, // corrupted state
-		},
-	}
-	c.loadRuntimeConfig(cfg)
-
-	c.mu.Lock()
-	goodPresent := c.indexOf("good") >= 0
-	badPresent := c.indexOf("bad") >= 0
-	c.mu.Unlock()
-	if !goodPresent {
-		t.Errorf("good member not restored")
-	}
-	if badPresent {
-		t.Errorf("bad member (empty base_url) was restored; want dropped")
-	}
-	logs := logBuf.String()
-	if !strings.Contains(logs, "refusing to restore") || !strings.Contains(logs, "bad") {
-		t.Errorf("expected loud log about dropped bad member, got: %q", logs)
-	}
-}
-
-// TestRuntimeConfig_mixedPoolStickyRoundTrip proves that a mixed pool (config
-// + runtime-added members) correctly restores the active sticky when the
-// active member before shutdown was a runtime-added one (issue #185 regression:
-// the old curNick == "" guard in loadRuntimeConfig silently dropped the
-// pendingSticky for any pool that had config members, because NewController
-// always set curNick to a config nick first).
+// TestRuntimeConfig_mixedPoolStickyRoundTrip proves that a pool with a
+// runtime-added member correctly restores the active sticky when the active
+// member before shutdown was that runtime-added one. Under issue #198 the
+// added member is in the config registry, so a fresh Pools built from the
+// config already has it, and LoadPersistState restores the sticky immediately.
 func TestRuntimeConfig_mixedPoolStickyRoundTrip(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "a", "b")
-	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg, store: quota.NewStore()}
 
 	// Add a runtime member "extra" and make it the active sticky.
 	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {
@@ -2072,17 +1963,9 @@ func TestRuntimeConfig_mixedPoolStickyRoundTrip(t *testing.T) {
 		t.Fatalf("pre-persist: current=%q, want extra", got)
 	}
 
-	// Persist runtime config and routing state into a round-trip.
-	rtCfg := c.runtimeConfig()
-	persistState := (&Pools{byPool: map[string]*Controller{"auto": c}}).PersistState()
-
-	// Reload into a fresh controller (simulates restart: config members a,b are
-	// re-seeded by NewController; extra is absent until loadRuntimeConfig).
-	c2 := newController(t, 0, clock, io.Discard, "a", "b")
-	c2p := &Pools{byPool: map[string]*Controller{"auto": c2}}
-	c2p.LoadPersistState(persistState) // sets pendingSticky = "extra" (not yet in members)
-	c2.loadRuntimeConfig(rtCfg)        // restores extra into members, then applies pendingSticky
-
+	// Round-trip through the config + observation state.
+	p2 := reloadViaConfig(t, p)
+	c2, _ := p2.controller("auto")
 	if got := c2.Current(); got != "extra" {
 		t.Fatalf("after restart: current=%q, want extra (active sticky should survive round-trip)", got)
 	}
@@ -2142,92 +2025,37 @@ func TestRuntimeConfig_concurrentMutation(t *testing.T) {
 }
 
 // TestRuntimeConfig_removedMemberRoundTripAndReanchor proves that a removed
-// member survives a persist/load cycle (issue #85): the tombstone is
-// serialized, restored on a fresh controller, and the active pointer is
-// re-anchored off the removed member at load — never left pointing at it.
+// member stays gone across a restart (issue #85, structural under #198:
+// removal deletes the member from the config registry, so a fresh Pools never
+// sees it) and the active pointer is never left on the removed member.
 func TestRuntimeConfig_removedMemberRoundTripAndReanchor(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	// Start anchored on "a" (index 0), then remove "a".
+	// Start anchored on "a" (index 0), then remove "a" through the config.
 	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
-	c.mu.Lock()
-	c.removedMembers["a"] = true
-	c.mu.Unlock()
-
-	cfg := c.runtimeConfig()
-	if len(cfg.RemovedMembers) != 1 || cfg.RemovedMembers[0] != "a" {
-		t.Fatalf("RemovedMembers=%v, want [a]", cfg.RemovedMembers)
+	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg, store: quota.NewStore()}
+	if status, err := p.RemoveMember("auto", "a"); status != 200 || err != nil {
+		t.Fatalf("RemoveMember: status=%d err=%v", status, err)
 	}
 
-	// The tombstone must land in the serialized JSON (the persisted state file).
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatalf("marshal cfg: %v", err)
-	}
-	if !strings.Contains(string(raw), `"removed_members"`) {
-		t.Errorf("serialized config missing removed_members: %s", raw)
+	// Live: a is gone and the pointer moved off it.
+	if got := c.Current(); got == "a" {
+		t.Errorf("after removal Current()=%q, want a surviving member", got)
 	}
 
-	// Reload into a fresh controller that also starts anchored on the removed
-	// member "a" (worst case: loadState restored sticky=a before runtime config).
-	c2 := newController(t, 0, clock, io.Discard, "a", "b", "c")
-	c2.loadRuntimeConfig(cfg)
-
-	// a stays removed across restart.
-	c2.mu.Lock()
-	stillRemoved := c2.isRemovedLocked("a")
-	c2.mu.Unlock()
-	if !stillRemoved {
-		t.Error("removed member a not restored after reload")
-	}
-
-	// Active pointer must have been re-anchored off the removed member.
+	// Reload from the config + observation state: a must not resurface.
+	p2 := reloadViaConfig(t, p)
+	c2, _ := p2.controller("auto")
 	if got := c2.Current(); got == "a" {
-		t.Errorf("after reload Current()=%q, want a non-removed member", got)
+		t.Errorf("after reload Current()=%q, want a surviving member", got)
 	}
-
-	// a must be absent from both user-facing rosters.
 	ps := c2.poolStatus(quota.NewStore())
 	if ps.Active == "a" {
-		t.Errorf("poolStatus Active=%q, want non-removed", ps.Active)
+		t.Errorf("poolStatus Active=%q, want a surviving member", ps.Active)
 	}
 	for _, m := range ps.Members {
 		if m.Nick == "a" {
 			t.Errorf("poolStatus still lists removed member a: %+v", ps.Members)
 		}
-	}
-}
-
-// TestRecord429_soonestFallbackExcludesRemoved proves the all-unavailable
-// fallback never surfaces a removed member as the representative, even when
-// that member is also exhausted with the soonest reset (issue #85).
-func TestRecord429_soonestFallbackExcludesRemoved(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	c := newController(t, 0, clock, io.Discard, "a", "b")
-
-	// a 429s with the SOONER reset, then is removed: it stays in the exhausted
-	// map but must not be eligible as the soonest representative.
-	if err := c.ModifyResponse(resp429(c.resolve(t, "a"), clock, 60*time.Second)); err != nil {
-		t.Fatalf("ModifyResponse a: %v", err)
-	}
-	c.mu.Lock()
-	c.removedMembers["a"] = true
-	c.mu.Unlock()
-
-	// b 429s with a LATER reset; pool is now dry (a removed, b exhausted).
-	resp := resp429(c.resolve(t, "b"), clock, 300*time.Second)
-	if err := c.ModifyResponse(resp); err != nil {
-		t.Fatalf("ModifyResponse b: %v", err)
-	}
-
-	if got := c.Current(); got != "b" {
-		t.Errorf("all-unavailable representative=%q, want b (removed a must be excluded)", got)
-	}
-	rb, _, exhausted := c.ResolveAuto()
-	if !exhausted {
-		t.Error("ResolveAuto exhausted=false, want true while pool dry")
-	}
-	if rb.Nick != "b" {
-		t.Errorf("ResolveAuto nick=%q, want b (removed a must never be surfaced)", rb.Nick)
 	}
 }
 
@@ -2295,7 +2123,7 @@ func TestPoolStatus_runtimeAddedNickSuppressesUntilObservation(t *testing.T) {
 func TestController_MarkLocalSnapshot_unknownNickIgnored(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "a", "b")
-	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 
 	pools.MarkLocalSnapshot("", "a")             // empty pool
 	pools.MarkLocalSnapshot("auto", "")          // empty nick
@@ -2321,7 +2149,7 @@ func TestController_MarkLocalSnapshot_unknownNickIgnored(t *testing.T) {
 func TestPoolPersistState_localSnapshotNicksRoundTrip(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
-	pools := &Pools{byPool: map[string]*Controller{"auto": c}}
+	pools := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 
 	// Mark b and a local-snapshot (mimics the controller having observed
 	// traffic for them). Add a stale entry for "ghost" that no longer
@@ -2345,7 +2173,7 @@ func TestPoolPersistState_localSnapshotNicksRoundTrip(t *testing.T) {
 	// Fresh controller, same members, restore. The "ghost" entry is in
 	// the persisted set and must be silently dropped on load.
 	c2 := newController(t, 1, clock, io.Discard, "a", "b", "c")
-	pools2 := &Pools{byPool: map[string]*Controller{"auto": c2}}
+	pools2 := &Pools{byPool: map[string]*Controller{"auto": c2}, reg: c2.reg}
 	pools2.LoadPersistState(ps)
 
 	// Static members are seeded at construction; the restored
@@ -2394,11 +2222,8 @@ func TestPoolPersistState_runtimeAddedMemberRoundTrip(t *testing.T) {
 	// (header observer or poller tick), so the gate opens for it.
 	p.MarkLocalSnapshot("rt", "shared")
 
-	// Capture the persisted state. The runtime pool, its added member,
-	// and the local-snapshot entry all need to round-trip.
-	addedPools := p.PersistAddedPools()
+	// Verify the persisted observation state carries the local-snapshot entry.
 	persistState := p.PersistState()
-	runtimeConfig := p.PersistRuntimeConfig()
 	if _, ok := persistState["rt"]; !ok {
 		t.Fatalf("PersistState missing rt entry: %+v", persistState)
 	}
@@ -2406,22 +2231,13 @@ func TestPoolPersistState_runtimeAddedMemberRoundTrip(t *testing.T) {
 		t.Fatalf("persist LocalSnapshotNicks=%v, want [shared]", persistState["rt"].LocalSnapshotNicks)
 	}
 
-	// Re-instantiate in the production load order: added pools first,
-	// then persist state, then runtime config. The deferred
-	// applyPendingLocalSnapshotsLocked runs at the end of
-	// LoadRuntimeConfig.
-	clock2 := newMoveClock()
-	p2 := loadMovePools(t, clock2, map[string]string{
-		backend.EnvPrefix + "ONE_BACKEND_SHARED": "cred-shared",
-		backend.EnvPrefix + "TWO_BACKEND_X":      "cred-x",
-	})
-	p2.LoadAddedPools(addedPools)
-	p2.LoadPersistState(persistState)
-	p2.LoadRuntimeConfig(runtimeConfig)
+	// Restart via the config round-trip: the runtime pool + member are now in
+	// the config registry, so a fresh Pools has them, and LoadPersistState
+	// seeds the local-snapshot immediately (no deferral).
+	p2 := reloadViaConfig(t, p)
 
-	// The runtime member must be back in the controller's effective
-	// set AND its poolLocalSnapshots entry must be present (the gate
-	// is open — no "-" re-flash after restart).
+	// The runtime member must be back in the controller's effective set AND its
+	// poolLocalSnapshots entry present (gate open — no "-" re-flash on restart).
 	c, ok := p2.controller("rt")
 	if !ok {
 		t.Fatal("rt pool missing after restart")
@@ -2430,14 +2246,14 @@ func TestPoolPersistState_runtimeAddedMemberRoundTrip(t *testing.T) {
 	_, sharedOK := c.poolLocalSnapshots["shared"]
 	c.mu.Unlock()
 	if !sharedOK {
-		t.Errorf("after restart: poolLocalSnapshots[shared] missing, want true (deferred-apply regression)")
+		t.Errorf("after restart: poolLocalSnapshots[shared] missing, want true")
 	}
 
 	// Sanity: the runtime member is actually a member, and a fresh
 	// status view attaches the snapshot (gate open + data present).
 	store := quota.NewStore()
 	u := 0.42
-	store.Put("shared", quota.Snapshot{Unified5hUtilization: &u, AsOf: clock2.now()})
+	store.Put("shared", quota.Snapshot{Unified5hUtilization: &u, AsOf: clock.now()})
 	status, _ := p2.PoolStatus("rt", store)
 	snap := snapshotByNick(status)["shared"]
 	if snap == nil {
@@ -2557,9 +2373,8 @@ func TestResolveAuto_allParkedLivePastStoreFutureHalfOpen(t *testing.T) {
 // nicks; after the collapse c.curNick is used directly).
 func TestRecord429_runtimeAddedActiveMember(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	p := &Pools{byPool: map[string]*Controller{
-		"auto": newController(t, 0, clock, io.Discard, "a"),
-	}}
+	c0 := newController(t, 0, clock, io.Discard, "a")
+	p := &Pools{byPool: map[string]*Controller{"auto": c0}, reg: c0.reg}
 
 	// Add a runtime member "extra" and make it the active one.
 	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {
@@ -2590,7 +2405,7 @@ func TestRecord429_zeroStaticMembersPoolDry(t *testing.T) {
 	// pool "dummy" so backend.Load succeeds. The "solo" pool is created at
 	// runtime with zero static members via AddPool.
 	p := loadMovePools(t, clock, map[string]string{
-		backend.EnvPrefix + "DUMMY_BACKEND_X": "cred-dummy",
+		backend.EnvPrefix + "DUMMY_BACKEND_D": "cred-dummy",
 	})
 	if status, err := p.AddPool("solo", ""); status != http.StatusCreated || err != nil {
 		t.Fatalf("AddPool solo: status=%d err=%v, want 201", status, err)
@@ -2628,7 +2443,7 @@ func TestParkAndFailover_addedActiveMemberFailsOverToHealthyAdded(t *testing.T) 
 	// One static member "a" (will be parked), active = runtime-added "extra1",
 	// healthy = runtime-added "extra2".
 	c := newController(t, 0, clock, io.Discard, "a")
-	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 	if status, err := p.AddMember("auto", "extra1", "cred-extra1", "https://extra1.example", nil); status != 200 || err != nil {
 		t.Fatalf("AddMember extra1: status=%d err=%v, want 200", status, err)
 	}
@@ -2665,7 +2480,7 @@ func TestBalance_runtimeAddedMemberParticipates(t *testing.T) {
 	// Balance pool with members a, b.  a is active; b has a high lead so the
 	// balance switch should fire.
 	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 
 	// Add a runtime member "extra" with a low lead (no snapshot → util=0).
 	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {

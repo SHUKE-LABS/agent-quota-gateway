@@ -895,9 +895,15 @@ func (r *Registry) Spec() Spec {
 	spec := Spec{Pools: make(map[string]PoolSpec, len(r.pools))}
 	for name, p := range r.pools {
 		ps := PoolSpec{
-			BaseURL: p.baseURL,
 			Members: make(map[string]MemberSpec, len(p.byNick)),
 			Balance: p.balance,
+		}
+		// A pool whose effective base URL is just the gateway default is
+		// emitted with an empty base_url (inherits): it keeps the shape clean
+		// and, for a zero-member pool, avoids tripping the memberless-pool
+		// "declared base_url" guard on the rebuild.
+		if p.baseURL != r.defaultBaseURL {
+			ps.BaseURL = p.baseURL
 		}
 		if len(p.priority) > 0 {
 			ps.Priority = append([]string(nil), p.priority...)

@@ -420,7 +420,7 @@ func TestPreemptor_preemptToRuntimeAddedMember(t *testing.T) {
 	// Priority pool: a > b (static). "extra" will be placed at rank 0 (above a).
 	c := newPriorityController(t, -1, clock, &logBuf, "a,b", "a", "b")
 	// AddMember with placement "extra,a,b" installs a runtime priority override.
-	if status, err := (&Pools{byPool: map[string]*Controller{"auto": c}}).AddMember(
+	if status, err := (&Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}).AddMember(
 		"auto", "extra", "cred-extra", "https://extra.example", []string{"extra", "a", "b"},
 	); status != 200 || err != nil {
 		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
@@ -467,7 +467,7 @@ func TestPreemptor_runtimeAddedMemberPreemptBack(t *testing.T) {
 	c := newPriorityController(t, -1, clock, &logBuf, "a,b,c", "a", "b", "c")
 
 	// Add "extra" as a runtime member and make it the active one.
-	if status, err := (&Pools{byPool: map[string]*Controller{"auto": c}}).AddMember(
+	if status, err := (&Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}).AddMember(
 		"auto", "extra", "cred-extra", "https://extra.example", []string{"a", "b", "c", "extra"},
 	); status != 200 || err != nil {
 		t.Fatalf("AddMember extra: status=%d err=%v", status, err)

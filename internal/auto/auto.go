@@ -133,11 +133,21 @@ type Pools struct {
 	mu     sync.RWMutex
 	byPool map[string]*Controller
 
+	// reg is the current authoritative registry — operator intent for every
+	// pool (issue #198: config is the single source of truth). Runtime
+	// mutations replace it wholesale with a fresh copy-on-write registry
+	// (backend.Registry.With*) under p.mu, then reconcile the affected
+	// controllers and trigger a config-file write. Read under p.mu.
 	reg      *backend.Registry
 	store    *quota.Store
 	now      func() time.Time
 	logOut   io.Writer
 	onMutate func()
+	// onConfigChange, if non-nil, is called (non-blocking) after any operator
+	// mutation that changes operator intent, so the configfile writer flushes
+	// the new config to disk. Distinct from onMutate, which persists runtime
+	// observation (sticky/exhausted) to the state file.
+	onConfigChange func()
 }
 
 // NewPools builds one Controller per pool in reg. Each controller starts
@@ -395,59 +405,13 @@ type PoolPersistState struct {
 	LocalSnapshotNicks []string `json:"local_snapshot_nicks,omitempty"`
 }
 
-// PoolRuntimeConfig is the serializable runtime configuration for one pool.
-// It carries operator mutations that overlay the immutable static config:
-// a priority order override, a per-member disabled flag, and runtime-added
-// members with their credentials.
-// It is exported so the persist package can embed it in GatewayState.
-type PoolRuntimeConfig struct {
-	// PriorityOverride is the expanded total order (highest first) when the
-	// operator has set a runtime priority order. A partial list (e.g. ["b"])
-	// is expanded via effectiveOrder to include all unlisted members in sorted
-	// order, so the stored form is always a complete total order. nil means
-	// no override is in effect.
-	PriorityOverride []string `json:"priority_override,omitempty"`
-	// Disabled is the list of member nicks that are operator-disabled.
-	// Each nick appears at most once. Empty means no members are disabled.
-	Disabled []string `json:"disabled,omitempty"`
-	// AddedMembers is the set of runtime-added pool members with their credentials.
-	// Keys are normalized nicks; values include credential and optional base URL.
-	// The state file may contain credentials after this change, so it must be
-	// protected at 0600 (see persist package).
-	AddedMembers map[string]AddedMember `json:"added_members,omitempty"`
-	// RemovedMembers is the list of member nicks that have been operator-removed.
-	// Persisting these tombstones makes removal permanent and uniform: a removed
-	// static member stays removed across restart instead of resurfacing, matching
-	// the always-permanent behaviour of a removed runtime-added member. Each nick
-	// appears at most once. Empty means no members are removed.
-	RemovedMembers []string `json:"removed_members,omitempty"`
-}
-
-// AddedMember is a pool member entry in the persisted runtime config.
-// Kept as the on-disk format for PoolRuntimeConfig.AddedMembers.
-type AddedMember struct {
-	Credential string `json:"credential"`         // stored, never returned in config views
-	BaseURL    string `json:"base_url,omitempty"` // optional for a known nick (cross-pool resolved); always non-empty once persisted
-}
-
-// memberEntry is one member in the Controller's unified ordered member collection.
-// It holds no origin tag — config-seeded and runtime-added members are
-// indistinguishable once inside the Controller (issue #185).
+// memberEntry is one member in the Controller's ordered member collection,
+// re-derived from the config registry on every reconcile (issue #198).
 type memberEntry struct {
 	Nick       string
 	Credential string
 	BaseURL    string
 }
-
-// AddedPoolSpec is the persisted marker that a pool name was created at runtime
-// (POST /_gateway/pool) and so must be re-instantiated on restart. A runtime
-// pool owns no properties beyond its name — members and routing state are
-// persisted separately (config / pools), so a re-instantiated pool is a clean
-// slate. It carries no fields today but is retained as the persisted value type
-// so a pre-change state file whose entry still holds a "base_url" field decodes
-// cleanly (Go's decoder ignores the unknown field). Exported so the persist
-// package can embed it in GatewayState.
-type AddedPoolSpec struct{}
 
 // LoadPersistState applies previously persisted routing state to each pool's
 // controller. Called once at startup, before the server begins serving.
@@ -464,42 +428,52 @@ func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 // no empty strings) and then expanded via effectiveOrder() to a total order.
 // Returns (httpStatus, error) with error containing a credential-free message.
 func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
-	c, ok := p.controller(poolName)
+	name := backend.NormalizeName(poolName)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	c, ok := p.byPool[name]
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Reject priority override on a balanced pool (mutually exclusive modes).
+	// Reject priority on a balanced pool (mutually exclusive modes).
 	if c.balanceGap > 0 {
+		c.mu.Unlock()
 		return http.StatusConflict, fmt.Errorf("balanced pools do not support priority override")
 	}
-
-	// Normalize and validate the input order against the unified member collection.
+	// Normalize and validate the input order against the current membership.
 	seen := make(map[string]bool)
 	validOrder := make([]string, 0, len(order))
 	for _, raw := range order {
 		nick := backend.NormalizeName(raw)
 		if nick == "" {
+			c.mu.Unlock()
 			return http.StatusBadRequest, fmt.Errorf("priority list contains empty nick")
 		}
 		if seen[nick] {
+			c.mu.Unlock()
 			return http.StatusBadRequest, fmt.Errorf("priority list contains duplicate nick: %s", nick)
 		}
 		seen[nick] = true
 		if c.indexOf(nick) < 0 {
+			c.mu.Unlock()
 			return http.StatusBadRequest, fmt.Errorf("unknown nick: %s", nick)
 		}
 		validOrder = append(validOrder, nick)
 	}
+	c.mu.Unlock()
 
-	// Expand via the effective set (static ∪ added − removed) so unlisted
-	// runtime-added members rank last, matching the documented behavior for
-	// unlisted static members. setPriorityOverrideEffectiveLocked is already
-	// used by MoveMember and loadRuntimeConfig for the same reason.
-	c.setPriorityOverrideEffectiveLocked(validOrder)
+	// Write the priority through to the config registry (single source of
+	// truth). effectiveOrder expansion (unlisted members rank last) happens on
+	// reconcile, matching NewController.
+	next, err := p.reg.WithPriority(name, validOrder)
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+	p.applyRegistryLocked(next, name)
+	p.markConfigDirtyLocked()
 	return http.StatusOK, nil
 }
 
@@ -510,56 +484,33 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 // surface. Returns (httpStatus, error) with error containing a
 // credential-free message.
 func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) {
-	c, ok := p.controller(poolName)
-	if !ok {
-		return http.StatusNotFound, fmt.Errorf("pool not found")
-	}
+	name := backend.NormalizeName(poolName)
 	normalized := backend.NormalizeName(nick)
 	if normalized == "" {
 		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
 	}
 
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c, ok := p.byPool[name]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+
 	c.mu.Lock()
-	present := c.indexOf(normalized) >= 0 && !c.isRemovedLocked(normalized)
+	present := c.indexOf(normalized) >= 0
+	c.mu.Unlock()
 	if !present {
-		c.mu.Unlock()
 		return http.StatusBadRequest, fmt.Errorf("unknown nick: %s", normalized)
 	}
-	c.setDisabledLocked(normalized, off)
-	c.mu.Unlock()
-	return http.StatusOK, nil
-}
 
-// resolveAcrossPools scans every pool other than skipPool for a present
-// (non-removed) member with the given normalized nick, collecting the distinct
-// credentials and distinct *resolved* base URLs found. It is used to fill an
-// omitted credential and/or base_url when re-adding a known subscription by
-// name. Each pool lock is taken and released independently — no other lock is
-// held by the caller — mirroring MoveMember's phase separation.
-func (p *Pools) resolveAcrossPools(skipPool, nick string) (creds, baseURLs []string) {
-	credSeen := make(map[string]bool)
-	urlSeen := make(map[string]bool)
-	for name, c := range p.controllersSnapshot() {
-		if name == skipPool {
-			continue
-		}
-		c.mu.Lock()
-		present := c.indexOf(nick) >= 0 && !c.isRemovedLocked(nick)
-		if present {
-			if b, ok := c.backendByNickLocked(nick); ok {
-				if b.Credential != "" && !credSeen[b.Credential] {
-					credSeen[b.Credential] = true
-					creds = append(creds, b.Credential)
-				}
-				if b.BaseURL != "" && !urlSeen[b.BaseURL] {
-					urlSeen[b.BaseURL] = true
-					baseURLs = append(baseURLs, b.BaseURL)
-				}
-			}
-		}
-		c.mu.Unlock()
+	next, err := p.reg.WithMemberDisabled(name, normalized, off)
+	if err != nil {
+		return http.StatusBadRequest, err
 	}
-	return creds, baseURLs
+	p.applyRegistryLocked(next, name)
+	p.markConfigDirtyLocked()
+	return http.StatusOK, nil
 }
 
 // AddMember adds a runtime member to a pool. Credential and baseURL are optional
@@ -570,27 +521,31 @@ func (p *Pools) resolveAcrossPools(skipPool, nick string) (creds, baseURLs []str
 // resolved concrete base_url is persisted — never an empty string when one is
 // resolvable. Returns (httpStatus, error) with a credential-free message.
 func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement []string) (int, error) {
-	c, ok := p.controller(poolName)
-	if !ok {
-		return http.StatusNotFound, fmt.Errorf("pool not found")
-	}
+	name := backend.NormalizeName(poolName)
 	normalized := backend.NormalizeName(nick)
 	if normalized == "" {
 		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
 	}
-	// Validate baseURL if explicitly provided.
 	if baseURL != "" {
 		if _, err := backend.ValidateBaseURL(baseURL); err != nil {
 			return http.StatusBadRequest, fmt.Errorf("invalid base_url: %w", err)
 		}
 	}
 
-	// Phase 1: resolve omitted credential/base_url from other pools (no target
-	// lock held). Credential and base_url are resolved independently.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c, ok := p.byPool[name]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+
+	// Resolve omitted credential/base_url from the other pools of the current
+	// registry (lock-free; reg is immutable). Credential and base_url resolve
+	// independently.
 	resolvedCred := credential
 	resolvedURL := baseURL
 	if credential == "" || baseURL == "" {
-		creds, baseURLs := p.resolveAcrossPools(poolName, normalized)
+		creds, baseURLs := crossPoolResolve(p.reg, name, normalized)
 		if credential == "" {
 			switch len(creds) {
 			case 1:
@@ -610,29 +565,32 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 		// len(baseURLs)==0 leaves resolvedURL empty → pool default below.
 	}
 
-	// Phase 2: validate + commit on the target pool under its lock.
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Duplicate check: already a live (non-removed) member.
-	if c.indexOf(normalized) >= 0 && !c.isRemovedLocked(normalized) {
+	// Duplicate check: already a member.
+	if c.indexOf(normalized) >= 0 {
+		c.mu.Unlock()
 		return http.StatusConflict, fmt.Errorf("nick %s already exists as a member", normalized)
 	}
-
-	// Resolve base_url to a concrete value so the persisted record is
+	// Resolve base_url to a concrete value so the config record is
 	// self-describing. An unresolved (new-nick) base_url falls back to the
 	// first member's URL; a pool with no members has no default to borrow, so
-	// a genuinely new nick must supply base_url explicitly.
+	// a genuinely new nick must supply base_url explicitly. (WithMemberSet
+	// would otherwise inherit the pool default, but keeping the explicit
+	// fallback preserves the documented cross-pool-add ergonomics.)
 	if resolvedURL == "" {
 		if len(c.members) > 0 {
 			resolvedURL = c.members[0].BaseURL
 		} else {
+			// A genuinely new nick in an empty pool has no default to borrow;
+			// require an explicit base_url rather than silently inheriting the
+			// gateway default (which could point a vendor key at the wrong
+			// upstream).
+			c.mu.Unlock()
 			return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no members")
 		}
 	}
-
 	// Placement: a priority target needs an explicit order including nick; a
-	// plain/balanced target must not carry one. Same rules as the move path.
+	// plain/balanced target must not carry one.
 	isPriorityTarget := c.balanceGap == 0 && len(c.effectivePriorityLocked()) > 0
 	var normPlacement []string
 	if isPriorityTarget {
@@ -640,110 +598,67 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 		var err error
 		normPlacement, status, err = c.validatePlacementLocked(normalized, placement)
 		if err != nil {
+			c.mu.Unlock()
 			return status, err
 		}
 	} else if len(placement) > 0 {
+		c.mu.Unlock()
 		return http.StatusBadRequest, fmt.Errorf("placement is only applicable to a priority target pool")
 	}
+	c.mu.Unlock()
 
-	// Clear any tombstone so the nick becomes selectable again (issue #185:
-	// re-adding a config-derived nick after removal now always succeeds).
-	delete(c.removedMembers, normalized)
-
-	// Upsert into the unified member collection: update if present (e.g. a
-	// config nick that was removed and is being re-added), insert if new.
-	if idx := c.indexOf(normalized); idx >= 0 {
-		c.members[idx].Credential = resolvedCred
-		c.members[idx].BaseURL = resolvedURL
-	} else {
-		c.members = append(c.members, memberEntry{
-			Nick:       normalized,
-			Credential: resolvedCred,
-			BaseURL:    resolvedURL,
-		})
+	// Commit through the config registry. An empty resolvedURL means the member
+	// inherits the pool default (a fresh pool with a member's own base_url).
+	next, err := p.reg.WithMemberSet(name, normalized, resolvedCred, resolvedURL, false)
+	if err != nil {
+		return http.StatusBadRequest, err
 	}
 	if isPriorityTarget {
-		c.setPriorityOverrideEffectiveLocked(normPlacement)
+		next, err = next.WithPriority(name, normPlacement)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
 	}
-	c.notifyMutate()
-	fmt.Fprintf(c.logOut, "auto[%s]: added member %s\n", c.pool, normalized)
+	p.applyRegistryLocked(next, name)
+	p.markConfigDirtyLocked()
+	fmt.Fprintf(c.logOut, "auto[%s]: added member %s\n", name, normalized)
 	return http.StatusOK, nil
 }
 
-// RemoveMember removes a member (static or runtime-added) from pool selection.
-// Returns (httpStatus, error) with error containing a credential-free message.
+// RemoveMember removes a member from a pool. Removal is permanent: the member
+// is deleted from the config registry (issue #198), pruned from the pool's
+// priority order, and if it was the active sticky member the pointer
+// force-switches on reconcile. Returns (httpStatus, error) with a
+// credential-free message.
 func (p *Pools) RemoveMember(poolName, nick string) (int, error) {
-	c, ok := p.controller(poolName)
-	if !ok {
-		return http.StatusNotFound, fmt.Errorf("pool not found")
-	}
+	name := backend.NormalizeName(poolName)
 	normalized := backend.NormalizeName(nick)
 	if normalized == "" {
 		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c, ok := p.byPool[name]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
 
-	if c.indexOf(normalized) < 0 {
+	c.mu.Lock()
+	present := c.indexOf(normalized) >= 0
+	c.mu.Unlock()
+	if !present {
 		return http.StatusBadRequest, fmt.Errorf("nick %s not found in pool", normalized)
 	}
 
-	c.removeMemberLocked(normalized)
+	next, err := p.reg.WithMemberRemoved(name, normalized)
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+	p.applyRegistryLocked(next, name)
+	p.markConfigDirtyLocked()
+	fmt.Fprintf(c.logOut, "auto[%s]: removed member %s\n", name, normalized)
 	return http.StatusOK, nil
-}
-
-// removeMemberLocked tombstones nick so it is hidden from selection and listing.
-// Members stay in c.members; isRemovedLocked gates them out at routing time,
-// matching the reviewer note (issue #185). If the removed member was the active
-// sticky pointer, the pointer force-switches to the next healthy member (as on
-// a 429). If a runtime priority override is in effect, it is rebuilt over the
-// post-mutation effective member set so the override no longer references the
-// removed nick — making live behaviour match post-restart behaviour (issue #120).
-// The caller is responsible for validating that the member exists. Caller holds c.mu.
-func (c *Controller) removeMemberLocked(nick string) {
-	// Tombstone the nick so it is filtered from routing and listing.
-	c.removedMembers[nick] = true
-	fmt.Fprintf(c.logOut, "auto[%s]: removed member %s\n", c.pool, nick)
-
-	// If the pool currently has a runtime priority override, prune it of any
-	// nick no longer in the effective member set (the removed nick plus any
-	// other stale nick). allMemberNicksLocked already filters out nicks present
-	// in c.removedMembers, so the just-removed nick falls out automatically.
-	// An empty filtered list drops the override entirely (the pool becomes a
-	// plain pool; the UI hides the priority column). Otherwise re-expand via
-	// effectiveOrder so a partial override still yields a total order over the
-	// current effective set — symmetric with setPriorityOverrideEffective /
-	// loadRuntimeConfig (issue #120).
-	if c.priorityOverride != nil {
-		effective := c.allMemberNicksLocked()
-		keep := make(map[string]bool, len(effective))
-		for _, m := range effective {
-			keep[m] = true
-		}
-		filtered := make([]string, 0, len(c.priorityOverride))
-		for _, n := range c.priorityOverride {
-			if keep[n] {
-				filtered = append(filtered, n)
-			}
-		}
-		if len(filtered) == 0 {
-			c.priorityOverride = nil
-		} else {
-			c.priorityOverride = effectiveOrder(filtered, effective)
-		}
-	}
-
-	// If the removed member was the active sticky pointer, force-switch to
-	// the next healthy member. This is similar to what happens on a 429.
-	if c.curNick == nick {
-		if next, ok := c.firstHealthyNickLocked(); ok {
-			c.setActiveMemberLocked(next)
-			fmt.Fprintf(c.logOut, "auto[%s]: switched %s -> %s (removed member %s)\n", c.pool, nick, next, nick)
-		}
-	}
-
-	c.notifyMutate()
 }
 
 // MoveMember relocates a subscription (nick) from one pool to another. It is
@@ -757,107 +672,88 @@ func (c *Controller) removeMemberLocked(nick string) {
 // same-nick slot, needs no placement.
 //
 // Conflict: an existing same-nick member in the target whose credential and
-// resolved base URL match is silently overwritten in place (slot preserved); a
-// differing runtime-added member returns 409 unless force is set; a static
-// target member can never be overwritten by a move (it is immutable here).
+// resolved base URL match is a silent no-op (slot preserved); a differing one
+// returns 409 unless force is set.
 //
 // No surprise re-anchor: the target's healthy active member is never force-
 // switched by the move; the new order applies on the next selection event.
 func (p *Pools) MoveMember(fromPool, nick, toPool string, placement []string, force bool) (int, error) {
-	src, ok := p.controller(fromPool)
-	if !ok {
-		return http.StatusNotFound, fmt.Errorf("source pool not found")
-	}
-	dst, ok := p.controller(toPool)
-	if !ok {
-		return http.StatusNotFound, fmt.Errorf("target pool not found")
-	}
+	from := backend.NormalizeName(fromPool)
+	to := backend.NormalizeName(toPool)
 	normalized := backend.NormalizeName(nick)
 	if normalized == "" {
 		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
 	}
-	if fromPool == toPool {
+	if from == to {
 		return http.StatusBadRequest, fmt.Errorf("source and target pools are the same")
 	}
 
-	// Phase 1: read the source member's resolved credential + base URL.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	src, ok := p.byPool[from]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("source pool not found")
+	}
+	dst, ok := p.byPool[to]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("target pool not found")
+	}
+
+	// Read the source member's resolved credential + base URL.
 	src.mu.Lock()
-	srcPresent := src.indexOf(normalized) >= 0 && !src.isRemovedLocked(normalized)
+	srcBackend, srcPresent := src.backendByNickLocked(normalized)
+	src.mu.Unlock()
 	if !srcPresent {
-		src.mu.Unlock()
 		return http.StatusBadRequest, fmt.Errorf("nick %s not found in source pool", normalized)
 	}
-	srcBackend, _ := src.backendByNickLocked(normalized)
-	src.mu.Unlock()
 
-	// Phase 2: validate + commit on the target (single lock, no source held).
+	// Validate the target-side conflict/placement rules.
 	dst.mu.Lock()
-	status, err := dst.placeMovedMemberLocked(normalized, srcBackend.Credential, srcBackend.BaseURL, placement, force)
-	dst.mu.Unlock()
-	if err != nil {
-		return status, err
-	}
-
-	// Phase 3: persistent remove from the source. Committing the target first
-	// means the worst-case failure is "briefly present in both", never "lost
-	// from both".
-	src.mu.Lock()
-	src.removeMemberLocked(normalized)
-	src.mu.Unlock()
-
-	fmt.Fprintf(src.logOut, "auto: moved member %s from %s to %s\n", normalized, fromPool, toPool)
-	return http.StatusOK, nil
-}
-
-// placeMovedMemberLocked applies the target-side half of a move: it resolves
-// the same-nick conflict / placement rules and commits the add or in-place
-// overwrite. In the unified collection there is no static/added distinction —
-// any existing live member with matching cred+baseURL is a silent no-op or
-// tombstone-clear; differing cred/baseURL requires force (issue #185).
-// Returns (httpStatus, error). Caller holds c.mu (c is the target).
-func (c *Controller) placeMovedMemberLocked(nick, cred, baseURL string, placement []string, force bool) (int, error) {
-	// Existing live member with this nick.
-	if idx := c.indexOf(nick); idx >= 0 && !c.isRemovedLocked(nick) {
-		tb := c.backendAt(idx)
-		if tb.Credential == cred && tb.BaseURL == baseURL {
-			return http.StatusOK, nil // identical: no-op
-		}
-		if !force {
-			return http.StatusConflict, fmt.Errorf("target nick %s exists with a different credential or base_url; confirm to overwrite", nick)
-		}
-		c.members[idx].Credential = cred
-		c.members[idx].BaseURL = baseURL
-		c.notifyMutate()
-		return http.StatusOK, nil
-	}
-
-	// Tombstoned member or brand-new nick: add/restore. A priority target needs
-	// explicit placement; a plain/balanced target must not carry one.
-	isPriorityTarget := c.balanceGap == 0 && len(c.effectivePriorityLocked()) > 0
 	var normPlacement []string
-	if isPriorityTarget {
-		var status int
-		var err error
-		normPlacement, status, err = c.validatePlacementLocked(nick, placement)
-		if err != nil {
-			return status, err
+	if dstBackend, exists := dst.backendByNickLocked(normalized); exists {
+		if dstBackend.Credential != srcBackend.Credential || dstBackend.BaseURL != srcBackend.BaseURL {
+			if !force {
+				dst.mu.Unlock()
+				return http.StatusConflict, fmt.Errorf("target nick %s exists with a different credential or base_url; confirm to overwrite", normalized)
+			}
 		}
-	} else if len(placement) > 0 {
-		return http.StatusBadRequest, fmt.Errorf("placement is only applicable to a priority target pool")
-	}
-
-	delete(c.removedMembers, nick) // clear any stale tombstone
-	if idx := c.indexOf(nick); idx >= 0 {
-		// Was tombstoned; restore with updated credential/baseURL.
-		c.members[idx].Credential = cred
-		c.members[idx].BaseURL = baseURL
+		// Existing slot: no placement needed (identical → effective no-op on dst).
 	} else {
-		c.members = append(c.members, memberEntry{Nick: nick, Credential: cred, BaseURL: baseURL})
+		isPriorityTarget := dst.balanceGap == 0 && len(dst.effectivePriorityLocked()) > 0
+		if isPriorityTarget {
+			var status int
+			var err error
+			normPlacement, status, err = dst.validatePlacementLocked(normalized, placement)
+			if err != nil {
+				dst.mu.Unlock()
+				return status, err
+			}
+		} else if len(placement) > 0 {
+			dst.mu.Unlock()
+			return http.StatusBadRequest, fmt.Errorf("placement is only applicable to a priority target pool")
+		}
 	}
-	if isPriorityTarget {
-		c.setPriorityOverrideEffectiveLocked(normPlacement)
+	dst.mu.Unlock()
+
+	// Commit through the config registry: add/overwrite on the target, then
+	// remove from the source. A single new registry keeps both halves atomic.
+	next, err := p.reg.WithMemberSet(to, normalized, srcBackend.Credential, srcBackend.BaseURL, false)
+	if err != nil {
+		return http.StatusBadRequest, err
 	}
-	c.notifyMutate()
+	if len(normPlacement) > 0 {
+		next, err = next.WithPriority(to, normPlacement)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+	}
+	next, err = next.WithMemberRemoved(from, normalized)
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+	p.applyRegistryLocked(next, from, to)
+	p.markConfigDirtyLocked()
+	fmt.Fprintf(src.logOut, "auto: moved member %s from %s to %s\n", normalized, from, to)
 	return http.StatusOK, nil
 }
 
@@ -987,34 +883,6 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 	return out
 }
 
-// PersistRuntimeConfig snapshots the runtime configuration for all pools.
-func (p *Pools) PersistRuntimeConfig() map[string]PoolRuntimeConfig {
-	snapshot := p.controllersSnapshot()
-	out := make(map[string]PoolRuntimeConfig, len(snapshot))
-	for name, c := range snapshot {
-		out[name] = c.runtimeConfig()
-	}
-	return out
-}
-
-// LoadRuntimeConfig restores runtime configuration from persisted state.
-func (p *Pools) LoadRuntimeConfig(cfg map[string]PoolRuntimeConfig) {
-	for name, poolCfg := range cfg {
-		if c, ok := p.controller(name); ok {
-			c.loadRuntimeConfig(poolCfg)
-		}
-	}
-	// After every controller has its runtime members back, seed the
-	// local-snapshot set for the persisted entries loadState had to defer
-	// (runtime-added members are not visible to backendByNickLocked until
-	// now). Apply per controller under its own lock.
-	for _, c := range p.controllersSnapshot() {
-		c.mu.Lock()
-		c.applyPendingLocalSnapshotsLocked()
-		c.mu.Unlock()
-	}
-}
-
 // PersistState snapshots the current routing state for all pools.
 func (p *Pools) PersistState() map[string]PoolPersistState {
 	snapshot := p.controllersSnapshot()
@@ -1025,13 +893,14 @@ func (p *Pools) PersistState() map[string]PoolPersistState {
 	return out
 }
 
-// AddPool creates a new plain pool at runtime and inserts it so the proxy can
-// route to it immediately. name is normalized; mode defaults to "plain" and
-// only "plain" is supported. A runtime pool owns no base_url — it is a pure
-// named container, and each member resolves its own base_url via AddMember's
-// fallback chain. The pool starts empty (no members, no routing state) —
-// members are added afterward via AddMember. Returns (httpStatus, error) with
-// a credential-free message; (http.StatusCreated, nil) on success.
+// AddPool creates a new plain pool at runtime, folding it into the config
+// registry (issue #198: runtime pools are config, not a separate state-file
+// overlay) and inserting a controller so the proxy can route to it
+// immediately. name is normalized; mode defaults to "plain" and only "plain"
+// is supported. The pool starts empty (no members, inherits the gateway
+// default upstream); members are added afterward via AddMember. Returns
+// (httpStatus, error) with a credential-free message; (StatusCreated, nil) on
+// success.
 func (p *Pools) AddPool(name, mode string) (int, error) {
 	normalized := backend.NormalizeName(name)
 	if normalized == "" {
@@ -1044,69 +913,25 @@ func (p *Pools) AddPool(name, mode string) (int, error) {
 		return http.StatusBadRequest, fmt.Errorf("unsupported mode %q: only \"plain\" is supported", mode)
 	}
 
-	// An env-defined pool name is authoritative and can never be shadowed by a
-	// runtime pool.
-	if p.reg.HasPool(normalized) {
-		return http.StatusConflict, fmt.Errorf("pool %s already exists (env-defined)", normalized)
-	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, exists := p.byPool[normalized]; exists {
+	if _, exists := p.byPool[normalized]; exists || p.reg.HasPool(normalized) {
 		return http.StatusConflict, fmt.Errorf("pool %s already exists", normalized)
 	}
 
-	c := NewController(p.reg, normalized, -1, p.store, p.now, p.logOut)
+	next, err := p.reg.WithPoolCreated(normalized)
+	if err != nil {
+		return http.StatusConflict, err
+	}
+	p.reg = next
+	c := NewController(next, normalized, -1, p.store, p.now, p.logOut)
 	c.onMutate = p.onMutate
 	p.byPool[normalized] = c
-	c.notifyMutate() // persist the new pool (added_pools) promptly
+	p.markConfigDirtyLocked()
 	if p.logOut != nil {
 		fmt.Fprintf(p.logOut, "auto: created runtime pool %s\n", normalized)
 	}
 	return http.StatusCreated, nil
-}
-
-// PersistAddedPools snapshots the runtime-created pools for serialisation.
-// Env-defined pools are excluded — they are reconstructed from the environment,
-// not the state file — so only pools that exist solely at runtime are recorded.
-func (p *Pools) PersistAddedPools() map[string]AddedPoolSpec {
-	snapshot := p.controllersSnapshot()
-	out := make(map[string]AddedPoolSpec, len(snapshot))
-	for name := range snapshot {
-		if p.reg.HasPool(name) {
-			continue
-		}
-		out[name] = AddedPoolSpec{}
-	}
-	return out
-}
-
-// LoadAddedPools re-instantiates runtime-created pools from persisted state.
-// Called once at startup, after NewPools and before LoadPersistState /
-// LoadRuntimeConfig so those can find the pool by name. A spec whose name
-// collides with an env-defined pool is dropped with a warning (env wins); the
-// pool is created as a clean slate (no members, no routing state).
-func (p *Pools) LoadAddedPools(specs map[string]AddedPoolSpec) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for rawName := range specs {
-		name := backend.NormalizeName(rawName)
-		if name == "" {
-			continue
-		}
-		if p.reg.HasPool(name) {
-			if p.logOut != nil {
-				fmt.Fprintf(p.logOut, "auto: dropping runtime pool %s; name reappeared as env-defined (env wins)\n", name)
-			}
-			continue
-		}
-		if _, exists := p.byPool[name]; exists {
-			continue
-		}
-		c := NewController(p.reg, name, -1, p.store, p.now, p.logOut)
-		// onMutate is wired later by SetOnMutate, which fans out over byPool.
-		p.byPool[name] = c
-	}
 }
 
 // SetOnMutate installs a callback that every controller calls (non-blocking)
@@ -1127,6 +952,76 @@ func (p *Pools) SetOnMutate(fn func()) {
 	}
 }
 
+// SetOnConfigChange installs the callback fired (non-blocking) after any
+// operator mutation, so the configfile writer flushes the new config to disk
+// (issue #198). Retained on Pools so it survives across runtime pool creation.
+func (p *Pools) SetOnConfigChange(fn func()) {
+	p.mu.Lock()
+	p.onConfigChange = fn
+	p.mu.Unlock()
+}
+
+// CurrentRegistry returns the current authoritative registry — the operator
+// intent the configfile writer serializes to aqg.json. Safe for concurrent
+// use with runtime mutations.
+func (p *Pools) CurrentRegistry() *backend.Registry {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.reg
+}
+
+// markConfigDirtyLocked triggers a config-file flush. Caller holds p.mu; the
+// callback is non-blocking (a channel signal), so calling it under the lock is
+// safe — the actual serialization runs later in the writer goroutine.
+func (p *Pools) markConfigDirtyLocked() {
+	if p.onConfigChange != nil {
+		p.onConfigChange()
+	}
+}
+
+// applyRegistryLocked installs next as the authoritative registry and
+// reconciles the named pools' controllers from it, preserving each
+// controller's runtime observation (sticky/exhausted/balance/local-snapshot).
+// Caller holds p.mu. Only the named pools are reconciled — every other pool's
+// membership is byte-identical in next, so re-deriving it would be a no-op.
+func (p *Pools) applyRegistryLocked(next *backend.Registry, pools ...string) {
+	p.reg = next
+	for _, name := range pools {
+		if c, ok := p.byPool[name]; ok {
+			c.mu.Lock()
+			c.reconcileLocked(next)
+			c.mu.Unlock()
+		}
+	}
+}
+
+// crossPoolResolve scans every pool other than skipPool in reg for a member
+// with the given (normalized) nick, collecting the distinct credentials and
+// distinct resolved base URLs. Used to fill an omitted credential / base_url
+// when re-adding a known subscription by name. Lock-free: reg is immutable.
+func crossPoolResolve(reg *backend.Registry, skipPool, nick string) (creds, baseURLs []string) {
+	credSeen := make(map[string]bool)
+	urlSeen := make(map[string]bool)
+	for _, name := range reg.PoolNames() {
+		if name == skipPool {
+			continue
+		}
+		b, ok := reg.ResolveIn(name, nick)
+		if !ok {
+			continue
+		}
+		if b.Credential != "" && !credSeen[b.Credential] {
+			credSeen[b.Credential] = true
+			creds = append(creds, b.Credential)
+		}
+		if b.BaseURL != "" && !urlSeen[b.BaseURL] {
+			urlSeen[b.BaseURL] = true
+			baseURLs = append(baseURLs, b.BaseURL)
+		}
+	}
+	return creds, baseURLs
+}
+
 // Controller is the sticky selector for one pool. The zero value is not
 // usable; call NewController.
 type Controller struct {
@@ -1135,11 +1030,10 @@ type Controller struct {
 	reg  *backend.Registry
 	pool string
 
-	// members is the unified ordered member collection. Config-seeded and
-	// runtime-added members are indistinguishable here (issue #185). Members
-	// are never evicted from this slice; removedMembers tombstones gate them
-	// out of routing and listing, identical to how static members were gated
-	// before the collapse. Accessed only under c.mu.
+	// members is the ordered member collection, re-derived from the registry
+	// on every reconcile (issue #198). A removed member is simply absent from
+	// the registry, so it is absent here — there are no tombstones. Accessed
+	// only under c.mu.
 	members []memberEntry
 
 	// store is the shared quota store. A member whose snapshot reports its
@@ -1149,48 +1043,26 @@ type Controller struct {
 	// disables the signal, leaving pure 429-driven failover.
 	store *quota.Store
 
-	// priority is the full preference order (highest first) when the pool
-	// opted into priority routing via AQG_POOL_<POOL>_PRIORITY: the
-	// declared nicks first, then any unlisted members in sorted order. It
-	// is nil for a pool with no declared priority, which keeps the default
-	// random-start, round-robin-failover behaviour.
+	// priority is the effective preference order (highest first): the
+	// operator-declared nicks first, then any unlisted members in sorted
+	// order. It is re-derived from the registry on every reconcile (issue
+	// #198 collapses the old static/override split — the registry priority is
+	// the single source). nil for a pool with no declared priority, which
+	// keeps the default random-start, round-robin-failover behaviour.
 	priority []string
 
-	// priorityOverride is the runtime-configurable priority order that
-	// overrides the static priority. When set, effectivePriorityLocked()
-	// returns this instead of c.priority. nil means no override is in effect.
-	priorityOverride []string
-
-	// disabled maps member nicks to a disabled flag: a member in this map
-	// is unselectable regardless of its exhaustion state, until explicitly
-	// re-enabled via SetMemberDisabled. This is operator-set, never
-	// auto-cleared, and distinct from the exhausted map (which ages out
-	// on reset). Accessed only under c.mu.
+	// disabled maps member nicks to a disabled flag: a disabled member is
+	// unselectable regardless of exhaustion state until re-enabled. It is
+	// re-derived from each backend's Disabled flag on reconcile — operator
+	// intent lives in the config file now, not a state-file overlay (issue
+	// #198). Distinct from the exhausted map (which ages out on reset).
+	// Accessed only under c.mu.
 	disabled map[string]bool
-
-	// removedMembers marks members as operator-removed. A removed member is
-	// hidden from selection and listing until explicitly re-added. Accessed
-	// only under c.mu.
-	removedMembers map[string]bool
 
 	// curNick is the nick of the currently active member (the sticky pointer).
 	// Replaces the old cur int + curAddedNick string pair. Accessed only
 	// under c.mu.
 	curNick string
-
-	// pendingSticky carries a persisted sticky nick deferred until
-	// loadRuntimeConfig has restored all members so a truly-gone nick can be
-	// distinguished from a not-yet-restored one. Always "" outside the load
-	// sequence. Accessed only under c.mu.
-	pendingSticky string
-
-	// pendingLocalSnapshots carries LocalSnapshotNicks that loadState could
-	// not apply because they name a member not yet present in c.members
-	// (LoadRuntimeConfig runs after LoadPersistState in main.go). Applied by
-	// applyPendingLocalSnapshotsLocked once all members are in place; nicks
-	// that still do not resolve are dropped. Always nil outside the load
-	// sequence. Accessed only under c.mu.
-	pendingLocalSnapshots []string
 
 	// exhausted maps a nick to the absolute time its blocking window
 	// resets. Presence means "exhausted-until-reset"; entries are cleared
@@ -1320,8 +1192,14 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		balanceDwell:       reg.PoolBalanceDwell(poolName),
 		lastSelectedSeq:    make(map[string]uint64),
 		disabled:           make(map[string]bool),
-		removedMembers:     make(map[string]bool),
 		poolLocalSnapshots: local,
+	}
+	// Seed the disabled set from the registry (config is the single source of
+	// truth for the disabled flag now — issue #198).
+	for _, m := range members {
+		if b, ok := reg.ResolveIn(poolName, m.Nick); ok && b.Disabled {
+			c.disabled[m.Nick] = true
+		}
 	}
 	n := len(members)
 	if n == 0 {
@@ -1349,6 +1227,69 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 	// never been active. loadState may overwrite this with persisted values.
 	c.stampSelectionLocked(c.curNick)
 	return c
+}
+
+// reconcileLocked re-derives this controller's membership, disabled set,
+// effective priority, and balance parameters from reg (the new authoritative
+// registry after a copy-on-write mutation, issue #198), preserving runtime
+// observation for members that survive: the sticky pointer, exhausted marks,
+// balance sequence, and the local-snapshot set. Observation for members no
+// longer in reg is pruned. If the active sticky member left the pool, the
+// pointer force-switches to the next healthy member (as on a removal/429); a
+// pool that just gained its first member anchors its pointer. Caller holds c.mu.
+func (c *Controller) reconcileLocked(reg *backend.Registry) {
+	c.reg = reg
+	nicks := reg.PoolNicks(c.pool) // sorted
+	present := make(map[string]bool, len(nicks))
+	members := make([]memberEntry, 0, len(nicks))
+	disabled := make(map[string]bool)
+	for _, nick := range nicks {
+		b, ok := reg.ResolveIn(c.pool, nick)
+		if !ok {
+			continue
+		}
+		present[nick] = true
+		members = append(members, memberEntry{Nick: nick, Credential: b.Credential, BaseURL: b.BaseURL})
+		if b.Disabled {
+			disabled[nick] = true
+		}
+	}
+	c.members = members
+	c.disabled = disabled
+	c.priority = effectiveOrder(reg.PoolPriority(c.pool), nicks)
+	c.balanceGap = reg.PoolBalanceGap(c.pool)
+	c.balanceDwell = reg.PoolBalanceDwell(c.pool)
+
+	// Prune runtime observation for members that left the pool.
+	for nick := range c.exhausted {
+		if !present[nick] {
+			delete(c.exhausted, nick)
+		}
+	}
+	for nick := range c.lastSelectedSeq {
+		if !present[nick] {
+			delete(c.lastSelectedSeq, nick)
+		}
+	}
+	for nick := range c.poolLocalSnapshots {
+		if !present[nick] {
+			delete(c.poolLocalSnapshots, nick)
+		}
+	}
+
+	switch {
+	case c.curNick != "" && !present[c.curNick]:
+		gone := c.curNick
+		c.curNick = ""
+		if next, ok := c.firstHealthyNickLocked(); ok {
+			c.setActiveMemberLocked(next)
+			fmt.Fprintf(c.logOut, "auto[%s]: switched %s -> %s (member %s left the pool)\n", c.pool, gone, next, gone)
+		}
+	case c.curNick == "" && len(members) > 0:
+		if next, ok := c.firstHealthyNickLocked(); ok {
+			c.setActiveMemberLocked(next)
+		}
+	}
 }
 
 // effectiveOrder expands a declared priority subset into a total order
@@ -1387,45 +1328,33 @@ func (c *Controller) indexOf(nick string) int {
 	return -1
 }
 
-// isRemovedLocked reports whether nick has been operator-removed (hidden
-// from selection). Caller holds c.mu.
-func (c *Controller) isRemovedLocked(nick string) bool {
-	return c.removedMembers[nick]
-}
-
-// allMemberNicksLocked returns all non-removed member nicks, sorted. It
-// replaces the old addedMembersLocked (which merged two separate stores).
+// allMemberNicksLocked returns all member nicks, sorted. Removal is now
+// absence from the registry (issue #198), so there is no tombstone filter.
 // Caller holds c.mu.
 func (c *Controller) allMemberNicksLocked() []string {
 	out := make([]string, 0, len(c.members))
 	for _, m := range c.members {
-		if !c.removedMembers[m.Nick] {
-			out = append(out, m.Nick)
-		}
+		out = append(out, m.Nick)
 	}
 	sort.Strings(out)
 	return out
 }
 
-// effectivePriorityLocked returns the effective priority order for this pool:
-// c.priorityOverride when set, otherwise c.priority. The override is the
-// runtime-configurable order; the base priority is the env-declared order.
-// Returns nil for a non-priority pool. Caller holds c.mu.
+// effectivePriorityLocked returns the effective priority order for this pool,
+// re-derived from the registry on reconcile (issue #198 collapsed the old
+// static/override split into a single config-sourced order). Returns nil for a
+// non-priority pool. Caller holds c.mu.
 func (c *Controller) effectivePriorityLocked() []string {
-	if c.priorityOverride != nil {
-		return c.priorityOverride
-	}
 	return c.priority
 }
 
 // isUnavailableLocked reports whether nick is currently unavailable for
-// selection, by either signal: exhausted (live 429 or store-driven),
-// operator-disabled, or operator-removed. This unifies the blocking signals
-// so the selection path can ask one question. The disabled and removed flags
-// are never auto-cleared, unlike exhausted marks which age out on reset.
-// Caller holds c.mu.
+// selection, by either signal: exhausted (live 429 or store-driven) or
+// operator-disabled. A removed member is simply absent from c.members (issue
+// #198), so it never reaches this check. The disabled flag is never
+// auto-cleared, unlike exhausted marks which age out on reset. Caller holds c.mu.
 func (c *Controller) isUnavailableLocked(nick string) bool {
-	if c.disabled[nick] || c.removedMembers[nick] {
+	if c.disabled[nick] {
 		return true
 	}
 	_, ok := c.exhaustedUntilLocked(nick)
@@ -1706,17 +1635,22 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 // loadState applies persisted routing state. Exhausted entries whose reset
 // has already passed are silently dropped. Persisted nicks absent from the
 // current pool membership are logged and skipped. Called once at startup
-// before the server begins serving; does not call onMutate.
+// before the server begins serving; does not call onMutate. With config as
+// the single source of truth (issue #198), every member — including
+// previously runtime-added ones — is already present from NewController, so
+// sticky and local-snapshot references resolve immediately (no deferral).
 func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, lastBalanceSwitch time.Time, balanceSeq uint64, lastSelectedSeq map[string]uint64, localSnapshots []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.indexOf(sticky) >= 0 {
 		c.curNick = sticky
 	} else if sticky != "" {
-		// Not yet a known member. It may name a member that loadRuntimeConfig
-		// restores moments later (runtime-added member not yet in c.members), so
-		// defer the truly-gone judgment and fall-back logging until then.
-		c.pendingSticky = sticky
+		reason := "random"
+		if len(c.priority) > 0 {
+			reason = "priority"
+		}
+		fmt.Fprintf(c.logOut, "loadState[%s]: persisted sticky=%s not in current pool members; keeping %s (%s)\n",
+			c.pool, sticky, c.curNick, reason)
 	}
 	now := c.now()
 	for nick, reset := range exhausted {
@@ -1752,42 +1686,19 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, la
 		}
 	}
 	// Restore the per-pool "we have seen traffic for this nick" set, dropping
-	// entries that no longer name a current member (mirroring the
-	// sticky-pointer drop above). Unconditional — applies to balanced and
-	// non-balanced pools alike.
-	//
-	// For static members this is a direct seed. For runtime-added members
-	// addedMembers has not been restored yet (LoadRuntimeConfig runs after
-	// LoadPersistState), so we defer them on pendingLocalSnapshots and
-	// apply them in applyPendingLocalSnapshotsLocked, invoked at the end
-	// of LoadRuntimeConfig.
+	// entries that no longer name a current member. Unconditional — applies to
+	// balanced and non-balanced pools alike.
 	for _, nick := range localSnapshots {
 		if nick == "" {
 			continue
 		}
 		if _, ok := c.backendByNickLocked(nick); ok {
 			c.seedLocalSnapshotLocked(nick)
-			continue
-		}
-		c.pendingLocalSnapshots = append(c.pendingLocalSnapshots, nick)
-	}
-}
-
-// applyPendingLocalSnapshotsLocked seeds the local-snapshot set for every
-// persisted entry that loadState could not resolve at the time because
-// runtime-added members had not yet been restored. Entries that still
-// name a non-member are dropped (the runtime member was removed between
-// runs and there is nothing to attach a snapshot to). Caller holds c.mu.
-func (c *Controller) applyPendingLocalSnapshotsLocked() {
-	if len(c.pendingLocalSnapshots) == 0 {
-		return
-	}
-	for _, nick := range c.pendingLocalSnapshots {
-		if _, ok := c.backendByNickLocked(nick); ok {
-			c.seedLocalSnapshotLocked(nick)
 		}
 	}
-	c.pendingLocalSnapshots = nil
+	// The persisted sticky may now name a disabled/exhausted member; re-anchor
+	// before serving so Current()/pool.active never point at an unavailable one.
+	c.reanchorLocked()
 }
 
 // persistState snapshots the controller's routing state for serialisation.
@@ -1831,203 +1742,6 @@ func (c *Controller) persistState() PoolPersistState {
 		}
 	}
 	return ps
-}
-
-// setPriorityOverrideEffectiveLocked sets the runtime priority override,
-// expanding the order over the full effective member set (unified collection
-// minus removed). Replaces the old setPriorityOverrideLocked which expanded
-// over c.nicks only (issue #185). Caller holds c.mu.
-func (c *Controller) setPriorityOverrideEffectiveLocked(order []string) {
-	if len(order) == 0 {
-		c.priorityOverride = nil
-	} else {
-		c.priorityOverride = effectiveOrder(order, c.allMemberNicksLocked())
-	}
-	c.notifyMutate()
-}
-
-// setDisabledLocked sets the disabled flag for a member. When off is true,
-// the member is marked disabled and becomes unselectable. When off is false,
-// the member is re-enabled. The operation does NOT force-switch the active
-// sticky member. Caller holds c.mu.
-func (c *Controller) setDisabledLocked(nick string, off bool) {
-	if off {
-		c.disabled[nick] = true
-	} else {
-		delete(c.disabled, nick)
-	}
-	c.notifyMutate()
-}
-
-// runtimeConfig snapshots the runtime configuration for this pool:
-// the current priority override (if any) and the list of disabled members.
-// Caller must not hold c.mu.
-func (c *Controller) runtimeConfig() PoolRuntimeConfig {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var priOverride []string
-	if c.priorityOverride != nil {
-		priOverride = make([]string, len(c.priorityOverride))
-		copy(priOverride, c.priorityOverride)
-	}
-	disabled := make([]string, 0, len(c.disabled))
-	for nick := range c.disabled {
-		disabled = append(disabled, nick)
-	}
-	sort.Strings(disabled)
-
-	// Persist all members' credentials — the unified collection no longer
-	// distinguishes config-derived from runtime-added (issue #185). On load,
-	// the second-pass upsert in loadRuntimeConfig overwrites config-derived
-	// nicks with fresh env values, so rotating a credential by editing env
-	// and restarting is always unconditionally correct.
-	addedMembers := make(map[string]AddedMember, len(c.members))
-	for _, m := range c.members {
-		addedMembers[m.Nick] = AddedMember{
-			Credential: m.Credential, // stored, never returned in config views
-			BaseURL:    m.BaseURL,
-		}
-	}
-
-	// Snapshot the removed-member tombstones (sorted) so removal survives restart.
-	removed := make([]string, 0, len(c.removedMembers))
-	for nick := range c.removedMembers {
-		removed = append(removed, nick)
-	}
-	sort.Strings(removed)
-
-	return PoolRuntimeConfig{
-		PriorityOverride: priOverride,
-		Disabled:         disabled,
-		AddedMembers:     addedMembers,
-		RemovedMembers:   removed,
-	}
-}
-
-// loadRuntimeConfig restores runtime configuration from persisted state.
-// Unknown pool/member references are dropped with a logged warning, never a
-// startup failure. The input priority override is expanded via effectiveOrder.
-// Caller must not hold c.mu.
-func (c *Controller) loadRuntimeConfig(cfg PoolRuntimeConfig) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Restore runtime-added members BEFORE the priority override, so a
-	// runtime-added member placed into a priority order is recognised as a
-	// current member when the override is validated.
-	// Config-seeded nicks are already in c.members from NewController; only
-	// nicks absent from c.members need to be appended. Tombstoned nicks stay
-	// in c.members (gated by isRemovedLocked at routing/listing) — matching
-	// the reviewer's note: eviction from the slice is not the right gate here.
-	for nick, am := range cfg.AddedMembers {
-		if c.indexOf(nick) >= 0 {
-			// Already present (config-seeded or previously restored); credentials
-			// will be refreshed by the second-pass upsert below for config nicks.
-			continue
-		}
-		// A runtime-added member's base_url is always baked non-empty by
-		// AddMember; an empty value here means the state file was hand-edited
-		// or corrupted. Refuse to restore it rather than later routing a live
-		// request against an empty upstream URL (issue #172). The member is
-		// dropped loudly; any priority/sticky references to it fall through
-		// their own drop-with-warning validation below.
-		if am.BaseURL == "" {
-			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: refusing to restore added member %q: persisted base_url is empty (state file corrupted); dropping\n", c.pool, nick)
-			continue
-		}
-		c.members = append(c.members, memberEntry{
-			Nick:       nick,
-			Credential: am.Credential,
-			BaseURL:    am.BaseURL,
-		})
-	}
-
-	// Second-pass upsert: overwrite credential/BaseURL for every config-declared
-	// nick with fresh env-derived values. This makes credential rotation
-	// unconditionally correct even when a state file from a prior run already
-	// holds a persisted entry for that nick (issue #185). It does NOT touch
-	// disabled/priority-override state or tombstones.
-	for _, nick := range c.reg.PoolNicks(c.pool) {
-		b, ok := c.reg.ResolveIn(c.pool, nick)
-		if !ok {
-			continue
-		}
-		if idx := c.indexOf(nick); idx >= 0 {
-			c.members[idx].Credential = b.Credential
-			c.members[idx].BaseURL = b.BaseURL
-		}
-	}
-
-	// Restore removed-member tombstones. These make removal permanent across
-	// restart. Tombstones for nicks not in c.members are harmless and kept.
-	c.removedMembers = make(map[string]bool)
-	for _, nick := range cfg.RemovedMembers {
-		c.removedMembers[nick] = true
-	}
-
-	// Restore priority override. A nick is valid if it is in c.members.
-	if len(cfg.PriorityOverride) > 0 {
-		validOverride := make([]string, 0, len(cfg.PriorityOverride))
-		for _, nick := range cfg.PriorityOverride {
-			if c.indexOf(nick) >= 0 {
-				validOverride = append(validOverride, nick)
-			} else {
-				fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from priority override\n", c.pool, nick)
-			}
-		}
-		if len(validOverride) > 0 {
-			c.priorityOverride = effectiveOrder(validOverride, c.allMemberNicksLocked())
-		} else {
-			c.priorityOverride = nil
-		}
-	} else {
-		c.priorityOverride = nil
-	}
-
-	// Restore disabled set. Accept any nick present in c.members.
-	c.disabled = make(map[string]bool)
-	for _, nick := range cfg.Disabled {
-		if c.indexOf(nick) >= 0 {
-			c.disabled[nick] = true
-		} else {
-			fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: dropping unknown nick %q from disabled list\n", c.pool, nick)
-		}
-	}
-
-	// Resolve a sticky that loadState deferred (it could not yet distinguish a
-	// member not yet restored from a truly-removed one). For a member-less runtime
-	// pool the persisted sticky IS the active added member; anchor on it — when
-	// healthy and nothing else is active yet — so the member that was active
-	// before restart stays active instead of being replaced by reanchorLocked's
-	// first-healthy pick.
-	sticky := c.pendingSticky
-	c.pendingSticky = ""
-	// Apply unconditionally once the member is present: the curNick == ""
-	// guard from before the unification was a no-op sentinel (loadState never
-	// set curAddedNick for config members) but it silently dropped the sticky
-	// for mixed pools (config + added) where curNick is already set by
-	// NewController. Drop the guard so the member that was active before
-	// restart stays active regardless of pool origin mix (issue #185 fixup).
-	if sticky != "" && c.indexOf(sticky) >= 0 && !c.isUnavailableLocked(sticky) {
-		c.setActiveMemberLocked(sticky)
-		sticky = ""
-	}
-
-	// loadState restored the sticky pointer before this runs, so the current
-	// member may now be removed (or otherwise unavailable). Re-anchor before
-	// serving traffic so Current() / pool.active never point at a removed member.
-	c.reanchorLocked()
-
-	// A deferred sticky that is still not a known member is truly gone; report
-	// the fall-back here rather than misleadingly at loadState time.
-	if sticky != "" && c.indexOf(sticky) < 0 {
-		reason := "random"
-		if len(c.priority) > 0 {
-			reason = "priority"
-		}
-		fmt.Fprintf(c.logOut, "loadRuntimeConfig[%s]: persisted sticky=%s not in current pool members; falling back to %s (%s)\n",
-			c.pool, sticky, c.curNick, reason)
-	}
 }
 
 // reanchorLocked moves the active pointer off a current member that is now
@@ -2417,7 +2131,7 @@ func (c *Controller) tryRecoverParked() string {
 	for nick := range c.exhausted {
 		// Skip disabled / removed members — they are unreachable regardless
 		// of upstream state.
-		if c.disabled[nick] || c.removedMembers[nick] {
+		if c.disabled[nick] {
 			continue
 		}
 		// Resolve the backend so we can detect the poller-recognised
@@ -2829,7 +2543,7 @@ func (c *Controller) soonestNickLocked() (string, time.Time) {
 	best, bestSet := c.curNick, false
 	var bestReset time.Time
 	for _, m := range c.members {
-		if c.disabled[m.Nick] || c.removedMembers[m.Nick] {
+		if c.disabled[m.Nick] {
 			continue
 		}
 		reset, ok := c.exhaustedUntilLocked(m.Nick)
@@ -2940,7 +2654,7 @@ func (c *Controller) nextParkedButResetPassedLocked() (string, bool) {
 	for off := 1; off <= n; off++ {
 		idx := (startIdx + off) % n
 		nick := effectiveNicks[idx]
-		if c.disabled[nick] || c.removedMembers[nick] {
+		if c.disabled[nick] {
 			continue
 		}
 		// Look only at the live-429 park (c.exhausted). If it has a
