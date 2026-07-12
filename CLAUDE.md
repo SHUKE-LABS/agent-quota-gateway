@@ -101,11 +101,13 @@ request dump (`internal/reqlog`, credentials redacted).
   resolver middleware, `QuotaKey()`/`NormalizeName`. `PoolRouter` lives
   here so `backend` does not import `auto` (which depends on it).
 - `internal/auto/` — the routing brain. One in-memory `Controller` per
-  pool (`auto.go`, ~3000 lines); `Pools` bundles them and implements
-  `PoolRouter`. Sticky-reactive-zero-probe rotation, priority/balance
-  modes, the runtime overlay (add/remove/move/disable members, priority
-  override), pool status views, and the preemptor (`preempt.go`) that
-  returns a priority pool to a higher member once its window resets.
+  pool (`auto.go`); `Pools` bundles them and implements `PoolRouter`.
+  Sticky-reactive-zero-probe rotation, priority/balance modes, runtime
+  mutations that write through to the config file (add/remove/move/disable
+  members, priority, create pool — via a copy-on-write registry swap +
+  `Controller.reconcileLocked`, issue #198), pool status views, and the
+  preemptor (`preempt.go`) that returns a priority pool to a higher member
+  once its window resets.
 - `internal/proxy/` — thin `httputil.ReverseProxy` wrapper; director
   stamps credential + upstream from the context.
 - `internal/quota/` — Anthropic unified rate-limit header extraction +
@@ -116,8 +118,10 @@ request dump (`internal/reqlog`, credentials redacted).
 - `internal/config/`, `internal/configfile/` — env loading/validation and
   JSON file loading + precedence.
 - `internal/persist/` — single debounced atomic state file (0600,
-  temp+rename); restores sticky pointers, exhausted maps, snapshots,
-  runtime config, and runtime-added pools across restarts.
+  temp+rename) for **runtime observation only**: sticky pointers, exhausted
+  maps, snapshots, balance sequence, local-snapshot nicks. Operator intent
+  lives in the config file (issue #198), not here. `internal/configfile/`
+  owns the config write path (`Marshal` + debounced `Writer`).
 - `internal/logging/` — one JSON line/request to stderr; bodies and
   credential headers never logged (V1 hard constraint — the proxy is the
   credential boundary). `internal/reqlog/` — opt-in debug dump.
@@ -144,11 +148,17 @@ request dump (`internal/reqlog`, credentials redacted).
   preserve the prompt cache); for poller-tracked backends (no status)
   utilization `1.0` is the signal. The gateway never pre-empts a member
   the upstream still serves, and never probes to measure one.
-- **Runtime changes are an overlay on an immutable static base.** Env/file
-  config is never mutated; priority overrides and disabled/added members
-  layer on top and persist to the state file. A persisted reference to a
-  member/pool no longer in the base is dropped with a warning, not a
-  startup failure.
+- **The config file is the single source of operator intent (issue #198).**
+  A runtime change (add/remove/update/disable member, priority, create pool,
+  move) builds a fresh validated `*backend.Registry` via copy-on-write
+  (`Registry.With*` → `BuildFromSpec`, so the nick↔credential bijection is
+  enforced on every mutation), swaps it in under `Pools.mu`, reconciles the
+  affected controllers (`reconcileLocked` preserves sticky/exhausted/balance/
+  local-snapshot observation), and flushes to `aqg.json`. There is no
+  state-file overlay. On first deploy with no `aqg.json`, env + the legacy
+  state overlay are merged once (state-wins) to bootstrap the file; env is
+  never read again. `Registry` is immutable-after-build; the hot read path
+  stays lock-free.
 - **Trust boundary = loopback** (or a Tailscale ACL in shared mode). No
   auth on `/_gateway/*`; the bind address is validated at config load
   (loopback or a literal Tailscale range only).

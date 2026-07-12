@@ -73,6 +73,7 @@ ssh "${HOST}" "
 	rm -f /tmp/agent-quota-gateway /tmp/agent-quota-gateway.service /tmp/remote-install.sh
 "
 
-echo ">> done. Env file on ${HOST}: /etc/agent-quota-gateway/aqg.env"
+echo ">> done. First-start bootstrap seed: /etc/agent-quota-gateway/aqg.env (${HOST})"
+echo "         Live config after first start: /var/lib/agent-quota-gateway/aqg.json"
 echo "   logs:   ssh ${HOST} journalctl -u agent-quota-gateway -f"
 echo "   verify: ssh ${HOST} agent-quota-gateway -version"
