@@ -93,10 +93,10 @@ type legacyState struct {
 }
 
 type legacyPoolConfig struct {
-	PriorityOverride []string                 `json:"priority_override"`
-	Disabled         []string                 `json:"disabled"`
-	AddedMembers     map[string]legacyMember  `json:"added_members"`
-	RemovedMembers   []string                 `json:"removed_members"`
+	PriorityOverride []string                `json:"priority_override"`
+	Disabled         []string                `json:"disabled"`
+	AddedMembers     map[string]legacyMember `json:"added_members"`
+	RemovedMembers   []string                `json:"removed_members"`
 }
 
 type legacyMember struct {
