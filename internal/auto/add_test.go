@@ -7,10 +7,10 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 )
 
-// addedMember reads a member's stored spec directly (bypassing the
-// display-time base_url fallback in backendByNickLocked) so tests can prove
-// what was actually stored in the unified c.members collection.
-func addedMember(t *testing.T, p *Pools, pool, nick string) (AddedMember, bool) {
+// addedMember reads a member's resolved entry directly from the controller's
+// member collection so tests can prove what the config produced (credential +
+// resolved base_url).
+func addedMember(t *testing.T, p *Pools, pool, nick string) (memberEntry, bool) {
 	t.Helper()
 	c := p.byPool[pool]
 	c.mu.Lock()
@@ -18,10 +18,10 @@ func addedMember(t *testing.T, p *Pools, pool, nick string) (AddedMember, bool) 
 	normalized := backend.NormalizeName(nick)
 	for _, m := range c.members {
 		if m.Nick == normalized {
-			return AddedMember{Credential: m.Credential, BaseURL: m.BaseURL}, true
+			return m, true
 		}
 	}
-	return AddedMember{}, false
+	return memberEntry{}, false
 }
 
 // TestAdd_resolvesKnownCredentialAndBaseURL proves that adding a known
@@ -50,15 +50,13 @@ func TestAdd_resolvesKnownCredentialAndBaseURL(t *testing.T) {
 	}
 }
 
-// TestAdd_ambiguousCredentialRejected proves that an omitted credential for a
-// nick that exists with differing credentials across pools is rejected.
-//
-// The static-config bijection (a nick must carry the same credential
-// everywhere) forbids the same nick in two pools at load time, so the
-// cross-pool state is seeded here via the runtime add path — the only
-// remaining way the same nick can land in two pools. The runtime ambiguity
-// guard under test is unchanged.
-func TestAdd_ambiguousCredentialRejected(t *testing.T) {
+// TestAdd_bijectionRejectsDifferentCredential proves the nick↔credential
+// bijection is now enforced on runtime mutations too (issue #198): adding a
+// nick that already exists in another pool, but with a different credential,
+// is rejected. Under the old overlay this slipped through (runtime adds were
+// not re-validated), which is exactly the drift #198's copy-on-write model
+// closes — so the cross-pool "ambiguous credential" state can no longer arise.
+func TestAdd_bijectionRejectsDifferentCredential(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "ONE_BACKEND_SHARED": "cred-1",
@@ -66,18 +64,13 @@ func TestAdd_ambiguousCredentialRejected(t *testing.T) {
 		backend.EnvPrefix + "DST_BACKEND_X":      "cred-x",
 	})
 
-	// Seed "shared" in a second pool with a differing credential.
-	if status, err := p.AddMember("two", "shared", "cred-2", "", nil); status != http.StatusOK || err != nil {
-		t.Fatalf("seed AddMember two shared: status=%d err=%v, want 200", status, err)
+	// "shared" already exists in ONE with cred-1; adding it to TWO with a
+	// different credential violates the bijection and is rejected.
+	if status, err := p.AddMember("two", "shared", "cred-2", "", nil); status != http.StatusBadRequest || err == nil {
+		t.Fatalf("different-credential add: status=%d err=%v, want 400 (bijection)", status, err)
 	}
-
-	// Adding "shared" to dst with the credential omitted is now ambiguous:
-	// ONE holds cred-1, TWO holds cred-2.
-	if status, err := p.AddMember("dst", "shared", "", "", nil); status != http.StatusBadRequest || err == nil {
-		t.Fatalf("ambiguous credential: status=%d err=%v, want 400", status, err)
-	}
-	if _, ok := addedMember(t, p, "dst", "shared"); ok {
-		t.Errorf("shared was added to dst despite ambiguous credential")
+	if _, ok := addedMember(t, p, "two", "shared"); ok {
+		t.Errorf("shared was added to two despite the bijection violation")
 	}
 }
 

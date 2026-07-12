@@ -97,11 +97,9 @@ func TestAddPool_rejectsBadInput(t *testing.T) {
 	}
 }
 
-// TestAddPool_persistRoundTrip proves a runtime pool round-trips through
-// PersistAddedPools / LoadAddedPools as a clean slate (no members, no base_url
-// — the pool is a pure named container post-#172), excludes env pools from the
-// persisted set, and that a cross-pool add to the reloaded pool resolves the
-// base_url the way any other pool would (not via a pool default).
+// TestAddPool_persistRoundTrip proves a runtime pool and its member round-trip
+// through the config (issue #198 folds runtime pools into the config file), and
+// that the env pool remains alongside it.
 func TestAddPool_persistRoundTrip(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
@@ -114,36 +112,28 @@ func TestAddPool_persistRoundTrip(t *testing.T) {
 		t.Fatalf("AddMember: status=%d err=%v", status, err)
 	}
 
-	specs := p.PersistAddedPools()
-	if _, ok := specs["src"]; ok {
-		t.Errorf("PersistAddedPools included env pool src: %v", specs)
-	}
-	if _, ok := specs["rt"]; !ok {
-		t.Fatalf("PersistAddedPools missing runtime pool rt: %v", specs)
-	}
-
-	// Re-instantiate into a fresh Pools (same env registry).
-	clock2 := newMoveClock()
-	p2 := loadMovePools(t, clock2, map[string]string{
-		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
-	})
-	p2.LoadAddedPools(specs)
+	// Restart via the config round-trip: rt (and its member a) plus the env
+	// pool src all survive.
+	p2 := reloadViaConfig(t, p)
 	if !poolNames(t, p2)["rt"] {
-		t.Fatalf("rt not re-instantiated after LoadAddedPools")
+		t.Fatalf("rt not present after restart")
 	}
-	if got := poolMembers(t, p2, "rt"); len(got) != 0 {
-		t.Errorf("re-instantiated rt has members %v, want clean slate", got)
+	if !poolNames(t, p2)["src"] {
+		t.Errorf("env pool src missing after restart")
 	}
-	// Persisting state over an empty re-instantiated pool must not panic.
+	if got := poolMembers(t, p2, "rt"); !got["a"] {
+		t.Errorf("rt member a lost after restart: %v", got)
+	}
+	if m, ok := addedMember(t, p2, "rt", "a"); !ok || m.Credential != "cred-a" || m.BaseURL != "https://a.example" {
+		t.Errorf("rt member a spec after restart = %+v ok=%v, want cred-a/https://a.example", m, ok)
+	}
 	_ = p2.PersistState()
 }
 
-// TestRuntimePool_stickyPreservedAcrossRestart proves that the active
-// runtime-added member of a member-less pool survives a persist/reload cycle.
-// The reload follows the PRODUCTION order (LoadAddedPools -> LoadPersistState ->
-// LoadRuntimeConfig, per cmd/agent-quota-gateway/main.go), under which loadState
-// runs before added members exist; the deferred sticky must still re-anchor on
-// the pre-restart member rather than reanchorLocked's first-healthy pick (#109).
+// TestRuntimePool_stickyPreservedAcrossRestart proves that the active member
+// of a runtime-created pool survives a config round-trip restart (the pool and
+// its members are config now, and the sticky pointer is restored from the
+// observation state).
 func TestRuntimePool_stickyPreservedAcrossRestart(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
@@ -166,42 +156,11 @@ func TestRuntimePool_stickyPreservedAcrossRestart(t *testing.T) {
 		t.Fatalf("Current(rt) before restart: %+v ok=%v, want Pool=rt Nick=a", cur, ok)
 	}
 
-	addedPools := p.PersistAddedPools()
-	persistState := p.PersistState()
-	runtimeConfig := p.PersistRuntimeConfig()
-
-	// Re-instantiate in the production load order.
-	clock2 := newMoveClock()
-	p2 := loadMovePools(t, clock2, map[string]string{
-		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
-	})
-	p2.LoadAddedPools(addedPools)
-	p2.LoadPersistState(persistState)
-	p2.LoadRuntimeConfig(runtimeConfig)
+	p2 := reloadViaConfig(t, p)
 
 	// "a" must still be the active sticky after restart.
 	if cur, ok := p2.Current("rt"); !ok || cur.Pool != "rt" || cur.Nick != "a" {
-		t.Errorf("Current(rt) after restart: %+v ok=%v, want Pool=rt Nick=a — active added member lost", cur, ok)
-	}
-}
-
-// TestAddPool_loadAddedPoolsDropsEnvCollision proves a persisted runtime pool
-// whose name has since reappeared as an env pool is dropped (env wins).
-func TestAddPool_loadAddedPoolsDropsEnvCollision(t *testing.T) {
-	clock := newMoveClock()
-	p := loadMovePools(t, clock, map[string]string{
-		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
-	})
-	// "src" is env-defined; a stale runtime spec for it must not register a
-	// second controller — env wins, and the original env controller is
-	// untouched (no defaultBaseURL field exists post-#172).
-	p.LoadAddedPools(map[string]AddedPoolSpec{"src": {}})
-	if _, ok := p.controller("src"); !ok {
-		t.Fatalf("env pool src missing")
-	}
-	// Only the one env controller for "src" should exist.
-	if got := p.controllersSnapshot(); len(got) != 1 {
-		t.Errorf("env pool src got duplicate controllers: %d (%v)", len(got), got)
+		t.Errorf("Current(rt) after restart: %+v ok=%v, want Pool=rt Nick=a — active member lost", cur, ok)
 	}
 }
 
@@ -257,7 +216,7 @@ func TestAddPool_concurrentWithReaders(t *testing.T) {
 			_ = p.EffectiveConfig()
 			_ = p.AllPoolStatuses(store)
 			_, _, _, _ = p.Route("src")
-			_ = p.PersistAddedPools()
+			_ = p.CurrentRegistry()
 			_ = p.PersistState()
 		}()
 	}

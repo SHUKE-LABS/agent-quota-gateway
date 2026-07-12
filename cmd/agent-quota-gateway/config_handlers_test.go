@@ -20,7 +20,7 @@ import (
 func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/config", configHandler(pools))
+	mux.HandleFunc("/_gateway/config", configHandler(pools, nil))
 	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
@@ -52,6 +52,20 @@ func loadPools(t *testing.T) *auto.Pools {
 		t.Fatalf("backend.Load: %v", err)
 	}
 	return auto.NewPools(registry, nil, nil, io.Discard)
+}
+
+// reloadPools simulates a restart under the config-single-source model (issue
+// #198): the current registry (operator intent) is round-tripped through the
+// config Spec and a fresh Pools is built from it. Env is NOT re-read, so
+// operator mutations recorded in the config survive exactly as they would
+// across a real restart reading aqg.json.
+func reloadPools(t *testing.T, pools *auto.Pools) *auto.Pools {
+	t.Helper()
+	reg, err := backend.BuildFromSpec(pools.CurrentRegistry().Spec(), "https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("rebuild registry from config: %v", err)
+	}
+	return auto.NewPools(reg, nil, nil, io.Discard)
 }
 
 // TestConfigEndpoint_redactsCredentials proves GET /_gateway/config returns the
@@ -206,9 +220,7 @@ func TestDisableEnableEndpoints_runtimeAdded(t *testing.T) {
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/c",
 		`{"credential":"sk-ant-c"}`, http.StatusOK)
 	post(t, srv.URL+"/_gateway/pool/auto/member/c/disable", http.StatusOK)
-	cfg := pools.PersistRuntimeConfig()
-	pools2 := loadPools(t)
-	pools2.LoadRuntimeConfig(cfg)
+	pools2 := reloadPools(t, pools)
 	srv2 := configMux(t, pools2)
 	if !memberDisabled(t, srv2.URL, "auto", "c") {
 		t.Error("runtime-added member c disabled flag did not survive restart")
@@ -378,16 +390,12 @@ func TestAddRemoveEndpoints(t *testing.T) {
 		}
 	}
 
-	// Removal must survive a restart (#85). Exercise the full persist path —
-	// DELETE handler → PersistRuntimeConfig serialization → LoadRuntimeConfig →
-	// config view — by snapshotting the runtime config, reloading it into a
-	// fresh Pools (whose controllers start anchored on the now-removed "a"),
-	// and asserting the reloaded view still omits the removed members. A fresh
-	// Pools re-reads AQG_POOL_AUTO_BACKEND_A/B, so without persisted tombstones
-	// "a" would resurface — exactly the regression #85 fixed.
-	cfg := pools.PersistRuntimeConfig()
-	pools2 := loadPools(t)
-	pools2.LoadRuntimeConfig(cfg)
+	// Removal must survive a restart (#85, now structural under #198). Exercise
+	// the config round-trip: the removed members are gone from the config
+	// registry, so a fresh Pools built from that config never sees them. Env is
+	// not re-read, so "a" cannot resurface — the removal is permanent because
+	// the config, not env, is the source of truth.
+	pools2 := reloadPools(t, pools)
 	srv2 := configMux(t, pools2)
 	reloaded := fetchPool(t, srv2.URL, "auto")
 	sawSurvivor := false
@@ -445,8 +453,15 @@ func TestMoveEndpoint(t *testing.T) {
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/ghost/move", `{"to":"spare"}`, http.StatusBadRequest) // missing member
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/b/move", `{}`, http.StatusBadRequest)                 // missing target
 
-	// Conflict path: spare already has a different b → 409, then force overwrites.
-	addJSON(t, srv.URL+"/_gateway/pool/spare/member/b", `{"credential":"sk-ant-other"}`, http.StatusOK)
+	// The nick↔credential bijection is now enforced on runtime mutations too
+	// (issue #198): the same nick with a different credential is rejected.
+	addJSON(t, srv.URL+"/_gateway/pool/spare/member/b", `{"credential":"sk-ant-other"}`, http.StatusBadRequest)
+
+	// Conflict path: spare already has b under the SAME credential but a
+	// different base_url → move is a base_url conflict → 409, then force
+	// overwrites. (A different credential is impossible under the bijection, so
+	// base_url is the only legitimate same-nick conflict.)
+	addJSON(t, srv.URL+"/_gateway/pool/spare/member/b", `{"credential":"sk-ant-b","base_url":"https://other.example"}`, http.StatusOK)
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/b/move", `{"to":"spare"}`, http.StatusConflict)
 	if !memberPresent(t, srv.URL, "auto", "b") {
 		t.Error("b vanished from auto after a rejected (409) move")

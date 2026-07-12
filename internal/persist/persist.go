@@ -30,20 +30,15 @@ import (
 // one write per defaultDebounce interval.
 const defaultDebounce = 200 * time.Millisecond
 
-// GatewayState is the complete on-disk JSON record.
+// GatewayState is the complete on-disk JSON record. It holds pure runtime
+// observation only (issue #198): per-pool sticky/exhausted routing state and
+// per-backend quota snapshots. Operator intent (members, credentials,
+// priority, disabled, runtime-created pools) lives in the config file now, not
+// here. A pre-#198 state file's `config` / `added_pools` keys are ignored on
+// load (the bootstrap migration reads them separately, once).
 type GatewayState struct {
 	Pools     map[string]auto.PoolPersistState `json:"pools"`
 	Snapshots map[string]quota.Snapshot        `json:"snapshots"`
-	// Config is the runtime configuration overlay: per-pool priority
-	// overrides and disabled members. nil when no runtime config is set.
-	// Stored separately from Pools because it's mutable at runtime via
-	// the /_gateway/config API, while Pools carries the sticky/exhausted
-	// routing state.
-	Config map[string]auto.PoolRuntimeConfig `json:"config,omitempty"`
-	// AddedPools records pools created at runtime via POST /_gateway/pool, so
-	// they are re-instantiated on restart. Env-defined pools are excluded.
-	// Absent in older state files, which load as no runtime pools.
-	AddedPools map[string]auto.AddedPoolSpec `json:"added_pools,omitempty"`
 }
 
 // Load reads the state file at path. A missing file returns an empty

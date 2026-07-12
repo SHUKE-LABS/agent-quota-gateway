@@ -2,7 +2,6 @@ package persist
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,14 +10,16 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 )
 
-// TestLoad_missingAddedPoolsIsBackwardCompatible proves a state file written
-// before the added_pools field (issue #104) loads cleanly, with AddedPools
-// left nil rather than erroring.
-func TestLoad_missingAddedPoolsIsBackwardCompatible(t *testing.T) {
+// TestLoad_legacyOverlayKeysIgnored proves a pre-#198 state file carrying the
+// old operator-intent overlay keys (config / added_pools) loads cleanly — the
+// state file is observation-only now, and Go's decoder ignores the unknown
+// keys. The bootstrap migration reads them separately, once (issue #198).
+func TestLoad_legacyOverlayKeysIgnored(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
-	// A legacy state file: pools + snapshots, no added_pools key.
-	legacy := `{"pools":{"auto":{"sticky":"a","exhausted":{}}},"snapshots":{}}`
+	legacy := `{"pools":{"auto":{"sticky":"a","exhausted":{}}},"snapshots":{},` +
+		`"config":{"auto":{"disabled":["a"],"added_members":{"b":{"credential":"x","base_url":"https://e"}}}},` +
+		`"added_pools":{"rt":{}}}`
 	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -27,59 +28,8 @@ func TestLoad_missingAddedPoolsIsBackwardCompatible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if state.AddedPools != nil {
-		t.Errorf("AddedPools=%v, want nil for a legacy state file", state.AddedPools)
-	}
 	if _, ok := state.Pools["auto"]; !ok {
-		t.Errorf("legacy pools not loaded: %+v", state.Pools)
-	}
-}
-
-// TestLoad_roundTripsAddedPools proves added_pools survives a marshal/Load
-// round-trip as a set of runtime pool names (post-#172, AddedPoolSpec carries
-// no fields — a runtime pool is a pure named marker).
-func TestLoad_roundTripsAddedPools(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-
-	data, err := json.Marshal(GatewayState{
-		AddedPools: map[string]auto.AddedPoolSpec{
-			"rt": {},
-		},
-	})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	got, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if _, ok := got.AddedPools["rt"]; !ok {
-		t.Fatalf("added_pools missing rt after round-trip: %+v", got.AddedPools)
-	}
-}
-
-// TestLoad_legacyAddedPoolBaseURLIsIgnored proves a pre-#172 state file whose
-// added_pools entries still carry a "base_url" field loads cleanly — Go's
-// decoder ignores the now-unknown field. No migration, no version bump
-// (issue #172 acceptance criterion).
-func TestLoad_legacyAddedPoolBaseURLIsIgnored(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	legacy := `{"added_pools":{"legacy":{"base_url":"https://legacy.example"}},"pools":{}}`
-	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	got, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if _, ok := got.AddedPools["legacy"]; !ok {
-		t.Errorf("legacy runtime pool lost: %+v", got.AddedPools)
+		t.Errorf("observation pools not loaded: %+v", state.Pools)
 	}
 }
 
@@ -90,7 +40,7 @@ func TestLoad_missingFileStartsFresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if state.Pools != nil || state.AddedPools != nil {
+	if state.Pools != nil || state.Snapshots != nil {
 		t.Errorf("missing file should yield empty state, got %+v", state)
 	}
 }
@@ -102,7 +52,7 @@ func TestLoad_emptyPathStartsFresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if state.Pools != nil || state.AddedPools != nil {
+	if state.Pools != nil || state.Snapshots != nil {
 		t.Errorf("empty path should yield empty state, got %+v", state)
 	}
 }
@@ -118,7 +68,7 @@ func TestLoad_unparseableStartsFresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load should not error on unparseable file: %v", err)
 	}
-	if state.Pools != nil || state.AddedPools != nil {
+	if state.Pools != nil || state.Snapshots != nil {
 		t.Errorf("unparseable file should yield empty state, got %+v", state)
 	}
 }
@@ -163,11 +113,11 @@ func TestMarkDirty_coalesces(t *testing.T) {
 	}
 }
 
-// stateWith returns a GatewayState carrying an identifiable added pool so a
-// flushed file can be distinguished from empty. The marker is the presence of
-// the "rt" key — post-#172 the AddedPoolSpec carries no fields.
+// stateWith returns a GatewayState carrying an identifiable observation entry
+// so a flushed file can be distinguished from empty. The marker is a "rt" pool
+// with a sticky pointer.
 func stateWith(_ string) GatewayState {
-	return GatewayState{AddedPools: map[string]auto.AddedPoolSpec{"rt": {}}}
+	return GatewayState{Pools: map[string]auto.PoolPersistState{"rt": {Sticky: "a"}}}
 }
 
 // waitForFile polls for path to appear, failing the test if it never does.
@@ -202,8 +152,8 @@ func TestRun_flushesAfterDebounce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if _, ok := got.AddedPools["rt"]; !ok {
-		t.Errorf("flushed state missing rt added pool: %+v", got.AddedPools)
+	if _, ok := got.Pools["rt"]; !ok {
+		t.Errorf("flushed state missing rt pool: %+v", got.Pools)
 	}
 }
 
@@ -231,8 +181,8 @@ func TestRun_finalFlushOnShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if _, ok := got.AddedPools["rt"]; !ok {
-		t.Errorf("final-flush state missing rt added pool: %+v", got.AddedPools)
+	if _, ok := got.Pools["rt"]; !ok {
+		t.Errorf("final-flush state missing rt pool: %+v", got.Pools)
 	}
 }
 

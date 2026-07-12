@@ -10,11 +10,19 @@ After=network-online.target tailscaled.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/agent-quota-gateway
-# Pool credentials and SHARED_LISTEN_ADDR live here. The file is read by
-# the systemd manager (root) and the values are injected into the process
-# environment, so the file stays 0600 root:root and the DynamicUser below
-# never reads it directly.
-EnvironmentFile=/etc/agent-quota-gateway/aqg.env
+# Config file (issue #198): the mutable single source of truth for pools,
+# members, credentials, priority, balance, and disabled. It lives under the
+# StateDirectory so the DynamicUser can rewrite it when operators change pools
+# through the UI/API. %S expands to /var/lib. The file is created 0600 by the
+# service on first start and never overwritten by a redeploy.
+Environment=AQG_CONFIG=%S/agent-quota-gateway/aqg.json
+# Bootstrap seed only. On the FIRST start (no aqg.json yet) the gateway reads
+# these AQG_POOL_* vars + any existing state file to generate aqg.json, then
+# never consults the environment again. Safe to leave in place (ignored once
+# aqg.json exists) or remove after the first successful start. Read by the
+# systemd manager (root) and injected into the process environment, so it
+# stays 0600 root:root.
+EnvironmentFile=-/etc/agent-quota-gateway/aqg.env
 Restart=always
 RestartSec=2
 # The app drains in-flight streaming responses for up to 30s on shutdown;

@@ -27,7 +27,8 @@
         },
         "y": {
           "credential": "sk-ant-oat-PLACEHOLDER-Y",
-          "base_url": "https://custom.example.com"
+          "base_url": "https://custom.example.com",
+          "disabled": true
         }
       },
       "priority": [],

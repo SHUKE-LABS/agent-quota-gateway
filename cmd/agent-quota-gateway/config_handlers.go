@@ -11,13 +11,19 @@ import (
 )
 
 // configHandler serves GET /_gateway/config — the effective configuration
-// for all pools, with credentials fully redacted. Non-GET returns 405.
-func configHandler(pools *auto.Pools) http.HandlerFunc {
+// for all pools, with credentials fully redacted. Non-GET returns 405. When
+// the config writer has unflushed changes (issue #198 decision 3), the
+// response carries an X-AQG-Unsaved-Config: true header so the UI can surface
+// that on-disk config lags memory; unsaved is nil in env-only mode.
+func configHandler(pools *auto.Pools, unsaved func() bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
+		}
+		if unsaved != nil && unsaved() {
+			w.Header().Set("X-AQG-Unsaved-Config", "true")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(pools.EffectiveConfig())

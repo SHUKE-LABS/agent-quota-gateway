@@ -142,7 +142,7 @@ func TestIntegration_fullStack(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/health", healthHandler())
+	mux.HandleFunc("/_gateway/health", healthHandler(nil))
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
@@ -475,7 +475,7 @@ func TestQuotaHandler_unknownPoolEmptySnapshot(t *testing.T) {
 // TestHealthHandler_methodGuard pins the GET-only contract on
 // /_gateway/health: GET works, other verbs get 405 + Allow: GET.
 func TestHealthHandler_methodGuard(t *testing.T) {
-	srv := httptest.NewServer(healthHandler())
+	srv := httptest.NewServer(healthHandler(nil))
 	defer srv.Close()
 
 	getResp, err := http.Get(srv.URL + "/_gateway/health")
@@ -965,24 +965,14 @@ func TestMigrateSnapshotKeys_orphanedOldKeyDropped(t *testing.T) {
 	}
 }
 
-// TestMigrateSnapshotKeys_runtimeAddedMemberKnown proves the migration
-// recognises runtime-added pool members (persisted in
-// Config[name].AddedMembers) as known nicks. A snapshot keyed under such
-// a member's nick must NOT be dropped — the runtime-added pool itself has
-// not been re-instantiated by LoadAddedPools yet at this point in run(),
-// but the persisted Config already carries the member list.
-func TestMigrateSnapshotKeys_runtimeAddedMemberKnown(t *testing.T) {
-	// Env-declared "auto" pool lists only "cch" — "ccw" is NOT in the
-	// registry, so a snapshot keyed "auto/ccw" would be dropped unless
-	// the runtime-added source is consulted.
-	reg := migrateTestRegistry(t, "cch")
+// TestMigrateSnapshotKeys_configMemberKnown proves a member present in the
+// config registry is a known nick for snapshot migration. Under #198 every
+// member — including former runtime-added ones — lives in the config file and
+// is therefore in the registry, so its snapshot is never dropped.
+func TestMigrateSnapshotKeys_configMemberKnown(t *testing.T) {
+	reg := migrateTestRegistry(t, "cch", "ccw")
 	util := 0.3
 	state := persist.GatewayState{
-		Config: map[string]auto.PoolRuntimeConfig{
-			"auto": {AddedMembers: map[string]auto.AddedMember{
-				"ccw": {Credential: "sk-ant-ccw"},
-			}},
-		},
 		Snapshots: map[string]quota.Snapshot{
 			"auto/ccw": {UnifiedStatus: "allowed", Unified5hUtilization: &util},
 		},
@@ -991,10 +981,10 @@ func TestMigrateSnapshotKeys_runtimeAddedMemberKnown(t *testing.T) {
 	migrated, dropped := migrateSnapshotKeys(state, reg)
 
 	if _, ok := migrated["ccw"]; !ok {
-		t.Errorf("migrated map missing %q (runtime-added member should be known; got keys %v)", "ccw", keysOf(migrated))
+		t.Errorf("migrated map missing %q (config member should be known; got keys %v)", "ccw", keysOf(migrated))
 	}
 	if len(dropped) != 0 {
-		t.Errorf("dropped = %v, want [] (runtime-added nick is known)", dropped)
+		t.Errorf("dropped = %v, want [] (config nick is known)", dropped)
 	}
 }
 

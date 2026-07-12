@@ -2,7 +2,15 @@
 # Installs (or upgrades) agent-quota-gateway on the local machine. Runs as
 # root on the target — invoked by scripts/deploy.sh over ssh+sudo. Takes
 # the uploaded binary and unit paths as args; all install destinations are
-# fixed. Never overwrites an existing env file.
+# fixed.
+#
+# Config model (issue #198): the living source of truth is aqg.json in the
+# service StateDirectory (/var/lib/agent-quota-gateway/aqg.json), written and
+# rewritten by the service itself (0600, DynamicUser-owned). The env file this
+# script seeds is only a FIRST-START bootstrap: on the first start with no
+# aqg.json, the gateway reads its AQG_POOL_* vars (+ any state file) to
+# generate aqg.json, then never consults the environment again. This script
+# never overwrites an existing env file, and never touches aqg.json.
 set -euo pipefail
 
 BIN=agent-quota-gateway
@@ -22,14 +30,18 @@ if [[ ! -e "${ENV_FILE}" ]]; then
 	ts_ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
 	umask 077
 	cat >"${ENV_FILE}" <<ENV
-# Fill in your pools, then: sudo systemctl restart ${BIN}
+# FIRST-START bootstrap seed only (issue #198). On the first start with no
+# aqg.json, the gateway reads these vars to generate its config file at
+# /var/lib/${BIN}/aqg.json, then never reads the environment again — edit the
+# pools THERE afterwards (or via the UI). Fill in, then: sudo systemctl restart ${BIN}
 # SHARED_LISTEN_ADDR binds this host's Tailscale IP. Omit it for loopback.
 SHARED_LISTEN_ADDR=${ts_ip:-100.64.0.0}:${PORT}
 # AQG_POOL_AUTO_BACKEND_A=sk-ant-oat...
 # AQG_POOL_AUTO_BACKEND_B=sk-ant-oat...
 ENV
 	chmod 0600 "${ENV_FILE}"
-	echo ">> created ${ENV_FILE} (template) — edit it, then: sudo systemctl restart ${BIN}"
+	echo ">> created ${ENV_FILE} (bootstrap seed) — fill in pools, then: sudo systemctl restart ${BIN}"
+	echo "   after first start the live config is /var/lib/${BIN}/aqg.json (edit there / via the UI)"
 else
 	echo ">> kept existing ${ENV_FILE}"
 	# A common footgun: pointing the unit at a sourced shell env file.

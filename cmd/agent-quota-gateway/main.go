@@ -17,7 +17,6 @@ import (
 
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
-	"github.com/shukebeta/agent-quota-gateway/internal/config"
 	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
 	"github.com/shukebeta/agent-quota-gateway/internal/persist"
@@ -71,26 +70,13 @@ func main() {
 }
 
 func run(configFlag string) error {
-	var cfg config.Config
-	var registry *backend.Registry
-	var err error
-
-	// Check for config file first: flag > AQG_CONFIG > ./aqg.json > env.
-	if path, useFile := configfile.Resolve(configFlag); useFile {
-		cfg, registry, err = configfile.LoadFile(path)
-		if err != nil {
-			return err
-		}
-	} else {
-		cfg, err = config.Load()
-		if err != nil {
-			return fmt.Errorf("config: %w", err)
-		}
-
-		registry, err = backend.Load(cfg.AnthropicBaseURL)
-		if err != nil {
-			return fmt.Errorf("backend: %w", err)
-		}
+	// Resolve the config source (issue #198): env-only local dev (no config
+	// file), an existing aqg.json (env ignored), or first-deploy bootstrap
+	// (generate aqg.json from env + legacy state, then read it). configPath is
+	// "" in env-only mode, which disables config write-through.
+	cfg, registry, configPath, err := resolveConfig(configFlag, os.Stderr)
+	if err != nil {
+		return err
 	}
 
 	store := quota.NewStore()
@@ -130,31 +116,31 @@ func run(configFlag string) error {
 	// backends (z.ai / MiniMaxi) ever produce.
 	pools := auto.NewPools(registry, store, nil, nil)
 
-	// Re-instantiate runtime-created pools (POST /_gateway/pool) before any
-	// per-pool state is restored, so LoadPersistState / LoadRuntimeConfig below
-	// can resolve them by name. Each is a clean slate (no members, no routing
-	// state); a name that collides with an env pool is dropped (env wins).
-	pools.LoadAddedPools(persisted.AddedPools)
-
 	// Restore sticky pointers and exhausted maps from the persisted state.
-	// Expired exhausted entries are silently dropped by LoadPersistState.
+	// Every member — including former runtime-added ones — is already present
+	// from the config registry (issue #198), so a persisted sticky/snapshot
+	// nick resolves immediately. Expired exhausted entries are dropped.
 	pools.LoadPersistState(persisted.Pools)
 
-	// Restore runtime configuration (priority overrides, disabled members).
-	pools.LoadRuntimeConfig(persisted.Config)
-
-	// Wire up the persister so state mutations are coalesced and flushed
-	// atomically to disk. The persister goroutine is started below.
+	// Wire up the state persister (runtime observation only: sticky/exhausted/
+	// snapshots). Operator intent is no longer persisted here — it lives in the
+	// config file (issue #198). The persister goroutine is started below.
 	statePersister := persist.NewPersister(cfg.StateFile, func() persist.GatewayState {
 		return persist.GatewayState{
-			Pools:      pools.PersistState(),
-			Snapshots:  store.Snapshot(),
-			Config:     pools.PersistRuntimeConfig(),
-			AddedPools: pools.PersistAddedPools(),
+			Pools:     pools.PersistState(),
+			Snapshots: store.Snapshot(),
 		}
 	})
 	pools.SetOnMutate(statePersister.MarkDirty)
 	store.SetOnChange(statePersister.MarkDirty)
+
+	// Wire the config writer: every operator mutation re-serializes the whole
+	// config registry to aqg.json (debounced atomic 0600). In env-only mode
+	// configPath is "" and the writer is a no-op (no credentials on disk).
+	configWriter := configfile.NewWriter(configPath, func() ([]byte, error) {
+		return configfile.Marshal(cfg, pools.CurrentRegistry())
+	})
+	pools.SetOnConfigChange(configWriter.MarkDirty)
 
 	// observer is invoked once per upstream response, before the proxy
 	// streams the body back to the client. It extracts the rate-limit
@@ -209,12 +195,12 @@ func run(configFlag string) error {
 	// request carries a resolved backend; the gateway's own /_gateway
 	// endpoints are mounted directly and take no selector.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/health", healthHandler())
+	mux.HandleFunc("/_gateway/health", healthHandler(configWriter.Unsaved))
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
 	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
 	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
 	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
-	mux.HandleFunc("/_gateway/config", configHandler(pools))
+	mux.HandleFunc("/_gateway/config", configHandler(pools, configWriter.Unsaved))
 	mux.HandleFunc("/_gateway/ui", uiHandler())
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
@@ -242,6 +228,11 @@ func run(configFlag string) error {
 	// the state file. It shares the shutdown context so the final flush
 	// lands before the process exits.
 	go statePersister.Run(ctx)
+
+	// The config writer flushes operator mutations to aqg.json. It shares the
+	// shutdown context so the last mutation lands before exit. No-op in
+	// env-only mode (empty config path).
+	go configWriter.Run(ctx)
 
 	// The poller fills the quota store for backends that never emit
 	// Anthropic rate-limit headers (Z.ai / ZhipuAI, MiniMaxi) by polling
@@ -303,12 +294,10 @@ func run(configFlag string) error {
 // runtime-added). When both old and new keys exist for the same nick,
 // the new key wins (a two-pass rewrite where Pass 2 overwrites Pass 1).
 //
-// The known-nicks set is built from two sources: the live env-declared
-// Registry (PoolNicks for each PoolNames entry) and the runtime-added
-// members persisted in state.Config[name].AddedMembers (issue #116). The
-// runtime-added source is consulted here — before pools.LoadAddedPools
-// runs in run() — because persisted.Config is already in scope at this
-// point and avoids a second registry walk.
+// The known-nicks set is the live registry (PoolNicks for each PoolNames
+// entry). With config as the single source of truth (issue #198), the
+// registry already contains every member — including former runtime-added
+// ones — so no separate overlay source is needed here.
 //
 // The function returns the rewritten map and the de-duplicated list of
 // dropped nicks (first-seen order) so the caller can log the loss.
@@ -316,11 +305,6 @@ func migrateSnapshotKeys(state persist.GatewayState, registry *backend.Registry)
 	knownNicks := make(map[string]bool)
 	for _, name := range registry.PoolNames() {
 		for _, nick := range registry.PoolNicks(name) {
-			knownNicks[nick] = true
-		}
-	}
-	for _, cfg := range state.Config {
-		for nick := range cfg.AddedMembers {
 			knownNicks[nick] = true
 		}
 	}
@@ -376,7 +360,10 @@ func migrateSnapshotKeys(state persist.GatewayState, registry *backend.Registry)
 // callers can tell "process is alive" from "upstream is reachable".
 // Method is GET only; non-GET requests receive 405 — matching
 // quotaHandler's policy so the two /_gateway/* endpoints agree.
-func healthHandler() http.HandlerFunc {
+// unsaved reports whether the config writer has changes it could not flush to
+// disk (issue #198 decision 3). nil means "no config write-through" (env-only
+// mode), which never reports unsaved.
+func healthHandler(unsaved func() bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -385,6 +372,10 @@ func healthHandler() http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		if unsaved != nil && unsaved() {
+			_, _ = w.Write([]byte(`{"status":"ok","unsaved_config_changes":true}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}
 }

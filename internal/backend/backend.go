@@ -95,6 +95,13 @@ type Backend struct {
 	Nick       string
 	Credential string
 	BaseURL    string
+	// Disabled is operator intent: a disabled member stays in the pool's
+	// membership (and in the config file) but is never selected by the auto
+	// controller until re-enabled. It is config-sourced (issue #198): the
+	// flag round-trips through the config file, not a separate state-file
+	// overlay. It never affects the outbound request — a resolved backend on
+	// the request path is by definition enabled.
+	Disabled bool
 }
 
 // QuotaKey is the stable key the quota store files this backend's
@@ -108,9 +115,17 @@ func (b Backend) QuotaKey() string {
 }
 
 // Registry maps pool names to their members. It is immutable after Load
-// and safe for concurrent reads.
+// and safe for concurrent reads. Runtime mutations do not mutate a Registry
+// in place: the copy-on-write With* methods return a fresh validated
+// *Registry that the caller swaps in (issue #198), so the lock-free read
+// path always sees a complete, consistent snapshot.
 type Registry struct {
 	pools map[string]*pool
+	// defaultBaseURL is the gateway default upstream this registry was built
+	// with (the ANTHROPIC_BASE_URL / config base_url). Retained so the
+	// copy-on-write With* mutators can rebuild via Spec()→BuildFromSpec
+	// without the caller having to thread it back through.
+	defaultBaseURL string
 }
 
 // Spec is the file-source representation of a pool configuration. It
@@ -142,6 +157,7 @@ type PoolSpec struct {
 type MemberSpec struct {
 	Credential string
 	BaseURL    string // empty means use the pool default
+	Disabled   bool   // operator intent: excluded from selection until re-enabled
 }
 
 // Duration is a time.Duration serialized as a string (e.g. "5m"). It
@@ -149,6 +165,16 @@ type MemberSpec struct {
 // as env vars.
 type Duration struct {
 	D time.Duration
+}
+
+// MarshalJSON emits the duration as a string (e.g. "5m0s"), or "" when zero,
+// so a config file round-trips symmetrically through UnmarshalJSON (which
+// treats "" as zero). Used by the configfile writer (issue #198).
+func (d Duration) MarshalJSON() ([]byte, error) {
+	if d.D == 0 {
+		return []byte(`""`), nil
+	}
+	return []byte(`"` + d.D.String() + `"`), nil
 }
 
 // UnmarshalJSON parses a duration string (e.g. "5m", "10s") into a Duration.
@@ -173,6 +199,14 @@ type pool struct {
 	name   string
 	byNick map[string]Backend
 	nicks  []string // sorted, stable order for the auto controller
+
+	// baseURL is the pool-level effective default upstream (the declared
+	// pool base_url, or the gateway default when none was declared). Retained
+	// so Spec() can reconstruct a clean config shape: a member whose resolved
+	// BaseURL equals this is written with an empty per-member base_url (it
+	// inherited the pool default) rather than baking an explicit override
+	// onto every member (issue #198).
+	baseURL string
 
 	// priority is the operator-declared preference order (highest first),
 	// a subset of nicks. nil when the pool declared no AQG_POOL_<POOL>_PRIORITY
@@ -218,6 +252,7 @@ func BuildFromSpec(spec Spec, defaultBaseURL string) (*Registry, error) {
 		poolBalanceDwell:       make(map[string]time.Duration),
 		poolBalanceDwellOrigin: make(map[string]string),
 		originKey:              make(map[string]string),
+		declaredPools:          make(map[string]bool),
 	}
 
 	// Detect duplicate pool names after normalization and normalize all pool names.
@@ -243,6 +278,10 @@ func BuildFromSpec(spec Spec, defaultBaseURL string) (*Registry, error) {
 	// Process each pool.
 	for poolKey, poolSpec := range spec.Pools {
 		poolName := normalizedPools[poolKey]
+
+		// Record the pool name so it materializes even with zero members
+		// (an operator-created plain pool awaiting its first member).
+		p.declaredPools[poolName] = true
 
 		// Normalize member nicks and detect collisions within the pool.
 		normalizedNicks := make(map[string]string, len(poolSpec.Members))
@@ -283,6 +322,7 @@ func BuildFromSpec(spec Spec, defaultBaseURL string) (*Registry, error) {
 				nick:        nick,
 				cred:        memberSpec.Credential,
 				urlOverride: memberSpec.BaseURL,
+				disabled:    memberSpec.Disabled,
 				originKey:   origin,
 			})
 		}
@@ -336,6 +376,7 @@ type rawMember struct {
 	nick        string
 	cred        string
 	urlOverride string // "" when the member did not override the pool default
+	disabled    bool   // operator intent, only ever set on the file/spec path
 	originKey   string // the env var, for collision/error messages
 }
 
@@ -345,6 +386,12 @@ type rawMember struct {
 // a Registry.
 type parsed struct {
 	members                []rawMember
+	// declaredPools lists every pool name the source declared, including a
+	// pool with zero members. The env path leaves it nil (an env pool always
+	// has at least one member); the file/spec path fills it from every pool
+	// key so an operator-created-but-empty pool (issue #198, folding in the
+	// old AddedPools) materializes in the Registry instead of vanishing.
+	declaredPools          map[string]bool
 	originKey              map[string]string // pool/nick -> origin key for errors
 	poolBaseURL            map[string]string // pool -> declared default upstream
 	poolURLOrigin          map[string]string // pool -> origin of base URL
@@ -523,7 +570,11 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 // priority names a non-member, gap/dwell without balance, priority+balance
 // exclusion.
 func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
-	if len(p.members) == 0 {
+	// A configuration with no pools and no members at all is an error (an
+	// empty gateway serves nothing). A pool with zero members is allowed:
+	// it is an operator-created plain pool awaiting its first member (issue
+	// #198), so the check is on the union, not on members alone.
+	if len(p.members) == 0 && len(p.declaredPools) == 0 {
 		return nil, fmt.Errorf("backend: no backends configured")
 	}
 
@@ -567,6 +618,26 @@ func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
 	}
 
 	pools := make(map[string]*pool)
+	// ensurePool materializes a pool and stamps its effective pool-level
+	// base URL (declared pool base_url, else the gateway default) exactly
+	// once, so Spec() can later reconstruct a clean config shape.
+	ensurePool := func(name string) *pool {
+		pl := pools[name]
+		if pl == nil {
+			base := defaultBaseURL
+			if u, ok := p.poolBaseURL[name]; ok {
+				base = u
+			}
+			pl = &pool{name: name, byNick: make(map[string]Backend), baseURL: base}
+			pools[name] = pl
+		}
+		return pl
+	}
+	// Pre-create every declared pool (including zero-member ones) so an
+	// operator-created empty pool survives the build.
+	for name := range p.declaredPools {
+		ensurePool(name)
+	}
 	for _, m := range p.members {
 		raw := defaultBaseURL
 		if u, ok := p.poolBaseURL[m.pool]; ok {
@@ -579,23 +650,24 @@ func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("backend: %s has an invalid base URL: %w", m.originKey, err)
 		}
-		pl := pools[m.pool]
-		if pl == nil {
-			pl = &pool{name: m.pool, byNick: make(map[string]Backend)}
-			pools[m.pool] = pl
-		}
+		pl := ensurePool(m.pool)
 		pl.byNick[m.nick] = Backend{
 			Pool:       m.pool,
 			Nick:       m.nick,
 			Credential: m.cred,
 			BaseURL:    baseURL,
+			Disabled:   m.disabled,
 		}
 	}
 
 	// A base URL declared for a pool with no members is almost certainly a
-	// typo'd nick; fail closed rather than silently ignore it.
+	// typo'd nick; fail closed rather than silently ignore it. An
+	// operator-created empty plain pool carries no base_url, so this guard
+	// still fires only on the typo case (issue #198 pre-creates empty pools,
+	// so the test is now "declared base_url but zero members", not "pool
+	// absent from the built map").
 	for poolName, origin := range p.poolURLOrigin {
-		if _, ok := pools[poolName]; !ok {
+		if pl, ok := pools[poolName]; !ok || len(pl.byNick) == 0 {
 			return nil, fmt.Errorf("backend: %s sets a base URL for pool %q, which has no backends", origin, poolName)
 		}
 	}
@@ -652,7 +724,7 @@ func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
 
 	for poolName, mode := range p.poolBalance {
 		pool, ok := pools[poolName]
-		if !ok {
+		if !ok || len(pool.byNick) == 0 {
 			return nil, fmt.Errorf("backend: %s sets balance mode for pool %q, which has no backends", p.poolBalanceOrigin[poolName], poolName)
 		}
 		if len(pool.priority) > 0 {
@@ -679,7 +751,7 @@ func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
 		}
 		sort.Strings(pool.nicks)
 	}
-	return &Registry{pools: pools}, nil
+	return &Registry{pools: pools, defaultBaseURL: defaultBaseURL}, nil
 }
 
 // splitCredURL splits a member value into its credential and an optional
@@ -810,6 +882,150 @@ func (r *Registry) ResolveIn(poolName, nick string) (Backend, bool) {
 	}
 	b, ok := p.byNick[normalizeName(nick)]
 	return b, ok
+}
+
+// Spec reconstructs the file-source Spec that would rebuild this Registry.
+// It is the inverse of BuildFromSpec: the copy-on-write With* mutators use it
+// to derive a mutated Registry, and the configfile writer uses it to serialize
+// operator intent back to aqg.json (issue #198). A member whose resolved
+// BaseURL equals its pool's effective default is emitted with an empty
+// per-member base_url, so a member that merely inherited the pool default is
+// not written with an explicit override (keeps the file shape clean).
+func (r *Registry) Spec() Spec {
+	spec := Spec{Pools: make(map[string]PoolSpec, len(r.pools))}
+	for name, p := range r.pools {
+		ps := PoolSpec{
+			Members: make(map[string]MemberSpec, len(p.byNick)),
+			Balance: p.balance,
+		}
+		// A pool whose effective base URL is just the gateway default is
+		// emitted with an empty base_url (inherits): it keeps the shape clean
+		// and, for a zero-member pool, avoids tripping the memberless-pool
+		// "declared base_url" guard on the rebuild.
+		if p.baseURL != r.defaultBaseURL {
+			ps.BaseURL = p.baseURL
+		}
+		if len(p.priority) > 0 {
+			ps.Priority = append([]string(nil), p.priority...)
+		}
+		if p.balance != "" {
+			ps.BalanceGap = p.balanceGap
+			ps.BalanceDwell = Duration{D: p.balanceDwell}
+		}
+		for nick, b := range p.byNick {
+			m := MemberSpec{Credential: b.Credential, Disabled: b.Disabled}
+			if b.BaseURL != p.baseURL {
+				m.BaseURL = b.BaseURL
+			}
+			ps.Members[nick] = m
+		}
+		spec.Pools[name] = ps
+	}
+	return spec
+}
+
+// WithMemberSet returns a fresh Registry with member nick in poolName added
+// or replaced (credential, base URL, disabled). An empty baseURL means the
+// member inherits the pool default. The result is fully re-validated
+// (nick↔credential bijection, base URL, priority membership) via
+// BuildFromSpec — the single validation core — so an invalid mutation is
+// rejected with an error and the caller keeps the prior Registry.
+func (r *Registry) WithMemberSet(poolName, nick, cred, baseURL string, disabled bool) (*Registry, error) {
+	poolName, nick = normalizeName(poolName), normalizeName(nick)
+	spec := r.Spec()
+	ps, ok := spec.Pools[poolName]
+	if !ok {
+		return nil, fmt.Errorf("backend: unknown pool %q", poolName)
+	}
+	if ps.Members == nil {
+		ps.Members = make(map[string]MemberSpec, 1)
+	}
+	ps.Members[nick] = MemberSpec{Credential: cred, BaseURL: baseURL, Disabled: disabled}
+	spec.Pools[poolName] = ps
+	return BuildFromSpec(spec, r.defaultBaseURL)
+}
+
+// WithMemberRemoved returns a fresh Registry with member nick removed from
+// poolName. The nick is also pruned from the pool's priority order so the
+// rebuild does not reject a priority entry that no longer names a member.
+func (r *Registry) WithMemberRemoved(poolName, nick string) (*Registry, error) {
+	poolName, nick = normalizeName(poolName), normalizeName(nick)
+	spec := r.Spec()
+	ps, ok := spec.Pools[poolName]
+	if !ok {
+		return nil, fmt.Errorf("backend: unknown pool %q", poolName)
+	}
+	if _, ok := ps.Members[nick]; !ok {
+		return nil, fmt.Errorf("backend: pool %q has no member %q", poolName, nick)
+	}
+	delete(ps.Members, nick)
+	if len(ps.Priority) > 0 {
+		pruned := make([]string, 0, len(ps.Priority))
+		for _, n := range ps.Priority {
+			if normalizeName(n) != nick {
+				pruned = append(pruned, n)
+			}
+		}
+		ps.Priority = pruned
+	}
+	spec.Pools[poolName] = ps
+	return BuildFromSpec(spec, r.defaultBaseURL)
+}
+
+// WithMemberDisabled returns a fresh Registry with member nick's disabled
+// flag set to disabled. Disabled is operator intent persisted to the config
+// file, not a state-file overlay (issue #198).
+func (r *Registry) WithMemberDisabled(poolName, nick string, disabled bool) (*Registry, error) {
+	poolName, nick = normalizeName(poolName), normalizeName(nick)
+	spec := r.Spec()
+	ps, ok := spec.Pools[poolName]
+	if !ok {
+		return nil, fmt.Errorf("backend: unknown pool %q", poolName)
+	}
+	m, ok := ps.Members[nick]
+	if !ok {
+		return nil, fmt.Errorf("backend: pool %q has no member %q", poolName, nick)
+	}
+	m.Disabled = disabled
+	ps.Members[nick] = m
+	spec.Pools[poolName] = ps
+	return BuildFromSpec(spec, r.defaultBaseURL)
+}
+
+// WithPriority returns a fresh Registry with poolName's priority order set to
+// order (highest first). An empty order clears the priority, returning the
+// pool to random-start/round-robin. Membership and duplicate checks run in
+// BuildFromSpec.
+func (r *Registry) WithPriority(poolName string, order []string) (*Registry, error) {
+	poolName = normalizeName(poolName)
+	spec := r.Spec()
+	ps, ok := spec.Pools[poolName]
+	if !ok {
+		return nil, fmt.Errorf("backend: unknown pool %q", poolName)
+	}
+	norm := make([]string, 0, len(order))
+	for _, o := range order {
+		norm = append(norm, normalizeName(o))
+	}
+	ps.Priority = norm
+	spec.Pools[poolName] = ps
+	return BuildFromSpec(spec, r.defaultBaseURL)
+}
+
+// WithPoolCreated returns a fresh Registry with a new empty plain pool named
+// name (issue #198 folds the old runtime AddedPools into the config file). The
+// pool inherits the gateway default upstream until members declare their own.
+func (r *Registry) WithPoolCreated(name string) (*Registry, error) {
+	name = normalizeName(name)
+	if name == "" {
+		return nil, fmt.Errorf("backend: pool name is empty after normalization")
+	}
+	spec := r.Spec()
+	if _, exists := spec.Pools[name]; exists {
+		return nil, fmt.Errorf("backend: pool %q already exists", name)
+	}
+	spec.Pools[name] = PoolSpec{Members: make(map[string]MemberSpec)}
+	return BuildFromSpec(spec, r.defaultBaseURL)
 }
 
 // NormalizeName canonicalizes a selector the same way the loader

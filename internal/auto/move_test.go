@@ -173,8 +173,9 @@ func TestMove_overwriteConflict(t *testing.T) {
 	if status, err := p.AddMember("src", "a", "k1", "https://u1.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember src a: status=%d err=%v", status, err)
 	}
-	// Target already has a different a.
-	if status, err := p.AddMember("dst", "a", "k2", "https://u2.example", nil); status != http.StatusOK || err != nil {
+	// Target already has a under the SAME credential (bijection) but a
+	// different base_url — the only legitimate same-nick conflict.
+	if status, err := p.AddMember("dst", "a", "k1", "https://u2.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("AddMember dst a: status=%d err=%v", status, err)
 	}
 
@@ -253,9 +254,10 @@ func TestMove_staticTarget(t *testing.T) {
 	}
 }
 
-// TestMove_runtimeAddedTarget covers moving onto a same-nick target whose
-// existing slot is a runtime-added member with a different credential: the
-// move needs force=true to overwrite, and a plain call returns 409.
+// TestMove_runtimeAddedTarget covers moving onto a same-nick target slot that
+// differs only by base_url (the sole legitimate same-nick conflict under the
+// nick↔credential bijection): the move needs force=true to overwrite, and a
+// plain call returns 409.
 func TestMove_runtimeAddedTarget(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
@@ -263,10 +265,9 @@ func TestMove_runtimeAddedTarget(t *testing.T) {
 		backend.EnvPrefix + "DST_BACKEND_X": "cred-x",
 	})
 
-	// Seed a runtime-added "a" in dst with a differing credential. The
-	// static bijection does not cover runtime adds, so the only way to
-	// reach this conflict is via the management API.
-	if status, err := p.AddMember("dst", "a", "cred-different", "", nil); status != http.StatusOK || err != nil {
+	// Seed "a" in dst under the SAME credential as src (bijection) but a
+	// different base_url, so the move is a base_url conflict.
+	if status, err := p.AddMember("dst", "a", "cred-a", "https://dst-a.example", nil); status != http.StatusOK || err != nil {
 		t.Fatalf("seed AddMember dst a: status=%d err=%v, want 200", status, err)
 	}
 
@@ -279,8 +280,8 @@ func TestMove_runtimeAddedTarget(t *testing.T) {
 }
 
 // TestMove_persistsAcrossRestart proves a move into a priority pool (placed
-// runtime-added member) survives a PersistRuntimeConfig -> LoadRuntimeConfig
-// restart, including the placement and the source tombstone.
+// member) survives a config round-trip restart, including the placement and
+// the source member's departure.
 func TestMove_persistsAcrossRestart(t *testing.T) {
 	clock := newMoveClock()
 	env := map[string]string{
@@ -293,11 +294,9 @@ func TestMove_persistsAcrossRestart(t *testing.T) {
 	if status, err := p.MoveMember("src", "a", "dst", []string{"a", "p"}, false); status != http.StatusOK || err != nil {
 		t.Fatalf("MoveMember: status=%d err=%v", status, err)
 	}
-	cfg := p.PersistRuntimeConfig()
 
-	// Fresh pools from the same env, then replay the persisted runtime config.
-	p2 := loadMovePools(t, clock, env)
-	p2.LoadRuntimeConfig(cfg)
+	// Restart via the config round-trip (operator intent survives; env not re-read).
+	p2 := reloadViaConfig(t, p)
 
 	if poolMembers(t, p2, "src")["a"] {
 		t.Errorf("a resurfaced in src after restart")

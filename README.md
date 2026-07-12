@@ -328,7 +328,7 @@ Declaring both is a startup error.
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
-| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all state is in-memory only and lost on restart. The file stores sticky pointers, exhausted maps, quota snapshots, runtime-added members (including their credentials), and removed-member tombstones (so a removal stays in effect across restart). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. |
+| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file's `config` / `added_pools` keys are ignored on load (the first-deploy bootstrap reads them once; see [Config file](#config-file)). |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
@@ -341,31 +341,49 @@ and `PRIORITY` both declared on the same pool, both `LISTEN_ADDR` and
 Tailscale ranges. A `|` in a credential is rejected because the tail must
 parse as a URL — tokens do not contain `|`.
 
-Pools live in the environment by default — the gateway reads no credential
-from disk in that mode (see [Security model](#security-model)). If you
-prefer a `.env`, source it before launch (`set -a; . ./.env; set +a`) or
-use systemd `EnvironmentFile=` / a secret manager.
+In env-only mode (no config file resolved) pools live in the environment and
+the gateway reads no credential from disk (see [Security model](#security-model)).
+If you prefer a `.env`, source it before launch (`set -a; . ./.env; set +a`) or
+use systemd `EnvironmentFile=` / a secret manager. Once a config file is in play
+(the deployed default — see the next section), `aqg.json` is the source of truth
+and the environment is only a first-start bootstrap seed.
 
 ## Config file
 
-As an alternative to environment variables, you can declare pools and gateway
-settings in a JSON config file. This is opt-in: the gateway uses env vars by
-default, and only reads a file when explicitly directed via `--config`,
-`AQG_CONFIG`, or by placing `aqg.json` in the working directory.
+`aqg.json` is the **single source of truth for operator intent** (issue #198):
+pools, members (credential + `base_url`), priority, balance, and the `disabled`
+flag. Every runtime mutation made through the UI/API — add/remove/update a
+member, disable/enable, set priority, create a pool, move a member — is
+**written through to `aqg.json`** (debounced atomic write at 0600). There is no
+separate persisted overlay: the state file holds only runtime *observation*
+(see the `AQG_STATE_FILE` note above).
 
-**Precedence (highest to lowest):**
+**Config source resolution (highest to lowest):**
 
 1. `--config <path>` flag
 2. `AQG_CONFIG=<path>` environment variable
 3. `./aqg.json` in the current working directory
-4. Environment variables (the default)
+4. Environment variables (env-only mode — see below)
 
-When a config file is used, the gateway follows an **all-or-nothing** rule:
-all pools and gateway settings must come from the file; env vars for pool
-configuration are ignored. (The env vars listed in the table below are only
-read when no config file is found.) A malformed file, an unknown JSON key,
-or a file with looser-than-0600 permissions causes startup to fail closed —
-no silent fallback to env.
+**How env and the config file relate (the bootstrap-once contract):**
+
+- If a config path resolves (1–3) **and the file exists**, the gateway reads it
+  and **ignores `AQG_POOL_*` env entirely**. UI/API mutations round-trip back
+  to that file.
+- If a config path resolves **but the file does not exist yet** (first deploy),
+  the gateway **bootstraps it once**: it merges the `AQG_POOL_*` env with any
+  operator mutations recorded in the state file (`state`-wins precedence),
+  writes `aqg.json` at 0600, and then reads only `aqg.json` on every subsequent
+  start — **the environment is never consulted again**. This is how an existing
+  env-based deploy upgrades: keep the `EnvironmentFile` in place for the first
+  start, then edit pools in `aqg.json` (or via the UI).
+- If **no config path resolves at all** (no flag, no `AQG_CONFIG`, no
+  `./aqg.json`), the gateway runs in **env-only mode**: pools come from the
+  environment, nothing is written to disk (zero credentials on disk — the local
+  dev default), and UI mutations are in-memory only.
+
+A malformed file, an unknown JSON key, or a file with looser-than-0600
+permissions causes startup to fail closed — no silent fallback to env.
 
 **File format:**
 
@@ -381,7 +399,8 @@ no silent fallback to env.
       "members": {
         "<NICK>": {
           "credential": "<real-credential>",
-          "base_url": "<optional-per-member-override>"
+          "base_url": "<optional-per-member-override>",
+          "disabled": false
         }
       },
       "priority": ["nick-a", "nick-b"],
@@ -399,6 +418,7 @@ no silent fallback to env.
 |---------|-----------|-------|
 | `AQG_POOL_<P>_BACKEND_<N>` | `pools.<P>.members.<N>.credential` | Required. |
 | `AQG_POOL_<P>_BACKEND_<N>\|<URL>` | `pools.<P>.members.<N>.base_url` | Optional per-member override. |
+| _(runtime disable via UI/API)_ | `pools.<P>.members.<N>.disabled` | `true` takes the member out of selection until re-enabled. Persisted to config (issue #198). |
 | `AQG_POOL_<P>_BASE_URL` | `pools.<P>.base_url` | Pool-level default. |
 | `AQG_POOL_<P>_PRIORITY` | `pools.<P>.priority` | Array of nicks, highest first. |
 | `AQG_POOL_<P>_BALANCE` | `pools.<P>.balance` | Set to `"lead"` for balanced routing. |
@@ -690,16 +710,17 @@ effective priority order, and per-member `nick` / `base_url` / `disabled` /
 ]
 ```
 
-**Overlay on an immutable base.** The static configuration (env vars or the
-config file) is never mutated — it stays immutable and lock-free on the hot
-path. Runtime changes are an *overlay* layered on top of it: a priority
-override replaces the declared order, and a disabled flag removes a member
-from selection (like an exhausted member, but operator-set and never
-auto-cleared). The overlay is persisted to the state file alongside routing
-state and re-applied on top of the static base at startup; a persisted
-reference to a member or pool that no longer exists in the base is dropped
-with a logged warning, not a startup failure. Runtime-added members are
-persisted with their credentials (the state file is protected at mode 0600).
+**Write-through to the config file.** Runtime changes mutate the config
+registry, not a separate overlay (issue #198). Under the hood the gateway
+builds a fresh, fully-validated registry (copy-on-write) and swaps it in
+atomically, so the hot read path stays lock-free; the change is then flushed to
+`aqg.json` (debounced atomic write at 0600). Priority sets the pool's order, and
+a disabled flag removes a member from selection (like an exhausted member, but
+operator-set and never auto-cleared) — both are ordinary config fields now, so
+they survive restart because the gateway re-reads the same `aqg.json`. Every
+mutation is re-validated by the same rules as a startup load (including the
+nick↔credential bijection), so an invalid change is rejected and the prior
+config is kept. In env-only mode (no config file) mutations are in-memory only.
 
 A priority reorder does **not** force the pool off a healthy active member
 (prompt-cache preservation is unchanged): the new order takes effect on the
@@ -714,9 +735,10 @@ adds a runtime member. The JSON body is `{"credential": "...", "base_url": "..."
 
 - `credential` — optional when the nick is already a known subscription in
   another pool; the gateway resolves it by scanning all other pools for the same
-  nick. Required when the nick is new (not found in any other pool). Returns `400`
-  if the nick's credential is ambiguous (found under different credentials in two
-  or more pools); supply it explicitly to disambiguate.
+  nick. Required when the nick is new (not found in any other pool). The
+  nick↔credential bijection guarantees the same nick carries the same credential
+  everywhere, so cross-pool resolution is unambiguous; supplying a *different*
+  credential for a nick that already exists elsewhere is rejected with `400`.
 - `base_url` — optional with the same fallback chain as before: omitting it falls
   back to the other-pool resolution (same logic), then to the pool's first static
   member's URL. Returns `400` if the base_url is ambiguous across other pools;
@@ -727,33 +749,35 @@ adds a runtime member. The JSON body is `{"credential": "...", "base_url": "..."
   the added nick. Required when the target pool is in priority mode — there is no
   implicit insertion position. Rejected with `400` for plain/balanced-mode targets.
 
-On success the member is persisted to the state file *with its credential* (file
-mode `0600`) and re-applied at startup. Status codes: `200` on success; `400` on
-a missing or empty nick, invalid JSON body, missing credential (nick not in any
-other pool), ambiguous credential across pools, invalid `base_url`, ambiguous
-`base_url` across pools, missing `base_url` for a pool with no members and no
-resolvable URL, missing `placement` for a priority target with no existing slot,
-unknown nick in `placement`, `placement` not containing the added nick, duplicate
-nick in `placement`, or `placement` supplied for a non-priority target; `404` on
-an unknown pool; `409` when the nick is already an active (non-removed) member.
+On success the member is written through to the config file *with its
+credential* (mode `0600`) and re-read at startup. Status codes: `200` on
+success; `400` on a missing or empty nick, invalid JSON body, missing credential
+(nick not in any other pool), a credential conflicting with the nick's existing
+credential (bijection), invalid `base_url`, ambiguous `base_url` across pools,
+missing `base_url` for a pool with no members and no resolvable URL, missing
+`placement` for a priority target with no existing slot, unknown nick in
+`placement`, `placement` not containing the added nick, duplicate nick in
+`placement`, or `placement` supplied for a non-priority target; `404` on an
+unknown pool; `409` when the nick is already a member.
 `DELETE /_gateway/pool/{name}/member/{nick}` removes a member from selection and
 returns `200`; `404` on an unknown pool and `400` on a missing nick or a nick not
 present in the pool. If the removed member was the active one, the pool
 force-switches to the next healthy member. All error bodies are credential-free.
 
-Removal is **permanent and survives restart**: the tombstone is persisted to
-the state file so a removed member stays removed across a restart instead of
-resurfacing. A removed member is omitted entirely from both `/_gateway/config`
-and `/_gateway/pool`, not merely flagged disabled, and is never selected for
-routing. Any removed member — regardless of origin — can be re-added with
-`POST .../member/{nick}`, which clears its tombstone and restores it to
-rotation.
+Removal is **permanent and survives restart**: the member is deleted from the
+config file, so a fresh start reading `aqg.json` never sees it (there is no env
+value to resurface it — the root cause of the old revert bug, #197). A removed
+member is omitted entirely from both `/_gateway/config` and `/_gateway/pool`,
+not merely flagged disabled, and is never selected for routing. Any removed
+member can be re-added with `POST .../member/{nick}`, which writes it back into
+the config.
 
 **Moving a subscription between pools.** `POST
 /_gateway/pool/{name}/member/{nick}/move` relocates a subscription from `{name}`
-to the pool named in the body. It is the same overlay machinery: a persistent
-remove from the source plus an add to the target carrying the source member's
-credential and resolved `base_url`, so the move survives restart. The JSON body
+to the pool named in the body. It is the same write-through machinery: a remove
+from the source plus an add to the target carrying the source member's
+credential and resolved `base_url`, all in one atomic config update, so the move
+survives restart. The JSON body
 is `{"to": "<pool>", "placement": [...], "force": false}`:
 
 - `to` (required) is the target pool. Moving to the same pool returns `400`.
@@ -764,11 +788,13 @@ is `{"to": "<pool>", "placement": [...], "force": false}`:
   (`400`) and is unnecessary when overwriting an existing same-nick slot (the
   slot is preserved).
 - `force` confirms an overwrite when the target already has a member with the
-  same nick but a different credential or `base_url`.
+  same nick but a different resolved `base_url`. (The credential cannot differ:
+  the nick↔credential bijection guarantees one credential per nick, so a
+  same-nick conflict is always a `base_url` difference.)
 
-Conflict handling: a same-nick target whose credential **and** resolved
-`base_url` match is silently overwritten in place (the slot is preserved); a
-differing target returns `409` until `force: true` is sent. The move does **not** force the
+Conflict handling: a same-nick target whose resolved `base_url` matches is
+silently overwritten in place (the slot is preserved); a differing `base_url`
+returns `409` until `force: true` is sent. The move does **not** force the
 target off a healthy active member; the new order applies on the next selection
 event. Status codes: `200` on success; `400` on a missing/empty `to`, a
 same-pool move, a missing source member, or an invalid/absent placement; `404`
@@ -874,11 +900,15 @@ guarantees that follow:
 - Request and response bodies are not logged, persisted, or inspected. The
   logging middleware records only `method`, `path`, `status`, `duration`,
   and a request ID.
-- Credentials live only in the process environment (or an opt-in,
-  operator-protected JSON config file at `0600` permissions) and in
-  memory — the gateway keeps zero credentials on disk by default, and the
-  file path is an explicit opt-in alternative to a `0600` `aqg.env`. How
-  the environment (or file) is populated is the operator's choice.
+- Credentials live in memory and, when a config file is in use, in the
+  `aqg.json` config file at `0600` (issue #198 makes it the single source of
+  truth, so it is the credential store — the gateway writes and re-reads it).
+  On a systemd deploy it lives in the service `StateDirectory`
+  (`/var/lib/agent-quota-gateway/aqg.json`) so the ephemeral `DynamicUser` that
+  runs the process can rewrite it on UI mutations; it stays `0600`, readable
+  only by that service account. In env-only mode (no config file) the gateway
+  keeps **zero credentials on disk**. Config views (`/_gateway/config`) always
+  redact credentials regardless.
 - Quota snapshots, sticky pointers, and exhausted maps can optionally be
   persisted to a local state file (see `AQG_STATE_FILE` below) so state
   survives a restart. The file contains only quota utilization data and

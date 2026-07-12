@@ -289,7 +289,7 @@ func TestRecover_runtimeAddedMemberSetsActiveOnRecovery(t *testing.T) {
 	c := NewController(reg, "auto", 0, nil, clock.now, io.Discard)
 	c.SetProbeHTTPClient(probeSrv.Client())
 
-	p := &Pools{byPool: map[string]*Controller{"auto": c}}
+	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 	if status, err := p.AddMember("auto", "extra", "cred-extra", probeSrv.URL, nil); status != 200 || err != nil {
 		t.Fatalf("AddMember extra: status=%d err=%v, want 200", status, err)
 	}
