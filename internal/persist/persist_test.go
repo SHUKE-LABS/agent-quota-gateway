@@ -186,6 +186,34 @@ func TestRun_finalFlushOnShutdown(t *testing.T) {
 	}
 }
 
+// TestRun_flushesBufferedDirtyOnShutdown covers the shutdown select race
+// (issue #201): a dirty signal that is buffered but not yet promoted to
+// pending must still be flushed when ctx.Done() and dirty are simultaneously
+// ready. Go's select is uniform-random, so without the drain in the
+// ctx.Done() branch this drops ~50% of the time; the loop amplifies that to a
+// near-certain failure without the fix, while the fix makes it always flush.
+func TestRun_flushesBufferedDirtyOnShutdown(t *testing.T) {
+	for i := 0; i < 64; i++ {
+		path := filepath.Join(t.TempDir(), "state.json")
+		p := NewPersister(path, func() GatewayState { return stateWith("") })
+		p.debounce = 30 * time.Second // never fires; only the shutdown path can flush
+
+		ctx, cancel := context.WithCancel(context.Background())
+		// Buffer a dirty signal and cancel BEFORE Run starts, so Run's first
+		// select sees both ctx.Done() and dirty ready at once.
+		p.MarkDirty()
+		cancel()
+
+		done := make(chan struct{})
+		go func() { p.Run(ctx); close(done) }()
+		<-done
+
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("iteration %d: buffered dirty dropped at shutdown, file not written: %v", i, err)
+		}
+	}
+}
+
 // TestFlush_atomicAnd0600 proves flush writes at mode 0600 and leaves no
 // leftover temp file after the rename.
 func TestFlush_atomicAnd0600(t *testing.T) {

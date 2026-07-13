@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -224,15 +225,29 @@ func run(configFlag string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// The persister coalesces state mutations and writes them atomically to
-	// the state file. It shares the shutdown context so the final flush
-	// lands before the process exits.
-	go statePersister.Run(ctx)
+	// The persister and config writer run on their own context, cancelled
+	// only AFTER the HTTP server has drained (see the shutdown block below),
+	// not on the signal. A mutation can complete during the 30s grace window
+	// srv.Shutdown grants in-flight requests; if the writers had already
+	// exited on the signal, that mutation's 200 would be acknowledged but its
+	// MarkDirty() dropped (no reader on the buffered dirty channel), silently
+	// losing operator intent — and any runtime-added credential — on the next
+	// boot (issue #201). Draining the server first guarantees no mutation
+	// outlives its writer.
+	writersCtx, cancelWriters := context.WithCancel(context.Background())
+	// defer covers the early errCh return path below; the shutdown path calls
+	// cancelWriters() explicitly and then waits for the final flush.
+	defer cancelWriters()
+	var writersWG sync.WaitGroup
+	writersWG.Add(2)
 
-	// The config writer flushes operator mutations to aqg.json. It shares the
-	// shutdown context so the last mutation lands before exit. No-op in
+	// The persister coalesces state mutations and writes them atomically to
+	// the state file.
+	go func() { defer writersWG.Done(); statePersister.Run(writersCtx) }()
+
+	// The config writer flushes operator mutations to aqg.json. No-op in
 	// env-only mode (empty config path).
-	go configWriter.Run(ctx)
+	go func() { defer writersWG.Done(); configWriter.Run(writersCtx) }()
 
 	// The poller fills the quota store for backends that never emit
 	// Anthropic rate-limit headers (Z.ai / ZhipuAI, MiniMaxi) by polling
@@ -280,12 +295,27 @@ func run(configFlag string) error {
 	// exits. Streaming Messages responses can run for many seconds, so
 	// 30s is the smallest reasonable window that does not interrupt
 	// them. Future versions may make this configurable.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := gracefulShutdown(srv, 30*time.Second, cancelWriters, &writersWG); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	return nil
+}
+
+// gracefulShutdown drains the HTTP server, then stops the background writers
+// and waits for their final flush. The ordering is load-bearing (issue #201):
+// draining the server FIRST guarantees no mutation can still arrive, and a
+// mutation acked 200 during the grace window is observed by a still-running
+// writer (its debounce flush, or the writer's final flush after cancelWriters).
+// Cancelling the writers before the drain would drop any grace-window
+// mutation's MarkDirty — a silently-lost operator change, including a
+// runtime-added credential, on the next boot.
+func gracefulShutdown(srv *http.Server, timeout time.Duration, cancelWriters context.CancelFunc, writers *sync.WaitGroup) error {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	err := srv.Shutdown(shutdownCtx)
+	cancelWriters()
+	writers.Wait()
+	return err
 }
 
 // migrateSnapshotKeys rewrites persisted quota snapshots from the
