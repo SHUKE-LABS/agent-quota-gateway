@@ -170,7 +170,9 @@ request dump (`internal/reqlog`, credentials redacted).
 
 `GET /_gateway/health`, `/_gateway/quota?backend=<pool>` (active member's
 snapshot), `/_gateway/pool[?pool=<name>]` (per-member health),
-`/_gateway/config` (effective config, credentials redacted), `/_gateway/ui`,
+`/_gateway/activity` (rolling 60-min per-endpoint volume/error-rate/latency,
+in-memory, `internal/activity`), `/_gateway/config` (effective config,
+credentials redacted), `/_gateway/ui`,
 plus runtime mutations under `POST|DELETE /_gateway/pool/{name}/...`
 (priority, member add/remove/move, disable/enable) and
 `POST /_gateway/clear` (drop live-429 parks). Non-GET probes on the
