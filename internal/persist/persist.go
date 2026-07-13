@@ -98,9 +98,10 @@ func (p *Persister) MarkDirty() {
 	}
 }
 
-// Run drives the debounced flush loop until ctx is done, then performs
-// one final flush so the last mutation before shutdown is persisted.
-// Callers start it in a goroutine that shares the process shutdown context.
+// Run drives the debounced flush loop until ctx is done, then performs one
+// final flush so any state observed up to context cancellation is persisted.
+// Callers cancel this context after the HTTP server drains, so state written
+// during the shutdown grace window is still captured (issue #201).
 func (p *Persister) Run(ctx interface{ Done() <-chan struct{} }) {
 	if p.path == "" {
 		return
@@ -122,6 +123,15 @@ func (p *Persister) Run(ctx interface{ Done() <-chan struct{} }) {
 
 		select {
 		case <-ctx.Done():
+			// A dirty signal may be buffered but not yet promoted to pending
+			// (Go's select is uniform-random, so ctx.Done() can win over a
+			// simultaneously-ready dirty). Drain it so the final flush is not
+			// skipped, dropping the last mutation before shutdown (issue #201).
+			select {
+			case <-p.dirty:
+				pending = true
+			default:
+			}
 			if pending {
 				p.flush()
 			}

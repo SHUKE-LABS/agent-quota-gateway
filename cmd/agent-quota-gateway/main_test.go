@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1327,5 +1328,74 @@ func TestConfigEndpoint_includesWindowLabels(t *testing.T) {
 	}
 	if zaiLabels["short"] != "5h" || zaiLabels["long"] != "monthly" {
 		t.Errorf("zai window_labels = %+v, want {short:5h, long:monthly}", zaiLabels)
+	}
+}
+
+// TestGracefulShutdown_drainsServerBeforeCancellingWriters asserts the
+// load-bearing shutdown ordering (issue #201): the HTTP server drains fully
+// before the config writer / state persister are cancelled, so a mutation
+// acked during the grace window is never orphaned with no writer to persist
+// it. The test holds one request in-flight so srv.Shutdown must block, releases
+// it just before the drain completes, and fails if cancelWriters runs before
+// that release (which is what draining-second would cause).
+func TestGracefulShutdown_drainsServerBeforeCancellingWriters(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	handlerInFlight := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		close(handlerInFlight)
+		<-releaseHandler
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+
+	// Fire a request and wait until its handler is executing, so srv.Shutdown
+	// must block draining it.
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/slow")
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+	<-handlerInFlight
+
+	// Release the in-flight handler shortly after shutdown begins, letting the
+	// drain complete. Correct ordering calls cancelWriters only after this.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		close(releaseHandler)
+	}()
+
+	cancelCalled := make(chan struct{})
+	cancelWriters := func() {
+		// The server must have drained before writers are cancelled: the
+		// in-flight handler is released only just before the drain completes,
+		// so releaseHandler must already be closed here (issue #201 ordering).
+		select {
+		case <-releaseHandler:
+		default:
+			t.Error("cancelWriters called before the server drained (issue #201 ordering violated)")
+		}
+		close(cancelCalled)
+	}
+
+	// Model the writer goroutines: they return (wg.Done) once cancelled.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { <-cancelCalled; wg.Done() }()
+
+	if err := gracefulShutdown(srv, 5*time.Second, cancelWriters, &wg); err != nil {
+		t.Fatalf("gracefulShutdown: %v", err)
+	}
+	select {
+	case <-cancelCalled:
+	default:
+		t.Fatal("gracefulShutdown returned without cancelling writers")
 	}
 }

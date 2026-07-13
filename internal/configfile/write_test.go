@@ -123,6 +123,37 @@ func TestWriter_debouncedFlushAndUnsaved(t *testing.T) {
 	<-done
 }
 
+// TestWriter_flushesBufferedDirtyOnShutdown covers the shutdown select race
+// (issue #201): a dirty signal buffered but not yet promoted to pending must
+// still be flushed when ctx.Done() and dirty are simultaneously ready. Losing
+// it drops an operator mutation — including a runtime-added credential — from
+// aqg.json on the next boot. Go's select is uniform-random, so without the
+// drain in the ctx.Done() branch this fails ~50% per iteration; the loop makes
+// a without-fix failure near-certain while the fix always flushes.
+func TestWriter_flushesBufferedDirtyOnShutdown(t *testing.T) {
+	cfg := testConfig(t)
+	reg := testRegistry(t)
+	for i := 0; i < 64; i++ {
+		path := filepath.Join(t.TempDir(), "aqg.json")
+		w := NewWriter(path, func() ([]byte, error) { return Marshal(cfg, reg) })
+		w.debounce = 30 * time.Second // never fires; only the shutdown path can flush
+
+		ctx, cancel := context.WithCancel(context.Background())
+		// Buffer a dirty signal and cancel BEFORE Run starts, so Run's first
+		// select sees both ctx.Done() and dirty ready at once.
+		w.MarkDirty()
+		cancel()
+
+		done := make(chan struct{})
+		go func() { w.Run(ctx); close(done) }()
+		<-done
+
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("iteration %d: buffered dirty dropped at shutdown, config not written: %v", i, err)
+		}
+	}
+}
+
 func TestWriter_emptyPathIsNoOp(t *testing.T) {
 	w := NewWriter("", func() ([]byte, error) { return []byte("{}"), nil })
 	w.MarkDirty() // must not panic or block

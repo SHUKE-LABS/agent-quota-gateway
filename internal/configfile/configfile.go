@@ -228,7 +228,10 @@ func (w *Writer) Unsaved() bool {
 }
 
 // Run drives the debounced flush loop until ctx is done, then performs one
-// final flush so the last mutation before shutdown is persisted.
+// final flush so any mutation observed up to context cancellation is
+// persisted. The caller (main.run) cancels this context only after the HTTP
+// server has drained, so a mutation acked 200 during the shutdown grace
+// window is still captured by the final flush (issue #201).
 func (w *Writer) Run(ctx interface{ Done() <-chan struct{} }) {
 	if w.path == "" {
 		return
@@ -250,6 +253,15 @@ func (w *Writer) Run(ctx interface{ Done() <-chan struct{} }) {
 
 		select {
 		case <-ctx.Done():
+			// A dirty signal may be buffered but not yet promoted to pending
+			// (Go's select is uniform-random, so ctx.Done() can win over a
+			// simultaneously-ready dirty). Drain it so the final flush is not
+			// skipped, dropping the last mutation before shutdown (issue #201).
+			select {
+			case <-w.dirty:
+				pending = true
+			default:
+			}
 			if pending {
 				w.flush()
 			}
