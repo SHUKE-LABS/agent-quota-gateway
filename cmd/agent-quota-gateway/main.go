@@ -254,7 +254,10 @@ func run(configFlag string) error {
 	// each provider's proprietary quota API for the active member of each
 	// pool. It is a no-op for Anthropic and any other untracked backend.
 	// It shares the shutdown context, so it stops when the process does.
-	qp := poller.New(registry.PoolNames(), pools.Current, pools.MarkLocalSnapshot, store, nil, 0, nil, nil)
+	// NewDynamic (not New): the pool set is re-read from pools each tick, so a
+	// pool created at runtime via POST /_gateway/pool is polled without a
+	// restart (issue #202).
+	qp := poller.NewDynamic(pools.PoolNames, pools.Current, pools.MarkLocalSnapshot, store, nil, 0, nil, nil)
 	go qp.Run(ctx)
 
 	// The preemptor returns a priority pool to a higher-priority member once

@@ -193,6 +193,41 @@ func (p *Pools) controllersSnapshot() map[string]*Controller {
 	return out
 }
 
+// PoolNames returns the current pool names in sorted order, taken under the
+// read lock so it reflects runtime-created pools (AddPool). The poller calls
+// it fresh each tick so a pool created after startup is polled without a
+// restart (issue #202).
+func (p *Pools) PoolNames() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]string, 0, len(p.byPool))
+	for name := range p.byPool {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sortedControllers returns every controller in sorted-name order, taken under
+// the read lock so the set reflects runtime-created pools (AddPool). The
+// preemptor calls it fresh each tick, so a pool created — or given a priority
+// order — after startup is subject to preempt-back (issue #202). Sorted so the
+// preemptor evaluates pools deterministically.
+func (p *Pools) sortedControllers() []*Controller {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	names := make([]string, 0, len(p.byPool))
+	for name := range p.byPool {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]*Controller, 0, len(names))
+	for _, name := range names {
+		out = append(out, p.byPool[name])
+	}
+	return out
+}
+
 // Route implements backend.PoolRouter: it resolves the named pool's
 // controller and returns its current sticky backend. ok is false for an
 // unknown pool.

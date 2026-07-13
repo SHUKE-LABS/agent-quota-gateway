@@ -69,7 +69,10 @@ type MarkLocalSnapshotFunc func(poolName, nick string)
 // Poller refreshes the quota store for proprietary-API backends. The zero
 // value is not usable; call New.
 type Poller struct {
-	poolNames   []string
+	// poolNames resolves the set of pools to poll fresh on every tick, so a
+	// pool created at runtime (auto.Pools.AddPool) is polled without a restart
+	// (issue #202). New wraps a fixed slice; NewDynamic takes the accessor.
+	poolNames   func() []string
 	current     CurrentFunc
 	markLocal   MarkLocalSnapshotFunc
 	store       *quota.Store
@@ -79,15 +82,24 @@ type Poller struct {
 	logOut      io.Writer
 }
 
-// New builds a Poller over the given pool names. current resolves a pool's
-// active backend; store is where snapshots are filed; markLocal is called
-// after every successful poll so the originating pool's controller can
-// stop suppressing the cross-pool snapshot for that nick (issue #111).
-// markLocal may be nil for tests that do not care about the
-// per-pool-snapshot signal. client defaults to a 10s-timeout client,
-// interval to 2 minutes, now to time.Now, and logOut to os.Stderr when
-// their zero value is passed.
+// New builds a Poller over a fixed set of pool names. Production wants the
+// pool set resolved dynamically (see NewDynamic); New is retained for tests and
+// any caller whose pool set never changes. current resolves a pool's active
+// backend; store is where snapshots are filed; markLocal is called after every
+// successful poll so the originating pool's controller can stop suppressing the
+// cross-pool snapshot for that nick (issue #111). markLocal may be nil for
+// tests that do not care about the per-pool-snapshot signal. client defaults to
+// a 10s-timeout client, interval to 2 minutes, now to time.Now, and logOut to
+// os.Stderr when their zero value is passed.
 func New(poolNames []string, current CurrentFunc, markLocal MarkLocalSnapshotFunc, store *quota.Store, client *http.Client, interval time.Duration, now func() time.Time, logOut io.Writer) *Poller {
+	return NewDynamic(func() []string { return poolNames }, current, markLocal, store, client, interval, now, logOut)
+}
+
+// NewDynamic is New with the pool set resolved fresh on every tick from
+// poolNames instead of frozen at construction, so a pool created at runtime
+// (auto.Pools.AddPool) is polled on the next tick without a restart (issue
+// #202). All other arguments behave as in New.
+func NewDynamic(poolNames func() []string, current CurrentFunc, markLocal MarkLocalSnapshotFunc, store *quota.Store, client *http.Client, interval time.Duration, now func() time.Time, logOut io.Writer) *Poller {
 	if client == nil {
 		client = &http.Client{Timeout: defaultTimeout}
 	}
@@ -136,7 +148,7 @@ func (p *Poller) Run(ctx context.Context) {
 // backends are skipped; each poll is independent, so one failure never
 // blocks the rest.
 func (p *Poller) pollAll(ctx context.Context) {
-	for _, name := range p.poolNames {
+	for _, name := range p.poolNames() {
 		b, ok := p.current(name)
 		if !ok {
 			continue

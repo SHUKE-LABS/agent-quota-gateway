@@ -774,10 +774,11 @@ func TestStoreExhaustion_runtimePriorityPreemptsBack(t *testing.T) {
 	pools := NewPools(reg, nil, clock.now, io.Discard)
 	c := pools.byPool["auto"]
 
-	// NewPreemptor now collects all controllers, including this non-priority one.
+	// NewPreemptor now reads all controllers each tick, including this
+	// non-priority one.
 	p := NewPreemptor(pools, store, 0, clock.now, io.Discard)
-	if len(p.controllers) != 1 {
-		t.Fatalf("preemptor collected %d controllers, want 1", len(p.controllers))
+	if len(p.controllers()) != 1 {
+		t.Fatalf("preemptor collected %d controllers, want 1", len(p.controllers()))
 	}
 
 	// Set runtime priority: a > b.

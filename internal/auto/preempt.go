@@ -40,7 +40,12 @@ const defaultPreemptInterval = 5 * time.Minute
 // every read or write of Controller state goes through the controller's
 // own lock.
 type Preemptor struct {
-	controllers []*Controller // priority pools only; empty disables Run
+	// controllers resolves the pools to evaluate fresh on every tick, taken
+	// under Pools' read lock, so a pool created at runtime (AddPool) — or an
+	// existing pool later given a priority order — is picked up without a
+	// restart (issue #202). tick() skips non-priority pools, so returning all
+	// of them is correct and cheap; the empty case only arises with zero pools.
+	controllers func() []*Controller
 	store       *quota.Store
 	interval    time.Duration
 	now         func() time.Time
@@ -57,23 +62,27 @@ type Preemptor struct {
 	lastActed map[string]time.Time
 }
 
-// NewPreemptor builds a Preemptor over the priority pools in p. Pools
-// without an AQG_POOL_<POOL>_PRIORITY declaration are not collected, so
-// they never preempt. store supplies the precise unified_5h_reset;
-// interval defaults to 5 minutes, now to time.Now, and logOut to os.Stderr
-// when their zero value is passed.
+// NewPreemptor builds a Preemptor over the pools in p. It reads p's current
+// controller set fresh on every tick (via p.sortedControllers, under Pools'
+// lock), so runtime-created pools are picked up automatically; tick() itself
+// skips any pool that has not declared a priority order, so equal-strength
+// pools never preempt. store supplies the precise unified_5h_reset; interval
+// defaults to 5 minutes, now to time.Now, and logOut to os.Stderr when their
+// zero value is passed.
 func NewPreemptor(p *Pools, store *quota.Store, interval time.Duration, now func() time.Time, logOut io.Writer) *Preemptor {
-	var ctrls []*Controller
-	for _, name := range sortedPoolNames(p) {
-		c := p.byPool[name]
-		ctrls = append(ctrls, c)
-	}
-	return newPreemptor(ctrls, store, interval, now, logOut)
+	return newPreemptorFunc(p.sortedControllers, store, interval, now, logOut)
 }
 
-// newPreemptor is the shared constructor (also used by tests) that applies
-// the zero-value defaults.
+// newPreemptor is a static-source constructor used by tests: it evaluates the
+// given controller slice on every tick. Production uses NewPreemptor, whose
+// source re-reads Pools each tick (issue #202).
 func newPreemptor(controllers []*Controller, store *quota.Store, interval time.Duration, now func() time.Time, logOut io.Writer) *Preemptor {
+	return newPreemptorFunc(func() []*Controller { return controllers }, store, interval, now, logOut)
+}
+
+// newPreemptorFunc is the shared constructor that applies the zero-value
+// defaults over a dynamic controller source.
+func newPreemptorFunc(controllers func() []*Controller, store *quota.Store, interval time.Duration, now func() time.Time, logOut io.Writer) *Preemptor {
 	if interval <= 0 {
 		interval = defaultPreemptInterval
 	}
@@ -93,30 +102,19 @@ func newPreemptor(controllers []*Controller, store *quota.Store, interval time.D
 	}
 }
 
-// sortedPoolNames returns p's pool names in a stable order so the preemptor
-// collects controllers deterministically.
-func sortedPoolNames(p *Pools) []string {
-	out := make([]string, 0, len(p.byPool))
-	for name := range p.byPool {
-		out = append(out, name)
-	}
-	// Insertion sort keeps the dependency surface tiny; pools are few.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j] < out[j-1]; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
-		}
-	}
-	return out
-}
-
 // Run drives the preempt-back loop until ctx is cancelled. Each pass
 // performs any due switches and returns the duration until the next known
 // recovery; Run then sleeps until then (or until ctx is done). It returns
-// immediately when no pool declared a priority, so a deployment with only
-// equal-strength pools pays nothing. Run blocks; callers start it in a
-// goroutine.
+// immediately only when there are no pools at all; a deployment with only
+// equal-strength pools still idles at the fallback interval doing nothing,
+// since tick() skips every non-priority pool. Run blocks; callers start it in
+// a goroutine.
 func (p *Preemptor) Run(ctx context.Context) {
-	if len(p.controllers) == 0 {
+	// Evaluated once at entry: in production Pools always has >=1 pool at
+	// startup, so this never short-circuits away dynamic pickup of a
+	// runtime-created pool (issue #202); it only spares a zero-pool test the
+	// idle loop.
+	if len(p.controllers()) == 0 {
 		return
 	}
 	for {
@@ -154,7 +152,7 @@ func (p *Preemptor) tick() time.Duration {
 		}
 	}
 
-	for _, c := range p.controllers {
+	for _, c := range p.controllers() {
 		v := c.preemptView()
 		if !v.isPriority {
 			continue

@@ -320,8 +320,8 @@ func TestNewPreemptor_tickSkipsNonPriorityPools(t *testing.T) {
 	reg := testRegistry(t, "a", "b")
 	pools := NewPools(reg, nil, clock.now, io.Discard)
 	p := NewPreemptor(pools, quota.NewStore(), 0, clock.now, io.Discard)
-	if len(p.controllers) != 1 {
-		t.Fatalf("collected %d controllers, want 1 (all pools collected)", len(p.controllers))
+	if len(p.controllers()) != 1 {
+		t.Fatalf("collected %d controllers, want 1 (all pools collected)", len(p.controllers()))
 	}
 
 	// tick() should skip the non-priority controller and return the idle interval.
