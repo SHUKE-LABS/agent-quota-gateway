@@ -4,10 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
+	"github.com/shukebeta/agent-quota-gateway/internal/debounce"
 )
 
 // TestLoad_legacyOverlayKeysIgnored proves a pre-#198 state file carrying the
@@ -101,15 +103,28 @@ func TestNewPersister_emptyPathIsNoOp(t *testing.T) {
 	}
 }
 
-// TestMarkDirty_coalesces proves repeated MarkDirty calls never block and
-// collapse to a single pending signal (the buffered cap-1 dirty channel).
+// TestMarkDirty_coalesces proves repeated MarkDirty calls never block and a
+// burst collapses to a single flush once the window elapses. (The buffered
+// cap-1 dirty channel itself is exercised directly in internal/debounce.)
 func TestMarkDirty_coalesces(t *testing.T) {
-	p := NewPersister(filepath.Join(t.TempDir(), "state.json"), func() GatewayState { return GatewayState{} })
+	var flushes int32
+	p := NewPersister(filepath.Join(t.TempDir(), "state.json"), func() GatewayState {
+		atomic.AddInt32(&flushes, 1)
+		return GatewayState{}
+	})
+	p.flusher = debounce.New(true, 10*time.Millisecond, p.flush)
+
 	for i := 0; i < 100; i++ {
-		p.MarkDirty() // must not block even with no Run draining.
+		p.MarkDirty() // must not block, even before Run starts draining.
 	}
-	if got := len(p.dirty); got != 1 {
-		t.Errorf("pending signals = %d, want 1 (coalesced)", got)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Run(ctx)
+
+	time.Sleep(80 * time.Millisecond) // past the debounce window
+	if got := atomic.LoadInt32(&flushes); got != 1 {
+		t.Errorf("burst of 100 MarkDirty produced %d flushes, want 1 (coalesced)", got)
 	}
 }
 
@@ -139,7 +154,7 @@ func waitForFile(t *testing.T, path string) {
 func TestRun_flushesAfterDebounce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	p := NewPersister(path, func() GatewayState { return stateWith("https://debounce.example") })
-	p.debounce = 10 * time.Millisecond
+	p.flusher = debounce.New(true, 10*time.Millisecond, p.flush)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -163,17 +178,15 @@ func TestRun_flushesAfterDebounce(t *testing.T) {
 func TestRun_finalFlushOnShutdown(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	p := NewPersister(path, func() GatewayState { return stateWith("https://shutdown.example") })
-	p.debounce = 30 * time.Second // long enough that the timer never fires in this test
+	p.flusher = debounce.New(true, 30*time.Second, p.flush) // long enough that the timer never fires in this test
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go p.Run(ctx)
 
 	p.MarkDirty()
-	// Wait until Run has consumed the dirty signal (and thus set pending),
-	// so the subsequent cancel deterministically takes the final-flush path.
-	for i := 0; i < 400 && len(p.dirty) != 0; i++ {
-		time.Sleep(5 * time.Millisecond)
-	}
+	// Give Run time to consume the dirty signal (and thus set pending), so the
+	// subsequent cancel takes the final-flush path rather than the drain path.
+	time.Sleep(50 * time.Millisecond)
 	cancel()
 	waitForFile(t, path)
 
@@ -196,7 +209,7 @@ func TestRun_flushesBufferedDirtyOnShutdown(t *testing.T) {
 	for i := 0; i < 64; i++ {
 		path := filepath.Join(t.TempDir(), "state.json")
 		p := NewPersister(path, func() GatewayState { return stateWith("") })
-		p.debounce = 30 * time.Second // never fires; only the shutdown path can flush
+		p.flusher = debounce.New(true, 30*time.Second, p.flush) // never fires; only the shutdown path can flush
 
 		ctx, cancel := context.WithCancel(context.Background())
 		// Buffer a dirty signal and cancel BEFORE Run starts, so Run's first

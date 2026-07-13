@@ -10,10 +10,10 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
+	"github.com/shukebeta/agent-quota-gateway/internal/debounce"
 )
 
 const (
@@ -172,24 +172,21 @@ func Marshal(cfg config.Config, reg *backend.Registry) ([]byte, error) {
 	return json.MarshalIndent(&dto, "", "  ")
 }
 
-// defaultDebounce bounds the config-file write rate, mirroring persist.
-const defaultDebounce = 200 * time.Millisecond
-
 // Writer coalesces config-file writes with a debounce window and writes
-// atomically (temp-file + rename at 0600), mirroring persist.Persister. An
-// operator mutation calls MarkDirty; the Run loop re-serializes the whole
-// config from snapFn and flushes. When path is empty (pure env-mode local
-// dev, no config file) the Writer is a no-op — nothing is written to disk.
+// atomically (temp-file + rename at 0600). An operator mutation calls
+// MarkDirty; the shared debounce loop (internal/debounce, issue #210)
+// re-serializes the whole config from snapFn and flushes. When path is empty
+// (pure env-mode local dev, no config file) the Writer is a no-op — nothing is
+// written to disk.
 //
 // Write-failure semantics (issue #198, decision 3): a failed flush does not
 // roll back the in-memory mutation (which already took effect). It logs
 // loudly and sets Unsaved so /_gateway/health and /_gateway/config can
 // surface that on-disk config lags memory until the next successful flush.
 type Writer struct {
-	path     string
-	snapFn   func() ([]byte, error)
-	dirty    chan struct{}
-	debounce time.Duration
+	path    string
+	snapFn  func() ([]byte, error)
+	flusher *debounce.Flusher
 
 	mu      sync.Mutex
 	unsaved bool
@@ -199,25 +196,17 @@ type Writer struct {
 // called from the Run goroutine, so it must be safe for concurrent use with
 // the registry it reads. An empty path makes the Writer a no-op.
 func NewWriter(path string, snapFn func() ([]byte, error)) *Writer {
-	return &Writer{
-		path:     path,
-		snapFn:   snapFn,
-		dirty:    make(chan struct{}, 1),
-		debounce: defaultDebounce,
+	w := &Writer{
+		path:   path,
+		snapFn: snapFn,
 	}
+	w.flusher = debounce.New(path != "", debounce.DefaultDebounce, w.flush)
+	return w
 }
 
 // MarkDirty signals that operator intent changed. Non-blocking: a pending
 // flush absorbs it. No-op when path is empty.
-func (w *Writer) MarkDirty() {
-	if w.path == "" {
-		return
-	}
-	select {
-	case w.dirty <- struct{}{}:
-	default:
-	}
-}
+func (w *Writer) MarkDirty() { w.flusher.MarkDirty() }
 
 // Unsaved reports whether the last flush failed and on-disk config is behind
 // the in-memory registry.
@@ -232,51 +221,7 @@ func (w *Writer) Unsaved() bool {
 // persisted. The caller (main.run) cancels this context only after the HTTP
 // server has drained, so a mutation acked 200 during the shutdown grace
 // window is still captured by the final flush (issue #201).
-func (w *Writer) Run(ctx interface{ Done() <-chan struct{} }) {
-	if w.path == "" {
-		return
-	}
-	var pending bool
-	var deadline time.Time
-
-	for {
-		var waitCh <-chan time.Time
-		if pending {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				w.flush()
-				pending = false
-				continue
-			}
-			waitCh = time.After(remaining)
-		}
-
-		select {
-		case <-ctx.Done():
-			// A dirty signal may be buffered but not yet promoted to pending
-			// (Go's select is uniform-random, so ctx.Done() can win over a
-			// simultaneously-ready dirty). Drain it so the final flush is not
-			// skipped, dropping the last mutation before shutdown (issue #201).
-			select {
-			case <-w.dirty:
-				pending = true
-			default:
-			}
-			if pending {
-				w.flush()
-			}
-			return
-		case <-w.dirty:
-			if !pending {
-				deadline = time.Now().Add(w.debounce)
-				pending = true
-			}
-		case <-waitCh:
-			w.flush()
-			pending = false
-		}
-	}
-}
+func (w *Writer) Run(ctx interface{ Done() <-chan struct{} }) { w.flusher.Run(ctx) }
 
 // flush atomically writes the current config to disk at 0600.
 func (w *Writer) flush() {

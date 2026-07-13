@@ -9,6 +9,7 @@ import (
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
+	"github.com/shukebeta/agent-quota-gateway/internal/debounce"
 )
 
 func testConfig(t *testing.T) config.Config {
@@ -97,7 +98,7 @@ func TestWriter_debouncedFlushAndUnsaved(t *testing.T) {
 	reg := testRegistry(t)
 
 	w := NewWriter(path, func() ([]byte, error) { return Marshal(cfg, reg) })
-	w.debounce = 5 * time.Millisecond
+	w.flusher = debounce.New(true, 5*time.Millisecond, w.flush)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -136,7 +137,7 @@ func TestWriter_flushesBufferedDirtyOnShutdown(t *testing.T) {
 	for i := 0; i < 64; i++ {
 		path := filepath.Join(t.TempDir(), "aqg.json")
 		w := NewWriter(path, func() ([]byte, error) { return Marshal(cfg, reg) })
-		w.debounce = 30 * time.Second // never fires; only the shutdown path can flush
+		w.flusher = debounce.New(true, 30*time.Second, w.flush) // never fires; only the shutdown path can flush
 
 		ctx, cancel := context.WithCancel(context.Background())
 		// Buffer a dirty signal and cancel BEFORE Run starts, so Run's first

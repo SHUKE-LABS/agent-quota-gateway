@@ -19,16 +19,11 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
+	"github.com/shukebeta/agent-quota-gateway/internal/debounce"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
-
-// defaultDebounce is the maximum write rate when callers are continuously
-// marking dirty. A chatty proxy path (many requests/s) produces at most
-// one write per defaultDebounce interval.
-const defaultDebounce = 200 * time.Millisecond
 
 // GatewayState is the complete on-disk JSON record. It holds pure runtime
 // observation only (issue #198): per-pool sticky/exhausted routing state and
@@ -64,12 +59,13 @@ func Load(path string) (GatewayState, error) {
 }
 
 // Persister coalesces state writes with a debounce window. Build with
-// NewPersister; call Run in a goroutine sharing the shutdown context.
+// NewPersister; call Run in a goroutine sharing the shutdown context. The
+// debounced-flush loop itself lives in internal/debounce (shared with
+// configfile.Writer, issue #210).
 type Persister struct {
-	path     string
-	snapFn   func() GatewayState
-	dirty    chan struct{}
-	debounce time.Duration
+	path    string
+	snapFn  func() GatewayState
+	flusher *debounce.Flusher
 }
 
 // NewPersister returns a Persister that writes to path using snapFn to
@@ -77,76 +73,24 @@ type Persister struct {
 // (not from MarkDirty), so it must be safe for concurrent use with the
 // objects it reads. When path is empty the persister is a no-op.
 func NewPersister(path string, snapFn func() GatewayState) *Persister {
-	return &Persister{
-		path:     path,
-		snapFn:   snapFn,
-		dirty:    make(chan struct{}, 1),
-		debounce: defaultDebounce,
+	p := &Persister{
+		path:   path,
+		snapFn: snapFn,
 	}
+	p.flusher = debounce.New(path != "", debounce.DefaultDebounce, p.flush)
+	return p
 }
 
 // MarkDirty signals that state has changed. The call is non-blocking: if
 // a flush is already pending it is absorbed. Safe to call while holding
-// any unrelated lock.
-func (p *Persister) MarkDirty() {
-	if p.path == "" {
-		return
-	}
-	select {
-	case p.dirty <- struct{}{}:
-	default:
-	}
-}
+// any unrelated lock. No-op when path is empty.
+func (p *Persister) MarkDirty() { p.flusher.MarkDirty() }
 
 // Run drives the debounced flush loop until ctx is done, then performs one
 // final flush so any state observed up to context cancellation is persisted.
 // Callers cancel this context after the HTTP server drains, so state written
 // during the shutdown grace window is still captured (issue #201).
-func (p *Persister) Run(ctx interface{ Done() <-chan struct{} }) {
-	if p.path == "" {
-		return
-	}
-	var pending bool
-	var deadline time.Time
-
-	for {
-		var waitCh <-chan time.Time
-		if pending {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				p.flush()
-				pending = false
-				continue
-			}
-			waitCh = time.After(remaining)
-		}
-
-		select {
-		case <-ctx.Done():
-			// A dirty signal may be buffered but not yet promoted to pending
-			// (Go's select is uniform-random, so ctx.Done() can win over a
-			// simultaneously-ready dirty). Drain it so the final flush is not
-			// skipped, dropping the last mutation before shutdown (issue #201).
-			select {
-			case <-p.dirty:
-				pending = true
-			default:
-			}
-			if pending {
-				p.flush()
-			}
-			return
-		case <-p.dirty:
-			if !pending {
-				deadline = time.Now().Add(p.debounce)
-				pending = true
-			}
-		case <-waitCh:
-			p.flush()
-			pending = false
-		}
-	}
-}
+func (p *Persister) Run(ctx interface{ Done() <-chan struct{} }) { p.flusher.Run(ctx) }
 
 // flush atomically writes the current state to disk.
 func (p *Persister) flush() {
