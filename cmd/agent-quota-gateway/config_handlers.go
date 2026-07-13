@@ -5,10 +5,28 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/activity"
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 )
+
+// activityHandler serves GET /_gateway/activity — the rolling per-endpoint
+// activity series (volume, error rate, latency percentiles) over the last 60
+// one-minute buckets. In-memory only; empty until the first non-gateway
+// request lands. Non-GET returns 405, matching the sibling read endpoints.
+func activityHandler(store *activity.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(store.Snapshot(time.Now()))
+	}
+}
 
 // configHandler serves GET /_gateway/config — the effective configuration
 // for all pools, with credentials fully redacted. Non-GET returns 405. When

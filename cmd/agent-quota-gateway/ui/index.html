@@ -423,6 +423,33 @@
   }
   footer.bottom p { margin: 0 0 6px; }
   footer.bottom p:last-child { margin-bottom: 0; }
+
+  /* Recent-activity panel: a single per-endpoint summary table over the
+     rolling window, styled to match the members table. */
+  section.activity {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    margin: 16px 0;
+    padding: 16px;
+  }
+  section.activity header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; }
+  section.activity h2 { font-size: 15px; margin: 0; }
+  section.activity .badge { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  table.activity { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.activity th, table.activity td {
+    padding: 6px 10px;
+    text-align: right;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  table.activity th:first-child, table.activity td:first-child { text-align: left; }
+  table.activity td.endpoint { font-family: var(--mono); font-size: 12px; }
+  table.activity th { font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  table.activity tr:last-child td { border-bottom: none; }
+  table.activity td.err { color: var(--danger); }
+  section.activity .note { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
 </style>
 </head>
 <body>
@@ -435,6 +462,7 @@
   <div id="unsaved" role="alert"></div>
   <div id="addsub"></div>
   <div id="pools"></div>
+  <div id="activity"></div>
 </main>
 <footer class="bottom">
   <p>Inherits the gateway&rsquo;s trust boundary. Default mode: loopback only.</p>
@@ -1350,8 +1378,139 @@
     return String(s).replace(/[^a-zA-Z0-9_-]/g, function (c) { return '\\' + c; });
   }
 
+  // ---- Recent activity panel (issue #217) --------------------------------
+  // /_gateway/activity returns a per-endpoint series of up to 60 one-minute
+  // buckets. The panel collapses each endpoint's series into one summary row:
+  // window totals for volume/errors, and latency read from the most recent
+  // bucket (percentiles can't be honestly re-derived across buckets, so the
+  // window max is the only cross-bucket latency stat shown).
+  var activityRoot = document.getElementById('activity');
+
+  function loadActivity() {
+    return fetchJSON('/_gateway/activity').then(function (r) {
+      if (!r.ok || !r.body || typeof r.body !== 'object') {
+        renderActivity(null);
+        return;
+      }
+      renderActivity(r.body);
+    }).catch(function () { renderActivity(null); });
+  }
+
+  function summarizeSeries(points) {
+    var volume = 0, errors = 0, maxMs = 0, latest = null;
+    for (var i = 0; i < points.length; i++) {
+      var p = points[i];
+      volume += p.volume || 0;
+      errors += p.errors || 0;
+      var m = (p.latency && p.latency.maxMs) || 0;
+      if (m > maxMs) maxMs = m;
+      if (!latest || p.bucketStart > latest.bucketStart) latest = p;
+    }
+    var lat = (latest && latest.latency) || { p50Ms: 0, p95Ms: 0, maxMs: 0 };
+    return {
+      volume: volume,
+      errors: errors,
+      errorRate: volume > 0 ? errors / volume : 0,
+      p50Ms: lat.p50Ms || 0,
+      p95Ms: lat.p95Ms || 0,
+      maxMs: maxMs
+    };
+  }
+
+  function fmtMs(ms) {
+    if (!ms) return '0';
+    if (ms >= 1000) return (ms / 1000).toFixed(2) + ' s';
+    return Math.round(ms) + ' ms';
+  }
+
+  function fmtPct(rate) { return (rate * 100).toFixed(1) + '%'; }
+
+  function renderActivity(series) {
+    activityRoot.innerHTML = '';
+    var section = document.createElement('section');
+    section.className = 'activity';
+
+    var head = document.createElement('header');
+    var h2 = document.createElement('h2');
+    h2.textContent = 'Recent activity (60 min)';
+    head.appendChild(h2);
+    var badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = 'in-memory · resets on restart';
+    head.appendChild(badge);
+    section.appendChild(head);
+
+    var paths = series ? Object.keys(series).sort() : [];
+    if (paths.length === 0) {
+      var empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No traffic recorded yet.';
+      section.appendChild(empty);
+      activityRoot.appendChild(section);
+      return;
+    }
+
+    var table = document.createElement('table');
+    table.className = 'activity';
+    var thead = document.createElement('thead');
+    var htr = document.createElement('tr');
+    ['Endpoint', 'Requests (60m)', 'Error rate', 'p50', 'p95', 'Max'].forEach(function (label) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    paths.forEach(function (path) {
+      var s = summarizeSeries(series[path] || []);
+      var tr = document.createElement('tr');
+
+      var tdPath = document.createElement('td');
+      tdPath.className = 'endpoint';
+      tdPath.textContent = path;
+      tr.appendChild(tdPath);
+
+      appendCell(tr, String(s.volume));
+
+      var tdErr = appendCell(tr, fmtPct(s.errorRate));
+      if (s.errors > 0) tdErr.className = 'err';
+
+      appendCell(tr, fmtMs(s.p50Ms));
+      appendCell(tr, fmtMs(s.p95Ms));
+      appendCell(tr, fmtMs(s.maxMs));
+
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    section.appendChild(table);
+
+    var note = document.createElement('p');
+    note.className = 'note';
+    // Latency for streaming /v1/messages is full end-to-end wall time (the
+    // whole SSE response), not time-to-first-byte. p50/p95 are the latest
+    // one-minute bucket; Max is over the whole 60-minute window.
+    note.textContent = 'Streaming latency is full end-to-end (SSE) wall time, not time-to-first-byte. ' +
+      'p50/p95 reflect the latest minute; Max spans the full window.';
+    section.appendChild(note);
+
+    activityRoot.appendChild(section);
+  }
+
+  function appendCell(tr, text) {
+    var td = document.createElement('td');
+    td.textContent = text;
+    tr.appendChild(td);
+    return td;
+  }
+  // ------------------------------------------------------------------------
+
   function tick() {
-    loadStatus().then(applyLiveStatus).then(function () {
+    Promise.all([
+      loadStatus().then(applyLiveStatus),
+      loadActivity()
+    ]).then(function () {
       setTimeout(tick, POLL_MS);
     }).catch(function (e) {
       console.error('status poll failed', e);
@@ -1364,6 +1523,7 @@
       .then(renderAll)
       .then(loadStatus)
       .then(applyLiveStatus)
+      .then(loadActivity)
       .then(tick)
       .catch(function (e) {
         console.error('boot failed', e);

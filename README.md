@@ -664,6 +664,47 @@ probing would start a new session and consume quota.
 `?pool=<unknown>` returns HTTP 404. The endpoint is `GET`-only; non-GET
 returns `405` with `Allow: GET`.
 
+### Recent activity
+
+`GET /_gateway/activity` returns a rolling, in-memory view of per-endpoint
+request health over the last 60 one-minute buckets. It turns the same signal
+the per-request log line carries (`path`/`status`/`duration`) into a temporal
+series the point-in-time `health`/`quota`/`pool`/`config` endpoints don't
+expose. It records only `path`/`status`/`duration` — never bodies, headers, or
+credentials — and is **ephemeral**: in memory only, lost on restart, no
+persistence.
+
+```bash
+curl http://127.0.0.1:8080/_gateway/activity
+```
+
+The response is a JSON object keyed by request path; each value is a
+chronological array of up to 60 points:
+
+```json
+{
+  "/v1/messages": [
+    {
+      "bucketStart": "2026-07-13T12:00:00Z",
+      "volume": 42,
+      "errors": 1,
+      "errorRate": 0.0238,
+      "latency": { "p50Ms": 820.5, "p95Ms": 2140.0, "maxMs": 4102.7 }
+    }
+  ]
+}
+```
+
+`errorRate` is the fraction of non-2xx responses in the bucket. Latency
+percentiles are nearest-rank over a bounded per-bucket sample; for streaming
+`/v1/messages` they are **full end-to-end (SSE) wall time**, not
+time-to-first-byte. Memory is bounded regardless of traffic — a fixed bucket
+ring, a per-bucket cap on distinct paths (overflow folds into an `(other)`
+key), and a fixed latency sample ring. `/_gateway/*` requests (the dashboard's
+own polling) are excluded. The endpoint is `GET`-only; non-GET returns `405`
+with `Allow: GET`. The management UI renders this as a "Recent activity
+(60 min)" panel that refreshes on the normal poll cadence.
+
 ### Runtime pool configuration
 
 Priority order, per-member enable/disable, and pool membership can be changed

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/activity"
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
@@ -195,9 +196,15 @@ func run(configFlag string) error {
 	// The resolver middleware sits in front of it so every forwarded
 	// request carries a resolved backend; the gateway's own /_gateway
 	// endpoints are mounted directly and take no selector.
+	// activityStore aggregates per-endpoint volume/error-rate/latency into a
+	// rolling 60-minute window for /_gateway/activity and its UI panel. In
+	// memory only, lost on restart (issue #217).
+	activityStore := activity.New()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/health", healthHandler(configWriter.Unsaved))
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
+	mux.HandleFunc("/_gateway/activity", activityHandler(activityStore))
 	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
 	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
 	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
@@ -211,7 +218,11 @@ func run(configFlag string) error {
 	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
-	handler := reqlog.Middleware(logging.Middleware(mux))
+	// activity.Middleware sits innermost (closest to the mux) so it observes
+	// the same status the handler emits; it excludes /_gateway/* itself. Its
+	// statusRecorder implements Unwrap, so logging's outer recorder and the
+	// proxy's flusher still reach the real writer and SSE keeps streaming.
+	handler := reqlog.Middleware(logging.Middleware(activity.Middleware(activityStore, mux)))
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
