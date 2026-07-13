@@ -212,6 +212,36 @@ func TestLoadFile_rejectsInvalidBalanceMode(t *testing.T) {
 	}
 }
 
+func TestLoadFile_rejectsOutOfRangeBalanceGap(t *testing.T) {
+	// A gap >= 1.0 is unreachable and silently disables balancing; the
+	// config-file path shares buildRegistry's check, so it must fail load
+	// (issue #215). 15 is the classic percent/fraction mix-up (meant 0.15).
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+
+	content := `{
+		"base_url": "https://api.anthropic.com",
+		"pools": {
+			"sub": {
+				"members": {
+					"a": {"credential": "sk-ant-oat-aaa"}
+				},
+				"balance": "lead",
+				"balance_gap": 15
+			}
+		}
+	}`
+
+	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := LoadFile(configPath)
+	if err == nil {
+		t.Error("LoadFile with balance_gap >= 1.0 should fail")
+	}
+}
+
 func TestLoadFile_endToEndParity(t *testing.T) {
 	// Load the same config via file and via env vars; compare results.
 	tmpDir := t.TempDir()

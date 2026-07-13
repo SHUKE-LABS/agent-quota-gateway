@@ -423,7 +423,7 @@ permissions causes startup to fail closed — no silent fallback to env.
 | `AQG_POOL_<P>_BASE_URL` | `pools.<P>.base_url` | Pool-level default. |
 | `AQG_POOL_<P>_PRIORITY` | `pools.<P>.priority` | Array of nicks, highest first. |
 | `AQG_POOL_<P>_BALANCE` | `pools.<P>.balance` | Set to `"lead"` for balanced routing. |
-| `AQG_POOL_<P>_BALANCE_GAP` | `pools.<P>.balance_gap` | Omit for the default (0.15). An explicit non-positive value is rejected. |
+| `AQG_POOL_<P>_BALANCE_GAP` | `pools.<P>.balance_gap` | Omit for the default (0.15). A fraction in `(0, 1)`; a value `<= 0` or `>= 1.0` is rejected (a gap `>= 1.0` is unreachable — don't pass a percent like `15`). |
 | `AQG_POOL_<P>_BALANCE_DWELL` | `pools.<P>.balance_dwell` | Omit for the default (`5m`). An explicit non-positive value is rejected. |
 | `ANTHROPIC_BASE_URL` | `base_url` | Gateway default upstream. |
 | `LISTEN_ADDR` | `listen_addr` | Loopback-only bind address. |

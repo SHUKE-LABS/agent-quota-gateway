@@ -383,6 +383,14 @@ func TestLoadFrom_balanceRejectsBadInput(t *testing.T) {
 			"AQG_POOL_SUB_BALANCE_GAP=high",
 			"AQG_POOL_SUB_BACKEND_A=cred-a",
 		},
+		// 15 is the classic percent/fraction mix-up (meant 0.15); a gap >= 1.0
+		// is unreachable and silently disables balancing, so it must be
+		// rejected at load (issue #215).
+		"invalid gap (>= 1.0)": {
+			"AQG_POOL_SUB_BALANCE=lead",
+			"AQG_POOL_SUB_BALANCE_GAP=15",
+			"AQG_POOL_SUB_BACKEND_A=cred-a",
+		},
 		"invalid dwell (zero)": {
 			"AQG_POOL_SUB_BALANCE=lead",
 			"AQG_POOL_SUB_BALANCE_DWELL=0s",
@@ -596,6 +604,49 @@ func TestBuildFromSpec_balanceWithCustomTuning(t *testing.T) {
 	}
 	if got := reg.PoolBalanceDwell("sub"); got != 10*time.Minute {
 		t.Errorf("PoolBalanceDwell(sub) = %v, want 10m", got)
+	}
+}
+
+func TestBuildFromSpec_rejectsOutOfRangeBalanceGap(t *testing.T) {
+	// The config-file path funnels through BuildFromSpec; a gap >= 1.0 is
+	// unreachable and silently disables balancing, so it must fail load
+	// (issue #215). 15 is the classic percent/fraction mix-up (meant 0.15).
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"SUB": {
+				Balance:    "lead",
+				BalanceGap: 15,
+				Members: map[string]MemberSpec{
+					"A": {Credential: "cred-a"},
+				},
+			},
+		},
+	}
+	if _, err := BuildFromSpec(spec, testDefaultBaseURL); err == nil {
+		t.Error("BuildFromSpec with balance_gap >= 1.0 should fail")
+	}
+}
+
+func TestBuildFromSpec_acceptsGapNearOne(t *testing.T) {
+	// 0.99 is a legitimate fractional gap just below the ceiling; it must load.
+	spec := Spec{
+		Pools: map[string]PoolSpec{
+			"SUB": {
+				Balance:    "lead",
+				BalanceGap: 0.99,
+				Members: map[string]MemberSpec{
+					"A": {Credential: "cred-a"},
+					"B": {Credential: "cred-b"},
+				},
+			},
+		},
+	}
+	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	if got := reg.PoolBalanceGap("sub"); got != 0.99 {
+		t.Errorf("PoolBalanceGap(sub) = %v, want 0.99", got)
 	}
 }
 

@@ -679,10 +679,19 @@ func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
 		}
 	}
 
-	// Validate non-positive gap/dwell
+	// Validate out-of-range gap/dwell. The gap is a fraction in (0, 1): the
+	// per-member lead is utilization-minus-elapsed ∈ [-1, 1], so the switch
+	// delta curOverall-candOverall ∈ [-2, 2] and any gap >= 1.0 is effectively
+	// unreachable — balancing never fires and the pool silently degenerates to
+	// plain sticky routing. Rejecting >= 1.0 catches the common percent/fraction
+	// mix-up (e.g. 15 typed for 0.15) that would otherwise load with no signal
+	// (issue #215).
 	for poolName, gap := range p.poolBalanceGap {
 		if gap <= 0 {
 			return nil, fmt.Errorf("backend: %s must be a positive fraction (e.g. 0.15)", p.poolBalanceGapOrigin[poolName])
+		}
+		if gap >= 1.0 {
+			return nil, fmt.Errorf("backend: %s must be a fraction below 1.0 (e.g. 0.15 = 15%% faster); a value >= 1.0 is unreachable and never balances — did you mean a fraction like 0.15 rather than a percent like 15?", p.poolBalanceGapOrigin[poolName])
 		}
 	}
 	for poolName, dwell := range p.poolBalanceDwell {
