@@ -20,7 +20,7 @@ type PoolRouter interface {
 	// Route returns the backend to serve a request for the named pool.
 	// ok is false when the pool name is unknown (the middleware fails
 	// closed with 403). When exhausted is true the whole pool is
-	// rate-limited and the caller must emit 429 with the given
+	// rate-limited and the caller must emit 503 with the given
 	// Retry-After (the wait until the soonest member resets); b is then
 	// the soonest-resetting member the client's post-wait retry lands on.
 	Route(pool string) (b Backend, retryAfter time.Duration, ok, exhausted bool)
@@ -35,7 +35,7 @@ type PoolRouter interface {
 // puts ANTHROPIC_AUTH_TOKEN there, and here that value is a local *pool
 // name*, not a credential. The router auto-rotates within that pool. An
 // unknown pool fails closed with 403 and never reaches the upstream; an
-// exhausted pool returns an honest 429 with a precise Retry-After. The
+// exhausted pool returns a 503 with a precise Retry-After. The
 // selector value is deliberately never logged or echoed — a
 // misconfigured client could have put a real token there, and we must
 // not leak it.
@@ -63,9 +63,12 @@ func Middleware(router PoolRouter, next http.Handler) http.Handler {
 			return
 		}
 		if exhausted {
-			// Whole pool is rate-limited; there is nothing to switch to,
-			// so be honest: 429 with the precise wait until the soonest
-			// member resets.
+			// Whole pool is rate-limited; there is nothing to switch to.
+			// Emit 503 (not 429) with the precise wait until the soonest
+			// member resets: a 429 surfaces to Claude Code as a hard
+			// rate-limit error that ends the turn, whereas a 503 is a
+			// transient signal it retries — so the agent auto-resumes once
+			// the advertised window elapses (issue #203).
 			writeRateLimited(w, retryAfter)
 			return
 		}
@@ -94,15 +97,17 @@ func writeForbidden(w http.ResponseWriter) {
 	_, _ = w.Write([]byte(`{"error":"unknown backend selector"}`))
 }
 
-// writeRateLimited emits the honest 429 returned when every member of a
-// pool is exhausted. Retry-After carries the precise wait until the
-// soonest member resets (ceiled to whole seconds, floored at 1 so a
-// client never busy-loops on a zero/negative hint). The body is generic
-// and leaks no nick.
+// writeRateLimited emits the 503 returned when every member of a pool is
+// exhausted. It is a 503, not a 429, deliberately: a 429 ends the Claude
+// Code turn as a hard rate-limit error, whereas a 503 is transient and
+// retried, so the agent auto-resumes once the window resets (issue #203).
+// Retry-After carries the precise wait until the soonest member resets
+// (ceiled to whole seconds, floored at 1 so a client never busy-loops on
+// a zero/negative hint). The body is generic and leaks no nick.
 func writeRateLimited(w http.ResponseWriter, retryAfter time.Duration) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
-	w.WriteHeader(http.StatusTooManyRequests)
+	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = w.Write([]byte(`{"error":"all backends rate-limited"}`))
 }
 

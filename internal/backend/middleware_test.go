@@ -98,7 +98,7 @@ func TestMiddleware_unknownPoolFailsClosed(t *testing.T) {
 	}
 }
 
-func TestMiddleware_exhaustedReturns429(t *testing.T) {
+func TestMiddleware_exhaustedReturns503(t *testing.T) {
 	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("next must not be called when the pool is exhausted")
 	})
@@ -110,8 +110,10 @@ func TestMiddleware_exhaustedReturns429(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusTooManyRequests {
-		t.Errorf("status=%d, want 429", rec.Code)
+	// 503, not 429: a 429 ends the Claude Code turn; a 503 is retried so
+	// the agent auto-resumes once the advertised window resets (issue #203).
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503", rec.Code)
 	}
 	if ra := rec.Header().Get("Retry-After"); ra != "90" {
 		t.Errorf("Retry-After=%q, want 90", ra)

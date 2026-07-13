@@ -520,10 +520,16 @@ its own body:
   transient "retry" signal, deliberately distinct from a `429` — Claude
   Code and any non-trivial client retry it.
 - **Every member is exhausted →** there is nothing to switch to, so the
-  gateway forwards an honest `429` with `Retry-After` set to the precise
-  wait until the soonest member resets (read from the upstream
+  gateway returns a `503` with `Retry-After` set to the precise wait until
+  the soonest member resets (read from the upstream
   `anthropic-ratelimit-unified-reset` header when present, otherwise a
-  conservative 5-hour window). The sticky pointer is pre-pointed at that
+  conservative 5-hour window). It is a `503`, not a `429`, on purpose: a
+  `429` surfaces to Claude Code as a hard rate-limit error that ends the
+  turn, whereas a `503` is a transient signal it retries — so the agent
+  auto-resumes once the advertised window elapses instead of the client
+  giving up while the gateway already knows exactly when a member recovers.
+  The `Retry-After` here is the *long precise* value, distinct from the
+  switch case's `Retry-After: 1`. The sticky pointer is pre-pointed at that
   soonest member so the client's post-wait retry lands on it. An exhausted
   mark clears automatically once its reset time passes — or earlier, the
   moment the polled quota store reports the member fresh and non-blocking

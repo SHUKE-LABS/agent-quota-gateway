@@ -275,7 +275,7 @@ func TestModifyResponse_passThroughCases(t *testing.T) {
 	})
 }
 
-func TestModifyResponse_allExhaustedForwards429WithRetryAfter(t *testing.T) {
+func TestModifyResponse_allExhaustedReturns503WithRetryAfter(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	var logBuf bytes.Buffer
 	c := newController(t, 0, clock, &logBuf, "a", "b")
@@ -288,13 +288,14 @@ func TestModifyResponse_allExhaustedForwards429WithRetryAfter(t *testing.T) {
 		t.Fatalf("after a 429, Current()=%q, want b", c.Current())
 	}
 
-	// b 429s with the sooner reset; pool is now dry → honest 429.
+	// b 429s with the sooner reset; pool is now dry → 503 with the precise
+	// long Retry-After (not a forwarded 429; issue #203).
 	resp := resp429(c.resolve(t, "b"), clock, 120*time.Second)
 	if err := c.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse b: %v", err)
 	}
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Errorf("status=%d, want 429 (pool dry)", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503 (pool dry)", resp.StatusCode)
 	}
 	if ra := resp.Header.Get("Retry-After"); ra != "120" {
 		t.Errorf("Retry-After=%q, want 120 (precise min-reset)", ra)
@@ -315,7 +316,51 @@ func TestModifyResponse_allExhaustedForwards429WithRetryAfter(t *testing.T) {
 		t.Errorf("ResolveAuto retry=%v, want (0,120s]", retry)
 	}
 	if !strings.Contains(logBuf.String(), "all backends exhausted") {
-		t.Errorf("dry-pool 429 not logged; got %q", logBuf.String())
+		t.Errorf("dry-pool 503 not logged; got %q", logBuf.String())
+	}
+}
+
+// TestModifyResponse_dryPoolNoRecoveryRewritesTo503 pins the issue #203
+// no-recovery branch of parkAndFailover: when every member is parked and no
+// poller-tracked member can recover via probe (Anthropic backends are skipped
+// by the probe), the last 429 is rewritten to a 503 that carries the precise
+// long Retry-After (the exact wait to the soonest reset), NOT the ~1s switch
+// value. The upstream body and anthropic-ratelimit-* headers are replaced so
+// the synthetic response leaks no member quota state out the pool channel.
+func TestModifyResponse_dryPoolNoRecoveryRewritesTo503(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+
+	// a 429s (far reset) → switch to b.
+	if err := c.ModifyResponse(resp429(c.resolve(t, "a"), clock, 300*time.Second)); err != nil {
+		t.Fatalf("ModifyResponse a: %v", err)
+	}
+	// b 429s (sooner reset) → pool dry, no poller recovery for Anthropic.
+	resp := resp429(c.resolve(t, "b"), clock, 120*time.Second)
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse b: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503 (dry, no recovery)", resp.StatusCode)
+	}
+	// Precise long Retry-After, not the ~1s switch value.
+	if ra := resp.Header.Get("Retry-After"); ra != "120" {
+		t.Errorf("Retry-After=%q, want 120 (precise min-reset, not the switch ~1s)", ra)
+	}
+	// Upstream 429 body replaced with the generic pool-dry object.
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "upstream 429 body") {
+		t.Errorf("dry-pool 503 still carries the upstream body: %q", body)
+	}
+	if !strings.Contains(string(body), "all backends rate-limited") {
+		t.Errorf("dry-pool 503 body=%q, want the generic pool-dry object", body)
+	}
+	// The last-parked member's quota headers must not leak out the pool.
+	for k := range resp.Header {
+		if strings.HasPrefix(strings.ToLower(k), "anthropic-ratelimit-") {
+			t.Errorf("dry-pool 503 leaked upstream quota header %q", k)
+		}
 	}
 }
 
@@ -323,13 +368,13 @@ func TestResolveAuto_reEligibleAfterReset(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "solo")
 
-	// The only backend 429s → pool dry.
+	// The only backend 429s → pool dry → client-facing 503 (issue #203).
 	resp := resp429(c.resolve(t, "solo"), clock, 100*time.Second)
 	if err := c.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status=%d, want 429 (single-backend pool dry)", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503 (single-backend pool dry)", resp.StatusCode)
 	}
 	if _, _, exhausted := c.ResolveAuto(); !exhausted {
 		t.Fatalf("ResolveAuto exhausted=false right after 429, want true")
@@ -643,8 +688,8 @@ func TestModifyResponse_genuine429NoResetHeaderParks(t *testing.T) {
 	if err := c.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status=%d, want 429 (single-backend pool dry)", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503 (single-backend pool dry)", resp.StatusCode)
 	}
 	// Still parked just shy of the conservative window.
 	clock.advance(defaultExhaustionWindow - time.Minute)
@@ -744,9 +789,9 @@ func TestPools_routesPerPool(t *testing.T) {
 	if err := pools.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
-	// api is a single-member pool → dry → honest 429.
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Errorf("api 429 status=%d, want 429 (single-member pool dry)", resp.StatusCode)
+	// api is a single-member pool → dry → client-facing 503 (issue #203).
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("api 429 status=%d, want 503 (single-member pool dry)", resp.StatusCode)
 	}
 	// The auto pool is still healthy and resolvable.
 	if _, _, _, exhausted := pools.Route("auto"); exhausted {

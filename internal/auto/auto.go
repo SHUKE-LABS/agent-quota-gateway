@@ -1959,19 +1959,25 @@ func hasLegacyRateLimitHeader(h http.Header) bool {
 }
 
 // parkAndFailover parks nick until reset, advances the sticky pointer, and
-// rewrites resp: a 503 "backend switching" when a healthy member remains, or
-// the honest upstream status with a precise Retry-After when the pool is dry.
-// reason is the log phrase describing why the backend was parked.
+// rewrites resp: a 503 "backend switching" (short Retry-After) when a healthy
+// member remains, or a 503 with the precise long Retry-After when the pool is
+// dry. reason is the log phrase describing why the backend was parked.
 //
 // When every member is parked (res.allExhausted), a recovery probe is fired
-// against each poller-recognised member before the upstream 429 is
-// forwarded: if a probe returns a snapshot that no longer satisfies the
+// against each poller-recognised member before the response is finalised:
+// if a probe returns a snapshot that no longer satisfies the
 // freshness/exhaustion predicate (windowBlocks — the post-#125 rule), the
 // member's park mark is cleared and the pool retries selection. If any
 // member is now selectable, the response is rewritten to 503 (the normal
 // switch shape) and the request is effectively re-routed to the recovered
-// member. If the probe does not produce a healthy member, the existing
-// forward-upstream-429 path runs (issue #124).
+// member. If the probe does not produce a healthy member, a genuine-quota 429
+// is rewritten to a 503 carrying the precise long Retry-After (the exact wait
+// until the soonest member resets) rather than forwarded as a 429: a 429 ends
+// the Claude Code turn, a 503 is retried, so the agent auto-resumes once the
+// window resets (issue #203). A credential-rejection (401/403) all-dead case
+// is instead forwarded honestly with the same Retry-After — the client must
+// see the real auth status, not a transient 503 (the dry-pool failover itself
+// is #124).
 func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset time.Time, reason string) error {
 	res := c.record429(nick, reset)
 
@@ -1990,6 +1996,17 @@ func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset tim
 			return nil
 		}
 		secs := retryAfterSeconds(res.retryAfter)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			// Genuine quota exhaustion: rewrite the 429 to a 503 carrying the
+			// precise long Retry-After so Claude Code retries and auto-resumes
+			// once the window resets, rather than ending the turn on a hard 429
+			// (issue #203). A credential-rejection (401/403) all-dead case is
+			// NOT a 429 and is forwarded honestly below — the client must see
+			// the real auth status, not a transient 503.
+			rewriteTo503DryPool(resp, secs)
+			fmt.Fprintf(c.logOut, "auto[%s]: all backends exhausted; returning 503 (retry after %ds)\n", c.pool, secs)
+			return nil
+		}
 		setRetryAfter(resp.Header, secs)
 		fmt.Fprintf(c.logOut, "auto[%s]: all backends exhausted; forwarding upstream %d (retry after %ds)\n", c.pool, resp.StatusCode, secs)
 		return nil
@@ -2753,6 +2770,39 @@ func rewriteTo503(resp *http.Response) {
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	h.Del("Content-Encoding")
 	h.Set("Retry-After", strconv.Itoa(switchRetryAfterSeconds))
+}
+
+// rewriteTo503DryPool turns the upstream 429 that exhausted the last member
+// into the client-facing 503 emitted when the whole pool is dry. Unlike
+// rewriteTo503 (the switch shape, Retry-After≈1s) it carries the precise
+// long Retry-After (secs = the exact wait until the soonest member resets),
+// so a client that honours it retries once the window actually recovers.
+// It is a 503 rather than a forwarded 429 on purpose: a 429 ends the Claude
+// Code turn as a hard rate-limit error, a 503 is a transient signal it
+// retries, so the agent auto-resumes (issue #203). The upstream body is
+// replaced with a generic object matching backend.writeRateLimited so both
+// pool-dry emission points read consistently, and the upstream
+// anthropic-ratelimit-* headers are stripped — pool-boundary hygiene: the
+// synthetic response must not carry the last-parked member's quota state out
+// the pool channel.
+func rewriteTo503DryPool(resp *http.Response, secs int) {
+	body := []byte(`{"error":"all backends rate-limited"}`)
+
+	resp.StatusCode = http.StatusServiceUnavailable
+	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+
+	h := resp.Header
+	for k := range h {
+		if strings.HasPrefix(strings.ToLower(k), "anthropic-ratelimit-") {
+			h.Del(k)
+		}
+	}
+	h.Set("Content-Type", "application/json")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	h.Del("Content-Encoding")
+	setRetryAfter(h, secs)
 }
 
 // rewriteTo503WithBody turns an upstream policy/punishment 429 into a 503

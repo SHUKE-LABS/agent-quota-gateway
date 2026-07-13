@@ -72,9 +72,10 @@ request dump (`internal/reqlog`, credentials redacted).
    selector (falls back to `X-Api-Key`), normalizes it, and calls
    `auto.Pools.Route`.
 2. `Route` returns **403 unknown selector** (fail closed, no upstream
-   round-trip), **429 + Retry-After** (whole pool exhausted — wait until
-   the soonest member resets), or the pool's current **sticky backend**,
-   stored on the request context.
+   round-trip), **503 + Retry-After** (whole pool exhausted — wait until
+   the soonest member resets; 503 not 429 so Claude Code retries and
+   auto-resumes rather than ending the turn, issue #203), or the pool's
+   current **sticky backend**, stored on the request context.
 3. `proxy.New`'s director reads the resolved backend, picks the auth
    scheme by credential prefix (`sk-ant-oat*`→`Bearer`+`oauth-2025-04-20`
    beta; `sk-ant-api*`→`x-api-key`; else `Bearer` no beta), and forwards
@@ -87,9 +88,11 @@ request dump (`internal/reqlog`, credentials redacted).
    quota window. An empty / org-id-only Put would wipe the last known
    resets (issue #121), so `hasQuotaWindow` gates it.
 5. `pools.ModifyResponse` dispatches per-pool failover: upstream **429**
-   → synthetic **503** (switch member) or honest **429** (pool dry);
-   **401/403** → park the dead credential and fail over (a revoked account
-   never 429s, so without this the pool would stick to it).
+   → synthetic **503** (switch member — short `Retry-After`) or **503**
+   with the precise long `Retry-After` (pool dry, issue #203; the two 503
+   flavors differ only in `Retry-After`); **401/403** → park the dead
+   credential and fail over (a revoked account never 429s, so without this
+   the pool would stick to it).
 
 ### Packages
 
