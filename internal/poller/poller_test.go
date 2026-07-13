@@ -186,6 +186,36 @@ func TestParseMinimaxi_emptyRemainsIsError(t *testing.T) {
 	}
 }
 
+func TestParseMinimaxi_absentRemainingPercentNotFabricated(t *testing.T) {
+	// An entry that carries the weekly window but omits
+	// current_interval_remaining_percent must NOT fabricate a 5h
+	// utilization=1.0 window (issue #207): a plain float64 would read the
+	// absent field as 0 → (100-0)/100 = 1.0 and park a healthy member.
+	body := []byte(`{
+		"model_remains": [
+			{
+				"model_name": "general",
+				"current_weekly_remaining_percent": 90,
+				"weekly_end_time": 1781452800000
+			}
+		]
+	}`)
+	snap, err := parseMinimaxi(body, fixedNow)
+	if err != nil {
+		t.Fatalf("parseMinimaxi: %v", err)
+	}
+	if snap.Unified5hUtilization != nil {
+		t.Fatalf("Unified5hUtilization = %v; want nil (interval field absent)", *snap.Unified5hUtilization)
+	}
+	wantFloatPtr(t, "Unified7dUtilization", snap.Unified7dUtilization, 0.10)
+
+	// An entry with no remaining-percent fields at all is unreadable and must
+	// error, so store.Merge keeps the prior good snapshot.
+	if _, err := parseMinimaxi([]byte(`{"model_remains":[{"model_name":"general"}]}`), fixedNow); err == nil {
+		t.Fatal("parseMinimaxi: want error when no remaining-percent fields present, got nil")
+	}
+}
+
 func TestParseVolcengine_sessionWeeklyMapped(t *testing.T) {
 	// session → 5h window, weekly → 7d window. ResetTimestamp is epoch
 	// seconds (not milliseconds). monthly is ignored.
