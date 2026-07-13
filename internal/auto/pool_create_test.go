@@ -1,13 +1,117 @@
 package auto
 
 import (
+	"io"
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
+
+// loadPoolsWithStore is loadMovePools wired to a live quota store, so the
+// store-exhaustion signal (what the poller fills for poller-tracked members) is
+// active for the runtime-pool tests below.
+func loadPoolsWithStore(t *testing.T, clock *fixedClock, store *quota.Store, env map[string]string) *Pools {
+	t.Helper()
+	scrubPoolEnv(t)
+	for k, v := range env {
+		t.Setenv(k, v)
+	}
+	reg, err := backend.Load(testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	return NewPools(reg, store, clock.now, io.Discard)
+}
+
+// TestRuntimePool_failsOverOnStoreExhaustion proves a pool created at runtime
+// fails over between its members on the store-exhaustion signal exactly as an
+// env-declared pool does. The poller — now reading its pool set dynamically
+// (issue #202) — is what fills that store for poller-tracked members (Z.AI),
+// so without this the runtime pool would never detect exhaustion or fail over.
+func TestRuntimePool_failsOverOnStoreExhaustion(t *testing.T) {
+	clock := newMoveClock()
+	store := quota.NewStore()
+	p := loadPoolsWithStore(t, clock, store, map[string]string{
+		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
+	})
+
+	if status, err := p.AddPool("rt", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool: status=%d err=%v", status, err)
+	}
+	if status, err := p.AddMember("rt", "a", "cred-a", "https://api.z.ai", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember a: status=%d err=%v", status, err)
+	}
+	if status, err := p.AddMember("rt", "b", "cred-b", "https://api.z.ai", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember b: status=%d err=%v", status, err)
+	}
+
+	// "a" is the active sticky (first member added). The store reports it fully
+	// consumed — util 1.0, no status: the shape a poller-tracked Z.AI member
+	// produces — so Route must fail the runtime pool over to the healthy "b".
+	c, ok := p.controller("rt")
+	if !ok {
+		t.Fatalf("controller(rt) not found")
+	}
+	putUtil(t, store, c, "a", 1.0, clock.now().Add(time.Hour))
+
+	b, _, known, exhausted := p.Route("rt")
+	if !known {
+		t.Fatalf("Route(rt): known=false")
+	}
+	if exhausted {
+		t.Fatalf("Route(rt): exhausted=true, want false (b is healthy)")
+	}
+	if b.Nick != "b" {
+		t.Errorf("Route(rt) picked %q, want b (a is store-exhausted)", b.Nick)
+	}
+}
+
+// TestRuntimePool_preemptedAfterSetPriority proves a pool created at runtime and
+// then given a priority order via SetPriority is picked up by the preemptor,
+// which reads the pool set fresh each tick (issue #202), and preempted back to
+// its healthy higher-priority member. The preemptor is built BEFORE the pool
+// exists, so this asserts dynamic pickup rather than a startup snapshot.
+func TestRuntimePool_preemptedAfterSetPriority(t *testing.T) {
+	clock := newMoveClock()
+	store := quota.NewStore()
+	p := loadPoolsWithStore(t, clock, store, map[string]string{
+		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
+	})
+
+	// Preemptor constructed while only the env pool "src" exists.
+	pre := NewPreemptor(p, store, 0, clock.now, io.Discard)
+
+	if status, err := p.AddPool("rt", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool: status=%d err=%v", status, err)
+	}
+	if status, err := p.AddMember("rt", "a", "cred-a", "https://api.z.ai", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember a: status=%d err=%v", status, err)
+	}
+	if status, err := p.AddMember("rt", "b", "cred-b", "https://api.z.ai", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember b: status=%d err=%v", status, err)
+	}
+	if status, err := p.SetPriority("rt", []string{"a", "b"}); status != http.StatusOK || err != nil {
+		t.Fatalf("SetPriority: status=%d err=%v", status, err)
+	}
+
+	// Model the pool having fallen over to the lower-priority "b"; "a" is healthy.
+	c, ok := p.controller("rt")
+	if !ok {
+		t.Fatalf("controller(rt) not found")
+	}
+	c.setCur("b")
+
+	// One tick: the preemptor (built before rt existed) must now see rt and
+	// switch back to the healthy higher-priority "a".
+	pre.tick()
+	if got := c.Current(); got != "a" {
+		t.Errorf("Current(rt) = %q, want a (runtime pool preempted back to healthy higher)", got)
+	}
+}
 
 // poolNames returns the set of pool names present in EffectiveConfig.
 func poolNames(t *testing.T, p *Pools) map[string]bool {

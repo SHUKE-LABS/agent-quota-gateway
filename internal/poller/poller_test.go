@@ -361,6 +361,40 @@ func stubCurrent(m map[string]backend.Backend) CurrentFunc {
 	}
 }
 
+// TestPollAll_dynamicPoolSet proves NewDynamic re-reads its pool set on every
+// tick: a pool absent when the poller was built (as a runtime-created pool is)
+// is skipped, then polled on the next tick once the supplier reports it — the
+// fix for the frozen poolNames snapshot in issue #202.
+func TestPollAll_dynamicPoolSet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":{"limits":[
+			{"type":"TOKENS_LIMIT","percentage":25,"nextResetTime":1781418024826}
+		]}}`)
+	}))
+	defer srv.Close()
+
+	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
+	store := quota.NewStore()
+
+	// Supplier starts empty, then gains "chn" — modelling AddPool after startup.
+	var names []string
+	p := NewDynamic(func() []string { return names },
+		stubCurrent(map[string]backend.Backend{"chn": b}),
+		nil, store, srv.Client(), time.Hour, func() time.Time { return fixedNow }, io.Discard)
+	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
+
+	// First tick: the pool does not exist yet, so nothing is polled.
+	p.pollAll(context.Background())
+	if store.Get(b.QuotaKey()).HasData() {
+		t.Fatal("store populated before the pool appeared in the supplier")
+	}
+
+	// The pool appears at runtime; the next tick must pick it up.
+	names = []string{"chn"}
+	p.pollAll(context.Background())
+	wantFloatPtr(t, "Unified5hUtilization", store.Get(b.QuotaKey()).Unified5hUtilization, 0.25)
+}
+
 func TestPollAll_zaiPopulatesStoreWithCorrectAuth(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
