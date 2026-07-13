@@ -329,6 +329,7 @@ Declaring both is a startup error.
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
 | `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file's `config` / `added_pools` keys are ignored on load (the first-deploy bootstrap reads them once; see [Config file](#config-file)). |
+| `AQG_DEBUG_LOG_REQUESTS` | _(unset)_ | Set to `1` to dump every inbound request and outbound upstream request to stderr for debugging; any other value (or unset) leaves it off. Credentials are always redacted — the `Authorization` and `x-api-key` headers are never logged — but the inbound request body is dumped and may contain user message content, so enable only in dev/debug runs. |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
@@ -728,6 +729,16 @@ mutation is re-validated by the same rules as a startup load (including the
 nick↔credential bijection), so an invalid change is rejected and the prior
 config is kept. In env-only mode (no config file) mutations are in-memory only.
 
+**Watching for a lagging flush.** The debounced write to `aqg.json` can lag
+or fail while the in-memory registry has already moved on. When it does,
+`GET /_gateway/config` sets an `X-AQG-Unsaved-Config: true` response header,
+and `GET /_gateway/health` adds `unsaved_config_changes: true` to its body
+(see [Health](#health)). Either signal means on-disk config trails memory, so
+a restart could lose runtime mutations — including credentials — that have not
+yet reached disk; monitor for it and expect it to clear once the flush lands.
+Neither signal is emitted in env-only mode, where there is no config file to
+flush.
+
 A priority reorder does **not** force the pool off a healthy active member
 (prompt-cache preservation is unchanged): the new order takes effect on the
 next failover and on reset-driven preempt-back. Validation: an unknown nick
@@ -885,11 +896,19 @@ curl http://127.0.0.1:8080/_gateway/ui
 ### Health
 
 A loopback-only liveness probe is exposed at `GET /_gateway/health`. It
-returns `200` with body `{"status":"ok"}` and a `Content-Type` of
-`application/json`. The response is intentionally minimal — no version, no
-uptime, no upstream reachability check — because the trust model treats
-any local process as legitimate. Like `/_gateway/quota`, it is `GET`-only;
-any other method returns `405` with an `Allow: GET` response header.
+returns `200` with a `Content-Type` of `application/json`. The response
+carries no version, uptime, or upstream reachability check — because the
+trust model treats any local process as legitimate. The body is normally
+`{"status":"ok"}`, but when the on-disk `aqg.json` lags the in-memory
+config (a pending or failed debounced flush — issue #198 decision 3) it
+gains a second field: `{"status":"ok","unsaved_config_changes":true}`.
+That field is the operator's signal that runtime mutations — including
+credentials — may not yet be persisted; watch for it and expect it to
+clear once the flush succeeds. It never appears in env-only mode (no
+config file, so nothing to flush). A strict readiness probe should assert
+on `status` rather than a byte-for-byte body match. Like `/_gateway/quota`,
+it is `GET`-only; any other method returns `405` with an `Allow: GET`
+response header.
 
 ## Security model
 
