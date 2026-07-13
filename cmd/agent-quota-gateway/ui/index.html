@@ -78,6 +78,22 @@
   }
   #banner.show { display: block; }
 
+  /* Persistent unsaved-config warning (issue #218). Kept separate from
+     #banner so transient showBanner messages neither overwrite it nor trigger
+     its auto-hide; this one stays visible until a later config load clears it.
+     Amber, not the danger red of #banner, so a lagging on-disk write reads as
+     a warning rather than a hard failure. */
+  #unsaved {
+    display: none;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    border-radius: 6px;
+    background: rgba(154, 103, 0, 0.12);
+    color: #9a6700;
+    border: 1px solid #9a6700;
+  }
+  #unsaved.show { display: block; }
+
   .pool {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -416,6 +432,7 @@
 </header>
 <main>
   <div id="banner" role="alert"></div>
+  <div id="unsaved" role="alert"></div>
   <div id="addsub"></div>
   <div id="pools"></div>
 </main>
@@ -438,6 +455,7 @@
 
   var root = document.getElementById('pools');
   var banner = document.getElementById('banner');
+  var unsavedBanner = document.getElementById('unsaved');
   var POLL_MS = 3000;
 
   // currentViews holds the latest sanitized config views, so the move flow can
@@ -452,6 +470,22 @@
     showBanner._t = setTimeout(function () {
       banner.classList.remove('show');
     }, 5000);
+  }
+
+  // showUnsaved surfaces the persistent unsaved-config warning (issue #218)
+  // driven by the X-AQG-Unsaved-Config response header on /_gateway/config.
+  // No auto-hide: it stays until a later config load reports the header gone.
+  // The header is set only when a config flush to disk has FAILED
+  // (internal/configfile Unsaved), so this is a genuine data-loss risk, not a
+  // transient "write pending" state.
+  function showUnsaved(on) {
+    if (on) {
+      unsavedBanner.textContent =
+        'On-disk config lags memory; a recent change may not be saved yet.';
+      unsavedBanner.classList.add('show');
+    } else {
+      unsavedBanner.classList.remove('show');
+    }
   }
 
   function escapeHTML(s) {
@@ -500,12 +534,15 @@
   function fetchJSON(url, opts) {
     return fetch(url, opts || {}).then(function (resp) {
       var ct = resp.headers.get('content-type') || '';
+      // Only /_gateway/config sets this; harmless (false) elsewhere. Read here
+      // so loadConfig can surface the unsaved-config warning (issue #218).
+      var unsavedConfig = resp.headers.get('X-AQG-Unsaved-Config') === 'true';
       var p = resp.text().then(function (text) {
         var body = text;
         if (ct.indexOf('application/json') !== -1) {
           try { body = JSON.parse(text); } catch (e) { body = null; }
         }
-        return { status: resp.status, ok: resp.ok, body: body };
+        return { status: resp.status, ok: resp.ok, body: body, unsavedConfig: unsavedConfig };
       });
       return p;
     });
@@ -979,8 +1016,11 @@
     return fetchJSON('/_gateway/config').then(function (r) {
       if (!r.ok || !Array.isArray(r.body)) {
         showBanner('Failed to load /_gateway/config (status ' + r.status + ')');
+        // Leave the unsaved warning as-is: a failed fetch is not evidence the
+        // on-disk flush succeeded, so don't clear a standing warning here.
         return [];
       }
+      showUnsaved(r.unsavedConfig);
       return r.body.map(sanitizeView);
     });
   }

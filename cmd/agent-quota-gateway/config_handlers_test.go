@@ -559,6 +559,17 @@ func TestUIHandler_servesHTML(t *testing.T) {
 	}
 }
 
+// TestUIHandler_surfacesUnsavedConfig is the regression guard for issue #218:
+// the management UI must consume the X-AQG-Unsaved-Config signal it was built
+// to display. Before the fix a grep for the header over the embedded page
+// returned zero matches — the documented UI-facing signal was silently ignored.
+// A static assertion on uiHTML keeps a future copy from dropping the consumer.
+func TestUIHandler_surfacesUnsavedConfig(t *testing.T) {
+	if !strings.Contains(uiHTML, "X-AQG-Unsaved-Config") {
+		t.Error("UI HTML does not reference X-AQG-Unsaved-Config; the unsaved-config warning is not wired (issue #218)")
+	}
+}
+
 // TestUIHandler_methodNotAllowed confirms non-GET methods receive 405 with
 // an Allow header, matching the policy of the other /_gateway/* endpoints.
 func TestUIHandler_methodNotAllowed(t *testing.T) {
