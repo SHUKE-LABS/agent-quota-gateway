@@ -959,6 +959,16 @@ func (r *Registry) WithMemberRemoved(poolName, nick string) (*Registry, error) {
 		return nil, fmt.Errorf("backend: pool %q has no member %q", poolName, nick)
 	}
 	delete(ps.Members, nick)
+	// Draining the last member drops the pool's declared base_url: a zero-member
+	// pool that still carried a non-default base_url would trip the
+	// memberless-pool guard in buildRegistry ("declared base_url but no
+	// backends"), making the final member of a vendor pool unremovable
+	// (issue #200). Clearing it is loss-free — refilling an empty pool via
+	// AddMember requires an explicit base_url anyway, which re-establishes the
+	// vendor upstream at the member level.
+	if len(ps.Members) == 0 {
+		ps.BaseURL = ""
+	}
 	if len(ps.Priority) > 0 {
 		pruned := make([]string, 0, len(ps.Priority))
 		for _, n := range ps.Priority {

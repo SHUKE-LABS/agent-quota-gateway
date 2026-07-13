@@ -118,6 +118,71 @@ func TestWithMemberRemoved_prunesPriority(t *testing.T) {
 	}
 }
 
+// TestWithMemberRemoved_drainsDeclaredBasePool proves that removing the last
+// member of a pool whose base_url differs from the gateway default drains it to
+// a valid zero-member pool — parity with a default-base pool — and that the
+// drained pool round-trips through Spec()→BuildFromSpec (restart-safe), rather
+// than tripping the memberless-pool guard (issue #200).
+func TestWithMemberRemoved_drainsDeclaredBasePool(t *testing.T) {
+	reg, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{
+		"zai": { // declared base_url, single member
+			BaseURL: "https://open.example/anthropic",
+			Members: map[string]MemberSpec{"only": {Credential: "vendor-only"}},
+		},
+		"auto": { // default-base, single member (parity control)
+			Members: map[string]MemberSpec{"solo": {Credential: "cred-solo"}},
+		},
+	}}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+
+	// Declared-base pool drains to empty without error.
+	drained, err := reg.WithMemberRemoved("zai", "only")
+	if err != nil {
+		t.Fatalf("draining declared-base pool: %v", err)
+	}
+	if !drained.HasPool("zai") {
+		t.Fatal("zai pool vanished after draining its last member")
+	}
+	if nicks := drained.PoolNicks("zai"); len(nicks) != 0 {
+		t.Fatalf("zai should be empty after drain, got %v", nicks)
+	}
+
+	// Parity: the default-base pool drains the same way.
+	if _, err := reg.WithMemberRemoved("auto", "solo"); err != nil {
+		t.Fatalf("draining default-base pool: %v", err)
+	}
+
+	// Restart-safety: the drained declared-base pool round-trips cleanly.
+	if spec := drained.Spec(); spec.Pools["zai"].BaseURL != "" {
+		t.Fatalf("drained zai still emits base_url %q; would trip the guard on reload", spec.Pools["zai"].BaseURL)
+	}
+	rebuilt, err := BuildFromSpec(drained.Spec(), testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("rebuild of drained pool: %v", err)
+	}
+	if !rebuilt.HasPool("zai") || len(rebuilt.PoolNicks("zai")) != 0 {
+		t.Fatal("drained zai did not survive Spec()->BuildFromSpec as an empty pool")
+	}
+}
+
+// TestBuildFromSpec_memberlessBaseURLStillRejected fences the typo guard: a
+// genuine load declaring base_url for a pool with zero members is almost
+// certainly a typo'd nick and must still fail closed (issue #200 must not
+// weaken this for the initial load path).
+func TestBuildFromSpec_memberlessBaseURLStillRejected(t *testing.T) {
+	_, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{
+		"zai": {BaseURL: "https://open.example/anthropic"}, // no members
+		"auto": {
+			Members: map[string]MemberSpec{"a": {Credential: "cred-a"}},
+		},
+	}}, testDefaultBaseURL)
+	if err == nil {
+		t.Fatal("expected memberless-pool base_url to be rejected on load")
+	}
+}
+
 func TestWithMemberDisabled(t *testing.T) {
 	reg := specFixture(t)
 	reg2, err := reg.WithMemberDisabled("auto", "b", true)

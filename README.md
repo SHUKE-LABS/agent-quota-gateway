@@ -772,6 +772,13 @@ not merely flagged disabled, and is never selected for routing. Any removed
 member can be re-added with `POST .../member/{nick}`, which writes it back into
 the config.
 
+Removing the **last** member drains the pool to a valid zero-member pool — this
+holds for a vendor pool with its own `base_url` (`z-ai`, `minimax`, …) just as
+it does for a default-upstream pool; the drained pool persists and is refilled
+with `POST .../member/{nick}` (which requires an explicit `base_url` for an empty
+pool, re-establishing the vendor upstream). There is no separate pool-deletion
+API.
+
 **Moving a subscription between pools.** `POST
 /_gateway/pool/{name}/member/{nick}/move` relocates a subscription from `{name}`
 to the pool named in the body. It is the same write-through machinery: a remove
