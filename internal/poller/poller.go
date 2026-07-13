@@ -698,13 +698,23 @@ func parseZhipu(body []byte, now time.Time) (quota.Snapshot, error) {
 // reports the *remaining* percentage (100 = full quota), so utilization is
 // 100 minus that, divided by 100. The first model_remains entry drives the
 // snapshot; end_time / weekly_end_time are epoch milliseconds.
+//
+// The remaining-percent fields are decoded as *float64 so an absent field is
+// distinguishable from a real 0: a plain float64 would read a missing
+// current_interval_remaining_percent as 0, yielding utilization
+// (100-0)/100 = 1.0 and fabricating full exhaustion from a partial/renamed
+// body (issue #207). Each window is populated only when its remaining-percent
+// is actually present, and the trailing !HasData() guard — matching parseZhipu
+// / parseVolcengine — turns an unreadable entry (e.g. {}) into an error so
+// store.Merge preserves the prior good snapshot instead of parking a healthy
+// member.
 func parseMinimaxi(body []byte, now time.Time) (quota.Snapshot, error) {
 	var resp struct {
 		ModelRemains []struct {
-			CurrentIntervalRemainingPercent float64 `json:"current_interval_remaining_percent"`
-			CurrentWeeklyRemainingPercent   float64 `json:"current_weekly_remaining_percent"`
-			EndTime                         int64   `json:"end_time"`
-			WeeklyEndTime                   int64   `json:"weekly_end_time"`
+			CurrentIntervalRemainingPercent *float64 `json:"current_interval_remaining_percent"`
+			CurrentWeeklyRemainingPercent   *float64 `json:"current_weekly_remaining_percent"`
+			EndTime                         int64    `json:"end_time"`
+			WeeklyEndTime                   int64    `json:"weekly_end_time"`
 		} `json:"model_remains"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -715,10 +725,17 @@ func parseMinimaxi(body []byte, now time.Time) (quota.Snapshot, error) {
 	}
 	m := resp.ModelRemains[0]
 	snap := quota.Snapshot{AsOf: now.UTC()}
-	snap.Unified5hUtilization = floatPtr((100 - m.CurrentIntervalRemainingPercent) / 100)
-	snap.Unified5hReset = msToTime(m.EndTime)
-	snap.Unified7dUtilization = floatPtr((100 - m.CurrentWeeklyRemainingPercent) / 100)
-	snap.Unified7dReset = msToTime(m.WeeklyEndTime)
+	if m.CurrentIntervalRemainingPercent != nil {
+		snap.Unified5hUtilization = floatPtr((100 - *m.CurrentIntervalRemainingPercent) / 100)
+		snap.Unified5hReset = msToTime(m.EndTime)
+	}
+	if m.CurrentWeeklyRemainingPercent != nil {
+		snap.Unified7dUtilization = floatPtr((100 - *m.CurrentWeeklyRemainingPercent) / 100)
+		snap.Unified7dReset = msToTime(m.WeeklyEndTime)
+	}
+	if !snap.HasData() {
+		return quota.Snapshot{}, fmt.Errorf("no usable remaining-percent fields in response")
+	}
 	return snap, nil
 }
 
