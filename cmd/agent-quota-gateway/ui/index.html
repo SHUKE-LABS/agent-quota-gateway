@@ -18,6 +18,7 @@
     --ok: #1a7f37;
     --warn: #9a6700;
     --shadow: 0 1px 2px rgba(31, 35, 40, 0.04), 0 3px 6px rgba(31, 35, 40, 0.06);
+    --scroll-shadow: rgba(31, 35, 40, 0.22);
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   }
   @media (prefers-color-scheme: dark) {
@@ -33,6 +34,7 @@
       --ok: #3fb950;
       --warn: #d29922;
       --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 3px 6px rgba(0, 0, 0, 0.4);
+      --scroll-shadow: rgba(0, 0, 0, 0.55);
     }
   }
   * { box-sizing: border-box; }
@@ -166,33 +168,40 @@
      small tablets and phones) the cell can no longer hold it. This wrapper
      lets the table scroll horizontally inside its card instead of clipping
      the rightmost (actions) column. */
-  .members-scroll { overflow-x: auto; }
   /* On phones the members table overflows .members-scroll (a 7-column table
      can never fit a 375px viewport). It scrolls there, but touch viewports
      show no scrollbar affordance — Chromium suppresses custom scrollbars
-     under overlay/touch mode — so the clipped right columns read as missing
-     rather than scrollable. A static right-edge fade is the chosen indicator
-     (owner rejected a visible scrollbar as ugly; a JS scroll-aware overlay
-     was rejected too). The ::after is positioned against .members-scroll's
-     padding box (position:relative), so it pins to the visible right edge
-     and stays put while the table scrolls under it; pointer-events:none
-     keeps the touch scroll unblocked. The gradient's terminus is --panel so
-     it blends in both light and dark. Above the breakpoint (desktop / wide
-     tablets) the table fits and no fade shows. Static rather than an
-     animation-timeline:scroll() fade-out: iOS Safari lacks that feature, so
-     a large share of mobile users would see no affordance at all. */
-  @media (max-width: 720px) {
-    .members-scroll { position: relative; }
-    .members-scroll::after {
-      content: '';
-      position: absolute;
-      top: 0;
-      right: 0;
-      bottom: 0;
-      width: 28px;
-      background: linear-gradient(to right, transparent, var(--panel));
-      pointer-events: none;
-    }
+     under overlay/touch mode — so the clipped columns read as missing rather
+     than scrollable. An edge fade is the chosen indicator (owner rejected a
+     visible scrollbar as ugly, and a JS scroll-aware overlay too).
+
+     This uses the pure-CSS background-attachment:local scroll-shadow technique
+     (Lea Verou / Roman Komarov). Four background layers on the scroll box:
+     two --panel-colored *cover* gradients painted with background-attachment:
+     local (so they scroll with the content) sit on top of two *shadow*
+     gradients with background-attachment: scroll (pinned to the box edges).
+     At a scroll extreme the content edge lines up with the box edge, so the
+     cover masks the shadow beneath and that fade disappears — the fade shows
+     only when there is actually more content in that direction. This makes it
+     self-hiding at both edges, so it needs no viewport gate: at desktop the
+     table fits, nothing scrolls, both covers mask their shadows → invisible.
+
+     Chosen over animation-timeline:scroll() because iOS Safari lacks that
+     feature (a large share of mobile users would get no affordance at all),
+     while background-attachment: local is long-supported there. Covers are
+     --panel so they blend in both themes; the shadow uses the theme-aware
+     --scroll-shadow. Backgrounds sit behind content, so the fade never blocks
+     the touch scroll. */
+  .members-scroll {
+    overflow-x: auto;
+    background:
+      linear-gradient(to right, var(--panel), transparent) left center,
+      linear-gradient(to left, var(--panel), transparent) right center,
+      linear-gradient(to right, var(--scroll-shadow), transparent) left center,
+      linear-gradient(to left, var(--scroll-shadow), transparent) right center;
+    background-repeat: no-repeat;
+    background-size: 28px 100%, 28px 100%, 20px 100%, 20px 100%;
+    background-attachment: local, local, scroll, scroll;
   }
   table.members {
     width: 100%;
