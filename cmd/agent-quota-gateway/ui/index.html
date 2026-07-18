@@ -114,28 +114,12 @@
   .pool .badge { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
   .pool .updated { margin-left: auto; font-size: 12px; color: var(--muted); font-family: var(--mono); }
 
-  .columns {
-    display: grid;
-    grid-template-columns: minmax(160px, 280px) minmax(0, 1fr);
-    gap: 0;
-  }
-  /* Stack the two cards once the viewport can no longer fit the priority
-     column beside the wide 7-column members table side-by-side (priority
-     ~280px + table min-content ~727px + chrome). Below this the table takes
-     the full card width instead of being squeezed into a scrolling cell. */
-  @media (max-width: 1080px) {
-    .columns { grid-template-columns: 1fr; }
-  }
   .col {
     padding: 12px 16px;
-    /* Allow the grid item to be narrower than its (wide) content so the
-       members table's .members-scroll wrapper can actually scroll instead of
-       forcing the cell past the card edge (clipped by .pool overflow:hidden). */
+    /* Allow this block to be narrower than its (wide) content so the members
+       table's .members-scroll wrapper can actually scroll instead of forcing
+       the block past the card edge (clipped by .pool overflow:hidden). */
     min-width: 0;
-  }
-  .col + .col { border-left: 1px solid var(--border); }
-  @media (max-width: 1080px) {
-    .col + .col { border-left: none; border-top: 1px solid var(--border); }
   }
   .col h3 {
     margin: 0 0 8px;
@@ -145,33 +129,25 @@
     color: var(--muted);
   }
 
-  ol.priority {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    counter-reset: prio;
-  }
-  ol.priority li {
-    counter-increment: prio;
+  /* Priority rank + reorder controls, folded into the members table's leading
+     Nick cell (issue #222) so a member's rank and its quota/status read on one
+     row. The flex row keeps the rank number, nick, and ↑/↓ buttons on a single
+     line; nowrap keeps the buttons from dropping under the nick on a tight
+     column. */
+  td.nick .nick-prio {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 8px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--bg);
-    margin-bottom: 6px;
-    font-family: var(--mono);
+    flex-wrap: nowrap;
   }
-  ol.priority li::before {
-    content: counter(prio);
+  td.nick .rank {
     color: var(--muted);
-    width: 1.5em;
+    min-width: 1.2em;
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
-  ol.priority li .nick { flex: 1; }
-  ol.priority li button {
+  td.nick .nick-name { flex: 1; }
+  td.nick .prio-btn {
     border: 1px solid var(--border);
     background: var(--panel);
     color: var(--text);
@@ -180,8 +156,8 @@
     font-family: var(--mono);
     cursor: pointer;
   }
-  ol.priority li button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
-  ol.priority li button:disabled { opacity: 0.4; cursor: not-allowed; }
+  td.nick .prio-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  td.nick .prio-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .balanced-note { color: var(--muted); font-style: italic; }
 
   /* The members table is intrinsically wide (7 columns, with nowrap reset
@@ -614,85 +590,46 @@
 
     section.appendChild(head);
 
-    var cols = document.createElement('div');
-    cols.className = 'columns';
-
-    var colPrio = document.createElement('div');
-    colPrio.className = 'col';
-    var h3p = document.createElement('h3');
-    h3p.textContent = 'Priority order';
-    colPrio.appendChild(h3p);
+    // One card body: the "Members" table, ordered by priority, with the rank +
+    // ↑/↓ reorder controls folded into each row's leading Nick cell (issue
+    // #222). Collapsing the former two-column (priority | members) grid makes
+    // order consistency and row alignment structural instead of CSS-dependent.
+    var body = document.createElement('div');
+    body.className = 'col';
+    var h3m = document.createElement('h3');
+    h3m.textContent = 'Members';
+    body.appendChild(h3m);
 
     if (isBalanced(view)) {
       var note = document.createElement('p');
       note.className = 'balanced-note';
       note.textContent = 'Balanced pools rotate automatically; manual priority is not applicable.';
-      colPrio.appendChild(note);
-    } else {
-      colPrio.appendChild(renderPriority(view));
+      body.appendChild(note);
     }
-    cols.appendChild(colPrio);
 
-    var colMem = document.createElement('div');
-    colMem.className = 'col';
-    var h3m = document.createElement('h3');
-    h3m.textContent = 'Members';
-    colMem.appendChild(h3m);
-    colMem.appendChild(renderMembers(view));
-    cols.appendChild(colMem);
-
-    section.appendChild(cols);
+    body.appendChild(renderMembers(view));
+    section.appendChild(body);
     return section;
   }
 
-  function renderPriority(view) {
-    var ol = document.createElement('ol');
-    ol.className = 'priority';
-    ol.setAttribute('data-role', 'priority');
-
-    // When no priority is configured yet, seed the reorderable list from the
-    // pool's members so the operator can establish an initial order; the first
-    // reorder POSTs it to /priority and the pool becomes a priority pool. Only
-    // do this for pools with >=2 members — a single-member (or empty) pool gets
-    // no controls (nothing to order).
-    var order = view.priority.length > 0
-      ? view.priority
-      : (view.members.length >= 2
-          ? view.members.map(function (m) { return m.nick; })
-          : []);
-
-    order.forEach(function (nick, idx) {
-      var li = document.createElement('li');
-      li.setAttribute('data-nick', nick);
-      var name = document.createElement('span');
-      name.className = 'nick';
-      name.textContent = nick;
-      li.appendChild(name);
-
-      var up = document.createElement('button');
-      up.type = 'button';
-      up.textContent = '↑';
-      up.setAttribute('aria-label', 'Move ' + nick + ' up');
-      up.disabled = idx === 0;
-      up.addEventListener('click', function () {
-        movePriority(view.pool, idx, idx - 1);
-      });
-      li.appendChild(up);
-
-      var down = document.createElement('button');
-      down.type = 'button';
-      down.textContent = '↓';
-      down.setAttribute('aria-label', 'Move ' + nick + ' down');
-      down.disabled = idx === order.length - 1;
-      down.addEventListener('click', function () {
-        movePriority(view.pool, idx, idx + 1);
-      });
-      li.appendChild(down);
-
-      ol.appendChild(li);
+  // orderedMembers returns view.members as objects in effective priority order.
+  // For a priority pool that is view.priority; for a plain pool with no priority
+  // yet it seeds from the members' own order, so the first reorder POSTs that
+  // order and the pool becomes a priority pool. Balanced pools have no manual
+  // order — members' own order is kept. Any member missing from the priority
+  // list (members ranked after the listed ones, in the members' sorted order,
+  // per README) is appended so no row is dropped.
+  function orderedMembers(view) {
+    var members = view.members || [];
+    if (isBalanced(view) || view.priority.length === 0) return members.slice();
+    var byNick = {};
+    members.forEach(function (m) { byNick[m.nick] = m; });
+    var result = [];
+    view.priority.forEach(function (nick) {
+      if (byNick[nick]) { result.push(byNick[nick]); delete byNick[nick]; }
     });
-
-    return ol;
+    members.forEach(function (m) { if (byNick[m.nick]) result.push(m); });
+    return result;
   }
 
   function renderMembers(view) {
@@ -718,14 +655,60 @@
     thead.appendChild(trh);
     table.appendChild(thead);
 
+    // Rows render in priority order (issue #222). Show the rank number + ↑/↓
+    // reorder controls only when there is something to reorder: a non-balanced
+    // pool with >=2 members. Balanced pools rotate automatically, and a lone
+    // member has no order — both get a plain nick cell.
+    var ordered = orderedMembers(view);
+    var showReorder = !isBalanced(view) && ordered.length >= 2;
+
     var tbody = document.createElement('tbody');
-    view.members.forEach(function (m) {
+    ordered.forEach(function (m, idx) {
       var tr = document.createElement('tr');
       tr.setAttribute('data-nick', m.nick);
 
       var tdN = document.createElement('td');
       tdN.className = 'nick';
-      tdN.textContent = m.nick;
+      if (showReorder) {
+        var wrap = document.createElement('div');
+        wrap.className = 'nick-prio';
+
+        var rank = document.createElement('span');
+        rank.className = 'rank';
+        rank.textContent = String(idx + 1);
+        wrap.appendChild(rank);
+
+        var name = document.createElement('span');
+        name.className = 'nick-name';
+        name.textContent = m.nick;
+        wrap.appendChild(name);
+
+        var up = document.createElement('button');
+        up.type = 'button';
+        up.className = 'prio-btn';
+        up.textContent = '↑';
+        up.setAttribute('aria-label', 'Move ' + m.nick + ' up');
+        up.disabled = idx === 0;
+        up.addEventListener('click', function () {
+          movePriority(view.pool, idx, idx - 1);
+        });
+        wrap.appendChild(up);
+
+        var down = document.createElement('button');
+        down.type = 'button';
+        down.className = 'prio-btn';
+        down.textContent = '↓';
+        down.setAttribute('aria-label', 'Move ' + m.nick + ' down');
+        down.disabled = idx === ordered.length - 1;
+        down.addEventListener('click', function () {
+          movePriority(view.pool, idx, idx + 1);
+        });
+        wrap.appendChild(down);
+
+        tdN.appendChild(wrap);
+      } else {
+        tdN.textContent = m.nick;
+      }
       tr.appendChild(tdN);
 
       var tdS = document.createElement('td');
@@ -1159,9 +1142,9 @@
   function movePriority(pool, from, to) {
     var section = root.querySelector('section.pool[data-pool="' + cssEscape(pool) + '"]');
     if (!section) return;
-    var items = section.querySelectorAll('ol.priority li');
+    var items = section.querySelectorAll('table.members tbody tr');
     var order = [];
-    items.forEach(function (li) { order.push(li.getAttribute('data-nick')); });
+    items.forEach(function (tr) { order.push(tr.getAttribute('data-nick')); });
     if (from < 0 || to < 0 || from >= order.length || to >= order.length) return;
     var nick = order.splice(from, 1)[0];
     order.splice(to, 0, nick);
