@@ -203,11 +203,32 @@
     background-size: 28px 100%, 28px 100%, 20px 100%, 20px 100%;
     background-attachment: local, local, scroll, scroll;
   }
+  /* table-layout: fixed pins column widths from the th:nth-child rules below
+     instead of deriving them per-table from cell content, so the 7 columns
+     land at identical widths in every pool section (they don't align under
+     the default auto layout — issue #227). min-width keeps the table wider
+     than a phone viewport (~760px, roughly the old min-content) so it still
+     overflows into .members-scroll and scrolls horizontally on narrow
+     screens; without it a fixed + width:100% table collapses to the
+     container and would never scroll (issues #166/#171). */
   table.members {
     width: 100%;
+    min-width: 760px;
+    table-layout: fixed;
     border-collapse: collapse;
     font-size: 13px;
   }
+  /* Column widths (must sum to 100%): Nick, Status, 5H, 5H reset, 7/30D,
+     7/30D reset, actions. Reset columns take a fixed nowrap-friendly share;
+     the quota-bar columns (.quota-track flexes down to min-width:36px) take
+     the middle; actions is widest for the toggle + Move + Remove controls. */
+  table.members th:nth-child(1) { width: 18%; }
+  table.members th:nth-child(2) { width: 11%; }
+  table.members th:nth-child(3) { width: 13%; }
+  table.members th:nth-child(4) { width: 12%; }
+  table.members th:nth-child(5) { width: 13%; }
+  table.members th:nth-child(6) { width: 12%; }
+  table.members th:nth-child(7) { width: 21%; }
   table.members th, table.members td {
     text-align: left;
     padding: 6px 8px;
@@ -422,7 +443,19 @@
   section.activity header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; }
   section.activity h2 { font-size: 15px; margin: 0; }
   section.activity .badge { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
-  table.activity { width: 100%; border-collapse: collapse; font-size: 13px; }
+  /* table-layout: fixed pins these column widths (issue #227) so the numeric
+     columns don't jump around as the endpoint paths and values change. No
+     min-width: unlike table.members this table has no scroll wrapper, so a
+     min-width would overflow the card with no scroll affordance. Columns
+     (sum 100%): Endpoint (widest, left-aligned mono path), then the five
+     numeric columns. */
+  table.activity { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 13px; }
+  table.activity th:nth-child(1) { width: 34%; }
+  table.activity th:nth-child(2) { width: 16%; }
+  table.activity th:nth-child(3) { width: 14%; }
+  table.activity th:nth-child(4) { width: 12%; }
+  table.activity th:nth-child(5) { width: 12%; }
+  table.activity th:nth-child(6) { width: 12%; }
   table.activity th, table.activity td {
     padding: 6px 10px;
     text-align: right;
