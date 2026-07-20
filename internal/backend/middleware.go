@@ -62,6 +62,13 @@ func Middleware(router PoolRouter, next http.Handler) http.Handler {
 			writeForbidden(w)
 			return
 		}
+		// Request named a valid pool: flip the reached-pool marker so the
+		// outer activity.Middleware records it (issue #230). Set here, above
+		// the exhausted branch, so an exhausted-pool 503 is recorded too — a
+		// valid pool that is dry is genuine endpoint/pool-health signal;
+		// only the unknown-selector 403 returned above stays unmarked and
+		// dropped from the activity series.
+		MarkReachedPool(r.Context())
 		if exhausted {
 			// Whole pool is rate-limited; there is nothing to switch to.
 			// Emit 503 (not 429) with the precise wait until the soonest
