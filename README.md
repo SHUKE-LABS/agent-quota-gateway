@@ -923,7 +923,11 @@ member's live status (`active` / `exhausted` / `disabled` / `idle`), and to
 reorder priority, toggle enable/disable, or **clear a single member's live-429
 park**. The per-member "Clear park" button appears only on a member the gateway
 currently reports `parked: true`; clicking it confirms (it overrides the
-gateway's own judgment), clears that one nick, and re-fetches the view. It
+gateway's own judgment), clears that one nick, and re-fetches the view. A
+"Delete pool" control appears in a pool's header only once that pool is empty
+(no members): it calls `DELETE /_gateway/pool/{name}`, confirms, and refreshes
+the view — matching the empty-only API, which returns `409` for a pool that
+still has members. It
 contains no auth and no build step — it inherits the gateway's trust boundary. In shared mode this exposes
 write controls to any tailnet member that can reach the port; a Tailscale
 ACL restricting the port is the only gate.
