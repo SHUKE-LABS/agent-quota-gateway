@@ -22,6 +22,7 @@ func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_gateway/config", configHandler(pools, nil))
 	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
+	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
@@ -425,6 +426,86 @@ func TestAddRemoveEndpoints(t *testing.T) {
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{}`, http.StatusBadRequest)                                // empty credential
 	addJSON(t, srv.URL+"/_gateway/pool/auto/member/new", `{"credential":"x","base_url":"!"}`, http.StatusBadRequest) // invalid URL
 	delete(t, srv.URL+"/_gateway/pool/ghost/member/a", http.StatusNotFound)                                          // unknown pool
+}
+
+// TestDeletePoolEndpoint drives DELETE /_gateway/pool/{name}: an empty runtime
+// pool deletes with 200 and disappears from the config view and from a
+// round-trip restart; an unknown pool is 404; a pool with members is 409 until
+// drained; and a request whose selector names a just-deleted pool fails closed
+// with 403 through the real resolver middleware (issue #232).
+func TestDeletePoolEndpoint(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	pools := loadPools(t)
+	srv := configMux(t, pools)
+
+	// Create an empty runtime pool, then delete it → 200.
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"rt"}`, http.StatusCreated)
+	delete(t, srv.URL+"/_gateway/pool/RT", http.StatusOK) // name normalized server-side
+
+	// Gone from the config view.
+	for _, v := range fetchAllPools(t, srv.URL) {
+		if v.Pool == "rt" {
+			t.Error("deleted pool rt still appears in config view")
+		}
+	}
+
+	// Unknown pool → 404.
+	delete(t, srv.URL+"/_gateway/pool/ghost", http.StatusNotFound)
+
+	// A pool that still has members → 409; drain, then delete succeeds.
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"full"}`, http.StatusCreated)
+	addJSON(t, srv.URL+"/_gateway/pool/full/member/m", `{"credential":"sk-ant-m","base_url":"https://m.example"}`, http.StatusOK)
+	delete(t, srv.URL+"/_gateway/pool/full", http.StatusConflict)
+	delete(t, srv.URL+"/_gateway/pool/full/member/m", http.StatusOK)
+	delete(t, srv.URL+"/_gateway/pool/full", http.StatusOK)
+
+	// The deletion survives a restart: neither rt nor full reappears.
+	pools2 := reloadPools(t, pools)
+	srv2 := configMux(t, pools2)
+	for _, v := range fetchAllPools(t, srv2.URL) {
+		if v.Pool == "rt" || v.Pool == "full" {
+			t.Errorf("deleted pool %q reappeared after restart", v.Pool)
+		}
+	}
+
+	// Route-after-delete → 403 through the real resolver middleware. Delete the
+	// env pool's member then the pool, and confirm a request bearing its
+	// selector fails closed (unknown selector), not routed into stale state.
+	delete(t, srv.URL+"/_gateway/pool/auto/member/a", http.StatusOK)
+	delete(t, srv.URL+"/_gateway/pool/auto", http.StatusOK)
+	mw := backend.Middleware(pools, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("next handler reached for a deleted pool's selector")
+	}))
+	msrv := httptest.NewServer(mw)
+	t.Cleanup(msrv.Close)
+	req, err := http.NewRequest("POST", msrv.URL+"/v1/messages", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer auto")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("route after delete: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("route to deleted pool status=%d, want 403", resp.StatusCode)
+	}
+}
+
+// fetchAllPools returns the full config view from GET /_gateway/config.
+func fetchAllPools(t *testing.T, baseURL string) []auto.PoolConfigView {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/_gateway/config")
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	defer resp.Body.Close()
+	var views []auto.PoolConfigView
+	if err := json.NewDecoder(resp.Body).Decode(&views); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	return views
 }
 
 // TestMoveEndpoint exercises POST /_gateway/pool/{name}/member/{nick}/move:

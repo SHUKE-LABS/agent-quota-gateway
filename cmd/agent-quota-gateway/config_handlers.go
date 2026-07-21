@@ -81,6 +81,31 @@ func createPoolHandler(pools *auto.Pools) http.HandlerFunc {
 	}
 }
 
+// deletePoolHandler serves DELETE /_gateway/pool/{name} — removes an empty
+// runtime pool (issue #232). On success it returns 200 {"status":"ok"},
+// matching removeMemberHandler. A pool that still has members returns 409
+// (drain members first); an unknown pool returns 404.
+func deletePoolHandler(pools *auto.Pools) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		poolName := backend.NormalizeName(r.PathValue("name"))
+		if poolName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool name is required"})
+			return
+		}
+
+		status, err := pools.RemovePool(poolName)
+		if err != nil {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	}
+}
+
 // priorityHandler serves POST /_gateway/pool/{name}/priority — sets a
 // runtime priority override for the pool. The request body must be a JSON
 // array of nicks (highest priority first). The override is expanded to a

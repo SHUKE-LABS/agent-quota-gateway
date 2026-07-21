@@ -773,9 +773,6 @@ func TestBuildFromSpec_validatorTable(t *testing.T) {
 				},
 			},
 		},
-		"no backends": {
-			Pools: map[string]PoolSpec{},
-		},
 		"empty pool name": {
 			Pools: map[string]PoolSpec{
 				"": {Members: map[string]MemberSpec{"X": {Credential: "cred"}}},
@@ -810,6 +807,21 @@ func TestBuildFromSpec_validatorTable(t *testing.T) {
 				t.Errorf("expected error for case: %s", name)
 			}
 		})
+	}
+}
+
+// TestBuildFromSpec_emptySpecAllowed proves the spec path accepts a zero-pool
+// registry (issue #232): deleting the last runtime pool persists an empty
+// aqg.json, and rebooting from it must not fail. The env cold-start path keeps
+// its "no backends configured" guard (a fully empty environment is still a
+// misconfiguration) — see TestLoad_* for that path.
+func TestBuildFromSpec_emptySpecAllowed(t *testing.T) {
+	reg, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{}}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec(empty): %v, want nil (zero-pool registry is valid)", err)
+	}
+	if names := reg.PoolNames(); len(names) != 0 {
+		t.Errorf("empty registry has pools %v, want none", names)
 	}
 }
 

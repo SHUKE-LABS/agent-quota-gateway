@@ -247,3 +247,36 @@ func TestWithPoolCreated_emptyPoolSurvives(t *testing.T) {
 		t.Fatal("expected error creating an existing pool")
 	}
 }
+
+// TestWithPoolRemoved drops a pool and leaves the rest intact; an unknown pool
+// errors (issue #232, the inverse of WithPoolCreated). Membership is not
+// checked here — the auto layer owns the require-empty 409, matching
+// WithMemberRemoved's split of responsibility.
+func TestWithPoolRemoved(t *testing.T) {
+	reg := specFixture(t)
+	reg2, err := reg.WithPoolRemoved("Z_AI") // exercises normalization
+	if err != nil {
+		t.Fatalf("remove pool: %v", err)
+	}
+	if reg2.HasPool("z-ai") {
+		t.Fatal("removed pool z-ai still present")
+	}
+	if !reg2.HasPool("auto") {
+		t.Fatal("sibling pool auto dropped by unrelated removal")
+	}
+	// The removal round-trips through Spec()->BuildFromSpec (restart-safe).
+	rebuilt, err := BuildFromSpec(reg2.Spec(), testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("rebuild from spec: %v", err)
+	}
+	if rebuilt.HasPool("z-ai") {
+		t.Fatal("removed pool z-ai reappeared after Spec()->BuildFromSpec")
+	}
+	// Unknown pool errors; the original registry is untouched (immutable).
+	if _, err := reg.WithPoolRemoved("ghost"); err == nil {
+		t.Fatal("expected error removing an unknown pool")
+	}
+	if !reg.HasPool("z-ai") {
+		t.Fatal("source registry mutated by WithPoolRemoved (should be copy-on-write)")
+	}
+}
