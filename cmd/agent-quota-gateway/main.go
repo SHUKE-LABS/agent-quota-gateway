@@ -207,6 +207,7 @@ func run(configFlag string) error {
 	mux.HandleFunc("/_gateway/activity", activityHandler(activityStore))
 	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
 	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
+	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools))
 	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
 	mux.HandleFunc("/_gateway/config", configHandler(pools, configWriter.Unsaved))
 	mux.HandleFunc("/_gateway/ui", uiHandler())

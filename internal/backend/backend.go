@@ -366,7 +366,9 @@ func BuildFromSpec(spec Spec, defaultBaseURL string) (*Registry, error) {
 		}
 	}
 
-	return buildRegistry(defaultBaseURL, p)
+	// Spec path (config file + runtime mutations): an empty registry is a valid
+	// deliberate state (issue #232), so the non-empty guard is off here.
+	return buildRegistry(defaultBaseURL, p, false)
 }
 
 // rawMember is a parsed member declaration before its base URL is
@@ -557,7 +559,9 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 		return nil, fmt.Errorf("backend: %s is not a recognised AQG_POOL_ key (expected suffixes: _BASE_URL, _BACKEND_<NICK>, _PRIORITY, _BALANCE, _BALANCE_GAP, _BALANCE_DWELL)", key)
 	}
 
-	return buildRegistry(defaultBaseURL, p)
+	// Env cold-start path: a fully empty environment is a misconfiguration, so
+	// the non-empty guard is on.
+	return buildRegistry(defaultBaseURL, p, true)
 }
 
 // buildRegistry is the single semantic validation core shared by both
@@ -569,12 +573,17 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 // non-positive gap/dwell, base URL validity, memberless-pool base URL,
 // priority names a non-member, gap/dwell without balance, priority+balance
 // exclusion.
-func buildRegistry(defaultBaseURL string, p parsed) (*Registry, error) {
-	// A configuration with no pools and no members at all is an error (an
-	// empty gateway serves nothing). A pool with zero members is allowed:
-	// it is an operator-created plain pool awaiting its first member (issue
-	// #198), so the check is on the union, not on members alone.
-	if len(p.members) == 0 && len(p.declaredPools) == 0 {
+func buildRegistry(defaultBaseURL string, p parsed, requireNonEmpty bool) (*Registry, error) {
+	// On the env cold-start path a configuration with no pools and no members
+	// at all is an error (the operator forgot to configure anything; an empty
+	// gateway serves nothing). A pool with zero members is allowed: it is an
+	// operator-created plain pool awaiting its first member (issue #198), so the
+	// check is on the union, not on members alone. The spec path passes
+	// requireNonEmpty=false: an empty aqg.json is a deliberate operator-arrived
+	// state — deleting the last pool at runtime (issue #232) must both persist
+	// and reboot, so the zero-pool registry it produces is valid, not a
+	// misconfiguration. Routing then fails closed with 403 unknown selector.
+	if requireNonEmpty && len(p.members) == 0 && len(p.declaredPools) == 0 {
 		return nil, fmt.Errorf("backend: no backends configured")
 	}
 
@@ -1044,6 +1053,22 @@ func (r *Registry) WithPoolCreated(name string) (*Registry, error) {
 		return nil, fmt.Errorf("backend: pool %q already exists", name)
 	}
 	spec.Pools[name] = PoolSpec{Members: make(map[string]MemberSpec)}
+	return BuildFromSpec(spec, r.defaultBaseURL)
+}
+
+// WithPoolRemoved returns a fresh Registry with pool name deleted (issue #232,
+// closing the create/delete lifecycle WithPoolCreated opens). The caller is
+// responsible for the require-empty rule: this method removes the pool
+// regardless of membership — the auto layer refuses a non-empty pool with 409
+// before reaching here, matching WithMemberRemoved, which likewise leaves
+// HTTP-status mapping to auto. Errors only on an unknown pool.
+func (r *Registry) WithPoolRemoved(name string) (*Registry, error) {
+	name = normalizeName(name)
+	spec := r.Spec()
+	if _, ok := spec.Pools[name]; !ok {
+		return nil, fmt.Errorf("backend: unknown pool %q", name)
+	}
+	delete(spec.Pools, name)
 	return BuildFromSpec(spec, r.defaultBaseURL)
 }
 

@@ -708,15 +708,16 @@ with `Allow: GET`. The management UI renders this as a "Recent activity
 ### Runtime pool configuration
 
 Priority order, per-member enable/disable, and pool membership can be changed
-at runtime, without a restart, through six endpoints. This is for operating a
-pool mid-incident — taking a draining account out of rotation, reordering
-preference, or adding a fresh account — when editing config and restarting is
-the wrong tool.
+at runtime, without a restart, through the endpoints below. This is for
+operating a pool mid-incident — taking a draining account out of rotation,
+reordering preference, or adding a fresh account — when editing config and
+restarting is the wrong tool.
 
 | Method & path | Effect |
 |---------------|--------|
 | `GET /_gateway/config` | Effective configuration for every pool, **credentials redacted** |
 | `POST /_gateway/pool` | Create a plain pool at runtime; body `{"name": "...", "mode": "plain"}` (`name` required, `mode` optional and defaults to `plain`). A runtime pool is a pure named container with no pool-level base_url; each member resolves its own `base_url` via `AddMember`'s fallback chain. Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
+| `DELETE /_gateway/pool/{name}` | Remove a pool. The pool must be **empty** — drain members first via `DELETE .../member/{nick}`; a pool that still has members returns `409` (no cascade, so no persisted credential is silently discarded). Returns `200` `{"status": "ok"}`; an unknown pool returns `404`. Deleting the last pool is allowed (routing then fails closed with `403` unknown selector). Persisted: a deleted pool does not reappear on restart. |
 | `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
@@ -739,6 +740,8 @@ curl -X POST http://127.0.0.1:8080/_gateway/pool/priority/member/d \
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/d/move \
   -d '{"to": "spare"}'
 curl -X DELETE http://127.0.0.1:8080/_gateway/pool/auto/member/d
+# delete a pool (must be empty — drain its members first)
+curl -X DELETE http://127.0.0.1:8080/_gateway/pool/spare
 ```
 
 `GET /_gateway/config` returns one object per pool — balance settings, the
@@ -834,8 +837,21 @@ Removing the **last** member drains the pool to a valid zero-member pool — thi
 holds for a vendor pool with its own `base_url` (`z-ai`, `minimax`, …) just as
 it does for a default-upstream pool; the drained pool persists and is refilled
 with `POST .../member/{nick}` (which requires an explicit `base_url` for an empty
-pool, re-establishing the vendor upstream). There is no separate pool-deletion
-API.
+pool, re-establishing the vendor upstream).
+
+**Deleting a pool.** `DELETE /_gateway/pool/{name}` removes a pool entirely,
+closing the create/delete lifecycle `POST /_gateway/pool` opens. The pool must
+be **empty first**: a pool that still has one or more members returns `409` with
+a message naming the drain-first requirement — there is no cascade or `?force`,
+so a delete never silently discards a persisted credential (drain the members
+with `DELETE .../member/{nick}`, then delete the pool). An unknown pool returns
+`404`; success returns `200` `{"status": "ok"}`. Deletion writes through to
+`aqg.json`, so a deleted pool does not reappear on restart. Any empty pool is
+deletable regardless of whether it originated from env or a runtime create —
+post-#198 every pool is a config entry with no persisted origin distinction.
+Deleting the **last** pool is permitted and leaves the gateway with zero pools;
+routing afterward fails closed with `403` unknown selector, exactly as an
+unknown pool always has.
 
 **Moving a subscription between pools.** `POST
 /_gateway/pool/{name}/member/{nick}/move` relocates a subscription from `{name}`

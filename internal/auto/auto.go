@@ -969,6 +969,49 @@ func (p *Pools) AddPool(name, mode string) (int, error) {
 	return http.StatusCreated, nil
 }
 
+// RemovePool deletes an empty pool at runtime, the inverse of AddPool (issue
+// #232). It requires the pool to be drained first: a pool that still has one or
+// more members returns 409 so no persisted credential is silently discarded —
+// the operator removes members via DELETE .../member/{nick} first. Deleting the
+// last/only pool is permitted; routing afterward fails closed (403 unknown
+// selector) since the controller leaves byPool. Dropping the controller
+// releases all its runtime observation (sticky/exhausted/local-snapshot),
+// and PersistState rebuilds from byPool so the next flush omits it. Returns
+// (httpStatus, error) with a credential-free message; (StatusOK, nil) on
+// success.
+func (p *Pools) RemovePool(name string) (int, error) {
+	normalized := backend.NormalizeName(name)
+	if normalized == "" {
+		return http.StatusBadRequest, fmt.Errorf("pool name is empty after normalization")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c, ok := p.byPool[normalized]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+
+	c.mu.Lock()
+	memberCount := len(c.members)
+	c.mu.Unlock()
+	if memberCount > 0 {
+		return http.StatusConflict, fmt.Errorf("pool %s still has %d member(s); remove them first", normalized, memberCount)
+	}
+
+	next, err := p.reg.WithPoolRemoved(normalized)
+	if err != nil {
+		return http.StatusNotFound, err
+	}
+	p.reg = next
+	delete(p.byPool, normalized)
+	p.markConfigDirtyLocked()
+	if p.logOut != nil {
+		fmt.Fprintf(p.logOut, "auto: removed runtime pool %s\n", normalized)
+	}
+	return http.StatusOK, nil
+}
+
 // SetOnMutate installs a callback that every controller calls (non-blocking)
 // after any mutation to its sticky pointer or exhausted map. Used by the
 // persister to coalesce writes without importing this package. The callback
