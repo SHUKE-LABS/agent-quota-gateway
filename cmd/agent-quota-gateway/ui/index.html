@@ -376,6 +376,20 @@
     font-size: 12px;
   }
   button.clear-park:hover { border-color: var(--accent); background: rgba(0, 0, 0, 0.04); }
+  /* "Delete pool" — header control shown only for an empty pool (issue #233).
+     margin-left:auto floats it to the header's right edge; for an empty pool the
+     .updated span carries no text and collapses, so this owns the free space. */
+  button.delete-pool {
+    margin-left: auto;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--danger);
+    border-radius: 4px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  button.delete-pool:hover { border-color: var(--danger); background: rgba(207, 34, 46, 0.08); }
 
   .addsub-card {
     background: var(--panel);
@@ -629,6 +643,21 @@
     updated.setAttribute('data-role', 'updated');
     updated.textContent = '';
     head.appendChild(updated);
+
+    // Delete-pool control, offered only for an empty pool (issue #233). The
+    // DELETE API is empty-only — it returns 409 for a pool that still has
+    // members (issue #232) — so the button never appears while any row remains.
+    if ((view.members || []).length === 0) {
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'delete-pool';
+      del.setAttribute('data-role', 'delete-pool');
+      del.textContent = 'Delete pool';
+      del.addEventListener('click', function () {
+        deletePool(view.pool);
+      });
+      head.appendChild(del);
+    }
 
     section.appendChild(head);
 
@@ -1309,6 +1338,19 @@
     fetchJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick),
       { method: 'DELETE', headers: { 'Accept': 'application/json' } })
       .then(function (r) { return refreshAfter(r, 'Failed to remove subscription'); });
+  }
+
+  function deletePool(pool) {
+    var ok = window.confirm(
+      'Delete empty pool "' + pool + '"?\n\n' +
+      'This is permanent and cannot be undone.');
+    if (!ok) { return; }
+    // The pool may have gained a member between render and click; the API then
+    // returns 409 and refreshAfter surfaces that server error rather than
+    // failing silently (issue #233).
+    fetchJSON('/_gateway/pool/' + encodeURIComponent(pool),
+      { method: 'DELETE', headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return refreshAfter(r, 'Failed to delete pool'); });
   }
 
   function moveMember(fromPool, nick) {
