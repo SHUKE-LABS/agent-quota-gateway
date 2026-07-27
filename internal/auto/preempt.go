@@ -164,14 +164,13 @@ func (p *Preemptor) tick() time.Duration {
 			// Anthropic via headers, for z-ai/MiniMaxi via the poller) is
 			// preferred over the controller's conservative park.
 			qReset := p.store.Get(m.quotaKey).Unified5hReset
-			// Also check if the store reports the member as exhausted (util at cap).
-			// This catches members that are store-exhausted but not yet parked,
-			// which can happen when priority is set at runtime (issue #70).
-			qUtil := p.store.Get(m.quotaKey).Unified5hUtilization
-			isStoreExhausted := qUtil != nil && *qUtil >= 1.0
-
-			// Determine if the member is truly available (not exhausted by either signal).
-			isAvailable := !m.exhausted && !isStoreExhausted
+			// m.exhausted already incorporates store-driven exhaustion via
+			// exhaustedUntilLocked → storeExhaustedUntilLocked → windowBlocks,
+			// which is the only predicate that correctly handles Anthropic's
+			// allowed_warning status (util=1.0, status≠"rejected" → not blocking,
+			// issue #236). A raw util≥1.0 gate here would wrongly veto
+			// allowed_warning members that windowBlocks correctly passes.
+			isAvailable := !m.exhausted
 
 			if isAvailable {
 				// A higher-priority member the controller already considers
