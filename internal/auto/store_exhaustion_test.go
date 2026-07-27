@@ -770,8 +770,10 @@ func TestStoreExhaustion_runtimePriorityPreemptsBack(t *testing.T) {
 	store := quota.NewStore()
 
 	// Create a pool with NO static priority (plain controller, no AQG_POOL_AUTO_PRIORITY).
+	// Wire the store into NewPools so the controllers see store data via
+	// exhaustedUntilLocked, matching the production path (issue #236).
 	reg := testRegistry(t, "a", "b")
-	pools := NewPools(reg, nil, clock.now, io.Discard)
+	pools := NewPools(reg, store, clock.now, io.Discard)
 	c := pools.byPool["auto"]
 
 	// NewPreemptor now reads all controllers each tick, including this

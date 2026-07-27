@@ -452,6 +452,74 @@ func TestPreemptor_preemptToRuntimeAddedMember(t *testing.T) {
 	}
 }
 
+// TestPreempt_allowedWarningPreemptsBack is the regression for issue #236:
+// a higher-priority Anthropic member at utilization=1.0 with status
+// "allowed_warning" must not be vetoed by a raw util≥1.0 check. The member
+// is healthy (no live park) and windowBlocks correctly returns false for
+// allowed_warning, so the preemptor must switch back immediately.
+//
+// The store is wired into the controller so exhaustedUntilLocked can consult
+// it, matching the production path where NewPools passes the same store to
+// both the controller and the preemptor.
+func TestPreempt_allowedWarningPreemptsBack(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newPriorityController(t, -1, clock, io.Discard, "a,b", "b", "a")
+	c.store = store // wire the shared store, as NewPools does in production
+	c.setCur("b")  // on lower-priority b; a is preferred but not parked
+
+	qReset := clock.now().Add(time.Hour)
+	util := 1.0
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      "allowed_warning",
+		Unified5hReset:       &qReset,
+		AsOf:                 clock.now(),
+	})
+
+	p := newPreemptor([]*Controller{c}, store, 0, clock.now, io.Discard)
+
+	if wait := p.tick(); wait != defaultPreemptInterval {
+		t.Errorf("tick wait = %v, want idle interval (immediate switch)", wait)
+	}
+	if got := c.Current(); got != "a" {
+		t.Errorf("Current() = %q, want a (allowed_warning should not block preempt-back)", got)
+	}
+}
+
+// TestPreempt_rejectedStoreBlocksPreemptBack is the issue #70 guardrail
+// regression: a higher-priority member with a "rejected" store snapshot and
+// no live park must not be preempted to. The preemptor must schedule a wake
+// at the store reset and leave the pool on the lower-priority fallback.
+// The store is wired into the controller so exhaustedUntilLocked sees the
+// rejected snapshot, matching the production path (issue #70 scenario).
+func TestPreempt_rejectedStoreBlocksPreemptBack(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := newPriorityController(t, -1, clock, io.Discard, "a,b", "b", "a")
+	c.store = store // wire the shared store, as NewPools does in production
+	c.setCur("b")  // on lower-priority b; a has no live park but store says rejected
+
+	qReset := clock.now().Add(2 * time.Hour)
+	util := 1.0
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      "rejected",
+		Unified5hReset:       &qReset,
+		AsOf:                 clock.now(),
+	})
+
+	p := newPreemptor([]*Controller{c}, store, 0, clock.now, io.Discard)
+
+	wait := p.tick()
+	if got := c.Current(); got != "b" {
+		t.Errorf("Current() = %q, want b (rejected store should block preempt-back)", got)
+	}
+	if wait != 2*time.Hour {
+		t.Errorf("tick wait = %v, want 2h (the store reset for the rejected member)", wait)
+	}
+}
+
 // TestPreemptor_runtimeAddedMemberPreemptBack proves that a priority pool
 // whose current active member is a runtime-added one can still be preempted
 // back to a higher-priority static member once that member recovers (issue
