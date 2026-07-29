@@ -1072,6 +1072,45 @@ func (r *Registry) WithPoolRemoved(name string) (*Registry, error) {
 	return BuildFromSpec(spec, r.defaultBaseURL)
 }
 
+// WithPoolRenamed returns a fresh Registry with oldName renamed to newName
+// (issue #238). The pool's members, disabled flags, declared priority, and
+// balance parameters move with the rename — the rest of the registry is
+// untouched. The round-trip through Spec()→BuildFromSpec reuses the single
+// validation core, so the new registry is consistent by construction and a
+// Spec() on the result emits the pool under its new key (which is what the
+// configfile writer needs to persist the rename).
+//
+// Errors:
+//   - unknown oldName
+//   - empty newName (after normalization)
+//   - newName == oldName after normalization (a no-op rename is rejected
+//     loudly so the HTTP layer maps it to 400 rather than silently succeeding)
+//   - newName collides with a different existing pool
+func (r *Registry) WithPoolRenamed(oldName, newName string) (*Registry, error) {
+	oldNorm := normalizeName(oldName)
+	newNorm := normalizeName(newName)
+	if oldNorm == "" {
+		return nil, fmt.Errorf("backend: pool name is empty after normalization")
+	}
+	if newNorm == "" {
+		return nil, fmt.Errorf("backend: new pool name is empty after normalization")
+	}
+	if oldNorm == newNorm {
+		return nil, fmt.Errorf("backend: rename source and target normalize to the same name %q", newNorm)
+	}
+	spec := r.Spec()
+	ps, ok := spec.Pools[oldNorm]
+	if !ok {
+		return nil, fmt.Errorf("backend: unknown pool %q", oldNorm)
+	}
+	if _, exists := spec.Pools[newNorm]; exists {
+		return nil, fmt.Errorf("backend: pool %q already exists", newNorm)
+	}
+	delete(spec.Pools, oldNorm)
+	spec.Pools[newNorm] = ps
+	return BuildFromSpec(spec, r.defaultBaseURL)
+}
+
 // NormalizeName canonicalizes a selector the same way the loader
 // canonicalizes a pool name, so HTTP-boundary callers that resolve a
 // selector (the resolver middleware, the quota endpoint) match the
