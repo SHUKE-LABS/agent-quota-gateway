@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -407,5 +408,194 @@ func TestBootstrapConfigFile_issue197Regression(t *testing.T) {
 	}
 	if b.Credential != "state-cred" {
 		t.Errorf("credential = %q, want state-cred (state must win over env-cred, issue #197)", b.Credential)
+	}
+}
+
+// --- issue #241: legacy state-file priority reconciliation -----------------
+
+// sha256File reads path and returns its SHA256 digest as a hex string. Used
+// to detect whether resolveConfig rewrote aqg.json — WriteAtomic's temp+rename
+// changes the inode (and may leave mtime at coarse resolution unchanged), so
+// content equality is the only stable signal.
+func sha256File(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %q: %v", path, err)
+	}
+	sum := sha256.Sum256(data)
+	return string(sum[:])
+}
+
+// TestResolveConfig_existingFile_reconcilesLegacyPriority covers the
+// deploy/bootstrap regression path: aqg.json already exists, the state file
+// still carries an unmigrated priority_override, and the redeploy must
+// preserve the operator-adjusted order in the final aqg.json (issue #241).
+func TestResolveConfig_existingFile_reconcilesLegacyPriority(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+
+	// aqg.json already exists with the env order (a, b, c) and points its
+	// state_file at the legacy overlay we'll write next. The state file
+	// carries the operator-adjusted order (c, a, b). The redeploy must
+	// reconcile to (c, a, b) — both in the returned registry and on disk.
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"},"c":{"credential":"cc"}},"priority":["a","b","c"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	writeStateFile(t, dir,
+		`{"config":{"auto":{"priority_override":["c","a","b"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("AQG_STATE_FILE", statePath)
+
+	var buf bytes.Buffer
+	_, reg, path, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if path != cfgPath {
+		t.Errorf("path = %q, want %q", path, cfgPath)
+	}
+
+	wantPri := []string{"c", "a", "b"}
+	if got := reg.PoolPriority("auto"); strings.Join(got, ",") != strings.Join(wantPri, ",") {
+		t.Errorf("returned registry priority = %v, want %v (legacy state must win)", got, wantPri)
+	}
+
+	// Round-trip from disk: the reconciled order must be persisted.
+	_, reg2, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile post-reconcile: %v", err)
+	}
+	if got := reg2.PoolPriority("auto"); strings.Join(got, ",") != strings.Join(wantPri, ",") {
+		t.Errorf("aqg.json on disk priority = %v, want %v", got, wantPri)
+	}
+	if !strings.Contains(buf.String(), "reconciled legacy state-file priority") {
+		t.Errorf("expected reconcile log line, got %q", buf.String())
+	}
+}
+
+// TestResolveConfig_existingFile_noMigrationWhenOrderMatches proves the
+// steady-state no-write property: when the legacy state-file priority and
+// the loaded aqg.json priority match exactly, the file must not be
+// rewritten. Content equality (SHA256) is the signal — WriteAtomic uses
+// temp+rename, so the inode and mtime are unreliable, but the bytes must
+// be unchanged.
+func TestResolveConfig_existingFile_noMigrationWhenOrderMatches(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+
+	// Order on disk is [a, b, c]; the state file's priority_override is
+	// the same [a, b, c]. Post-migration steady state → no write.
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"},"c":{"credential":"cc"}},"priority":["a","b","c"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+	beforeHash := sha256File(t, cfgPath)
+
+	writeStateFile(t, dir,
+		`{"config":{"auto":{"priority_override":["a","b","c"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("AQG_STATE_FILE", statePath)
+
+	var buf bytes.Buffer
+	_, reg, _, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := reg.PoolPriority("auto"); strings.Join(got, ",") != "a,b,c" {
+		t.Errorf("priority = %v, want a,b,c (must keep loaded order on no-op reconcile)", got)
+	}
+	if got := sha256File(t, cfgPath); got != beforeHash {
+		t.Errorf("aqg.json content changed on a no-op reconcile (before=%s, after=%s)", beforeHash, got)
+	}
+	if strings.Contains(buf.String(), "reconciled legacy state-file priority") {
+		t.Errorf("no-op reconcile must not log the migration line; got %q", buf.String())
+	}
+}
+
+// TestResolveConfig_existingFile_failsLoudOnIrreconcilable: the state file's
+// priority_override targets an existing pool but every named nick is gone
+// from the loaded registry. Silent fallback would discard operator intent,
+// so startup must fail with a pool-named error (issue #241 AC: "fail loud").
+func TestResolveConfig_existingFile_failsLoudOnIrreconcilable(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+
+	// Pool exists with members [a, b]; the state file's priority_override
+	// names only nicks that no longer exist in the pool.
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+	beforeHash := sha256File(t, cfgPath)
+
+	writeStateFile(t, dir,
+		`{"config":{"auto":{"priority_override":["ghost1","ghost2"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("AQG_STATE_FILE", statePath)
+
+	_, _, _, err := resolveConfig("", &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("resolveConfig must fail when legacy priority_override has no surviving members")
+	}
+	if !strings.Contains(err.Error(), "auto") {
+		t.Errorf("error must name the offending pool; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "legacy") && !strings.Contains(err.Error(), "reconcile") {
+		t.Errorf("error should mention the legacy/reconcile context; got %v", err)
+	}
+	if got := sha256File(t, cfgPath); got != beforeHash {
+		t.Errorf("aqg.json must not be rewritten when reconciliation aborts (before=%s, after=%s)", beforeHash, got)
+	}
+}
+
+// TestResolveConfig_existingFile_legacyStateOutsideScopeIsSkipped: a state
+// file that only mentions a pool not in the loaded config (and not in
+// added_pools) must be logged and skipped — not aborted — matching the
+// bootstrap path's best-effort policy (issue #241 reviewer note).
+func TestResolveConfig_existingFile_legacyStateOutsideScopeIsSkipped(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}},"priority":["a","b"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+	beforeHash := sha256File(t, cfgPath)
+
+	// State file mentions a pool the loaded config does not have, and
+	// nothing in-scope. Must skip with a log line and not touch aqg.json.
+	writeStateFile(t, dir,
+		`{"config":{"ghostpool":{"priority_override":["x","y"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("AQG_STATE_FILE", statePath)
+
+	var buf bytes.Buffer
+	_, reg, _, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig must not abort on out-of-scope legacy entries: %v", err)
+	}
+	if got := reg.PoolPriority("auto"); strings.Join(got, ",") != "a,b" {
+		t.Errorf("priority = %v, want a,b (loaded config preserved)", got)
+	}
+	if got := sha256File(t, cfgPath); got != beforeHash {
+		t.Errorf("aqg.json must not be rewritten for out-of-scope legacy entries (before=%s, after=%s)", beforeHash, got)
+	}
+	if !strings.Contains(buf.String(), "ghostpool") {
+		t.Errorf("expected log naming the out-of-scope pool; got %q", buf.String())
 	}
 }

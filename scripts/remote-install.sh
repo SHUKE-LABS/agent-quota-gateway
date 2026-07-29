@@ -11,6 +11,11 @@
 # aqg.json, the gateway reads its AQG_POOL_* vars (+ any state file) to
 # generate aqg.json, then never consults the environment again. This script
 # never overwrites an existing env file, and never touches aqg.json.
+#
+# Legacy state-file operator intent (issue #241): on every subsequent start
+# the gateway also reconciles any unmigrated state-file priority_override
+# into aqg.json, then leaves the state file's overlay keys inert. After that
+# one-time reconciliation aqg.json is the single source of truth.
 set -euo pipefail
 
 BIN=agent-quota-gateway

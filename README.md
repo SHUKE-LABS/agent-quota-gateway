@@ -383,6 +383,25 @@ separate persisted overlay: the state file holds only runtime *observation*
   environment, nothing is written to disk (zero credentials on disk — the local
   dev default), and UI mutations are in-memory only.
 
+**Legacy state-file operator intent (issue #241):**
+
+When the deploy pins `AQG_CONFIG` to a fixed path under the systemd
+`StateDirectory`, `aqg.json` is never overwritten by a redeploy — so a
+pre-existing `aqg.json` survives every upgrade. A legacy operator who adjusted
+a pool's priority through the pre-#198 runtime API still has that adjustment
+recorded as `config.<pool>.priority_override` in the state file. On every
+start the gateway reconciles any such unmigrated `priority_override` into the
+loaded `aqg.json` (state-wins precedence, matching the bootstrap path) and
+writes the result back. After that one-time reconciliation, the state file's
+overlay keys become inert and `aqg.json` is the single source of truth. The
+gateway never edits the state file — runtime observation only.
+
+If a legacy `priority_override` references a pool or member that is no longer
+in the loaded config, reconciliation logs the entry and either skips it (pool
+not in config) or fails startup loud with a pool-named error (priority nicks
+all gone). Either way, the loaded `aqg.json` order is never silently preferred
+over an operator-stated state-file intent.
+
 A malformed file, an unknown JSON key, or a file with looser-than-0600
 permissions causes startup to fail closed — no silent fallback to env.
 
