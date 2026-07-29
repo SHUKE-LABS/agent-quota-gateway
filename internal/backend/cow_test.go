@@ -2,6 +2,7 @@ package backend
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -278,5 +279,102 @@ func TestWithPoolRemoved(t *testing.T) {
 	}
 	if !reg.HasPool("z-ai") {
 		t.Fatal("source registry mutated by WithPoolRemoved (should be copy-on-write)")
+	}
+}
+
+// TestWithPoolRenamed_movesEverything proves the rename carries every
+// attribute the pool declared (membership, per-member base URL override,
+// disabled flag, priority order, balance mode/params) over to the new key
+// while leaving every other pool untouched.
+func TestWithPoolRenamed_movesEverything(t *testing.T) {
+	reg := specFixture(t)
+
+	reg2, err := reg.WithPoolRenamed("auto", "Alpha")
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if reg2.HasPool("auto") {
+		t.Errorf("old name auto still present after rename")
+	}
+	if !reg2.HasPool("alpha") {
+		t.Fatalf("new name alpha missing after rename")
+	}
+	// Membership survives.
+	if got := reg2.PoolNicks("alpha"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("alpha members=%v, want [a b]", got)
+	}
+	// Priority survives.
+	if got := reg2.PoolPriority("alpha"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("alpha priority=%v, want [a b]", got)
+	}
+	// Other pool untouched.
+	if got := reg2.PoolNicks("z-ai"); len(got) != 2 {
+		t.Errorf("z-ai members=%v after unrelated rename", got)
+	}
+	// Original registry immutable.
+	if !reg.HasPool("auto") || reg.HasPool("alpha") {
+		t.Errorf("source registry mutated by rename (should be copy-on-write)")
+	}
+}
+
+// TestWithPoolRenamed_carriesBaseURLAndDisabled proves the rename preserves
+// the pool's declared base_url and a disabled member's flag — the attributes
+// the persisted config file and the active controller depend on.
+func TestWithPoolRenamed_carriesBaseURLAndDisabled(t *testing.T) {
+	reg := specFixture(t)
+	// Disable z-ai/x so the flag has something to carry.
+	disabled, err := reg.WithMemberDisabled("z-ai", "x", true)
+	if err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	reg2, err := disabled.WithPoolRenamed("z-ai", "Vendor")
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	b, ok := reg2.ResolveIn("vendor", "x")
+	if !ok {
+		t.Fatalf("vendor/x not resolvable after rename")
+	}
+	if !b.Disabled {
+		t.Errorf("vendor/x Disabled=false after rename, want true")
+	}
+	// y's per-member base_url override must survive.
+	y, ok := reg2.ResolveIn("vendor", "y")
+	if !ok {
+		t.Fatalf("vendor/y not resolvable after rename")
+	}
+	if y.BaseURL != "https://mirror.example/anthropic" {
+		t.Errorf("vendor/y base_url=%q after rename, want the mirror", y.BaseURL)
+	}
+	// Pool-level base_url round-trips through Spec() and rebuild.
+	rebuilt, err := BuildFromSpec(reg2.Spec(), testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if !rebuilt.HasPool("vendor") {
+		t.Fatalf("rebuilt registry missing vendor after Spec() round-trip")
+	}
+}
+
+// TestWithPoolRenamed_errors covers the four error paths:
+//   - unknown source pool
+//   - empty new name (after normalization)
+//   - new name identical to old (after normalization)
+//   - new name collides with a different existing pool
+func TestWithPoolRenamed_errors(t *testing.T) {
+	reg := specFixture(t)
+	cases := []struct {
+		old, new string
+		wantSub  string
+	}{
+		{"ghost", "renamed", "unknown pool"},
+		{"auto", "", "empty after normalization"},
+		{"auto", "Auto", "same name"},
+		{"auto", "z-ai", "already exists"},
+	}
+	for _, tc := range cases {
+		if _, err := reg.WithPoolRenamed(tc.old, tc.new); err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+			t.Errorf("WithPoolRenamed(%q,%q): err=%v, want substring %q", tc.old, tc.new, err, tc.wantSub)
+		}
 	}
 }

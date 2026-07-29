@@ -718,6 +718,7 @@ restarting is the wrong tool.
 | `GET /_gateway/config` | Effective configuration for every pool, **credentials redacted** |
 | `POST /_gateway/pool` | Create a plain pool at runtime; body `{"name": "...", "mode": "plain"}` (`name` required, `mode` optional and defaults to `plain`). A runtime pool is a pure named container with no pool-level base_url; each member resolves its own `base_url` via `AddMember`'s fallback chain. Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
 | `DELETE /_gateway/pool/{name}` | Remove a pool. The pool must be **empty** — drain members first via `DELETE .../member/{nick}`; a pool that still has members returns `409` (no cascade, so no persisted credential is silently discarded). Returns `200` `{"status": "ok"}`; an unknown pool returns `404`. Deleting the last pool is allowed (routing then fails closed with `403` unknown selector). Persisted: a deleted pool does not reappear on restart. |
+| `POST /_gateway/pool/{name}/rename` | Rename a pool in place; body `{"name": "<new>"}` (required, normalized server-side). Carries the pool's members, disabled flags, declared priority, and balance parameters over to the new key. The controller's runtime observation (sticky pointer, exhausted marks, balance sequence, local-snapshot set) is keyed by member nick, so it follows the rename unchanged. Returns `200` `{"pool": "<new>"}`. Empty / identical-after-normalize new name → `400`; unknown old pool → `404`; new name collides with a different existing pool → `409`. Persisted: the next config-roundtrip restart restores the rename under the new key. **Caveat for env-only mode** (`AQG_CONFIG` unset, no `aqg.json`): the config writer is a no-op, so the rename is runtime-only and reverts to the env-declared name on restart — same constraint `AddPool`/`AddMember` already carry. |
 | `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
@@ -742,6 +743,8 @@ curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/d/move \
 curl -X DELETE http://127.0.0.1:8080/_gateway/pool/auto/member/d
 # delete a pool (must be empty — drain its members first)
 curl -X DELETE http://127.0.0.1:8080/_gateway/pool/spare
+# rename a pool in place — membership and runtime observation follow
+curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/rename -d '{"name":"primary"}'
 ```
 
 `GET /_gateway/config` returns one object per pool — balance settings, the

@@ -106,6 +106,44 @@ func deletePoolHandler(pools *auto.Pools) http.HandlerFunc {
 	}
 }
 
+// renamePoolRequest is the JSON body for POST /_gateway/pool/{name}/rename.
+type renamePoolRequest struct {
+	Name string `json:"name"` // required; normalized server-side
+}
+
+// renamePoolHandler serves POST /_gateway/pool/{name}/rename — atomically
+// renames a pool in place (issue #238). On success it returns 200 with the
+// normalized new name, matching createPoolHandler's response shape. Mapping:
+// unknown old pool → 404; empty / identical-after-normalize new name → 400;
+// new name collides with a different existing pool → 409.
+func renamePoolHandler(pools *auto.Pools) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		poolName := backend.NormalizeName(r.PathValue("name"))
+		if poolName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool name is required"})
+			return
+		}
+
+		var req renamePoolRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
+			return
+		}
+
+		status, err := pools.RenamePool(poolName, req.Name)
+		if err != nil {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"pool": backend.NormalizeName(req.Name)})
+	}
+}
+
 // priorityHandler serves POST /_gateway/pool/{name}/priority — sets a
 // runtime priority override for the pool. The request body must be a JSON
 // array of nicks (highest priority first). The override is expanded to a

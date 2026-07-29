@@ -23,6 +23,7 @@ func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	mux.HandleFunc("/_gateway/config", configHandler(pools, nil))
 	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
 	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools))
+	mux.HandleFunc("POST /_gateway/pool/{name}/rename", renamePoolHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
@@ -506,6 +507,54 @@ func fetchAllPools(t *testing.T, baseURL string) []auto.PoolConfigView {
 		t.Fatalf("decode config: %v", err)
 	}
 	return views
+}
+
+// TestRenamePoolEndpoint drives POST /_gateway/pool/{name}/rename: the happy
+// path renames a runtime pool, the rename is reflected in GET /_gateway/config
+// and survives a config-roundtrip restart, and the four error paths return
+// the documented status codes (404 unknown old, 400 empty / identical new,
+// 409 conflict).
+func TestRenamePoolEndpoint(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	pools := loadPools(t)
+	srv := configMux(t, pools)
+
+	// Happy path: create a runtime pool and rename it.
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"rt"}`, http.StatusCreated)
+	addJSON(t, srv.URL+"/_gateway/pool/rt/member/m", `{"credential":"sk-ant-m","base_url":"https://m.example"}`, http.StatusOK)
+
+	postJSON(t, srv.URL+"/_gateway/pool/rt/rename", `{"name":"renamed"}`, http.StatusOK)
+
+	// Old name gone from config view; new name present with the same member.
+	for _, v := range fetchAllPools(t, srv.URL) {
+		if v.Pool == "rt" {
+			t.Error("old pool name rt still present after rename")
+		}
+	}
+	if !memberPresent(t, srv.URL, "renamed", "m") {
+		t.Error("renamed pool missing its member after rename")
+	}
+
+	// The rename survives a config-roundtrip restart (env is not re-read).
+	pools2 := reloadPools(t, pools)
+	srv2 := configMux(t, pools2)
+	for _, v := range fetchAllPools(t, srv2.URL) {
+		if v.Pool == "rt" {
+			t.Error("old name rt reappeared after restart")
+		}
+	}
+	if !memberPresent(t, srv2.URL, "renamed", "m") {
+		t.Error("renamed pool lost its member across restart")
+	}
+
+	// Error paths.
+	postJSON(t, srv.URL+"/_gateway/pool/ghost/rename", `{"name":"renamed2"}`, http.StatusNotFound)    // unknown old
+	postJSON(t, srv.URL+"/_gateway/pool/renamed/rename", `{"name":""}`, http.StatusBadRequest)        // empty new
+	postJSON(t, srv.URL+"/_gateway/pool/renamed/rename", `{"name":"Renamed"}`, http.StatusBadRequest) // identical after normalize
+	postJSON(t, srv.URL+"/_gateway/pool/auto/rename", `{"name":"renamed"}`, http.StatusConflict)      // collides with different existing pool
+
+	// Malformed body.
+	post(t, srv.URL+"/_gateway/pool/renamed/rename", http.StatusBadRequest)
 }
 
 // TestMoveEndpoint exercises POST /_gateway/pool/{name}/member/{nick}/move:
