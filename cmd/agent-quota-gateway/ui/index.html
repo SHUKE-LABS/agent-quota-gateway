@@ -390,6 +390,24 @@
     font-size: 12px;
   }
   button.delete-pool:hover { border-color: var(--danger); background: rgba(207, 34, 46, 0.08); }
+  /* "Rename pool" — header control shown for every pool (issue #238). When
+     a pool also shows the delete-pool button (empty pools only), a sibling
+     gap keeps them visually separated. */
+  button.rename-pool {
+    margin-left: auto;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--accent);
+    border-radius: 4px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  button.rename-pool + button.delete-pool { margin-left: 8px; }
+  button.rename-pool:hover { border-color: var(--accent); background: rgba(0, 0, 0, 0.04); }
+  /* On an empty pool, render rename first (auto) and delete after with a
+     small gap; on a populated pool rename is the only header control. */
+  button.delete-pool { margin-left: 0; }
 
   .addsub-card {
     background: var(--panel);
@@ -647,6 +665,17 @@
     // Delete-pool control, offered only for an empty pool (issue #233). The
     // DELETE API is empty-only — it returns 409 for a pool that still has
     // members (issue #232) — so the button never appears while any row remains.
+    // Rename-pool control is offered for every pool (issue #238); it lives
+    // next to delete when both apply (empty pool) and alone otherwise.
+    var rename = document.createElement('button');
+    rename.type = 'button';
+    rename.className = 'rename-pool';
+    rename.setAttribute('data-role', 'rename-pool');
+    rename.textContent = 'Rename pool';
+    rename.addEventListener('click', function () {
+      renamePool(view.pool);
+    });
+    head.appendChild(rename);
     if ((view.members || []).length === 0) {
       var del = document.createElement('button');
       del.type = 'button';
@@ -1351,6 +1380,27 @@
     fetchJSON('/_gateway/pool/' + encodeURIComponent(pool),
       { method: 'DELETE', headers: { 'Accept': 'application/json' } })
       .then(function (r) { return refreshAfter(r, 'Failed to delete pool'); });
+  }
+
+  function renamePool(pool) {
+    var newName = window.prompt(
+      'Rename pool "' + pool + '" to:\n\n' +
+      '(Pool names are normalized the same way env vars are: lowercase, underscores become hyphens.)',
+      pool);
+    if (newName == null) { return; }
+    newName = newName.trim();
+    if (!newName) {
+      showBanner('Rename failed: new name is required');
+      return;
+    }
+    // refreshAfter surfaces 400 (empty / identical-after-normalize) / 404
+    // (unknown pool) / 409 (collides with another pool) via the error banner,
+    // matching the pattern other mutation controls use.
+    fetchJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/rename',
+      { method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ name: newName }) })
+      .then(function (r) { return refreshAfter(r, 'Failed to rename pool'); });
   }
 
   function moveMember(fromPool, nick) {
