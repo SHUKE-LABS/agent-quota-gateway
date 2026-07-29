@@ -1,9 +1,9 @@
 package auto
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -174,12 +174,9 @@ func TestRenamePool_persistedAcrossRestart(t *testing.T) {
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
-	// Track whether the state-dirty callback fired. A no-op closure would
-	// let the rename write the config file but silently lose the state-file
-	// key (state-flush requires a fresh MarkDirty from somewhere; without
-	// the callback here the only path that calls MarkDirty is the rename's
-	// own onMutate fire, which a regression could drop). The test fails if
-	// the callback is not invoked.
+	// Track the state-dirty callback fire count. AddPool and AddMember also
+	// fire onMutate, so the assertion is on the delta around the rename, not
+	// on the absolute count.
 	var mutated int
 	p.SetOnMutate(func() { mutated++ })
 
@@ -206,10 +203,11 @@ func TestRenamePool_persistedAcrossRestart(t *testing.T) {
 
 	// Rename + a PersistState flush to materialise the new key in the state
 	// map that LoadPersistState will consume on restart.
+	before := mutated
 	if status, err := p.RenamePool("rt", "newname"); status != http.StatusOK || err != nil {
 		t.Fatalf("RenamePool: %v", err)
 	}
-	if mutated == 0 {
+	if mutated == before {
 		t.Fatal("state-dirty callback did not fire after RenamePool; state file would keep the old key on restart and LoadPersistState would drop observation (issue #238 AC)")
 	}
 	state := p.PersistState()
@@ -223,7 +221,7 @@ func TestRenamePool_persistedAcrossRestart(t *testing.T) {
 	// Reload from the registry (operator intent survives), then reapply the
 	// captured state — the new Pools must restore observation under newname.
 	reg := p.CurrentRegistry()
-	p2 := NewPools(reg, quota.NewStore(), clock.now, io.Discard)
+	p2 := NewPools(reg, quota.NewStore(), clock.now, os.Stderr)
 	p2.LoadPersistState(state)
 	c2, ok := p2.controller("newname")
 	if !ok {
@@ -329,15 +327,21 @@ func TestRenamePool_atomicPoolNameFollowsRename(t *testing.T) {
 }
 
 // TestRenamePool_concurrentWithModifyResponse drives the lock-free readers
-// that the atomic.Pointer[string] field guards (issue #238 review must-fix
-// #1 follow-on). The genuinely lock-free readers live inside parkAndFailover
-// (auto.go:2148, 2161, 2165, 2170) and the preemptor (preempt.go:221), all of
-// which read c.name() AFTER releasing c.mu — which is exactly what the
-// atomic pointer is for. We exercise that path by feeding Pools.ModifyResponse
-// a synthetic 429 with the renamed pool's backend on the request context,
-// then renaming the pool concurrently. Without the atomic swap, the log
-// sites would race against the rename writer; with it, every log line
-// observes one consistent value.
+// that the atomic.Pointer[string] field guards (issue #238 review follow-on).
+// The genuinely lock-free readers live inside ModifyResponse after the
+// unlock: the policy-429 log at auto.go:2022, the per-member rate-limit
+// throttle log at auto.go:2017, the parkAndFailover branch's "all backends
+// exhausted" log at auto.go:2168, and the switched log at auto.go:2173 —
+// all of which read c.name() AFTER releasing c.mu. The atomic pointer is
+// what keeps those reads race-clean against a concurrent RenamePool.
+//
+// To force the genuine-exhaustion branch (parkAndFailover), we feed the
+// shared quota store a snapshot with UnifiedStatus="rejected" so
+// isGenuineExhaustionSignal returns true via the store branch
+// (auto.go:2217-2221). A fresh *http.Response is built per iteration
+// because rewriteTo503 mutates StatusCode in place; sharing one response
+// across iterations would see the second-and-later ones fall through
+// after the first switch.
 //
 // The test runs under -race; a plain-string field on the controller would
 // race the writer that holds c.mu (the writer itself is fine, but the
@@ -345,9 +349,17 @@ func TestRenamePool_atomicPoolNameFollowsRename(t *testing.T) {
 // reports and no panic.
 func TestRenamePool_concurrentWithModifyResponse(t *testing.T) {
 	clock := newMoveClock()
-	p := loadMovePools(t, clock, map[string]string{
-		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
-	})
+	scrubPoolEnv(t)
+	t.Setenv(backend.EnvPrefix+"SRC_BACKEND_X", "cred-x")
+	reg, err := backend.Load(testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	// Use a stderr-backed logger so the test can prove the lock-free log
+	// site under test actually fires on a 429. io.Discard would hide the
+	// signal.
+	store := quota.NewStore()
+	p := NewPools(reg, store, clock.now, os.Stderr)
 	if status, err := p.AddPool("rt", ""); status != http.StatusCreated || err != nil {
 		t.Fatalf("AddPool: %v", err)
 	}
@@ -358,27 +370,37 @@ func TestRenamePool_concurrentWithModifyResponse(t *testing.T) {
 		t.Fatalf("AddMember b: %v", err)
 	}
 
-	// Pre-build a synthetic 429 response bound to the rt/a backend on its
-	// request context. ModifyResponse will dispatch into the per-pool
-	// controller and exercise the lock-free log sites via parkAndFailover.
-	resp := &http.Response{
-		StatusCode: http.StatusTooManyRequests,
-		Header:     http.Header{"Date": []string{clock.now().Format(http.TimeFormat)}},
-		Request:    httptest.NewRequest(http.MethodPost, "/v1/messages", nil),
+	// Pin the pool's only exhausted signal on the store so every 429
+	// classifies as genuine exhaustion. Without this the synthetic
+	// 429 (which carries no rate-limit headers) would take the
+	// policy-429 early return at auto.go:2022 and never reach the
+	// parkAndFailover branch the comment names.
+	store.Put("a", quota.Snapshot{UnifiedStatus: "rejected"})
+
+	// newResp builds a fresh 429 on the rt/a backend so each iteration
+	// takes the parkAndFailover route.
+	newResp := func() *http.Response {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		req = req.WithContext(backend.WithBackend(req.Context(),
+			backend.Backend{Pool: "rt", Nick: "a", Credential: "cred-a", BaseURL: "https://a.example"}))
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Date": []string{clock.now().Format(http.TimeFormat)}},
+			Request:    req,
+		}
 	}
-	resp.Request = resp.Request.WithContext(backend.WithBackend(resp.Request.Context(),
-		backend.Backend{Pool: "rt", Nick: "a", Credential: "cred-a", BaseURL: "https://a.example"}))
 
 	const N = 100
 	var wg sync.WaitGroup
 	wg.Add(2)
-	// Reader: drives ModifyResponse repeatedly. The 429 path inside
-	// parkAndFailover holds c.mu around setActiveMemberLocked and then logs
-	// under c.name() — the lock-free read the atomic pointer protects.
+	// Reader: drives ModifyResponse with a fresh 429 each iteration.
+	// parkAndFailover holds c.mu around setActiveMemberLocked and then
+	// logs under c.name() — the lock-free read the atomic pointer
+	// protects.
 	go func() {
 		defer wg.Done()
 		for i := 0; i < N; i++ {
-			_ = p.ModifyResponse(resp)
+			_ = p.ModifyResponse(newResp())
 		}
 	}()
 	// Writer: flips the name back and forth so each iteration forces a real

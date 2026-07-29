@@ -1105,7 +1105,7 @@ func (p *Pools) RenamePool(oldName, newName string) (int, error) {
 	// a non-blocking channel send (matching markConfigDirtyLocked's pattern),
 	// so calling it under p.mu is safe.
 	if p.onMutate != nil {
-//		p.onMutate()
+		p.onMutate()
 	}
 	if p.logOut != nil {
 		fmt.Fprintf(p.logOut, "auto: renamed pool %s -> %s\n", oldNorm, newNorm)
