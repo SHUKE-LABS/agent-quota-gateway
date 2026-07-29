@@ -218,7 +218,7 @@ func (p *Preemptor) tick() time.Duration {
 
 		if target != "" {
 			if c.PreemptTo(target) {
-				fmt.Fprintf(p.logOut, "preempt[%s]: %s -> %s (higher-priority member recovered)\n", c.pool, v.current, target)
+				fmt.Fprintf(p.logOut, "preempt[%s]: %s -> %s (higher-priority member recovered)\n", c.name(), v.current, target)
 			}
 		}
 	}

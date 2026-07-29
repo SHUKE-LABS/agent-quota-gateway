@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
@@ -191,6 +192,16 @@ func (p *Pools) controllersSnapshot() map[string]*Controller {
 		out[name] = c
 	}
 	return out
+}
+
+// name returns the controller's current byPool key. It is the lock-free
+// accessor for the atomic field; callers that need a stable name across
+// multiple operations must take c.mu and snapshot the result. A controller
+// always has a non-nil pool name — NewController initialises it before any
+// other path can observe the controller, and the rename writer stores a fresh
+// pointer rather than clearing it — so the dereference here is safe.
+func (c *Controller) name() string {
+	return *c.poolName.Load()
 }
 
 // PoolNames returns the current pool names in sorted order, taken under the
@@ -799,7 +810,7 @@ func (p *Pools) MoveMember(fromPool, nick, toPool string, placement []string, fo
 // success. Caller holds c.mu.
 func (c *Controller) validatePlacementLocked(nick string, placement []string) ([]string, int, error) {
 	if len(placement) == 0 {
-		return nil, http.StatusBadRequest, fmt.Errorf("explicit placement is required to move into priority pool %s", c.pool)
+		return nil, http.StatusBadRequest, fmt.Errorf("explicit placement is required to move into priority pool %s", c.name())
 	}
 	prospective := make(map[string]bool)
 	for _, m := range c.allMemberNicksLocked() {
@@ -1012,6 +1023,93 @@ func (p *Pools) RemovePool(name string) (int, error) {
 	return http.StatusOK, nil
 }
 
+// RenamePool renames a pool in place from oldName to newName (issue #238),
+// preserving the controller's runtime observation — sticky pointer, exhausted
+// marks, balance sequence, and local-snapshot set are all keyed by member
+// nick (not pool name) and so move with the rename for free. The credential-
+// free status mapping mirrors AddPool's conflict pattern: unknown old → 404,
+// empty / identical-after-normalize new → 400, new name collides with a
+// different existing pool → 409. The state-file persister is fired alongside
+// the config one so the next flush rewrites the pool under its new key —
+// otherwise LoadPersistState would silently drop observation on the next
+// restart (the file still carried the old key, with no controller by that
+// name to consume it).
+//
+// Atomicity: the c.poolName atomic.Pointer[string] is swapped under c.mu,
+// and the byPool map key moves under p.mu. A request already past Route but
+// not yet at ModifyResponse holds a b.Pool string captured at Route time;
+// that lookup misses the new key and ModifyResponse returns nil (no 429 park
+// for the in-flight request). The next request resolves cleanly. Same class
+// of window RemovePool already has, and the AC the issue names — "after
+// success only the new pool name remains, and routing by the old selector
+// fails closed" — is satisfied; the in-flight edge case is documented so a
+// later reader does not file it as a regression.
+func (p *Pools) RenamePool(oldName, newName string) (int, error) {
+	oldNorm := backend.NormalizeName(oldName)
+	newNorm := backend.NormalizeName(newName)
+	if oldNorm == "" {
+		return http.StatusBadRequest, fmt.Errorf("pool name is empty after normalization")
+	}
+	if newNorm == "" {
+		return http.StatusBadRequest, fmt.Errorf("new pool name is empty after normalization")
+	}
+	if oldNorm == newNorm {
+		return http.StatusBadRequest, fmt.Errorf("rename source and target normalize to the same name %q", newNorm)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	c, ok := p.byPool[oldNorm]
+	if !ok || !p.reg.HasPool(oldNorm) {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+	// Mirror AddPool's conflict check (both byPool and reg) so the two views
+	// cannot disagree.
+	if other, exists := p.byPool[newNorm]; exists && other != c {
+		return http.StatusConflict, fmt.Errorf("pool %s already exists", newNorm)
+	}
+	if p.reg.HasPool(newNorm) && newNorm != oldNorm {
+		return http.StatusConflict, fmt.Errorf("pool %s already exists", newNorm)
+	}
+
+	next, err := p.reg.WithPoolRenamed(oldNorm, newNorm)
+	if err != nil {
+		// Registry refused: identical-after-normalize or other collision. Map
+		// to 400 (a request-shape issue) rather than 409 (which is reserved
+		// for a pool that exists with different credentials).
+		return http.StatusBadRequest, err
+	}
+
+	// Rewire the controller to the new name. The membership, disabled set,
+	// priority, and balance params are unchanged by the rename — only the
+	// byPool key and the atomic poolName field need to move. reconcileLocked
+	// is intentionally NOT called here: it would re-read from reg.PoolNicks
+	// with the now-stale c.poolName if the swap ordering slipped, and
+	// nothing the rename changed requires it.
+	c.mu.Lock()
+	c.reg = next
+	newNameCopy := newNorm
+	c.poolName.Store(&newNameCopy)
+	c.mu.Unlock()
+
+	delete(p.byPool, oldNorm)
+	p.byPool[newNorm] = c
+	p.reg = next
+	p.markConfigDirtyLocked()
+	// Fire the state-dirty callback so the next flush rewrites the persisted
+	// sticky/exhausted/local-snapshot map under the new key. The callback is
+	// a non-blocking channel send (matching markConfigDirtyLocked's pattern),
+	// so calling it under p.mu is safe.
+	if p.onMutate != nil {
+		p.onMutate()
+	}
+	if p.logOut != nil {
+		fmt.Fprintf(p.logOut, "auto: renamed pool %s -> %s\n", oldNorm, newNorm)
+	}
+	return http.StatusOK, nil
+}
+
 // SetOnMutate installs a callback that every controller calls (non-blocking)
 // after any mutation to its sticky pointer or exhausted map. Used by the
 // persister to coalesce writes without importing this package. The callback
@@ -1105,8 +1203,17 @@ func crossPoolResolve(reg *backend.Registry, skipPool, nick string) (creds, base
 type Controller struct {
 	mu sync.Mutex
 
-	reg  *backend.Registry
-	pool string
+	reg *backend.Registry
+	// poolName is the current byPool key this controller is registered under.
+	// It is set at construction (NewController) and updated atomically by
+	// (*Pools).RenamePool — the field is *atomic* so the ~20 lock-free readers
+	// (logging, PoolStatus, the proxy response modifier) keep their shape
+	// while the rename path can swap the value without coordinating with
+	// every concurrent 429, preempt, or recovery-probe call site. Reads via
+	// (*Controller).poolName(); the only writer outside construction is the
+	// rename path, which holds c.mu and uses Store. Constructed non-nil so a
+	// reader racing a Store never dereferences a nil pointer.
+	poolName atomic.Pointer[string]
 
 	// members is the ordered member collection, re-derived from the registry
 	// on every reconcile (issue #198). A removed member is simply absent from
@@ -1256,7 +1363,6 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 	nicks := configNicks // used only for effectiveOrder below; not stored
 	c := &Controller{
 		reg:                reg,
-		pool:               poolName,
 		members:            members,
 		priority:           effectiveOrder(reg.PoolPriority(poolName), nicks),
 		store:              store,
@@ -1272,6 +1378,11 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		disabled:           make(map[string]bool),
 		poolLocalSnapshots: local,
 	}
+	// Initialise the atomic pool-name pointer before any other path can observe
+	// the controller. NewController hands the *Controller back to the caller
+	// (Pools, tests) which may immediately read c.name() under no lock; a
+	// nil pointer would crash there.
+	c.poolName.Store(&poolName)
 	// Seed the disabled set from the registry (config is the single source of
 	// truth for the disabled flag now — issue #198).
 	for _, m := range members {
@@ -1317,12 +1428,12 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 // pool that just gained its first member anchors its pointer. Caller holds c.mu.
 func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	c.reg = reg
-	nicks := reg.PoolNicks(c.pool) // sorted
+	nicks := reg.PoolNicks(c.name()) // sorted
 	present := make(map[string]bool, len(nicks))
 	members := make([]memberEntry, 0, len(nicks))
 	disabled := make(map[string]bool)
 	for _, nick := range nicks {
-		b, ok := reg.ResolveIn(c.pool, nick)
+		b, ok := reg.ResolveIn(c.name(), nick)
 		if !ok {
 			continue
 		}
@@ -1334,9 +1445,9 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	}
 	c.members = members
 	c.disabled = disabled
-	c.priority = effectiveOrder(reg.PoolPriority(c.pool), nicks)
-	c.balanceGap = reg.PoolBalanceGap(c.pool)
-	c.balanceDwell = reg.PoolBalanceDwell(c.pool)
+	c.priority = effectiveOrder(reg.PoolPriority(c.name()), nicks)
+	c.balanceGap = reg.PoolBalanceGap(c.name())
+	c.balanceDwell = reg.PoolBalanceDwell(c.name())
 
 	// Prune runtime observation for members that left the pool.
 	for nick := range c.exhausted {
@@ -1361,7 +1472,7 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 		c.curNick = ""
 		if next, ok := c.firstHealthyNickLocked(); ok {
 			c.setActiveMemberLocked(next)
-			fmt.Fprintf(c.logOut, "auto[%s]: switched %s -> %s (member %s left the pool)\n", c.pool, gone, next, gone)
+			fmt.Fprintf(c.logOut, "auto[%s]: switched %s -> %s (member %s left the pool)\n", c.name(), gone, next, gone)
 		}
 	case c.curNick == "" && len(members) > 0:
 		if next, ok := c.firstHealthyNickLocked(); ok {
@@ -1460,7 +1571,7 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 				from := c.curNick
 				c.lastBalanceSwitch = c.now()
 				c.setActiveMemberLocked(next)
-				fmt.Fprintf(c.logOut, "auto[%s]: balance %s -> %s (lead gap)\n", c.pool, from, next)
+				fmt.Fprintf(c.logOut, "auto[%s]: balance %s -> %s (lead gap)\n", c.name(), from, next)
 				if b, ok := c.backendByNickLocked(next); ok {
 					return b, 0, false
 				}
@@ -1707,7 +1818,7 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 		}
 		members = append(members, ms)
 	}
-	return PoolStatus{Pool: c.pool, Active: c.curNick, Members: members}
+	return PoolStatus{Pool: c.name(), Active: c.curNick, Members: members}
 }
 
 // loadState applies persisted routing state. Exhausted entries whose reset
@@ -1728,7 +1839,7 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, la
 			reason = "priority"
 		}
 		fmt.Fprintf(c.logOut, "loadState[%s]: persisted sticky=%s not in current pool members; keeping %s (%s)\n",
-			c.pool, sticky, c.curNick, reason)
+			c.name(), sticky, c.curNick, reason)
 	}
 	now := c.now()
 	for nick, reset := range exhausted {
@@ -1737,7 +1848,7 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, la
 		}
 		if c.indexOf(nick) < 0 {
 			fmt.Fprintf(c.logOut, "loadState[%s]: dropping persisted exhausted entry %s (not in current pool members)\n",
-				c.pool, nick)
+				c.name(), nick)
 			continue
 		}
 		c.exhausted[nick] = reset
@@ -1883,7 +1994,7 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 		// exhaustion classifier so a momentarily at-cap store snapshot can't
 		// misclassify the 1302 as genuine exhaustion and over-park.
 		if isZaiBackend(b) {
-			fmt.Fprintf(c.logOut, "auto[%s]: %s z.ai 429 concurrency throttle — absorbing as transient, not parking\n", c.pool, b.Nick)
+			fmt.Fprintf(c.logOut, "auto[%s]: %s z.ai 429 concurrency throttle — absorbing as transient, not parking\n", c.name(), b.Nick)
 			rewriteTo503(resp)
 			setRetryAfter(resp.Header, zaiThrottleRetryAfterSeconds)
 			return nil
@@ -1900,12 +2011,12 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 			// which carries no rate-limit headers): forward the body on a 503,
 			// also without parking.
 			if secs, ok := transientRateLimit429(resp); ok {
-				fmt.Fprintf(c.logOut, "auto[%s]: %s rate-limit 429 (transient throttle) — backing off %ds, not parking\n", c.pool, b.Nick, secs)
+				fmt.Fprintf(c.logOut, "auto[%s]: %s rate-limit 429 (transient throttle) — backing off %ds, not parking\n", c.name(), b.Nick, secs)
 				rewriteTo503(resp)
 				setRetryAfter(resp.Header, secs)
 				return nil
 			}
-			fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.pool, b.Nick)
+			fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.name(), b.Nick)
 			rewriteTo503WithBody(resp)
 			return nil
 		}
@@ -2034,7 +2145,7 @@ func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset tim
 			c.setActiveMemberLocked(recovered)
 			c.mu.Unlock()
 			fmt.Fprintf(c.logOut, "auto[%s]: %s -> %s (recovered %s via quota probe; upstream reset would have over-parked)\n",
-				c.pool, from, recovered, recovered)
+				c.name(), from, recovered, recovered)
 			rewriteTo503(resp)
 			return nil
 		}
@@ -2047,16 +2158,16 @@ func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset tim
 			// NOT a 429 and is forwarded honestly below — the client must see
 			// the real auth status, not a transient 503.
 			rewriteTo503DryPool(resp, secs)
-			fmt.Fprintf(c.logOut, "auto[%s]: all backends exhausted; returning 503 (retry after %ds)\n", c.pool, secs)
+			fmt.Fprintf(c.logOut, "auto[%s]: all backends exhausted; returning 503 (retry after %ds)\n", c.name(), secs)
 			return nil
 		}
 		setRetryAfter(resp.Header, secs)
-		fmt.Fprintf(c.logOut, "auto[%s]: all backends exhausted; forwarding upstream %d (retry after %ds)\n", c.pool, resp.StatusCode, secs)
+		fmt.Fprintf(c.logOut, "auto[%s]: all backends exhausted; forwarding upstream %d (retry after %ds)\n", c.name(), resp.StatusCode, secs)
 		return nil
 	}
 
 	if res.switched {
-		fmt.Fprintf(c.logOut, "auto[%s]: %s -> %s (%s %s)\n", c.pool, nick, res.to, nick, reason)
+		fmt.Fprintf(c.logOut, "auto[%s]: %s -> %s (%s %s)\n", c.name(), nick, res.to, nick, reason)
 	}
 	rewriteTo503(resp)
 	return nil
@@ -2281,7 +2392,7 @@ func (c *Controller) tryRecoverParked() string {
 			// through). Just clear the in-flight flag; do NOT extend the
 			// park — issue #124 contract: failed probe leaves the park alone.
 			c.clearProbeInFlight(t.quotaKey)
-			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s failed: %v (park retained)\n", c.pool, t.nick, err)
+			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s failed: %v (park retained)\n", c.name(), t.nick, err)
 			continue
 		}
 		// snapRejects (post-#125) shares the freshness predicate with the
@@ -2296,9 +2407,9 @@ func (c *Controller) tryRecoverParked() string {
 			if recovered == "" {
 				recovered = t.nick
 			}
-			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s returned healthy; unparked\n", c.pool, t.nick)
+			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s returned healthy; unparked\n", c.name(), t.nick)
 		} else {
-			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s still exhausted; park retained\n", c.pool, t.nick)
+			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s still exhausted; park retained\n", c.name(), t.nick)
 		}
 		c.probeInFlight[t.quotaKey] = false
 		c.mu.Unlock()
@@ -2659,7 +2770,7 @@ func (c *Controller) soonestNickLocked() (string, time.Time) {
 func (c *Controller) backendAt(i int) backend.Backend {
 	m := c.members[i]
 	return backend.Backend{
-		Pool:       c.pool,
+		Pool:       c.name(),
 		Nick:       m.Nick,
 		Credential: m.Credential,
 		BaseURL:    m.BaseURL,

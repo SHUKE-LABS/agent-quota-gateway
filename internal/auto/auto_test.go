@@ -181,9 +181,10 @@ func zaiController(t *testing.T, clock *fixedClock, logOut io.Writer, nicks ...s
 
 func (c *Controller) resolve(t *testing.T, nick string) backend.Backend {
 	t.Helper()
-	b, ok := c.reg.ResolveIn(c.pool, nick)
+	pool := c.name()
+	b, ok := c.reg.ResolveIn(pool, nick)
 	if !ok {
-		t.Fatalf("ResolveIn(%q,%q) not found", c.pool, nick)
+		t.Fatalf("ResolveIn(%q,%q) not found", pool, nick)
 	}
 	return b
 }
