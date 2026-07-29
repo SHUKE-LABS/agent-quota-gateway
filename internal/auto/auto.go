@@ -939,7 +939,60 @@ func (p *Pools) PersistState() map[string]PoolPersistState {
 	return out
 }
 
-// AddPool creates a new plain pool at runtime, folding it into the config
+// CreatePoolWithMember atomically creates a plain pool and optionally its first
+// member. All member validation runs before the registry is swapped (issue #240).
+func (p *Pools) CreatePoolWithMember(name, mode, nick, credential, baseURL string, placement []string) (int, error) {
+	normalized := backend.NormalizeName(name)
+	if normalized == "" {
+		return http.StatusBadRequest, fmt.Errorf("pool name is empty after normalization")
+	}
+	if mode == "" {
+		mode = "plain"
+	}
+	if mode != "plain" {
+		return http.StatusBadRequest, fmt.Errorf("unsupported mode %q: only \"plain\" is supported", mode)
+	}
+	member := backend.NormalizeName(nick)
+	if member == "" && len(placement) > 0 {
+		return http.StatusBadRequest, fmt.Errorf("nick is required when placement is supplied")
+	}
+	if baseURL != "" {
+		if _, err := backend.ValidateBaseURL(baseURL); err != nil {
+			return http.StatusBadRequest, fmt.Errorf("invalid base_url: %w", err)
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, exists := p.byPool[normalized]; exists || p.reg.HasPool(normalized) {
+		return http.StatusConflict, fmt.Errorf("pool %s already exists", normalized)
+	}
+	next, err := p.reg.WithPoolCreated(normalized)
+	if err != nil {
+		return http.StatusConflict, err
+	}
+	if member != "" {
+		if credential == "" {
+			return http.StatusBadRequest, fmt.Errorf("credential is required: nick %s is not a known subscription in any other pool", member)
+		}
+		if baseURL == "" {
+			return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no members")
+		}
+		next, err = next.WithMemberSet(normalized, member, credential, baseURL, false)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		if len(placement) > 0 {
+			return http.StatusBadRequest, fmt.Errorf("placement is only applicable to a priority target pool")
+		}
+	}
+	p.reg = next
+	c := NewController(next, normalized, -1, p.store, p.now, p.logOut)
+	c.onMutate = p.onMutate
+	p.byPool[normalized] = c
+	p.markConfigDirtyLocked()
+	return http.StatusCreated, nil
+}
+
 // registry (issue #198: runtime pools are config, not a separate state-file
 // overlay) and inserting a controller so the proxy can route to it
 // immediately. name is normalized; mode defaults to "plain" and only "plain"
@@ -2878,7 +2931,6 @@ func (c *Controller) nextParkedButResetPassedLocked() (string, bool) {
 	}
 	return "", false
 }
-
 
 // waitUntil is the non-negative duration from now until reset, floored so
 // callers never see a zero/negative wait.

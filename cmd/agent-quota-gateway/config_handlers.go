@@ -54,8 +54,12 @@ func configHandler(pools *auto.Pools, unsaved func() bool) http.HandlerFunc {
 // AddMember's fallback chain. An extra `base_url` field in the request body is
 // silently ignored by the decoder, keeping pre-issue-#172 clients working.
 type createPoolRequest struct {
-	Name string `json:"name"` // required; normalized server-side
-	Mode string `json:"mode"` // optional; defaults to "plain" (the only supported value)
+	Name       string   `json:"name"` // required; normalized server-side
+	Mode       string   `json:"mode"`
+	Nick       string   `json:"nick"`
+	Credential string   `json:"credential"`
+	BaseURL    string   `json:"base_url"`
+	Placement  []string `json:"placement"`
 }
 
 // createPoolHandler serves POST /_gateway/pool — creates a plain pool at
@@ -69,7 +73,7 @@ func createPoolHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
-		status, err := pools.AddPool(req.Name, req.Mode)
+		status, err := pools.CreatePoolWithMember(req.Name, req.Mode, req.Nick, req.Credential, req.BaseURL, req.Placement)
 		if err != nil {
 			w.WriteHeader(status)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
