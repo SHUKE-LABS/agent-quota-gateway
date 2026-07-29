@@ -1,16 +1,23 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/config"
+	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
 )
 
 // configMux builds a ServeMux with the runtime-config routes wired exactly as
@@ -492,6 +499,131 @@ func TestDeletePoolEndpoint(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("route to deleted pool status=%d, want 403", resp.StatusCode)
 	}
+}
+
+// TestDeletePoolEndpoint_configFilePersists drives the live management flow
+// end to end with the production config-writer wiring: bootstrap creates
+// aqg.json, the HTTP layer drains + deletes a pool, the debounced config
+// writer flushes the new config to disk, and a subsequent configfile.LoadFile
+// against the same path proves the deletion survives a real restart. The
+// failure mode the issue names — DELETE returns 200 in memory but the on-disk
+// config still carries the pool, so it resurrects on the next boot — fails
+// the disk-poll step (issue #239).
+func TestDeletePoolEndpoint_configFilePersists(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_CONFIG")
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BASE_URL", testBase)
+
+	// Bootstrap: resolveConfig creates aqg.json from env + the empty legacy
+	// state overlay, then returns the cfg the config writer marshals against.
+	var buf bytes.Buffer
+	resolvedCfg, _, path, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if path != cfgPath {
+		t.Fatalf("config path=%q, want %q", path, cfgPath)
+	}
+	// Pin the package-level type at setup: the closure below invokes
+	// configfile.Marshal on resolvedCfg, but go vet cannot see closure use, so
+	// without an explicit reference the import looks dead.
+	var _ config.Config = resolvedCfg
+
+	// Rebuild the in-memory registry the way a real process does: re-load
+	// aqg.json from disk so the runtime mutation path starts from the same
+	// authoritative source a real restart would. The registry handed back by
+	// resolveConfig is the bootstrap intermediate; what gets handed to NewPools
+	// in main.go is the file-loaded form.
+	_, reg, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+
+	pools := auto.NewPools(reg, nil, nil, io.Discard)
+
+	// Production-shaped writer: MarkDirty on every operator mutation, Run on
+	// its own goroutine sharing the test's shutdown context. The default
+	// 200ms debounce window is the one used in main.go.
+	cw := configfile.NewWriter(cfgPath, func() ([]byte, error) {
+		return configfile.Marshal(resolvedCfg, pools.CurrentRegistry())
+	})
+	pools.SetOnConfigChange(cw.MarkDirty)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { cw.Run(ctx); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	srv := configMux(t, pools)
+
+	// Env-origin empty pool: drain the only member, then delete the pool.
+	// Each step returns 200 (the in-memory contract the existing test already
+	// proves); this test additionally asserts the on-disk update lands.
+	delete(t, srv.URL+"/_gateway/pool/auto/member/a", http.StatusOK)
+	// Pause so the drain's debounced flush (default 200ms) lands before the
+	// delete runs. Back-to-back the two mark-dirties would share a single
+	// debounce window and a RemovePool regression that drops
+	// markConfigDirtyLocked would still produce one correct post-delete flush
+	// — the test would pass without exercising the regression. Separating
+	// them forces the drain to flush before the delete, so the regression
+	// surfaces as a stale "auto": {} left on disk that the next deletion
+	// never overwrites.
+	waitForDiskOmit(t, cfgPath, `"a"`)
+	delete(t, srv.URL+"/_gateway/pool/auto", http.StatusOK)
+
+	// Wait for the debounced writer to land (default 200ms; generous slack).
+	waitForDiskOmit(t, cfgPath, `"auto"`)
+
+	// Real-restart simulation: load aqg.json the same way resolveConfig would
+	// after a clean process restart, and confirm the deleted pool is gone.
+	_, reg2, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("post-delete LoadFile: %v", err)
+	}
+	if reg2.HasPool("auto") {
+		t.Errorf("deleted env-origin pool auto reappeared after disk restart")
+	}
+
+	// Runtime-origin empty pool: create a fresh runtime pool via the API and
+	// delete it, exercising the create→delete path under the same writer.
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"rt"}`, http.StatusCreated)
+	delete(t, srv.URL+"/_gateway/pool/rt", http.StatusOK)
+
+	waitForDiskOmit(t, cfgPath, `"rt"`)
+
+	_, reg3, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("post-delete LoadFile (rt): %v", err)
+	}
+	if reg3.HasPool("rt") {
+		t.Errorf("deleted runtime-origin pool rt reappeared after disk restart")
+	}
+}
+
+// waitForDiskOmit polls cfgPath until its body no longer contains needle, or
+// fails the test when the window elapses. The window must exceed the
+// configwriter's 200ms debounce plus a comfortable margin so a regression that
+// drops the on-disk flush fails here rather than passing because the test
+// raced the writer.
+func waitForDiskOmit(t *testing.T, cfgPath, needle string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		d, err := os.ReadFile(cfgPath)
+		if err == nil && !bytes.Contains(d, []byte(needle)) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	raw, _ := os.ReadFile(cfgPath)
+	t.Fatalf("aqg.json still contains %s after 3s: %s", needle, string(raw))
 }
 
 // fetchAllPools returns the full config view from GET /_gateway/config.
