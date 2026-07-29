@@ -171,12 +171,26 @@ func TestCreatePoolWithMemberEndpoint(t *testing.T) {
 		t.Fatalf("combined create members=%+v", v.Members)
 	}
 	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"bad","nick":"unknown"}`, http.StatusBadRequest)
-	if got := fetchPool(t, srv.URL, "bad"); got.Pool != "" {
-		t.Fatalf("invalid create left pool: %+v", got)
-	}
+	assertPoolAbsent(t, srv.URL, "bad")
 	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"placement","nick":"p","credential":"cred-p","base_url":"https://p.example","placement":["p"]}`, http.StatusBadRequest)
-	if got := fetchPool(t, srv.URL, "placement"); got.Pool != "" {
-		t.Fatalf("invalid placement left pool: %+v", got)
+	assertPoolAbsent(t, srv.URL, "placement")
+}
+
+func assertPoolAbsent(t *testing.T, baseURL, name string) {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/_gateway/config")
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	defer resp.Body.Close()
+	var views []auto.PoolConfigView
+	if err := json.NewDecoder(resp.Body).Decode(&views); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	for _, view := range views {
+		if view.Pool == name {
+			t.Fatalf("invalid create left pool: %s", name)
+		}
 	}
 }
 
