@@ -971,13 +971,30 @@ func (p *Pools) CreatePoolWithMember(name, mode, nick, credential, baseURL strin
 		return http.StatusConflict, err
 	}
 	if member != "" {
-		if credential == "" {
-			return http.StatusBadRequest, fmt.Errorf("credential is required: nick %s is not a known subscription in any other pool", member)
+		resolvedCred, resolvedURL := credential, baseURL
+		if credential == "" || baseURL == "" {
+			creds, baseURLs := crossPoolResolve(p.reg, normalized, member)
+			if credential == "" {
+				switch len(creds) {
+				case 1:
+					resolvedCred = creds[0]
+				case 0:
+					return http.StatusBadRequest, fmt.Errorf("credential is required: nick %s is not a known subscription in any other pool", member)
+				default:
+					return http.StatusBadRequest, fmt.Errorf("credential for nick %s is ambiguous across pools; specify it explicitly", member)
+				}
+			}
+			if baseURL == "" && len(baseURLs) > 1 {
+				return http.StatusBadRequest, fmt.Errorf("base_url for nick %s is ambiguous across pools; specify it explicitly", member)
+			}
+			if baseURL == "" && len(baseURLs) == 1 {
+				resolvedURL = baseURLs[0]
+			}
 		}
-		if baseURL == "" {
+		if resolvedURL == "" {
 			return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no members")
 		}
-		next, err = next.WithMemberSet(normalized, member, credential, baseURL, false)
+		next, err = next.WithMemberSet(normalized, member, resolvedCred, resolvedURL, false)
 		if err != nil {
 			return http.StatusBadRequest, err
 		}
