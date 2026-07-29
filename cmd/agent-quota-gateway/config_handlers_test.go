@@ -162,6 +162,24 @@ func TestCreatePoolEndpoint(t *testing.T) {
 	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"auto"}`, http.StatusConflict)
 }
 
+func TestCreatePoolWithMemberEndpoint(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	srv := configMux(t, loadPools(t))
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"fresh","nick":"n","credential":"cred-n","base_url":"https://n.example"}`, http.StatusCreated)
+	v := fetchPool(t, srv.URL, "fresh")
+	if len(v.Members) != 1 || v.Members[0].Nick != "n" {
+		t.Fatalf("combined create members=%+v", v.Members)
+	}
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"bad","nick":"unknown"}`, http.StatusBadRequest)
+	if got := fetchPool(t, srv.URL, "bad"); got.Pool != "" {
+		t.Fatalf("invalid create left pool: %+v", got)
+	}
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"placement","nick":"p","credential":"cred-p","base_url":"https://p.example","placement":["p"]}`, http.StatusBadRequest)
+	if got := fetchPool(t, srv.URL, "placement"); got.Pool != "" {
+		t.Fatalf("invalid placement left pool: %+v", got)
+	}
+}
+
 // TestDisableEnableEndpoints drives the disable/enable endpoints and verifies
 // the effective config reflects the change, plus the error codes for bad input.
 func TestDisableEnableEndpoints(t *testing.T) {
