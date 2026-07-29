@@ -3,6 +3,7 @@ package auto
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -153,9 +154,9 @@ func TestRenamePool_errors(t *testing.T) {
 	}{
 		{"ghost", "renamed", http.StatusNotFound},
 		{"rt", "", http.StatusBadRequest},
-		{"rt", "RT", http.StatusBadRequest},                // identical after normalize
-		{"rt", "other", http.StatusConflict},               // collides with different existing pool
-		{"", "renamed", http.StatusBadRequest},             // empty old
+		{"rt", "RT", http.StatusBadRequest},    // identical after normalize
+		{"rt", "other", http.StatusConflict},   // collides with different existing pool
+		{"", "renamed", http.StatusBadRequest}, // empty old
 	}
 	for _, tc := range cases {
 		status, err := p.RenamePool(tc.old, tc.new)
@@ -173,10 +174,14 @@ func TestRenamePool_persistedAcrossRestart(t *testing.T) {
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
 	})
-	// Install the state-dirty callback that the real wiring uses (issue #198
-	// state flush). The persister itself is not running, but the callback
-	// being wired proves the RenamePool path fires it.
-	p.SetOnMutate(func() {})
+	// Track whether the state-dirty callback fired. A no-op closure would
+	// let the rename write the config file but silently lose the state-file
+	// key (state-flush requires a fresh MarkDirty from somewhere; without
+	// the callback here the only path that calls MarkDirty is the rename's
+	// own onMutate fire, which a regression could drop). The test fails if
+	// the callback is not invoked.
+	var mutated int
+	p.SetOnMutate(func() { mutated++ })
 
 	if status, err := p.AddPool("rt", ""); status != http.StatusCreated || err != nil {
 		t.Fatalf("AddPool: %v", err)
@@ -203,6 +208,9 @@ func TestRenamePool_persistedAcrossRestart(t *testing.T) {
 	// map that LoadPersistState will consume on restart.
 	if status, err := p.RenamePool("rt", "newname"); status != http.StatusOK || err != nil {
 		t.Fatalf("RenamePool: %v", err)
+	}
+	if mutated == 0 {
+		t.Fatal("state-dirty callback did not fire after RenamePool; state file would keep the old key on restart and LoadPersistState would drop observation (issue #238 AC)")
 	}
 	state := p.PersistState()
 	if _, ok := state["rt"]; ok {
@@ -238,6 +246,9 @@ func TestRenamePool_persistedAcrossRestart(t *testing.T) {
 // claim (issue #238 AC "routing by the old selector fails closed"). A rename
 // followed by a Route under both names confirms the byPool swap is observed
 // by the read path without an explicit lock.
+//
+// The atomic-swap coverage lives in TestRenamePool_atomicPoolNameFollowsRename;
+// this test is the read-side check.
 func TestRenamePool_routeAfterRename(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
@@ -268,13 +279,71 @@ func TestRenamePool_routeAfterRename(t *testing.T) {
 	}
 }
 
-// TestRenamePool_concurrentWithRoute drives Route/ModifyResponse against a
-// rename under -race. The atomic pool-name pointer plus the under-p.mu byPool
-// swap must keep both paths race-clean: a Route that lands before the swap
-// sees the old name and fails closed; one that lands after sees the new name
-// and serves; one that lands in flight (during the swap window) sees one or
-// the other, never a torn map entry.
-func TestRenamePool_concurrentWithRoute(t *testing.T) {
+// TestRenamePool_atomicPoolNameFollowsRename is the regression guard for the
+// c.poolName atomic.Pointer[string] swap (issue #238 must-fix #2). If the
+// rename path skips the atomic Store and leaves the field at the old value,
+// every resolved Backend stamps the old name into the request context;
+// Pools.ModifyResponse looks the controller up by that name and misses the
+// byPool map (which moved), silently dropping 429 park/failover for every
+// request to the renamed pool. This test fails if either Backend.Pool is
+// stale or the post-rename lookup by that name returns unknown.
+func TestRenamePool_atomicPoolNameFollowsRename(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
+	})
+	if status, err := p.AddPool("rt", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool: %v", err)
+	}
+	if status, err := p.AddMember("rt", "a", "cred-a", "https://a.example", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember a: %v", err)
+	}
+
+	if status, err := p.RenamePool("rt", "renamed"); status != http.StatusOK || err != nil {
+		t.Fatalf("RenamePool: %v", err)
+	}
+
+	// Current returns the controller's sticky backend via the byPool lookup,
+	// which goes through the new key. The atomic field is what b.Pool on the
+	// request context stamps — a stale name would route correctly today but
+	// silently break ModifyResponse forever.
+	b, ok := p.Current("renamed")
+	if !ok {
+		t.Fatalf("Current(renamed) not ok after rename")
+	}
+	if b.Pool != "renamed" {
+		t.Errorf("Backend.Pool=%q after rename, want renamed (atomic swap regressed — ModifyResponse would skip 429 park for every request)", b.Pool)
+	}
+	if _, ok := p.controller(b.Pool); !ok {
+		t.Error("controller(b.Pool) miss after rename — byPool lookup by the stamped name fails; the request path would drop 429 park/failover")
+	}
+
+	// Controller's atomic field read directly, without going through byPool.
+	c, ok := p.controller("renamed")
+	if !ok {
+		t.Fatalf("controller(renamed) miss after rename")
+	}
+	if got := c.name(); got != "renamed" {
+		t.Errorf("c.name()=%q after rename, want renamed (atomic swap regressed)", got)
+	}
+}
+
+// TestRenamePool_concurrentWithModifyResponse drives the lock-free readers
+// that the atomic.Pointer[string] field guards (issue #238 review must-fix
+// #1 follow-on). The genuinely lock-free readers live inside parkAndFailover
+// (auto.go:2148, 2161, 2165, 2170) and the preemptor (preempt.go:221), all of
+// which read c.name() AFTER releasing c.mu — which is exactly what the
+// atomic pointer is for. We exercise that path by feeding Pools.ModifyResponse
+// a synthetic 429 with the renamed pool's backend on the request context,
+// then renaming the pool concurrently. Without the atomic swap, the log
+// sites would race against the rename writer; with it, every log line
+// observes one consistent value.
+//
+// The test runs under -race; a plain-string field on the controller would
+// race the writer that holds c.mu (the writer itself is fine, but the
+// readers outside c.mu would not be). The expected outcome is no race
+// reports and no panic.
+func TestRenamePool_concurrentWithModifyResponse(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
@@ -289,20 +358,31 @@ func TestRenamePool_concurrentWithRoute(t *testing.T) {
 		t.Fatalf("AddMember b: %v", err)
 	}
 
-	const N = 200
+	// Pre-build a synthetic 429 response bound to the rt/a backend on its
+	// request context. ModifyResponse will dispatch into the per-pool
+	// controller and exercise the lock-free log sites via parkAndFailover.
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Date": []string{clock.now().Format(http.TimeFormat)}},
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/messages", nil),
+	}
+	resp.Request = resp.Request.WithContext(backend.WithBackend(resp.Request.Context(),
+		backend.Backend{Pool: "rt", Nick: "a", Credential: "cred-a", BaseURL: "https://a.example"}))
+
+	const N = 100
 	var wg sync.WaitGroup
 	wg.Add(2)
-	// Reader: hammers Route + Current + controller lookup.
+	// Reader: drives ModifyResponse repeatedly. The 429 path inside
+	// parkAndFailover holds c.mu around setActiveMemberLocked and then logs
+	// under c.name() — the lock-free read the atomic pointer protects.
 	go func() {
 		defer wg.Done()
 		for i := 0; i < N; i++ {
-			_, _, _, _ = p.Route("rt")
-			_, _ = p.Current("rt")
-			_, _ = p.controller("rt")
-			_, _ = p.controller("renamed")
+			_ = p.ModifyResponse(resp)
 		}
 	}()
-	// Writer: renames back and forth so each iteration forces a real swap.
+	// Writer: flips the name back and forth so each iteration forces a real
+	// atomic swap.
 	go func() {
 		defer wg.Done()
 		for i := 0; i < N; i++ {

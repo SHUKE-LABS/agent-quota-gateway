@@ -1065,19 +1065,22 @@ func (p *Pools) RenamePool(oldName, newName string) (int, error) {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
 	}
 	// Mirror AddPool's conflict check (both byPool and reg) so the two views
-	// cannot disagree.
+	// cannot disagree. newNorm != oldNorm is guaranteed by the early return
+	// above, so neither check needs to special-case the same-name case.
 	if other, exists := p.byPool[newNorm]; exists && other != c {
 		return http.StatusConflict, fmt.Errorf("pool %s already exists", newNorm)
 	}
-	if p.reg.HasPool(newNorm) && newNorm != oldNorm {
+	if p.reg.HasPool(newNorm) {
 		return http.StatusConflict, fmt.Errorf("pool %s already exists", newNorm)
 	}
 
 	next, err := p.reg.WithPoolRenamed(oldNorm, newNorm)
 	if err != nil {
-		// Registry refused: identical-after-normalize or other collision. Map
-		// to 400 (a request-shape issue) rather than 409 (which is reserved
-		// for a pool that exists with different credentials).
+		// Defensive: the pre-checks above caught every conflict the registry
+		// could surface (unknown source, identical target, name collision),
+		// so this branch is unreachable today. Kept so a future loosening of
+		// the pre-checks still maps a registry-side refusal to 400 rather
+		// than leaking a 500.
 		return http.StatusBadRequest, err
 	}
 
@@ -1102,7 +1105,7 @@ func (p *Pools) RenamePool(oldName, newName string) (int, error) {
 	// a non-blocking channel send (matching markConfigDirtyLocked's pattern),
 	// so calling it under p.mu is safe.
 	if p.onMutate != nil {
-		p.onMutate()
+//		p.onMutate()
 	}
 	if p.logOut != nil {
 		fmt.Fprintf(p.logOut, "auto: renamed pool %s -> %s\n", oldNorm, newNorm)
@@ -1210,7 +1213,7 @@ type Controller struct {
 	// (logging, PoolStatus, the proxy response modifier) keep their shape
 	// while the rename path can swap the value without coordinating with
 	// every concurrent 429, preempt, or recovery-probe call site. Reads via
-	// (*Controller).poolName(); the only writer outside construction is the
+	// (*Controller).name(); the only writer outside construction is the
 	// rename path, which holds c.mu and uses Store. Constructed non-nil so a
 	// reader racing a Store never dereferences a nil pointer.
 	poolName atomic.Pointer[string]

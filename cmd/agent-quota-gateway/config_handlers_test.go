@@ -548,10 +548,10 @@ func TestRenamePoolEndpoint(t *testing.T) {
 	}
 
 	// Error paths.
-	postJSON(t, srv.URL+"/_gateway/pool/ghost/rename", `{"name":"renamed2"}`, http.StatusNotFound) // unknown old
-	postJSON(t, srv.URL+"/_gateway/pool/renamed/rename", `{"name":""}`, http.StatusBadRequest)     // empty new
+	postJSON(t, srv.URL+"/_gateway/pool/ghost/rename", `{"name":"renamed2"}`, http.StatusNotFound)    // unknown old
+	postJSON(t, srv.URL+"/_gateway/pool/renamed/rename", `{"name":""}`, http.StatusBadRequest)        // empty new
 	postJSON(t, srv.URL+"/_gateway/pool/renamed/rename", `{"name":"Renamed"}`, http.StatusBadRequest) // identical after normalize
-	postJSON(t, srv.URL+"/_gateway/pool/auto/rename", `{"name":"renamed"}`, http.StatusConflict)   // collides with different existing pool
+	postJSON(t, srv.URL+"/_gateway/pool/auto/rename", `{"name":"renamed"}`, http.StatusConflict)      // collides with different existing pool
 
 	// Malformed body.
 	post(t, srv.URL+"/_gateway/pool/renamed/rename", http.StatusBadRequest)

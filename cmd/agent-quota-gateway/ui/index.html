@@ -390,9 +390,9 @@
     font-size: 12px;
   }
   button.delete-pool:hover { border-color: var(--danger); background: rgba(207, 34, 46, 0.08); }
-  /* "Rename pool" — header control shown for every pool (issue #238). When
-     a pool also shows the delete-pool button (empty pools only), a sibling
-     gap keeps them visually separated. */
+  /* "Rename pool" — header control shown for every pool (issue #238). The
+     selector below targets the adjacent delete-pool button (rendered only
+     for empty pools) so the two stay visually separated when both apply. */
   button.rename-pool {
     margin-left: auto;
     border: 1px solid var(--border);
@@ -405,9 +405,6 @@
   }
   button.rename-pool + button.delete-pool { margin-left: 8px; }
   button.rename-pool:hover { border-color: var(--accent); background: rgba(0, 0, 0, 0.04); }
-  /* On an empty pool, render rename first (auto) and delete after with a
-     small gap; on a populated pool rename is the only header control. */
-  button.delete-pool { margin-left: 0; }
 
   .addsub-card {
     background: var(--panel);
