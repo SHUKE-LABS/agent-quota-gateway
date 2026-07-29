@@ -1273,39 +1273,15 @@
     var base = (fields.base.value || '').trim();
     var pool = fields.pool.value || '';
 
-    // "New pool…" mode: create the runtime pool first, then (optionally) add the
-    // first member into it. The pool is POSTed before any member, so a failed
-    // create leaves nothing partial behind. mode is omitted — the backend fixes
-    // it to "plain" (the only supported value).
+    // Create the pool and optional first member in one atomic request.
     if (pool === NEW_POOL) {
       var pName = (fields.poolName.value || '').trim();
       if (!pName) { showBanner('Create pool failed: pool name is required'); return; }
-      postJSON('/_gateway/pool', { name: pName }).then(function (r) {
-        if (!r || !r.ok) {
-          // Surfaces 409 (duplicate name) / 400 (invalid input) via showBanner.
-          return refreshAfter(r, 'Failed to create pool');
-        }
-        // Use the server-normalized pool name as the member target.
-        var created = (r.body && r.body.pool) || pName;
-        fields.poolName.value = '';
-        if (!nick) {
-          // Pool-only create: refresh so the new pool joins the list.
-          return refreshAfter(r, 'Failed to create pool');
-        }
-        // Add the first member into the fresh plain pool. A brand-new plain pool
-        // has no priority order, so no placement prompt is needed.
-        var mBody = {};
-        if (cred) { mBody['credential'] = cred; }
-        if (base) { mBody.base_url = base; }
-        return postJSON('/_gateway/pool/' + encodeURIComponent(created) +
-          '/member/' + encodeURIComponent(nick), mBody).then(function (r2) {
-          if (r2 && r2.ok) {
-            fields.nick.value = '';
-            fields.base.value = '';
-            fields.cred.value = '';
-          }
-          return refreshAfter(r2, 'Pool created but failed to add member');
-        });
+      var body = { name: pName };
+      if (nick) { body.nick = nick; if (cred) { body['credential'] = cred; } if (base) { body.base_url = base; } }
+      postJSON('/_gateway/pool', body).then(function (r) {
+        if (r && r.ok) { fields.poolName.value = ''; fields.nick.value = ''; fields.base.value = ''; fields.cred.value = ''; }
+        return refreshAfter(r, 'Failed to create pool');
       });
       return;
     }
