@@ -318,7 +318,7 @@ func TestAddPool_concurrentWithReaders(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			_ = p.EffectiveConfig()
-			_ = p.AllPoolStatuses(store)
+			_ = p.AllPoolStatuses(store, nil)
 			_, _, _, _ = p.Route("src")
 			_ = p.CurrentRegistry()
 			_ = p.PersistState()

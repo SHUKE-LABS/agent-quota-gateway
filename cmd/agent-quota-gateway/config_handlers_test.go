@@ -1079,7 +1079,7 @@ func TestHealthHandler_threeStates(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(healthHandler(tc.pers))
+			srv := httptest.NewServer(healthHandler(tc.pers, nil))
 			defer srv.Close()
 
 			resp, err := http.Get(srv.URL + "/_gateway/health")

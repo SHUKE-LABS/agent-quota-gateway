@@ -367,6 +367,18 @@ type PoolStatus struct {
 	Pool    string         `json:"pool"`
 	Active  string         `json:"active"`
 	Members []MemberStatus `json:"members"`
+
+	// Poller carries the per-pool liveness observation (issue #247):
+	// last successful poll, last error and its time, consecutive-
+	// failure count, and a derived staleness verdict. It is omitted
+	// entirely (the JSON key is absent, not "poller":null) for pools
+	// the poller does not track — Anthropic and any other untracked
+	// backend see no delta, so a caller can tell "this pool has no
+	// poller signal at all" from "this pool's poller signal is stale
+	// or failing". The poller package is the source of truth for
+	// tracking and staleness math (it owns the StaleAfterIntervals
+	// constant); auto only wires the result through.
+	Poller *poller.PoolStatus `json:"poller,omitempty"`
 }
 
 // PoolConfigView is the /_gateway/config response for one pool.
@@ -408,25 +420,36 @@ type PoolMemberConfigView struct {
 }
 
 // PoolStatus returns the current status of the named pool, or ok=false for an unknown pool.
-func (p *Pools) PoolStatus(poolName string, store *quota.Store) (PoolStatus, bool) {
+func (p *Pools) PoolStatus(poolName string, store *quota.Store, pl *poller.Poller) (PoolStatus, bool) {
 	c, ok := p.controller(poolName)
 	if !ok {
 		return PoolStatus{}, false
 	}
-	return c.poolStatus(store), true
+	// nil map — the single-pool path goes through LookupStatus's
+	// fallback which calls pl.Status() under the poller's mutex once.
+	return c.poolStatus(store, pl, nil), true
 }
 
 // AllPoolStatuses returns status for every pool in sorted order.
-func (p *Pools) AllPoolStatuses(store *quota.Store) []PoolStatus {
+func (p *Pools) AllPoolStatuses(store *quota.Store, pl *poller.Poller) []PoolStatus {
 	snapshot := p.controllersSnapshot()
 	names := make([]string, 0, len(snapshot))
 	for name := range snapshot {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	out := make([]PoolStatus, 0, len(names))
+	// Pre-build the per-pool poller map once (review of #267): each
+	// Controller.poolStatus would otherwise rebuild it under the
+	// poller's mutex N times per call, which compounds under UI polling.
+	// The map is empty for a nil poller, in which case every pool
+	// view simply carries no `poller` key (preserving AC2).
+	var pollerMap map[string]poller.PoolStatus
+	if pl != nil {
+		pollerMap = pl.Status()
+	}
+	out := make([]PoolStatus, 0, len(snapshot))
 	for _, name := range names {
-		out = append(out, snapshot[name].poolStatus(store))
+		out = append(out, snapshot[name].poolStatus(store, pl, pollerMap))
 	}
 	return out
 }
@@ -1829,8 +1852,14 @@ func (c *Controller) setActiveMemberLocked(nick string) {
 
 // poolStatus builds the /_gateway/pool response for this controller. store
 // is consulted for each member's latest snapshot; a member with no recorded
-// snapshot gets snapshot:null. Caller must not hold c.mu.
-func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
+// snapshot gets snapshot:null. pl is consulted for the per-pool poller
+// liveness observation (issue #247); pl may be nil (handlers in some
+// tests construct without one), in which case the poller field is left
+// nil and omitempty drops it from the wire. pollerMap is a pre-built
+// snapshot of pl.Status() to avoid repeating the lock acquisition per
+// pool in the AllPoolStatuses path (review of #267). Caller must not
+// hold c.mu.
+func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller, pollerMap map[string]poller.PoolStatus) PoolStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.clearExpiredLocked()
@@ -1891,7 +1920,38 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 		}
 		members = append(members, ms)
 	}
-	return PoolStatus{Pool: c.name(), Active: c.curNick, Members: members}
+	out := PoolStatus{Pool: c.name(), Active: c.curNick, Members: members}
+	// Per-pool poller liveness (issue #247, review of #267): the gate
+	// is config-based (the active backend's BaseURL matches a
+	// registered proprietary provider), not the poller's state map.
+	// A tracked pool that has never been polled surfaces the never-
+	// polled shape (last_success:null, stale:true) on this endpoint
+	// so it agrees with the quota view; an untracked pool (Anthropic,
+	// any unrecognised upstream) carries no `poller` key at all.
+	// LookupStatus consults the prebuilt map when present and falls
+	// back to a fresh Status() call for the single-pool path.
+	if pl != nil {
+		if baseURL, ok := c.activeBaseURLLocked(); ok {
+			if ps, ok := pl.LookupStatus(pollerMap, c.name(), baseURL); ok {
+				out.Poller = &ps
+			}
+		}
+	}
+	return out
+}
+
+// activeBaseURLLocked returns the current active backend's base URL,
+// or ok=false when the controller has no resolvable active backend.
+// Caller must hold c.mu.
+func (c *Controller) activeBaseURLLocked() (string, bool) {
+	if c.curNick == "" {
+		return "", false
+	}
+	b, ok := c.backendByNickLocked(c.curNick)
+	if !ok {
+		return "", false
+	}
+	return b.BaseURL, true
 }
 
 // loadState applies persisted routing state. Exhausted entries whose reset

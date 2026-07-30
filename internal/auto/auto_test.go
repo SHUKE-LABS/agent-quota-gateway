@@ -1159,7 +1159,7 @@ func TestController_ClearExhaustedNick_storeUntouched(t *testing.T) {
 	putSnap(store, c, "a", fptr(1.0), nil, tptr(reset), nil)
 	c.record429("a", reset)
 
-	if got := c.poolStatus(store); !memberParked(got, "a") {
+	if got := c.poolStatus(store, nil, nil); !memberParked(got, "a") {
 		t.Fatalf("before clear: a Parked=false, want true (live park active)")
 	}
 
@@ -1175,7 +1175,7 @@ func TestController_ClearExhaustedNick_storeUntouched(t *testing.T) {
 	if !aExhausted {
 		t.Fatalf("after ClearExhaustedNick(a), a healthy, want still store-exhausted")
 	}
-	got := c.poolStatus(store)
+	got := c.poolStatus(store, nil, nil)
 	if memberParked(got, "a") {
 		t.Fatalf("after clear: a Parked=true, want false (only store exhaustion remains)")
 	}
@@ -1296,7 +1296,7 @@ func TestPools_poolStatus(t *testing.T) {
 	pools := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 	store := quota.NewStore()
 
-	status, ok := pools.PoolStatus("auto", store)
+	status, ok := pools.PoolStatus("auto", store, nil)
 	if !ok {
 		t.Fatal("PoolStatus returned ok=false for known pool")
 	}
@@ -1332,7 +1332,7 @@ func TestPools_poolStatus(t *testing.T) {
 	if err := c.ModifyResponse(resp429(c.resolve(t, "a"), clock, time.Hour)); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
-	status2, _ := pools.PoolStatus("auto", store)
+	status2, _ := pools.PoolStatus("auto", store, nil)
 	byNick2 := make(map[string]MemberStatus)
 	for _, m := range status2.Members {
 		byNick2[m.Nick] = m
@@ -1366,7 +1366,7 @@ func TestPools_stickyParkedReportsExhausted(t *testing.T) {
 	}
 
 	// /_gateway/pool view.
-	status, ok := pools.PoolStatus("auto", store)
+	status, ok := pools.PoolStatus("auto", store, nil)
 	if !ok {
 		t.Fatal("PoolStatus returned ok=false")
 	}
@@ -1412,7 +1412,7 @@ func TestPools_stickyParkedReportsExhausted(t *testing.T) {
 // TestPools_poolStatus_unknownReturnsNotFound verifies ok=false for unknown pool.
 func TestPools_poolStatus_unknownReturnsNotFound(t *testing.T) {
 	pools := &Pools{byPool: map[string]*Controller{}}
-	_, ok := pools.PoolStatus("nonexistent", quota.NewStore())
+	_, ok := pools.PoolStatus("nonexistent", quota.NewStore(), nil)
 	if ok {
 		t.Fatal("PoolStatus returned ok=true for unknown pool")
 	}
@@ -1803,7 +1803,7 @@ func TestBalance_poolStatusExposesLead(t *testing.T) {
 	reset := clock.now().Add(window5h / 2)
 	putSnap(store, c, "a", fptr(0.7), nil, tptr(reset), nil)
 
-	status, ok := pools.PoolStatus("auto", store)
+	status, ok := pools.PoolStatus("auto", store, nil)
 	if !ok {
 		t.Fatal("PoolStatus returned ok=false")
 	}
@@ -1990,7 +1990,7 @@ func TestController_poolStatus_disabledField(t *testing.T) {
 	c := newController(t, 0, clock, io.Discard, "a", "b")
 
 	// Baseline: nobody disabled.
-	for _, m := range c.poolStatus(store).Members {
+	for _, m := range c.poolStatus(store, nil, nil).Members {
 		if m.Disabled {
 			t.Fatalf("before disable: %q Disabled=true, want false", m.Nick)
 		}
@@ -2001,7 +2001,7 @@ func TestController_poolStatus_disabledField(t *testing.T) {
 	c.setDisabledLocked("b", true)
 	c.mu.Unlock()
 
-	got := c.poolStatus(store)
+	got := c.poolStatus(store, nil, nil)
 	for _, m := range got.Members {
 		wantDisabled := m.Nick == "b"
 		if m.Disabled != wantDisabled {
@@ -2212,7 +2212,7 @@ func TestRuntimeConfig_removedMemberRoundTripAndReanchor(t *testing.T) {
 	if got := c2.Current(); got == "a" {
 		t.Errorf("after reload Current()=%q, want a surviving member", got)
 	}
-	ps := c2.poolStatus(quota.NewStore())
+	ps := c2.poolStatus(quota.NewStore(), nil, nil)
 	if ps.Active == "a" {
 		t.Errorf("poolStatus Active=%q, want a surviving member", ps.Active)
 	}
@@ -2262,7 +2262,7 @@ func TestPoolStatus_runtimeAddedNickSuppressesUntilObservation(t *testing.T) {
 
 	// Fresh render: snapshot must be nil (cell is "-"), not pool ONE's
 	// 100% — the bug we are fixing.
-	status, _ := pools.PoolStatus("two", store)
+	status, _ := pools.PoolStatus("two", store, nil)
 	if got := snapshotByNick(status)["shared"]; got != nil {
 		t.Errorf("right after AddMember: snapshot=%+v, want nil (no cross-pool flash)", got)
 	}
@@ -2271,7 +2271,7 @@ func TestPoolStatus_runtimeAddedNickSuppressesUntilObservation(t *testing.T) {
 	// MarkLocalSnapshot for the resolved backend, then the next render
 	// surfaces the snapshot.
 	pools.MarkLocalSnapshot("two", "shared")
-	statusAfter, _ := pools.PoolStatus("two", store)
+	statusAfter, _ := pools.PoolStatus("two", store, nil)
 	got := snapshotByNick(statusAfter)["shared"]
 	if got == nil {
 		t.Fatal("after MarkLocalSnapshot: snapshot=nil, want non-nil")
@@ -2418,7 +2418,7 @@ func TestPoolPersistState_runtimeAddedMemberRoundTrip(t *testing.T) {
 	store := quota.NewStore()
 	u := 0.42
 	store.Put("shared", quota.Snapshot{Unified5hUtilization: &u, AsOf: clock.now()})
-	status, _ := p2.PoolStatus("rt", store)
+	status, _ := p2.PoolStatus("rt", store, nil)
 	snap := snapshotByNick(status)["shared"]
 	if snap == nil {
 		t.Error("after restart: snapshot=nil, want non-nil (gate should be open)")

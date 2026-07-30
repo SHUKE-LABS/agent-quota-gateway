@@ -33,6 +33,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"sync"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +46,21 @@ import (
 // active backend. Two minutes is frequent enough to keep failover
 // decisions current without hammering a provider's dashboard API.
 const defaultInterval = 2 * time.Minute
+
+// StaleAfterIntervals is how many poll intervals a tracked pool may
+// go without a successful poll before it is considered stale for the
+// /_gateway/health aggregate and the /_gateway/pool per-pool card.
+//
+// One named constant in this package drives every surface that reads
+// "is this signal still live?" — handlers and the auto package derive
+// staleness by multiplying StaleAfterIntervals by the configured
+// interval, so a future bump is a one-line change.
+//
+// Three is the smallest multiplier that tolerates one missed poll
+// (network blip) plus one in-flight tick (cancelled context at
+// shutdown) without flagging healthy pools as stale, and is the
+// threshold issue #247 names.
+const StaleAfterIntervals = 3
 
 // defaultTimeout caps a single quota poll. The endpoints are lightweight
 // JSON; a slow one should not pin the loop past the next tick.
@@ -80,6 +96,29 @@ type Poller struct {
 	interval    time.Duration
 	now         func() time.Time
 	logOut      io.Writer
+
+	// stateMu guards state. state is per-pool liveness observation for
+	// the admin surface (issue #247): the last successful poll, the
+	// last error and its time, and the consecutive-failure count.
+	// A pool that has never been touched by the poller is absent from
+	// the map; the absence is itself meaningful — a tracked pool whose
+	// first tick has not yet fired reads "never polled", and a tracked
+	// pool currently sticky on an untracked member reads "stale" the
+	// same way as one whose polls are failing (pollAll `continue`s
+	// past those pools without updating state).
+	stateMu sync.Mutex
+	state   map[string]*poolState
+}
+
+// poolState is the per-pool liveness observation surfaced through
+// Status() and HealthSummary(). lastSuccess is the zero value when no
+// poll has ever succeeded for the pool; the map absence and
+// lastSuccess == zero are equivalent for callers.
+type poolState struct {
+	LastSuccess         time.Time
+	LastErr             string // human-readable, stable for JSON consumers
+	LastErrAt           time.Time
+	ConsecutiveFailures int
 }
 
 // New builds a Poller over a fixed set of pool names. Production wants the
@@ -121,6 +160,7 @@ func NewDynamic(poolNames func() []string, current CurrentFunc, markLocal MarkLo
 		interval:  interval,
 		now:       now,
 		logOut:    logOut,
+		state:     map[string]*poolState{},
 	}
 }
 
@@ -147,6 +187,13 @@ func (p *Poller) Run(ctx context.Context) {
 // on a backend a provider recognises. Unknown pools and untracked
 // backends are skipped; each poll is independent, so one failure never
 // blocks the rest.
+//
+// Per-pool liveness observation (issue #247) is recorded alongside every
+// attempt — success zeroes the consecutive-failure count and clears the
+// last error; failure increments and stamps the error/time. A pool that
+// has never been polled is absent from the state map; the absence is
+// itself a signal (a never-polled tracked pool, or a tracked pool
+// currently sticky on an untracked member, both read "no lastSuccess").
 func (p *Poller) pollAll(ctx context.Context) {
 	for _, name := range p.poolNames() {
 		b, ok := p.current(name)
@@ -160,6 +207,7 @@ func (p *Poller) pollAll(ctx context.Context) {
 		snap, err := p.pollOne(ctx, prov, b)
 		if err != nil {
 			fmt.Fprintf(p.logOut, "poller[%s]: %s poll failed: %v\n", name, prov.name, err)
+			p.recordFailure(name, err)
 			continue
 		}
 		// Merge, not Put: a poll response may omit a window (e.g. z.ai with
@@ -172,7 +220,220 @@ func (p *Poller) pollAll(ctx context.Context) {
 		if p.markLocal != nil {
 			p.markLocal(name, b.Nick)
 		}
+		p.recordSuccess(name)
 	}
+}
+
+// PollAllForTest exposes the package-private pollAll loop so handler-level
+// tests (issue #247) can drive a single poll cycle deterministically
+// without owning a goroutine. Production code must not call this.
+func (p *Poller) PollAllForTest(ctx context.Context) {
+	p.pollAll(ctx)
+}
+
+// recordSuccess marks a successful poll for pool name: zeroes the
+// consecutive-failure count and clears the last error. The pool's
+// lastSuccess is stamped with the poller's injectable now so AC9's
+// threshold-advance test can drive staleness without a clock into the
+// admin handlers.
+func (p *Poller) recordSuccess(name string) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	st, ok := p.state[name]
+	if !ok {
+		st = &poolState{}
+		p.state[name] = st
+	}
+	st.LastSuccess = p.now().UTC()
+	st.LastErr = ""
+	st.LastErrAt = time.Time{}
+	st.ConsecutiveFailures = 0
+}
+
+// recordFailure marks a failed poll for pool name: increments the
+// consecutive-failure count and stamps the error and its time.
+// lastSuccess is preserved so a recovering pool does not lose its
+// "last good" timestamp; that timestamp drives the staleness math
+// until a new success arrives.
+func (p *Poller) recordFailure(name string, err error) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	st, ok := p.state[name]
+	if !ok {
+		st = &poolState{}
+		p.state[name] = st
+	}
+	st.LastErr = err.Error()
+	st.LastErrAt = p.now().UTC()
+	st.ConsecutiveFailures++
+}
+
+// PoolStatus is the per-pool liveness observation surfaced through
+// Status(). It mirrors the on-wire shape the admin handler emits:
+// last_success is *time.Time so "never polled" is null in JSON, not
+// the zero time masquerading as data; last_error / last_error_at /
+// consecutive_failures follow the same omitempty convention.
+type PoolStatus struct {
+	LastSuccess         *time.Time `json:"last_success"`
+	LastError           string     `json:"last_error,omitempty"`
+	LastErrorAt         *time.Time `json:"last_error_at,omitempty"`
+	ConsecutiveFailures int        `json:"consecutive_failures"`
+	// Stale is the derived staleness verdict (>= StaleAfterIntervals since
+	// lastSuccess, or no success ever recorded). Computed at read time
+	// against the poller's injectable now so tests can drive it without
+	// touching the admin handlers.
+	Stale bool `json:"stale"`
+}
+
+// IsTracked reports whether the pool is currently being polled by this
+// poller instance. The admin surface uses this to omit the poller block
+// entirely for Anthropic / untracked pools (no delta in the JSON), so a
+// caller reading the shape can tell "this pool has no poller signal at
+// all" from "this pool's poller signal is stale or failing".
+func (p *Poller) IsTracked(name string) bool {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	_, ok := p.state[name]
+	return ok
+}
+
+// PoolTracked reports whether the named pool is configured for
+// poller-tracking — a stable property of the pool's current active
+// backend's base URL against the registered proprietary providers,
+// independent of whether the poller has ticked yet. This is the
+// single "is this pool tracked?" signal the admin surfaces should
+// use, so a never-polled tracked pool surfaces the same shape
+// (last_success:null, stale:true) on every endpoint instead of
+// diverging between view-layer and state-map gates (review of #267).
+//
+// The gate splits cleanly:
+//   - untracked (Anthropic): no poller block, no polled field, as_of
+//     passes through unchanged
+//   - tracked-but-never-polled (boot, no tick yet): poller block
+//     present with last_success:null and stale:true; quota view
+//     suppresses as_of
+//   - tracked-and-polled: full state surface
+//
+// Returns false when pl is nil (tests bypass the poller).
+func (p *Poller) PoolTracked(name, activeBaseURL string) bool {
+	if p == nil {
+		return false
+	}
+	_, ok := providerFor(activeBaseURL)
+	if !ok {
+		return false
+	}
+	return true
+}
+
+// StatusForPool returns the per-pool status entry for the named pool
+// if it is a tracked pool (per PoolTracked). The boolean is the
+// "tracked" verdict — false means "no poller signal at all", and the
+// caller should omit the poller block entirely. Tracked pools whose
+// state map has no entry yet (boot, before first tick) return a
+// zero-valued status with Stale=true so the on-wire shape matches
+// the never-polled contract from issue #247 / plan AC9.
+func (p *Poller) StatusForPool(name, activeBaseURL string) (PoolStatus, bool) {
+	if p == nil || !p.PoolTracked(name, activeBaseURL) {
+		return PoolStatus{}, false
+	}
+	return p.lookupStatus(name)
+}
+
+// LookupStatus is the map-aware variant of StatusForPool: callers that
+// already have a pre-built poller status map (AllPoolStatuses builds
+// one per request, review of #267) pass it in to skip the per-pool
+// mutex acquisition that Status() would otherwise repeat.
+func (p *Poller) LookupStatus(prebuilt map[string]PoolStatus, name, activeBaseURL string) (PoolStatus, bool) {
+	if p == nil || !p.PoolTracked(name, activeBaseURL) {
+		return PoolStatus{}, false
+	}
+	if st, ok := prebuilt[name]; ok {
+		return st, true
+	}
+	return p.lookupStatus(name)
+}
+
+// lookupStatus is the per-pool state-map read used by both the
+// lazy-builder path (StatusForPool) and the map-aware path
+// (LookupStatus). For a tracked pool with no state yet, returns a
+// synthesised never-polled entry whose Stale verdict derives from
+// the poller's current time and interval threshold — so callers do
+// not need a clock of their own.
+func (p *Poller) lookupStatus(name string) (PoolStatus, bool) {
+	statuses := p.Status()
+	if st, ok := statuses[name]; ok {
+		return st, true
+	}
+	now := p.now()
+	threshold := p.interval * StaleAfterIntervals
+	return poolStatusFrom(&poolState{}, now, threshold), true
+}
+
+// Status returns a copy of the per-pool liveness observation map keyed
+// by pool name. Pools the poller has never touched are absent from the
+// returned map; callers that need to iterate every pool consult the
+// pool registry directly. The map and its PoolStatus values are copies,
+// so the caller can mutate them freely.
+func (p *Poller) Status() map[string]PoolStatus {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	now := p.now()
+	threshold := p.interval * StaleAfterIntervals
+	out := make(map[string]PoolStatus, len(p.state))
+	for name, st := range p.state {
+		out[name] = poolStatusFrom(st, now, threshold)
+	}
+	return out
+}
+
+// HealthSummary returns the aggregate liveness verdict for
+// /_gateway/health. Stale is true when at least one tracked pool is
+// stale; absent-of-entry (a tracked pool never polled) is treated the
+// same way — staleness has no "fresh enough" signal for it. The
+// returned bool drives the additive `poller_health:"stale"` body field;
+// absence of the field on the wire means "ok".
+//
+// `polled` is the count of tracked pools; `stale` is the count of
+// those pools currently flagged stale (for an operator's at-a-glance
+// read on the per-pool level). Both numbers are also useful to tests.
+func (p *Poller) HealthSummary() (polled, stale int) {
+	statuses := p.Status()
+	return len(statuses), countStale(statuses)
+}
+
+func countStale(statuses map[string]PoolStatus) int {
+	n := 0
+	for _, s := range statuses {
+		if s.Stale {
+			n++
+		}
+	}
+	return n
+}
+
+// poolStatusFrom builds the on-wire PoolStatus from the poller's
+// internal state. now and threshold are passed in so the caller
+// (Status) reads p.now() under the lock once and reuses the snapshot.
+func poolStatusFrom(st *poolState, now time.Time, threshold time.Duration) PoolStatus {
+	out := PoolStatus{
+		ConsecutiveFailures: st.ConsecutiveFailures,
+		LastError:           st.LastErr,
+	}
+	if !st.LastSuccess.IsZero() {
+		ls := st.LastSuccess
+		out.LastSuccess = &ls
+	}
+	if !st.LastErrAt.IsZero() {
+		la := st.LastErrAt
+		out.LastErrorAt = &la
+	}
+	// Stale: zero lastSuccess (never polled) OR lastSuccess older than
+	// threshold. Either way the pool is missing fresh out-of-band data.
+	if st.LastSuccess.IsZero() || now.Sub(st.LastSuccess) > threshold {
+		out.Stale = true
+	}
+	return out
 }
 
 // pollOne performs one provider poll for backend b and returns the parsed

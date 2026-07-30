@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -808,4 +809,192 @@ func withTestProvider(t *testing.T, matchFragment string, quotaURL func(string) 
 		parse:    parse,
 	}}, providers...)
 	t.Cleanup(func() { providers = orig })
+}
+
+// recordingClock is a controllable clock for AC9's "advance now past the
+// staleness threshold" tests. Set+advance it directly from each test;
+// the poller reads it via its `now` field, so Status() / HealthSummary()
+// derive staleness against the value at read time.
+type recordingClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *recordingClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *recordingClock) Set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = t
+}
+
+// neverPolledFixture sets up a poller whose current() returns a tracked
+// backend but pollAll has never run. The poller is wired against a
+// controllable clock so the test can drive time.
+func neverPolledFixture(t *testing.T, clk *recordingClock) *Poller {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
+	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
+	return New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), nil, quota.NewStore(), srv.Client(), time.Hour, clk.Now, io.Discard)
+}
+
+// TestPoller_liveness_neverPolled covers the boot-time / never-ticked case
+// (issue #247): the pool is tracked, the backend matches a provider, but
+// no poll has ever succeeded. Status reports the absence (no LastSuccess,
+// stale=true). HealthSummary reports the pool as stale.
+func TestPoller_liveness_neverPolled(t *testing.T) {
+	clk := &recordingClock{now: fixedNow}
+	p := neverPolledFixture(t, clk)
+
+	if p.IsTracked("chn") {
+		t.Error("IsTracked(chn) = true before any poll; want false (absent-from-state)")
+	}
+
+	statuses := p.Status()
+	if _, ok := statuses["chn"]; ok {
+		t.Errorf("Status() contains 'chn' before any poll; want absent entry")
+	}
+
+	// Even with the clock at boot-time, the pool reads stale — there is
+	// no fresh signal. HealthSummary reports it as stale.
+	polled, stale := p.HealthSummary()
+	if polled != 0 || stale != 0 {
+		t.Errorf("HealthSummary() = (polled=%d, stale=%d); want (0,0) — empty state is not 'polled'", polled, stale)
+	}
+}
+
+// TestPoller_liveness_healthyAfterSuccess drives a successful poll and
+// verifies the per-pool state: LastSuccess set, no error, no consecutive
+// failures, Stale=false (the clock is at fixedNow so the threshold has
+// not elapsed).
+func TestPoller_liveness_healthyAfterSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":10,"nextResetTime":1}]}}`)
+	}))
+	defer srv.Close()
+	clk := &recordingClock{now: fixedNow}
+	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
+	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
+	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), nil, quota.NewStore(), srv.Client(), time.Hour, clk.Now, io.Discard)
+
+	p.pollAll(context.Background())
+
+	if !p.IsTracked("chn") {
+		t.Fatal("IsTracked(chn) = false after a successful poll; want true")
+	}
+	statuses := p.Status()
+	ps, ok := statuses["chn"]
+	if !ok {
+		t.Fatal("Status() missing 'chn' after a successful poll")
+	}
+	if ps.LastSuccess == nil {
+		t.Error("LastSuccess = nil; want set")
+	} else if !ps.LastSuccess.Equal(fixedNow) {
+		t.Errorf("LastSuccess = %v; want %v", *ps.LastSuccess, fixedNow)
+	}
+	if ps.LastError != "" {
+		t.Errorf("LastError = %q; want empty", ps.LastError)
+	}
+	if ps.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d; want 0", ps.ConsecutiveFailures)
+	}
+	if ps.Stale {
+		t.Error("Stale = true immediately after success; want false (threshold not elapsed)")
+	}
+	_, stale := p.HealthSummary()
+	if stale != 0 {
+		t.Errorf("HealthSummary() stale = %d; want 0", stale)
+	}
+}
+
+// TestPoller_liveness_polledThenFailing covers the issue's central case:
+// a poll succeeded once and is now failing. The per-pool record carries
+// the error and the consecutive-failure count; advancing the clock past
+// the threshold flips the aggregate to "stale".
+func TestPoller_liveness_polledThenFailing(t *testing.T) {
+	clk := &recordingClock{now: fixedNow}
+	var failNext atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failNext.Load() {
+			http.Error(w, "down", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(w, `{"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":10,"nextResetTime":1}]}}`)
+	}))
+	defer srv.Close()
+	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
+	withTestProvider(t, srv.URL, hostURL("/api/monitor/usage/quota/limit"), rawAuth, parseZhipu)
+	p := New([]string{"chn"}, stubCurrent(map[string]backend.Backend{"chn": b}), nil, quota.NewStore(), srv.Client(), time.Hour, clk.Now, io.Discard)
+
+	// One successful poll to seed LastSuccess.
+	p.pollAll(context.Background())
+	if !p.IsTracked("chn") || p.Status()["chn"].Stale {
+		t.Fatal("setup: expected healthy after one successful poll")
+	}
+
+	// Now flip the server to failing and drive one failure.
+	clk.Set(clk.Now().Add(30 * time.Second))
+	failNext.Store(true)
+	p.pollAll(context.Background())
+
+	ps := p.Status()["chn"]
+	if ps.LastError == "" {
+		t.Error("LastError = empty after a failure; want set")
+	}
+	if ps.LastErrorAt == nil {
+		t.Error("LastErrorAt = nil after a failure; want set")
+	}
+	if ps.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d; want 1", ps.ConsecutiveFailures)
+	}
+	if ps.LastSuccess == nil {
+		t.Error("LastSuccess = nil after success-then-fail; want preserved")
+	}
+	// One failure inside the threshold does not yet flip to stale.
+	if ps.Stale {
+		t.Error("Stale = true one failure after threshold; want false (still inside threshold)")
+	}
+
+	// Advance the clock past the threshold and read again — without
+	// driving more polls. The stale verdict is computed at read time.
+	clk.Set(clk.Now().Add(3 * time.Hour)) // > StaleAfterIntervals × 1h
+	ps = p.Status()["chn"]
+	if !ps.Stale {
+		t.Error("Stale = false after threshold elapsed since last success; want true")
+	}
+	polled, stale := p.HealthSummary()
+	if polled != 1 || stale != 1 {
+		t.Errorf("HealthSummary() = (polled=%d, stale=%d); want (1, 1)", polled, stale)
+	}
+}
+
+// TestPoller_liveness_omittedForUntrackedBackend covers the AC2 "omitted
+// entirely / no delta" requirement: a poller with no recorded state for
+// a pool must report IsTracked=false so the admin handler omits the
+// `poller` key for Anthropic / untracked backends.
+func TestPoller_liveness_omittedForUntrackedBackend(t *testing.T) {
+	clk := &recordingClock{now: fixedNow}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	// Anthropic-shaped backend: no provider matches its BaseURL, so
+	// pollAll will skip it (no state entry will be created).
+	b := backend.Backend{Pool: "us", Nick: "acct-a", Credential: "sk-ant", BaseURL: "https://api.anthropic.com"}
+	p := New([]string{"us"}, stubCurrent(map[string]backend.Backend{"us": b}), nil, quota.NewStore(), srv.Client(), time.Hour, clk.Now, io.Discard)
+
+	p.pollAll(context.Background())
+
+	if p.IsTracked("us") {
+		t.Error("IsTracked(us) = true for an untracked backend; want false (handler omits the field)")
+	}
+	if _, ok := p.Status()["us"]; ok {
+		t.Error("Status() contains 'us' for an untracked backend; want absent")
+	}
 }

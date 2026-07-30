@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
 	"github.com/shukebeta/agent-quota-gateway/internal/persist"
+	"github.com/shukebeta/agent-quota-gateway/internal/poller"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
@@ -144,8 +147,8 @@ func TestIntegration_fullStack(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/health", healthHandler(configfile.PersistenceState{}))
-	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
+	mux.HandleFunc("/_gateway/health", healthHandler(configfile.PersistenceState{}, nil))
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools, nil))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
 	handler := logging.Middleware(mux)
@@ -323,7 +326,7 @@ func TestIntegration_autoFailover(t *testing.T) {
 		t.Fatalf("proxy.New: %v", err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools, nil))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 	gw := httptest.NewServer(logging.Middleware(mux))
 	t.Cleanup(gw.Close)
@@ -398,7 +401,7 @@ func TestQuotaHandler_poolViewAddsActiveBackend(t *testing.T) {
 	util := 0.42
 	store.Put("acct-one", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util})
 
-	srv := httptest.NewServer(quotaHandler(store, pools))
+	srv := httptest.NewServer(quotaHandler(store, pools, nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/_gateway/quota?backend=auto")
@@ -451,7 +454,7 @@ func TestQuotaHandler_unknownPoolEmptySnapshot(t *testing.T) {
 		t.Fatalf("backend.Load: %v", err)
 	}
 	pools := auto.NewPools(registry, nil, nil, io.Discard)
-	srv := httptest.NewServer(quotaHandler(quota.NewStore(), pools))
+	srv := httptest.NewServer(quotaHandler(quota.NewStore(), pools, nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/_gateway/quota?backend=nope")
@@ -477,7 +480,7 @@ func TestQuotaHandler_unknownPoolEmptySnapshot(t *testing.T) {
 // TestHealthHandler_methodGuard pins the GET-only contract on
 // /_gateway/health: GET works, other verbs get 405 + Allow: GET.
 func TestHealthHandler_methodGuard(t *testing.T) {
-	srv := httptest.NewServer(healthHandler(configfile.PersistenceState{}))
+	srv := httptest.NewServer(healthHandler(configfile.PersistenceState{}, nil))
 	defer srv.Close()
 
 	getResp, err := http.Get(srv.URL + "/_gateway/health")
@@ -512,7 +515,7 @@ func TestHealthHandler_methodGuard(t *testing.T) {
 // health guard so the documented Allow contract is enforced for both
 // gateway endpoints.
 func TestQuotaHandler_methodGuard(t *testing.T) {
-	srv := httptest.NewServer(quotaHandler(quota.NewStore(), nil))
+	srv := httptest.NewServer(quotaHandler(quota.NewStore(), nil, nil))
 	defer srv.Close()
 
 	getResp, err := http.Get(srv.URL + "/_gateway/quota?backend=auto")
@@ -557,7 +560,7 @@ func TestPoolHandler_singlePool(t *testing.T) {
 	store.Put("auto/acct-one", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util})
 	pools := auto.NewPools(registry, nil, nil, io.Discard)
 
-	srv := httptest.NewServer(poolHandler(store, pools))
+	srv := httptest.NewServer(poolHandler(store, pools, nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/_gateway/pool?pool=auto")
@@ -617,7 +620,7 @@ func TestPoolHandler_allPools(t *testing.T) {
 	}
 	pools := auto.NewPools(registry, nil, nil, io.Discard)
 
-	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools))
+	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools, nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/_gateway/pool")
@@ -661,7 +664,7 @@ func TestPoolHandler_unknownPool(t *testing.T) {
 	}
 	pools := auto.NewPools(registry, nil, nil, io.Discard)
 
-	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools))
+	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools, nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/_gateway/pool?pool=nonexistent")
@@ -683,7 +686,7 @@ func TestPoolHandler_methodGuard(t *testing.T) {
 	}
 	pools := auto.NewPools(registry, nil, nil, io.Discard)
 
-	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools))
+	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools, nil))
 	t.Cleanup(srv.Close)
 
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
@@ -702,6 +705,287 @@ func TestPoolHandler_methodGuard(t *testing.T) {
 		if allow := resp.Header.Get("Allow"); allow != http.MethodGet {
 			t.Errorf("%s Allow=%q, want GET", method, allow)
 		}
+	}
+}
+
+// livenessClock is a poller-compatible injectable clock used by the
+// handler-level AC9 tests. The poller reads it via its `now` field
+// when Status() / HealthSummary() compute staleness.
+type livenessClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *livenessClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *livenessClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// seededPoller builds a poller whose current() resolves to a tracked
+// z.ai-shaped backend. The test can call pollAll() to record a success
+// or a failure (use a failing handler on the httptest server), then
+// advance the clock to drive the staleness verdict.
+func seededPoller(t *testing.T, clk *livenessClock, failNext *atomic.Bool) (*poller.Poller, *httptest.Server) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failNext != nil && failNext.Load() {
+			http.Error(w, "down", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(w, `{"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":10,"nextResetTime":1}]}}`)
+	}))
+	t.Cleanup(srv.Close)
+	b := backend.Backend{Pool: "chn", Nick: "key-a", Credential: "zkey", BaseURL: srv.URL}
+	poller.WithTestProviderForTest(t, srv.URL,
+		poller.HostURLForTest("/api/monitor/usage/quota/limit"),
+		poller.RawAuthForTest, poller.ParseZhipuForTest)
+	p := poller.New([]string{"chn"}, func(name string) (backend.Backend, bool) {
+		if name != "chn" {
+			return backend.Backend{}, false
+		}
+		return b, true
+	}, nil, quota.NewStore(), srv.Client(), time.Hour, clk.Now, io.Discard)
+	return p, srv
+}
+
+// TestPoolHandler_pollerField_omittedForAnthropic pins AC2: an
+// Anthropic-only pool carries no `poller` key at all (not
+// "poller":null). The handler is given a non-nil poller, but the pool
+// is untracked so the field is absent.
+func TestPoolHandler_pollerField_omittedForAnthropic(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_ACCT_ONE", "sk-ant-oat-one")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+	clk := &livenessClock{now: time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)}
+	p, _ := seededPoller(t, clk, nil)
+
+	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools, p))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/pool?pool=auto")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, has := got["poller"]; has {
+		t.Errorf("Anthropic-only pool carries `poller` key (value: %v); want absent", got["poller"])
+	}
+}
+
+// TestPoolHandler_pollerField_staleAfterFailure drives the issue's
+// central case: success, then failure, then advance the clock past the
+// threshold. The pool's `poller` block reports the failure detail and
+// the stale verdict; the handler keeps it present because the pool is
+// tracked.
+func TestPoolHandler_pollerField_staleAfterFailure(t *testing.T) {
+	clk := &livenessClock{now: time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)}
+	var failNext atomic.Bool
+	p, srv := seededPoller(t, clk, &failNext)
+	// Seed success.
+	p.PollAllForTest(context.Background())
+
+	// Flip the server to failing and drive one failure.
+	clk.Advance(30 * time.Second)
+	failNext.Store(true)
+	p.PollAllForTest(context.Background())
+
+	// Advance past the threshold (StaleAfterIntervals × 1h = 3h).
+	clk.Advance(3 * time.Hour)
+
+	// Register a tracked "chn" pool by hand for the handler. The
+	// BuildFromSpec path avoids reading ambient AQG_POOL_* env vars
+	// (backend.Load would fail in a clean env without them); the test
+	// is therefore self-contained and survives CI's bare env.
+	spec := backend.Spec{Pools: map[string]backend.PoolSpec{
+		"chn": {Members: map[string]backend.MemberSpec{"key-a": {Credential: "zkey"}}},
+	}}
+	registry, err := backend.BuildFromSpec(spec, srv.URL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+
+	srv2 := httptest.NewServer(poolHandler(quota.NewStore(), pools, p))
+	t.Cleanup(srv2.Close)
+
+	resp, err := http.Get(srv2.URL + "/_gateway/pool?pool=chn")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	pollerBlock, has := got["poller"]
+	if !has {
+		t.Fatalf("tracked-but-failing pool carries no `poller` block; got %v", got)
+	}
+	pm := pollerBlock.(map[string]any)
+	if cf, _ := pm["consecutive_failures"].(float64); cf != 1 {
+		t.Errorf("consecutive_failures = %v; want 1", pm["consecutive_failures"])
+	}
+	if pm["last_error"] == nil || pm["last_error"] == "" {
+		t.Errorf("last_error empty after a failure; got %v", pm["last_error"])
+	}
+	if st, _ := pm["stale"].(bool); !st {
+		t.Errorf("stale = false after threshold; want true")
+	}
+}
+
+// TestHealthHandler_pollerHealth_stale covers AC3: the additive
+// `poller_health:"stale"` field appears on the wire when at least one
+// tracked pool is stale, and is absent (omitted) otherwise. Status
+// stays 200 in every case.
+func TestHealthHandler_pollerHealth_stale(t *testing.T) {
+	clk := &livenessClock{now: time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)}
+	var failNext atomic.Bool
+	p, _ := seededPoller(t, clk, &failNext)
+
+	// Healthy at first.
+	srv := httptest.NewServer(healthHandler(configfile.PersistenceState{}, p))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/health")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Contains(body, []byte(`"status":"ok"`)) {
+		t.Errorf("body = %s; want status:ok", body)
+	}
+	if bytes.Contains(body, []byte(`poller_health`)) {
+		t.Errorf("healthy body contains poller_health; want absent (got %s)", body)
+	}
+
+	// Drive success, then failure, then advance past threshold.
+	p.PollAllForTest(context.Background())
+	clk.Advance(30 * time.Second)
+	failNext.Store(true)
+	p.PollAllForTest(context.Background())
+	clk.Advance(3 * time.Hour)
+
+	resp, err = http.Get(srv.URL + "/_gateway/health")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stale status=%d, want 200", resp.StatusCode)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Contains(body, []byte(`"poller_health":"stale"`)) {
+		t.Errorf("stale body missing poller_health:stale; got %s", body)
+	}
+}
+
+// TestQuotaHandler_suppressesAsOfForNeverPolledTrackedPool pins AC5:
+// a tracked pool whose first poll has not yet succeeded suppresses
+// Snapshot.AsOf in the JSON view (Store.Get's read-time stamp is not
+// data for that case). The `polled` field is absent because the pool
+// is not yet in the poller's state map; the absence is meaningful —
+// it is the AC5 "never polled" discriminator.
+func TestQuotaHandler_suppressesAsOfForNeverPolledTrackedPool(t *testing.T) {
+	// The poller below polls pool name "chn" and tracks it. We register
+	// the matching z.ai-shaped backend in the auto registry under the
+	// same name. Then quotaHandler("chn") sees a tracked never-polled
+	// pool and must drop the read-time AsOf from its JSON.
+	clk := &livenessClock{now: time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)}
+	var failNext atomic.Bool
+	p, srv := seededPoller(t, clk, &failNext)
+
+	// Build an auto registry that has a pool called "chn" whose active
+	// member points at the test server's BaseURL.
+	spec := backend.Spec{Pools: map[string]backend.PoolSpec{
+		"chn": {Members: map[string]backend.MemberSpec{"key-a": {Credential: "zkey"}}},
+	}}
+	registry, err := backend.BuildFromSpec(spec, srv.URL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+
+	srv2 := httptest.NewServer(quotaHandler(quota.NewStore(), pools, p))
+	t.Cleanup(srv2.Close)
+
+	resp, err := http.Get(srv2.URL + "/_gateway/quota?backend=chn")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if asOf, has := got["as_of"]; has && asOf != nil && asOf != "" {
+		t.Errorf("never-polled tracked pool carries as_of=%v; want absent or empty", asOf)
+	}
+}
+
+// TestQuotaHandler_passesAsOfThroughForAnthropicPool pins the inverse
+// of AC5: an untracked pool (Anthropic) carries the real AsOf through
+// unchanged — the suppression logic does NOT apply to untracked pools.
+func TestQuotaHandler_passesAsOfThroughForAnthropicPool(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_ACCT_ONE", "sk-ant-oat-one")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+	// Poller with no tracked pools; the handler is given it but no
+	// state entry exists for "auto".
+	clk := &livenessClock{now: time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)}
+	var failNext atomic.Bool
+	p, _ := seededPoller(t, clk, &failNext)
+
+	store := quota.NewStore()
+	util := 0.42
+	store.Put("acct-one", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &util, AsOf: time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)})
+
+	srv := httptest.NewServer(quotaHandler(store, pools, p))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/quota?backend=auto")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["as_of"] == nil || got["as_of"] == "" {
+		t.Errorf("Anthropic pool as_of dropped; want preserved. got=%v", got)
+	}
+	if _, has := got["polled"]; has {
+		t.Errorf("Anthropic pool carries `polled` key (value: %v); want absent (untracked)", got["polled"])
 	}
 }
 
@@ -825,7 +1109,7 @@ func TestPersist_roundTrip(t *testing.T) {
 	pools2 := auto.NewPools(registry, store2, nil, io.Discard)
 	pools2.LoadPersistState(loaded.Pools)
 
-	srv := httptest.NewServer(quotaHandler(store2, pools2))
+	srv := httptest.NewServer(quotaHandler(store2, pools2, nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/_gateway/quota?backend=auto")
