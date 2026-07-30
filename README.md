@@ -813,7 +813,10 @@ operator-set and never auto-cleared) — both are ordinary config fields now, so
 they survive restart because the gateway re-reads the same `aqg.json`. Every
 mutation is re-validated by the same rules as a startup load (including the
 nick↔credential bijection), so an invalid change is rejected and the prior
-config is kept. In env-only mode (no config file) mutations are in-memory only.
+config is kept. In env-only mode (no config file) mutations are in-memory only
+and every successful mutation response carries the
+`X-AQG-Persistence: env_only` header plus a `persistence: "env_only"` body
+field so the API caller sees the durability state directly.
 
 **Watching for a lagging flush.** The debounced write to `aqg.json` can lag
 or fail while the in-memory registry has already moved on. When it does,
@@ -822,8 +825,29 @@ and `GET /_gateway/health` adds `unsaved_config_changes: true` to its body
 (see [Health](#health)). Either signal means on-disk config trails memory, so
 a restart could lose runtime mutations — including credentials — that have not
 yet reached disk; monitor for it and expect it to clear once the flush lands.
-Neither signal is emitted in env-only mode, where there is no config file to
-flush.
+
+**Knowing you are in env-only mode (issue #246).** When no config file is
+configured (no `--config` flag, no `AQG_CONFIG`, no `./aqg.json`), the
+gateway runs in env-only mode and no runtime mutation is persisted. Every
+`/_gateway/*` response that reports config durability now distinguishes
+this case from both a clean save and a failed flush:
+
+- `GET /_gateway/health` returns
+  `{"status":"ok","persistence":"env_only"}` (additive body field; status
+  stays 200, `status` stays `"ok"`).
+- `GET /_gateway/config` adds a response header
+  `X-AQG-Persistence: env_only`.
+- Every successful runtime mutation (create/delete/rename pool, set
+  priority, disable/enable/add/remove/move member) adds the same
+  `X-AQG-Persistence: env_only` header and a `persistence: "env_only"`
+  body field on its 200/201 response, so an operator hitting the API
+  directly sees the change is in-memory only.
+
+In persisted mode those same responses carry
+`X-AQG-Persistence: persisted` and no `persistence` body field — the
+documented default stays byte-identical for clean saves, and the legacy
+`X-AQG-Unsaved-Config: true` header continues to fire only on flush
+failure.
 
 A priority reorder does **not** force the pool off a healthy active member
 (prompt-cache preservation is unchanged): the new order takes effect on the
@@ -1001,17 +1025,26 @@ curl http://127.0.0.1:8080/_gateway/ui
 A loopback-only liveness probe is exposed at `GET /_gateway/health`. It
 returns `200` with a `Content-Type` of `application/json`. The response
 carries no version, uptime, or upstream reachability check — because the
-trust model treats any local process as legitimate. The body is normally
-`{"status":"ok"}`, but when the on-disk `aqg.json` lags the in-memory
-config (a pending or failed debounced flush — issue #198 decision 3) it
-gains a second field: `{"status":"ok","unsaved_config_changes":true}`.
-That field is the operator's signal that runtime mutations — including
-credentials — may not yet be persisted; watch for it and expect it to
-clear once the flush succeeds. It never appears in env-only mode (no
-config file, so nothing to flush). A strict readiness probe should assert
-on `status` rather than a byte-for-byte body match. Like `/_gateway/quota`,
-it is `GET`-only; any other method returns `405` with an `Allow: GET`
-response header.
+trust model treats any local process as legitimate. The body is one of
+three shapes (issue #246):
+
+| Mode | Body | Meaning |
+| --- | --- | --- |
+| persisted, clean | `{"status":"ok"}` | everything saved |
+| persisted, lagging | `{"status":"ok","unsaved_config_changes":true}` | the on-disk `aqg.json` lags the in-memory config (a pending or failed debounced flush — issue #198 decision 3) |
+| env-only | `{"status":"ok","persistence":"env_only"}` | no config file is configured; every runtime mutation is in-memory only and is lost on restart |
+
+The `unsaved_config_changes` field is the operator's signal that runtime
+mutations — including credentials — may not yet be persisted; watch for it
+and expect it to clear once the flush succeeds. The `persistence` field is
+the operator's signal that the gateway is in env-only mode and that
+runtime mutations will be lost on the next restart; the body is the
+canonical surface for this state, and `GET /_gateway/config` advertises
+the same state via the `X-AQG-Persistence` response header (see
+"Watching for a lagging flush" above). A strict readiness probe should
+assert on `status` rather than a byte-for-byte body match. Like
+`/_gateway/quota`, it is `GET`-only; any other method returns `405` with
+an `Allow: GET` response header.
 
 ## Security model
 

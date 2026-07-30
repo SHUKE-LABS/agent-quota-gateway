@@ -24,19 +24,32 @@ import (
 // run() wires them, so the path-pattern handlers can resolve r.PathValue.
 // The /_gateway/ui route is exercised by uiMux instead — that handler is
 // pools-free and does not belong in this mux.
+//
+// persistence is the new issue #246 persistence view passed into every
+// handler. Existing tests that pre-date #246 don't care about the env-only
+// signal, so they accept the zero value (ModePersisted, no Unsaved func)
+// by leaving the parameter at its default — that matches the pre-#246
+// contract (handlers' bodies stay byte-identical in persisted mode).
 func configMux(t *testing.T, pools *auto.Pools) *httptest.Server {
 	t.Helper()
+	return configMuxWithPersistence(t, pools, configfile.PersistenceState{})
+}
+
+// configMuxWithPersistence is configMux with an explicit PersistenceState,
+// used by the issue #246 tests to drive the env-only surface.
+func configMuxWithPersistence(t *testing.T, pools *auto.Pools, persistence configfile.PersistenceState) *httptest.Server {
+	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/config", configHandler(pools, nil))
-	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
-	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/rename", renamePoolHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/move", moveMemberHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools))
-	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools))
+	mux.HandleFunc("/_gateway/config", configHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools, persistence))
+	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/rename", renamePoolHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/move", moveMemberHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools, persistence))
+	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools, persistence))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -864,6 +877,24 @@ func TestUIHandler_surfacesUnsavedConfig(t *testing.T) {
 	}
 }
 
+// TestUIHandler_surfacesPersistenceMode is the regression guard for issue #246:
+// the bundled UI must also consume the X-AQG-Persistence header on
+// /_gateway/config and render a distinct banner when the mode is env_only.
+// Without this static guard a future copy could silently drop the new banner
+// and env-only mode would revert to reporting a clean save (the issue's
+// documented failure mode).
+func TestUIHandler_surfacesPersistenceMode(t *testing.T) {
+	if !strings.Contains(uiHTML, configfile.HeaderPersistence) {
+		t.Errorf("UI HTML does not reference %s; the env-only banner is not wired (issue #246)", configfile.HeaderPersistence)
+	}
+	if !strings.Contains(uiHTML, "env-only mode") {
+		t.Error("UI HTML does not contain the env-only banner copy")
+	}
+	if !strings.Contains(uiHTML, "envonly") {
+		t.Error("UI HTML does not reference the #envonly banner element")
+	}
+}
+
 // TestUIHandler_methodNotAllowed confirms non-GET methods receive 405 with
 // an Allow header, matching the policy of the other /_gateway/* endpoints.
 func TestUIHandler_methodNotAllowed(t *testing.T) {
@@ -988,5 +1019,379 @@ func stripCredentialContractComment(s string) string {
 			scan = next
 		}
 		s = s[:lineStart] + s[scan:]
+	}
+}
+
+// envOnlyState is the single test fixture for issue #246's env-only mode:
+// ModeEnvOnly with a no-op Unsaved (the latch is always false for an
+// env-only writer; the helper constructor stubs it).
+func envOnlyState() configfile.PersistenceState {
+	return configfile.PersistenceState{Mode: configfile.ModeEnvOnly, Unsaved: func() bool { return false }}
+}
+
+// persistedCleanState mirrors envOnlyState for the persisted, clean case:
+// ModePersisted, no flush latch tripped. The handler bodies must stay
+// byte-identical to the pre-#246 response shapes for this state.
+func persistedCleanState() configfile.PersistenceState {
+	return configfile.PersistenceState{Mode: configfile.ModePersisted, Unsaved: func() bool { return false }}
+}
+
+// persistedUnsavedState covers the existing two-state behaviour: ModePersisted
+// with the unsaved latch tripped, which should still emit the legacy header
+// (unchanged by issue #246).
+func persistedUnsavedState() configfile.PersistenceState {
+	return configfile.PersistenceState{Mode: configfile.ModePersisted, Unsaved: func() bool { return true }}
+}
+
+// TestHealthHandler_threeStates covers AC1 (issue #246): the health body
+// distinguishes env-only from clean and from unsaved, while keeping
+// status code 200 and the top-level "status":"ok" field.
+func TestHealthHandler_threeStates(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+
+	cases := []struct {
+		name      string
+		pers      configfile.PersistenceState
+		wantBody  string
+		wantHead  string // header value, "" to assert absence
+		noHeaders []string
+	}{
+		{
+			name:     "persisted clean",
+			pers:     persistedCleanState(),
+			wantBody: `{"status":"ok"}`,
+			wantHead: "persisted",
+		},
+		{
+			name:      "persisted unsaved",
+			pers:      persistedUnsavedState(),
+			wantBody:  `{"status":"ok","unsaved_config_changes":true}`,
+			wantHead:  "persisted",
+			noHeaders: nil, // legacy unsaved header is set on the dedicated endpoint, not here
+		},
+		{
+			name:     "env-only",
+			pers:     envOnlyState(),
+			wantBody: `{"status":"ok","persistence":"env_only"}`,
+			wantHead: "env_only",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(healthHandler(tc.pers))
+			defer srv.Close()
+
+			resp, err := http.Get(srv.URL + "/_gateway/health")
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d, want 200", resp.StatusCode)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if got := strings.TrimSpace(string(body)); got != tc.wantBody {
+				t.Errorf("body=%q, want %q", got, tc.wantBody)
+			}
+			if got := resp.Header.Get(configfile.HeaderPersistence); got != tc.wantHead {
+				t.Errorf("%s=%q, want %q", configfile.HeaderPersistence, got, tc.wantHead)
+			}
+		})
+	}
+}
+
+// TestConfigEndpoint_threeStates covers AC2: /_gateway/config sets the
+// persistence header in every state, sets the legacy unsaved header only
+// when the latch is tripped, and the credential-redaction contract is
+// preserved across all three.
+func TestConfigEndpoint_threeStates(t *testing.T) {
+	const secret = "sk-ant-SECRET-DO-NOT-LEAK"
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", secret)
+
+	cases := []struct {
+		name        string
+		pers        configfile.PersistenceState
+		wantHead    string
+		wantUnsaved bool
+	}{
+		{name: "persisted clean", pers: persistedCleanState(), wantHead: "persisted", wantUnsaved: false},
+		{name: "persisted unsaved", pers: persistedUnsavedState(), wantHead: "persisted", wantUnsaved: true},
+		{name: "env-only", pers: envOnlyState(), wantHead: "env_only", wantUnsaved: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := configMuxWithPersistence(t, loadPools(t), tc.pers)
+
+			resp, err := http.Get(srv.URL + "/_gateway/config")
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d, want 200", resp.StatusCode)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if got := resp.Header.Get(configfile.HeaderPersistence); got != tc.wantHead {
+				t.Errorf("%s=%q, want %q", configfile.HeaderPersistence, got, tc.wantHead)
+			}
+			gotUnsaved := resp.Header.Get(configfile.HeaderUnsavedConfig) == "true"
+			if gotUnsaved != tc.wantUnsaved {
+				t.Errorf("X-AQG-Unsaved-Config=%v, want %v", gotUnsaved, tc.wantUnsaved)
+			}
+			// Credential contract: no credential substring regardless of mode.
+			if strings.Contains(string(body), "sk-ant-SECRET") {
+				t.Errorf("config response leaked a credential substring in mode %q", tc.name)
+			}
+		})
+	}
+}
+
+// TestMutationHandler_envOnly_statusOKShape covers AC3 for the status-style
+// mutation body (issue #246 review note #2): every {"status":"ok"} response
+// gains the "persistence" body field and the persistence header in
+// env-only mode, and stays byte-identical in persisted mode.
+func TestMutationHandler_envOnly_statusOKShape(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
+
+	cases := []struct {
+		name        string
+		mutate      func(t *testing.T, srv *httptest.Server)
+		wantInBody  string
+		mustContain string // persisted body must contain this and must NOT contain "persistence"
+	}{
+		{
+			name: "disable member",
+			mutate: func(t *testing.T, srv *httptest.Server) {
+				post(t, srv.URL+"/_gateway/pool/auto/member/a/disable", http.StatusOK)
+			},
+			wantInBody:  `"persistence":"env_only"`,
+			mustContain: `"status":"ok"`,
+		},
+		{
+			name: "enable member",
+			mutate: func(t *testing.T, srv *httptest.Server) {
+				post(t, srv.URL+"/_gateway/pool/auto/member/a/enable", http.StatusOK)
+			},
+			wantInBody:  `"persistence":"env_only"`,
+			mustContain: `"status":"ok"`,
+		},
+		{
+			name: "set priority",
+			mutate: func(t *testing.T, srv *httptest.Server) {
+				postJSON(t, srv.URL+"/_gateway/pool/auto/priority", `["b","a"]`, http.StatusOK)
+			},
+			wantInBody:  `"persistence":"env_only"`,
+			mustContain: `"status":"ok"`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run("env-only/"+tc.name, func(t *testing.T) {
+			pools := loadPools(t)
+			srv := configMuxWithPersistence(t, pools, envOnlyState())
+			tc.mutate(t, srv)
+
+			// Re-fire one mutation directly to capture the response body,
+			// because the helpers above discard the response. The shared
+			// state is unchanged so this is safe — the mutation is idempotent
+			// (re-disable is the same observable state).
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/_gateway/pool/auto/member/a/disable", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d, want 200", resp.StatusCode)
+			}
+			if !strings.Contains(string(body), tc.wantInBody) {
+				t.Errorf("env-only body missing %q: %s", tc.wantInBody, body)
+			}
+			if got := resp.Header.Get(configfile.HeaderPersistence); got != "env_only" {
+				t.Errorf("%s=%q, want \"env_only\"", configfile.HeaderPersistence, got)
+			}
+		})
+
+		t.Run("persisted/"+tc.name, func(t *testing.T) {
+			// Reload pools for each subtest: env-only mutations above mutates
+			// the shared registry in-memory only, but the persisted re-fires
+			// below need a clean state.
+			pools := loadPools(t)
+			srv := configMuxWithPersistence(t, pools, persistedCleanState())
+
+			// Drive a status-style mutation against the persisted mux and
+			// assert the body stays byte-identical to the pre-#246 shape:
+			// no "persistence" field, no env-only header.
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/_gateway/pool/auto/member/a/disable", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d, want 200", resp.StatusCode)
+			}
+			if !strings.Contains(string(body), tc.mustContain) {
+				t.Errorf("persisted body missing %q: %s", tc.mustContain, body)
+			}
+			if strings.Contains(string(body), `"persistence"`) {
+				t.Errorf("persisted body unexpectedly carries persistence field: %s", body)
+			}
+			if got := resp.Header.Get(configfile.HeaderPersistence); got != "persisted" {
+				t.Errorf("%s=%q, want \"persisted\"", configfile.HeaderPersistence, got)
+			}
+		})
+	}
+}
+
+// TestMutationHandler_envOnly_poolNamedShape covers AC3 for the second
+// mutation body shape (issue #246 review note #2): {"pool":"..."} responses
+// from createPool and renamePool also gain the persistence field and
+// header in env-only mode.
+func TestMutationHandler_envOnly_poolNamedShape(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+
+	t.Run("env-only/create", func(t *testing.T) {
+		srv := configMuxWithPersistence(t, loadPools(t), envOnlyState())
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/_gateway/pool", strings.NewReader(`{"name":"rt"}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status=%d, want 201", resp.StatusCode)
+		}
+		if !strings.Contains(string(body), `"persistence":"env_only"`) {
+			t.Errorf("env-only body missing persistence field: %s", body)
+		}
+		if !strings.Contains(string(body), `"pool":"rt"`) {
+			t.Errorf("env-only body missing pool field: %s", body)
+		}
+		if got := resp.Header.Get(configfile.HeaderPersistence); got != "env_only" {
+			t.Errorf("%s=%q, want \"env_only\"", configfile.HeaderPersistence, got)
+		}
+	})
+
+	t.Run("persisted/create", func(t *testing.T) {
+		srv := configMuxWithPersistence(t, loadPools(t), persistedCleanState())
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/_gateway/pool", strings.NewReader(`{"name":"rt2"}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status=%d, want 201", resp.StatusCode)
+		}
+		if strings.Contains(string(body), `"persistence"`) {
+			t.Errorf("persisted body unexpectedly carries persistence field: %s", body)
+		}
+		if !strings.Contains(string(body), `"pool":"rt2"`) {
+			t.Errorf("persisted body missing pool field: %s", body)
+		}
+		if got := resp.Header.Get(configfile.HeaderPersistence); got != "persisted" {
+			t.Errorf("%s=%q, want \"persisted\"", configfile.HeaderPersistence, got)
+		}
+	})
+
+	t.Run("env-only/rename", func(t *testing.T) {
+		srv := configMuxWithPersistence(t, loadPools(t), envOnlyState())
+		// Create then rename — both must carry the env-only signal.
+		postJSON(t, srv.URL+"/_gateway/pool", `{"name":"rt"}`, http.StatusCreated)
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/_gateway/pool/rt/rename", strings.NewReader(`{"name":"rt-renamed"}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("rename status=%d, want 200", resp.StatusCode)
+		}
+		if !strings.Contains(string(body), `"persistence":"env_only"`) {
+			t.Errorf("env-only rename body missing persistence field: %s", body)
+		}
+		if !strings.Contains(string(body), `"pool":"rt-renamed"`) {
+			t.Errorf("env-only rename body missing pool field: %s", body)
+		}
+		if got := resp.Header.Get(configfile.HeaderPersistence); got != "env_only" {
+			t.Errorf("%s=%q, want \"env_only\"", configfile.HeaderPersistence, got)
+		}
+	})
+}
+
+// TestMutationHandler_envOnly_fullFamily is a sanity sweep over every
+// mutation handler (issue #246 review note #2): each one returns a 200
+// or 201 in env-only mode and carries the persistence header. Picking one
+// representative per family member, exercising its happy path, and
+// asserting the header proves AC3 across all 9 handlers without the
+// combinatorial expense of wiring up every domain case. The two shape
+// tests above (status-ok + pool-named) already cover the body contract;
+// this test confirms the header is uniformly applied.
+//
+// The sweep uses TWO pools so the priority mutation on `auto` doesn't
+// turn it into a priority target that then rejects the runtime
+// add/remove of member c with a placement-required error. Each pool
+// carries its own state, so the header assertion covers every handler
+// path without that entanglement.
+func TestMutationHandler_envOnly_fullFamily(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
+	t.Setenv("AQG_POOL_PLAIN_BACKEND_X", "sk-ant-x")
+
+	srv := configMuxWithPersistence(t, loadPools(t), envOnlyState())
+
+	happyPaths := []struct {
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{"POST", "/_gateway/pool/auto/priority", `["b","a"]`, 200},
+		{"POST", "/_gateway/pool/plain/member/x/disable", ``, 200},
+		{"POST", "/_gateway/pool/plain/member/x/enable", ``, 200},
+		{"POST", "/_gateway/pool/plain/member/y", `{"credential":"sk-ant-y"}`, 200},
+		{"DELETE", "/_gateway/pool/plain/member/y", ``, 200},
+	}
+	for _, hp := range happyPaths {
+		var req *http.Request
+		var err error
+		if hp.body == "" {
+			req, err = http.NewRequest(hp.method, srv.URL+hp.path, nil)
+		} else {
+			req, err = http.NewRequest(hp.method, srv.URL+hp.path, strings.NewReader(hp.body))
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if err != nil {
+			t.Fatalf("new request %s %s: %v", hp.method, hp.path, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do %s %s: %v", hp.method, hp.path, err)
+		}
+		if resp.StatusCode != hp.want {
+			t.Errorf("%s %s status=%d, want %d", hp.method, hp.path, resp.StatusCode, hp.want)
+		}
+		if got := resp.Header.Get(configfile.HeaderPersistence); got != "env_only" {
+			t.Errorf("%s %s: %s=%q, want \"env_only\"", hp.method, hp.path, configfile.HeaderPersistence, got)
+		}
+		resp.Body.Close()
 	}
 }

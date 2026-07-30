@@ -10,6 +10,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/activity"
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
 )
 
 // activityHandler serves GET /_gateway/activity — the rolling per-endpoint
@@ -29,20 +30,24 @@ func activityHandler(store *activity.Store) http.HandlerFunc {
 }
 
 // configHandler serves GET /_gateway/config — the effective configuration
-// for all pools, with credentials fully redacted. Non-GET returns 405. When
-// the config writer has unflushed changes (issue #198 decision 3), the
-// response carries an X-AQG-Unsaved-Config: true header so the UI can surface
-// that on-disk config lags memory; unsaved is nil in env-only mode.
-func configHandler(pools *auto.Pools, unsaved func() bool) http.HandlerFunc {
+// for all pools, with credentials fully redacted. Non-GET returns 405.
+//
+// Config-durability headers (issue #246):
+//   - X-AQG-Persistence: <persisted|env_only> is set in every successful
+//     response (env-only advertises itself explicitly instead of being
+//     indistinguishable from a clean persisted state).
+//   - X-AQG-Unsaved-Config: true is set in addition when the flush latch
+//     is tripped (persisted but lagging memory; issue #198 decision 3).
+//   - Env-only mode never sets the unsaved header — there is nothing to
+//     flush and therefore nothing to lag.
+func configHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if unsaved != nil && unsaved() {
-			w.Header().Set("X-AQG-Unsaved-Config", "true")
-		}
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(pools.EffectiveConfig())
 	}
@@ -64,7 +69,11 @@ type createPoolRequest struct {
 
 // createPoolHandler serves POST /_gateway/pool — creates a plain pool at
 // runtime. On success it returns 201 with {"pool": "<normalized-name>"}.
-func createPoolHandler(pools *auto.Pools) http.HandlerFunc {
+// In env-only mode (issue #246) the response body gains a
+// "persistence":"env_only" field and the X-AQG-Persistence header is set
+// so an operator hitting the API directly sees the change is in-memory
+// only and is lost on restart.
+func createPoolHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createPoolRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -80,8 +89,11 @@ func createPoolHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(map[string]string{"pool": backend.NormalizeName(req.Name)})
+		body := map[string]any{"pool": backend.NormalizeName(req.Name)}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
@@ -89,7 +101,7 @@ func createPoolHandler(pools *auto.Pools) http.HandlerFunc {
 // runtime pool (issue #232). On success it returns 200 {"status":"ok"},
 // matching removeMemberHandler. A pool that still has members returns 409
 // (drain members first); an unknown pool returns 404.
-func deletePoolHandler(pools *auto.Pools) http.HandlerFunc {
+func deletePoolHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
 		if poolName == "" {
@@ -105,8 +117,11 @@ func deletePoolHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		body := map[string]any{"status": "ok"}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
@@ -120,7 +135,7 @@ type renamePoolRequest struct {
 // normalized new name, matching createPoolHandler's response shape. Mapping:
 // unknown old pool → 404; empty / identical-after-normalize new name → 400;
 // new name collides with a different existing pool → 409.
-func renamePoolHandler(pools *auto.Pools) http.HandlerFunc {
+func renamePoolHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
 		if poolName == "" {
@@ -143,8 +158,11 @@ func renamePoolHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{"pool": backend.NormalizeName(req.Name)})
+		body := map[string]any{"pool": backend.NormalizeName(req.Name)}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
@@ -152,7 +170,7 @@ func renamePoolHandler(pools *auto.Pools) http.HandlerFunc {
 // runtime priority override for the pool. The request body must be a JSON
 // array of nicks (highest priority first). The override is expanded to a
 // total order (unlisted members rank last in sorted order).
-func priorityHandler(pools *auto.Pools) http.HandlerFunc {
+func priorityHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
 		if poolName == "" {
@@ -175,14 +193,17 @@ func priorityHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		body := map[string]any{"status": "ok"}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
 // disableMemberHandler serves POST /_gateway/pool/{name}/member/{nick}/disable —
 // disables a pool member, making it unselectable until re-enabled.
-func disableMemberHandler(pools *auto.Pools) http.HandlerFunc {
+func disableMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
 		nick := backend.NormalizeName(r.PathValue("nick"))
@@ -199,14 +220,17 @@ func disableMemberHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		body := map[string]any{"status": "ok"}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
 // enableMemberHandler serves POST /_gateway/pool/{name}/member/{nick}/enable —
 // re-enables a previously disabled pool member.
-func enableMemberHandler(pools *auto.Pools) http.HandlerFunc {
+func enableMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
 		nick := backend.NormalizeName(r.PathValue("nick"))
@@ -223,8 +247,11 @@ func enableMemberHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		body := map[string]any{"status": "ok"}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
@@ -238,7 +265,7 @@ type addMemberRequest struct {
 // addMemberHandler serves POST /_gateway/pool/{name}/member/{nick} —
 // adds a runtime member to a pool. Credential and base_url are optional for a
 // known subscription; a priority target requires an explicit placement.
-func addMemberHandler(pools *auto.Pools) http.HandlerFunc {
+func addMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
 		nick := backend.NormalizeName(r.PathValue("nick"))
@@ -262,8 +289,11 @@ func addMemberHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		body := map[string]any{"status": "ok"}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
@@ -276,7 +306,7 @@ type moveMemberRequest struct {
 
 // moveMemberHandler serves POST /_gateway/pool/{name}/member/{nick}/move —
 // relocates a subscription from {name} to the target pool named in the body.
-func moveMemberHandler(pools *auto.Pools) http.HandlerFunc {
+func moveMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		fromPool := backend.NormalizeName(r.PathValue("name"))
 		nick := backend.NormalizeName(r.PathValue("nick"))
@@ -306,14 +336,17 @@ func moveMemberHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		body := map[string]any{"status": "ok"}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
 // removeMemberHandler serves DELETE /_gateway/pool/{name}/member/{nick} —
 // removes a member (static or runtime-added) from pool selection.
-func removeMemberHandler(pools *auto.Pools) http.HandlerFunc {
+func removeMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
 		nick := backend.NormalizeName(r.PathValue("nick"))
@@ -330,7 +363,10 @@ func removeMemberHandler(pools *auto.Pools) http.HandlerFunc {
 			return
 		}
 
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		body := map[string]any{"status": "ok"}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }

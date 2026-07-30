@@ -96,6 +96,21 @@
   }
   #unsaved.show { display: block; }
 
+  /* Persistent env-only warning (issue #246). Distinct copy, distinct
+     hue (info-blue) from both #banner (transient error, red) and #unsaved
+     (lagging flush, amber) so an operator can tell at a glance which
+     failure mode the banner names. */
+  #envonly {
+    display: none;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    border-radius: 6px;
+    background: rgba(9, 105, 218, 0.10);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+  }
+  #envonly.show { display: block; }
+
   .pool {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -507,6 +522,7 @@
 <main>
   <div id="banner" role="alert"></div>
   <div id="unsaved" role="alert"></div>
+  <div id="envonly" role="alert"></div>
   <div id="addsub"></div>
   <div id="pools"></div>
   <div id="activity"></div>
@@ -531,6 +547,7 @@
   var root = document.getElementById('pools');
   var banner = document.getElementById('banner');
   var unsavedBanner = document.getElementById('unsaved');
+  var envonlyBanner = document.getElementById('envonly');
   var POLL_MS = 3000;
 
   // currentViews holds the latest sanitized config views, so the move flow can
@@ -560,6 +577,22 @@
       unsavedBanner.classList.add('show');
     } else {
       unsavedBanner.classList.remove('show');
+    }
+  }
+
+  // showEnvOnly surfaces the persistent env-only banner (issue #246)
+  // driven by the X-AQG-Persistence response header on /_gateway/config.
+  // No auto-hide: it stays until a later config load reports a different
+  // persistence mode. Distinct from showUnsaved (failed flush) and
+  // showBanner (transient errors) by both copy and color, so the operator
+  // can tell which durability state the banner names.
+  function showEnvOnly(mode) {
+    if (mode === 'env_only') {
+      envonlyBanner.textContent =
+        'Running in env-only mode — runtime changes are not persisted and will be lost on restart.';
+      envonlyBanner.classList.add('show');
+    } else {
+      envonlyBanner.classList.remove('show');
     }
   }
 
@@ -609,15 +642,17 @@
   function fetchJSON(url, opts) {
     return fetch(url, opts || {}).then(function (resp) {
       var ct = resp.headers.get('content-type') || '';
-      // Only /_gateway/config sets this; harmless (false) elsewhere. Read here
-      // so loadConfig can surface the unsaved-config warning (issue #218).
+      // Only /_gateway/config sets these; harmless (false / empty) elsewhere.
+      // Read here so loadConfig can surface the unsaved-config warning
+      // (issue #218) and the env-only banner (issue #246).
       var unsavedConfig = resp.headers.get('X-AQG-Unsaved-Config') === 'true';
+      var persistenceMode = resp.headers.get('X-AQG-Persistence') || '';
       var p = resp.text().then(function (text) {
         var body = text;
         if (ct.indexOf('application/json') !== -1) {
           try { body = JSON.parse(text); } catch (e) { body = null; }
         }
-        return { status: resp.status, ok: resp.ok, body: body, unsavedConfig: unsavedConfig };
+        return { status: resp.status, ok: resp.ok, body: body, unsavedConfig: unsavedConfig, persistenceMode: persistenceMode };
       });
       return p;
     });
@@ -1129,6 +1164,7 @@
         return [];
       }
       showUnsaved(r.unsavedConfig);
+      showEnvOnly(r.persistenceMode);
       return r.body.map(sanitizeView);
     });
   }
