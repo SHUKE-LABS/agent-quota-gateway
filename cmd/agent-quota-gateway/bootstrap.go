@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -21,11 +22,13 @@ import (
 //     pure env-mode local dev — build from env, keep zero credentials on disk,
 //     no config writer (returned configPath is "").
 //   - A config path resolves and the file exists: read it, ignore AQG_POOL_*
-//     env entirely.
+//     env entirely. A pre-#198 state-file priority_override is consumed into
+//     aqg.json once before the server starts (issue #241).
 //   - A config path resolves but the file is absent (first deploy): generate it
 //     once by merging env (backend.Load) with the legacy state-file overlay
 //     using state-wins precedence, write it 0600, then read it back. Env is
-//     never consulted again on subsequent starts.
+//     never consulted again on subsequent starts, except for the legacy state
+//     file location probe described by reconcileLegacyPriority.
 //
 // It returns the effective config, the registry, and the config path the
 // writer should flush to ("" disables write-through).
@@ -48,16 +51,6 @@ func resolveConfig(configFlag string, logOut io.Writer) (config.Config, *backend
 		if err != nil {
 			return config.Config{}, nil, "", err
 		}
-		// Issue #241: a pre-existing aqg.json no longer suppresses a
-		// legacy state-file priority_override. The deploy path pins
-		// AQG_CONFIG to the StateDirectory and never overwrites aqg.json, so
-		// every redeploy/upgrade hits this branch — and an operator who
-		// adjusted a pool's priority before #198 made aqg.json the source of
-		// truth would otherwise lose that adjustment on the next start.
-		// reconcileLegacyPriority folds any unmigrated operator intent from
-		// the legacy state file into the loaded registry and writes the
-		// reconciled aqg.json back. After it runs, aqg.json is once again
-		// the single source of truth and the legacy overlay becomes inert.
 		reg, err = reconcileLegacyPriority(cfg, reg, path, logOut)
 		return cfg, reg, path, err
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -73,126 +66,220 @@ func resolveConfig(configFlag string, logOut io.Writer) (config.Config, *backend
 	return cfg, reg, path, err
 }
 
-// reconcileLegacyPriority folds a still-unmigrated legacy state-file
-// priority_override into the loaded config registry and persists the result
-// to path (issue #241). It is the second-chance twin of bootstrapConfigFile:
-// bootstrapConfigFile runs the same overlay against the env registry when
-// aqg.json does not yet exist; reconcileLegacyPriority runs it against the
-// loaded aqg.json when the file does exist.
+type legacyPriorityVerdict struct {
+	pool     string
+	previous []string
+	order    []string
+	migrate  bool
+	balanced bool
+}
+
+// reconcileLegacyPriority consumes a pre-#198 state-file priority_override into
+// an existing aqg.json (issue #241). aqg.json is written first; the consumed
+// priority keys are then removed from the state file. That write order makes a
+// crash between the two idempotent: the next start observes exact equality,
+// leaves aqg.json untouched, and retries only the state-file cleanup.
 //
-// Policy (mirrors applyLegacyOverlay):
-//   - a legacy priority_override that references a pool not in the loaded
-//     registry AND not brought in via the legacy added_pools overlay is
-//     logged and skipped — operator intent that names a now-gone pool is
-//     outside the reconciler's scope;
-//   - priority nicks that no longer name a current member are filtered out
-//     (matching the bootstrap path's policy);
-//   - if filtering empties the priority for a pool the overlay did target,
-//     the reconciliation aborts loud: a zero-member priority in aqg.json
-//     would silently discard operator intent, so startup must fail instead.
-//
-// reconcileLegacyPriority returns the in-memory registry (rebuilt on any
-// change so the runtime sees the migrated order immediately) and writes a
-// fresh aqg.json only when the legacy overlay actually changed something.
-// When nothing needs migrating the on-disk file is left untouched, so a
-// steady-state post-migration start incurs no write at all.
-func reconcileLegacyPriority(cfg config.Config, reg *backend.Registry, path string, logOut io.Writer) (*backend.Registry, error) {
-	legacy, ok := loadLegacyOverlay(cfg.StateFile)
+// This is intentionally priority-only. applyLegacyOverlay also replays legacy
+// members, credentials, removals, and disabled flags, which would overwrite
+// newer operator intent already stored in aqg.json. It remains confined to the
+// first-deploy bootstrap path.
+func reconcileLegacyPriority(cfg config.Config, reg *backend.Registry, configPath string, logOut io.Writer) (*backend.Registry, error) {
+	statePath, stateData, legacy, ok := findLegacyOverlay(cfg, logOut)
 	if !ok {
 		return reg, nil
 	}
 
-	// First pass: scope the overlay to pools that exist in the loaded
-	// registry (or that the legacy added_pools overlay will resurrect).
-	// Anything else is outside the reconciler's scope and is skipped with
-	// a log line, not an abort — matching applyLegacyOverlay.
-	for rawName := range legacy.AddedPools {
-		name := backend.NormalizeName(rawName)
-		if name == "" || reg.HasPool(name) {
-			continue
-		}
-		fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: skipping legacy added_pool %q (no matching pool in config)\n", name)
-	}
-
-	// Second pass: walk every legacy priority_override. Determine what
-	// would change, apply the copy-on-write mutation when it does, and
-	// collect any pool whose priority collapses to zero surviving members
-	// (the only condition that aborts startup).
+	spec := reg.Spec()
+	verdicts := make([]legacyPriorityVerdict, 0, len(legacy.Config))
 	var irreconcilable []string
-	updated := reg
 	for rawPool, pc := range legacy.Config {
-		pool := backend.NormalizeName(rawPool)
-		if pool == "" {
+		if len(pc.PriorityOverride) == 0 {
 			continue
 		}
-		// Pool outside the reconciler's scope — log and skip, no abort.
-		// This is the legacy-state-only entry the reviewer's note called
-		// out: a state file that mentions a pool the loaded config does not
-		// have is best-effort skipped.
-		if !reg.HasPool(pool) {
+		pool := backend.NormalizeName(rawPool)
+		if pool == "" || !reg.HasPool(pool) {
 			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: skipping legacy priority for pool %q (not in config)\n", pool)
 			continue
 		}
-		if len(pc.PriorityOverride) == 0 {
-			continue // no priority to migrate for this pool
-		}
-		// Filter to nicks that still name a current member of the pool.
-		order := make([]string, 0, len(pc.PriorityOverride))
-		for _, rawNick := range pc.PriorityOverride {
-			nick := backend.NormalizeName(rawNick)
-			if nick == "" {
-				continue
-			}
-			if _, ok := reg.ResolveIn(pool, nick); !ok {
-				fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: dropping legacy priority nick %q for pool %q (not a current member)\n", nick, pool)
-				continue
-			}
-			order = append(order, nick)
-		}
+
+		order := filteredLegacyPriority(reg, pool, pc.PriorityOverride, logOut)
 		if len(order) == 0 {
-			// The overlay targeted a pool we know about, but every nick in
-			// its priority_override names a now-gone member. Silent fallback
-			// would drop operator intent; abort so the operator sees a
-			// startup error.
 			irreconcilable = append(irreconcilable, pool)
 			continue
 		}
-		// No-op when the loaded priority is already an exact match for the
-		// legacy order — keeps the steady-state no-write property for
-		// installs that already migrated their order verbatim. Set-equal
-		// is not enough: the legacy state wins precedence (issue #197
-		// pattern), so a different ordering with the same nicks must still
-		// be migrated.
-		if equalStringSlices(reg.PoolPriority(pool), order) {
+
+		previous := reg.PoolPriority(pool)
+		v := legacyPriorityVerdict{
+			pool:     pool,
+			previous: previous,
+			order:    order,
+		}
+		if spec.Pools[pool].Balance != "" {
+			v.balanced = true
+			verdicts = append(verdicts, v)
 			continue
 		}
-		next, err := reg.WithPriority(pool, order)
-		if err != nil {
-			return reg, fmt.Errorf("reconcile: pool %q priority: %w", pool, err)
-		}
-		updated = next
+		v.migrate = !equalStringSlices(previous, order)
+		verdicts = append(verdicts, v)
 	}
 
 	if len(irreconcilable) > 0 {
 		sort.Strings(irreconcilable)
-		return reg, fmt.Errorf("reconcile: legacy priority_override has no surviving members for pool(s) %s; resolve the mismatch in the state file or aqg.json before restarting", strings.Join(irreconcilable, ", "))
+		return reg, fmt.Errorf("reconcile: legacy priority_override has no surviving members for pool(s) %s; state file %q and config file %q were not changed; remove those priority_override key(s) from the state file and restart", strings.Join(irreconcilable, ", "), statePath, configPath)
 	}
 
-	if updated == reg {
-		// No priority override actually changed anything; the file on disk
-		// is already the reconciled source of truth. Leave it untouched.
-		return reg, nil
+	updated := reg
+	var migrated []legacyPriorityVerdict
+	var handled []string
+	for _, v := range verdicts {
+		handled = append(handled, v.pool)
+		if v.balanced {
+			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: pool %q declares balance mode in aqg.json; legacy priority mode is superseded and will be consumed\n", v.pool)
+			continue
+		}
+		if !v.migrate {
+			continue
+		}
+		next, err := updated.WithPriority(v.pool, v.order)
+		if err != nil {
+			return reg, fmt.Errorf("reconcile: pool %q priority: %w", v.pool, err)
+		}
+		updated = next
+		migrated = append(migrated, v)
 	}
 
-	data, err := configfile.Marshal(cfg, updated)
-	if err != nil {
-		return reg, fmt.Errorf("reconcile: marshal %q: %w", path, err)
+	if updated != reg {
+		data, err := configfile.Marshal(cfg, updated)
+		if err != nil {
+			return reg, fmt.Errorf("reconcile: marshal %q: %w", configPath, err)
+		}
+		if err := configfile.WriteAtomic(configPath, data); err != nil {
+			return reg, fmt.Errorf("reconcile: write %q: %w", configPath, err)
+		}
+		for _, v := range migrated {
+			if len(v.previous) == 0 {
+				fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: pool %q priority %v -> %v migrated into %s; nothing was overridden\n", v.pool, v.previous, v.order, configPath)
+			} else {
+				fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: pool %q priority %v -> %v migrated into %s; re-setting the order in the UI will not recur\n", v.pool, v.previous, v.order, configPath)
+			}
+		}
 	}
-	if err := configfile.WriteAtomic(path, data); err != nil {
-		return reg, fmt.Errorf("reconcile: write %q: %w", path, err)
+
+	if len(handled) > 0 {
+		if err := consumeLegacyPriorities(statePath, stateData, handled); err != nil {
+			sort.Strings(handled)
+			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: aqg.json is current, but could not consume legacy priority_override for pool(s) %s from %q: %v; deletion will be retried on the next start\n", strings.Join(handled, ", "), statePath, err)
+		}
 	}
-	fmt.Fprintf(logOut, "agent-quota-gateway: reconciled legacy state-file priority into %s\n", path)
 	return updated, nil
+}
+
+func findLegacyOverlay(cfg config.Config, logOut io.Writer) (string, []byte, legacyState, bool) {
+	if cfg.StateFile != "" {
+		data, legacy, ok := readLegacyOverlay(cfg.StateFile)
+		return cfg.StateFile, data, legacy, ok
+	}
+
+	var candidates []string
+	if path := os.Getenv(config.EnvStateFile); path != "" {
+		candidates = append(candidates, path)
+	}
+	if dir := os.Getenv("STATE_DIRECTORY"); dir != "" {
+		path := filepath.Join(dir, "state.json")
+		if len(candidates) == 0 || path != candidates[0] {
+			candidates = append(candidates, path)
+		}
+	}
+	for _, path := range candidates {
+		if data, legacy, ok := readLegacyOverlay(path); ok {
+			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: discovered legacy state file %q from the environment because aqg.json declares no state_file\n", path)
+			return path, data, legacy, true
+		}
+	}
+	return "", nil, legacyState{}, false
+}
+
+func filteredLegacyPriority(reg *backend.Registry, pool string, rawOrder []string, logOut io.Writer) []string {
+	order := make([]string, 0, len(rawOrder))
+	seen := make(map[string]bool, len(rawOrder))
+	for _, rawNick := range rawOrder {
+		nick := backend.NormalizeName(rawNick)
+		if _, ok := reg.ResolveIn(pool, nick); !ok {
+			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: dropping legacy priority nick %q for pool %q (not a current member)\n", nick, pool)
+			continue
+		}
+		if seen[nick] {
+			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: dropping duplicate legacy priority nick %q for pool %q\n", nick, pool)
+			continue
+		}
+		seen[nick] = true
+		order = append(order, nick)
+	}
+	return order
+}
+
+// consumeLegacyPriorities removes only priority_override from each handled
+// pool's legacy config object. RawMessage keeps every unrelated JSON value
+// semantically unchanged; no live GatewayState decode is used because that
+// observation-only type deliberately omits legacy operator-intent fields.
+func consumeLegacyPriorities(path string, data []byte, pools []string) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	var configs map[string]json.RawMessage
+	if err := json.Unmarshal(root["config"], &configs); err != nil {
+		return err
+	}
+
+	handled := make(map[string]bool, len(pools))
+	for _, pool := range pools {
+		handled[backend.NormalizeName(pool)] = true
+	}
+	changed := false
+	for rawPool, raw := range configs {
+		if !handled[backend.NormalizeName(rawPool)] {
+			continue
+		}
+		var poolConfig map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &poolConfig); err != nil {
+			return fmt.Errorf("config.%s: %w", rawPool, err)
+		}
+		if _, ok := poolConfig["priority_override"]; !ok {
+			continue
+		}
+		poolConfig = withoutRawMessage(poolConfig, "priority_override")
+		updated, err := json.Marshal(poolConfig)
+		if err != nil {
+			return err
+		}
+		configs[rawPool] = updated
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	updatedConfigs, err := json.Marshal(configs)
+	if err != nil {
+		return err
+	}
+	root["config"] = updatedConfigs
+	updated, err := json.Marshal(root)
+	if err != nil {
+		return err
+	}
+	return configfile.WriteAtomic(path, updated)
+}
+
+func withoutRawMessage(m map[string]json.RawMessage, key string) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(m)-1)
+	for k, v := range m {
+		if k != key {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // equalStringSlices reports whether a and b contain the same elements in the
@@ -262,21 +349,27 @@ type legacyMember struct {
 // bootstrap falls back to env-only, matching the state file's own
 // tolerate-and-continue policy.
 func loadLegacyOverlay(path string) (legacyState, bool) {
+	data, ls, ok := readLegacyOverlay(path)
+	_ = data
+	return ls, ok
+}
+
+func readLegacyOverlay(path string) ([]byte, legacyState, bool) {
 	if path == "" {
-		return legacyState{}, false
+		return nil, legacyState{}, false
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return legacyState{}, false
+		return nil, legacyState{}, false
 	}
 	var ls legacyState
 	if err := json.Unmarshal(data, &ls); err != nil {
-		return legacyState{}, false
+		return nil, legacyState{}, false
 	}
 	if len(ls.Config) == 0 && len(ls.AddedPools) == 0 {
-		return legacyState{}, false
+		return nil, legacyState{}, false
 	}
-	return ls, true
+	return data, ls, true
 }
 
 // applyLegacyOverlay layers the legacy overlay onto the env registry with

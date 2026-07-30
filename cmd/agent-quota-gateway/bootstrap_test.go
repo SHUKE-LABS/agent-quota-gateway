@@ -164,8 +164,10 @@ func TestLoadLegacyOverlay(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			name:    "valid overlay",
-			path:    func() string { return writeStateFile(t, t.TempDir(), `{"config":{"auto":{"priority_override":["b","a"]}}}`) },
+			name: "valid overlay",
+			path: func() string {
+				return writeStateFile(t, t.TempDir(), `{"config":{"auto":{"priority_override":["b","a"]}}}`)
+			},
 			wantOK:  true,
 			wantPri: []string{"b", "a"},
 		},
@@ -474,8 +476,435 @@ func TestResolveConfig_existingFile_reconcilesLegacyPriority(t *testing.T) {
 	if got := reg2.PoolPriority("auto"); strings.Join(got, ",") != strings.Join(wantPri, ",") {
 		t.Errorf("aqg.json on disk priority = %v, want %v", got, wantPri)
 	}
-	if !strings.Contains(buf.String(), "reconciled legacy state-file priority") {
-		t.Errorf("expected reconcile log line, got %q", buf.String())
+	logText := buf.String()
+	for _, want := range []string{`pool "auto"`, "[a b c]", "[c a b]", "re-setting the order in the UI will not recur"} {
+		if !strings.Contains(logText, want) {
+			t.Errorf("reconcile log %q missing %q", logText, want)
+		}
+	}
+}
+
+// TestReconcileLegacyPriority_multiplePools verifies that independent legacy
+// priorities are accumulated into one registry before it is persisted. Each
+// copy-on-write WithPriority call must start from the preceding result; starting
+// from the original registry would silently keep only the final map iteration.
+func TestReconcileLegacyPriority_multiplePools(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"alpha":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}},"priority":["a","b"]},"beta":{"members":{"x":{"credential":"cx"},"y":{"credential":"cy"}},"priority":["x","y"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+	writeStateFile(t, dir,
+		`{"config":{"alpha":{"priority_override":["b","a"]},"beta":{"priority_override":["y","x"]}}}`)
+
+	cfg, reg, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	got, err := reconcileLegacyPriority(cfg, reg, cfgPath, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("reconcileLegacyPriority: %v", err)
+	}
+	for pool, want := range map[string]string{"alpha": "b,a", "beta": "y,x"} {
+		if pri := strings.Join(got.PoolPriority(pool), ","); pri != want {
+			t.Errorf("%s priority = %q, want %q", pool, pri, want)
+		}
+	}
+	_, reloaded, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile post-reconcile: %v", err)
+	}
+	for pool, want := range map[string]string{"alpha": "b,a", "beta": "y,x"} {
+		if pri := strings.Join(reloaded.PoolPriority(pool), ","); pri != want {
+			t.Errorf("persisted %s priority = %q, want %q", pool, pri, want)
+		}
+	}
+}
+
+func readJSONMap(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %q: %v", path, err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode %q: %v", path, err)
+	}
+	return got
+}
+
+func legacyPriorityPresent(t *testing.T, path, pool string) bool {
+	t.Helper()
+	got := readJSONMap(t, path)
+	configs, _ := got["config"].(map[string]any)
+	pc, _ := configs[pool].(map[string]any)
+	_, ok := pc["priority_override"]
+	return ok
+}
+
+func TestResolveConfig_existingFile_consumesLegacyPriorityOnly(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"new-a"},"b":{"credential":"new-b"}},"priority":["a","b"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateJSON := `{"pools":{"auto":{"sticky":"a"}},"snapshots":{"a":{"org_id":"org"}},"config":{"auto":{"priority_override":["b","a"],"disabled":["a"],"added_members":{"a":{"credential":"old-a"}},"removed_members":["b"]},"other":{"disabled":["x"]}},"added_pools":{"rt":{}}}`
+	if err := os.WriteFile(statePath, []byte(stateJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AQG_CONFIG", cfgPath)
+
+	_, reg, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "b,a" {
+		t.Fatalf("priority=%q, want b,a", got)
+	}
+	for nick, credential := range map[string]string{"a": "new-a", "b": "new-b"} {
+		member, ok := reg.ResolveIn("auto", nick)
+		if !ok || member.Credential != credential || member.Disabled {
+			t.Errorf("member %s=%+v, ok=%v; existing config intent must survive", nick, member, ok)
+		}
+	}
+	if legacyPriorityPresent(t, statePath, "auto") {
+		t.Error("handled priority_override remains in state file")
+	}
+	state := readJSONMap(t, statePath)
+	configs := state["config"].(map[string]any)
+	auto := configs["auto"].(map[string]any)
+	for _, key := range []string{"disabled", "added_members", "removed_members"} {
+		if _, ok := auto[key]; !ok {
+			t.Errorf("sibling legacy key %q was discarded", key)
+		}
+	}
+	for _, key := range []string{"pools", "snapshots", "added_pools"} {
+		if _, ok := state[key]; !ok {
+			t.Errorf("top-level state key %q was discarded", key)
+		}
+	}
+}
+
+func TestResolveConfig_existingFile_dedupesNormalizedPriority(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"key-a":{"credential":"ca"},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"auto":{"priority_override":["key_a","key-a","b"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	_, reg, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "key-a,b" {
+		t.Errorf("priority=%q, want key-a,b", got)
+	}
+	if legacyPriorityPresent(t, statePath, "auto") {
+		t.Error("deduped priority_override was not consumed")
+	}
+}
+
+func TestResolveConfig_existingFile_noPriorityOverrideUntouched(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"}},"priority":["a"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"auto":{"disabled":["a"]}}}`)
+	beforeConfig, beforeState := sha256File(t, cfgPath), sha256File(t, statePath)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	if _, _, _, err := resolveConfig("", &bytes.Buffer{}); err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := sha256File(t, cfgPath); got != beforeConfig {
+		t.Error("aqg.json changed without a priority_override")
+	}
+	if got := sha256File(t, statePath); got != beforeState {
+		t.Error("state.json changed without a priority_override")
+	}
+}
+
+func TestResolveConfig_existingFile_balancedPoolConsumesPriority(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}},"balance":"lead"}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"auto":{"priority_override":["b","a"]}}}`)
+	beforeConfig := sha256File(t, cfgPath)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	var log bytes.Buffer
+	_, reg, _, err := resolveConfig("", &log)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if reg.PoolPriority("auto") != nil || reg.PoolBalanceGap("auto") == 0 {
+		t.Errorf("balanced config changed: priority=%v balanceGap=%v", reg.PoolPriority("auto"), reg.PoolBalanceGap("auto"))
+	}
+	if got := sha256File(t, cfgPath); got != beforeConfig {
+		t.Error("balanced aqg.json was rewritten")
+	}
+	if legacyPriorityPresent(t, statePath, "auto") {
+		t.Error("priority superseded by balance was not consumed")
+	}
+	if !strings.Contains(log.String(), "balance mode") || !strings.Contains(log.String(), "priority mode") {
+		t.Errorf("log does not name both modes: %q", log.String())
+	}
+}
+
+func TestResolveConfig_existingFile_vacuousReportsAllAndWritesNeither(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"alpha":{"members":{"a":{"credential":"ca"}}},"beta":{"members":{"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"beta":{"priority_override":["ghost-b"]},"alpha":{"priority_override":["ghost-a"]}}}`)
+	beforeConfig, beforeState := sha256File(t, cfgPath), sha256File(t, statePath)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	_, _, _, err := resolveConfig("", &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("expected vacuous priority error")
+	}
+	for _, want := range []string{"alpha", "beta", statePath, cfgPath, "remove", "restart"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err, want)
+		}
+	}
+	if sha256File(t, cfgPath) != beforeConfig || sha256File(t, statePath) != beforeState {
+		t.Error("a file changed before aggregate validation completed")
+	}
+}
+
+func TestResolveConfig_existingFile_probesAQGStateFileFirst(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	envStatePath := filepath.Join(dir, "env-state.json")
+	stateDir := filepath.Join(dir, "state-dir")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDirPath := filepath.Join(stateDir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envStatePath, []byte(`{"config":{"auto":{"priority_override":["b","a"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateDirPath, []byte(`{"config":{"auto":{"priority_override":["a","b"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("AQG_STATE_FILE", envStatePath)
+	t.Setenv("STATE_DIRECTORY", stateDir)
+	_, reg, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "b,a" {
+		t.Errorf("priority=%q, want b,a from AQG_STATE_FILE", got)
+	}
+	if legacyPriorityPresent(t, envStatePath, "auto") {
+		t.Error("AQG_STATE_FILE priority was not consumed")
+	}
+	if !legacyPriorityPresent(t, stateDirPath, "auto") {
+		t.Error("lower-precedence STATE_DIRECTORY priority was consumed")
+	}
+}
+
+func TestResolveConfig_existingFile_probesPastNonOverlayCandidate(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	emptyStatePath := filepath.Join(dir, "empty-state.json")
+	stateDir := filepath.Join(dir, "state-dir")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(stateDir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(emptyStatePath, []byte(`{"pools":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte(`{"config":{"auto":{"priority_override":["b","a"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("AQG_STATE_FILE", emptyStatePath)
+	t.Setenv("STATE_DIRECTORY", stateDir)
+	_, reg, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "b,a" {
+		t.Errorf("priority=%q, want b,a from second candidate", got)
+	}
+}
+
+func TestResolveConfig_existingFile_probesStateDirectory(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	stateDir := filepath.Join(dir, "state-dir")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(stateDir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte(`{"config":{"auto":{"priority_override":["b","a"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("STATE_DIRECTORY", stateDir)
+	var log bytes.Buffer
+	cfg, reg, _, err := resolveConfig("", &log)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if cfg.StateFile != "" {
+		t.Errorf("discovered state path persisted into config: %q", cfg.StateFile)
+	}
+	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "b,a" {
+		t.Errorf("priority=%q, want b,a", got)
+	}
+	cfg2, _, err := configfile.LoadFile(cfgPath)
+	if err != nil || cfg2.StateFile != "" {
+		t.Errorf("on-disk state_file=%q, err=%v; want empty", cfg2.StateFile, err)
+	}
+	if legacyPriorityPresent(t, statePath, "auto") {
+		t.Error("probe-discovered priority was not consumed")
+	}
+	if !strings.Contains(log.String(), "discovered legacy state file") || !strings.Contains(log.String(), statePath) {
+		t.Errorf("missing discovery log: %q", log.String())
+	}
+}
+
+func TestResolveConfig_existingFile_declaredStateDoesNotProbe(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	declaredPath := filepath.Join(dir, "declared.json")
+	stateDir := filepath.Join(dir, "state-dir")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	probePath := filepath.Join(stateDir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + declaredPath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}},"priority":["a","b"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(declaredPath, []byte(`{"pools":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(probePath, []byte(`{"config":{"auto":{"priority_override":["b","a"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeConfig, beforeProbe := sha256File(t, cfgPath), sha256File(t, probePath)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("STATE_DIRECTORY", stateDir)
+	_, reg, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "a,b" {
+		t.Errorf("declared empty state was bypassed; priority=%q", got)
+	}
+	if sha256File(t, cfgPath) != beforeConfig || sha256File(t, probePath) != beforeProbe {
+		t.Error("non-declared state path was read and migrated")
+	}
+}
+
+func TestReconcileLegacyPriority_stateWriteFailureIsNonFatal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory write permissions")
+	}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	stateDir := filepath.Join(dir, "state-dir")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(stateDir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte(`{"config":{"auto":{"priority_override":["b","a"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) })
+
+	cfg, reg, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	got, err := reconcileLegacyPriority(cfg, reg, cfgPath, &log)
+	if err != nil {
+		t.Fatalf("state cleanup failure must not fail startup: %v", err)
+	}
+	if pri := strings.Join(got.PoolPriority("auto"), ","); pri != "b,a" {
+		t.Errorf("priority=%q, want b,a", pri)
+	}
+	if !legacyPriorityPresent(t, statePath, "auto") {
+		t.Error("state cleanup unexpectedly succeeded")
+	}
+	if !strings.Contains(log.String(), "retried on the next start") || !strings.Contains(log.String(), statePath) {
+		t.Errorf("missing retry log: %q", log.String())
+	}
+}
+
+func TestResolveConfig_existingFile_emptyPriorityLogsNothingOverridden(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"auto":{"priority_override":["b","a"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	var log bytes.Buffer
+	if _, _, _, err := resolveConfig("", &log); err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	text := log.String()
+	for _, want := range []string{`pool "auto"`, "[]", "[b a]", "nothing was overridden"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("reconcile log %q missing %q", text, want)
+		}
 	}
 }
 
@@ -516,7 +945,10 @@ func TestResolveConfig_existingFile_noMigrationWhenOrderMatches(t *testing.T) {
 	if got := sha256File(t, cfgPath); got != beforeHash {
 		t.Errorf("aqg.json content changed on a no-op reconcile (before=%s, after=%s)", beforeHash, got)
 	}
-	if strings.Contains(buf.String(), "reconciled legacy state-file priority") {
+	if legacyPriorityPresent(t, statePath, "auto") {
+		t.Error("equal priority_override must still be consumed")
+	}
+	if strings.Contains(buf.String(), "migrated into") {
 		t.Errorf("no-op reconcile must not log the migration line; got %q", buf.String())
 	}
 }

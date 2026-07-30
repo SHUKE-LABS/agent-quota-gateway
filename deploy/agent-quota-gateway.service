@@ -17,10 +17,9 @@ ExecStart=/usr/local/bin/agent-quota-gateway
 # service on first start and never overwritten by a redeploy.
 Environment=AQG_CONFIG=%S/agent-quota-gateway/aqg.json
 # On every start the gateway also reconciles any still-unmigrated legacy
-# state-file priority_override into aqg.json (issue #241), so an
-# operator-adjusted pool order from a pre-#198 install survives a redeploy.
-# Once migrated, aqg.json is the sole source of truth and the state file's
-# overlay keys become inert.
+# state-file priority_override into aqg.json (issue #241), then removes that
+# consumed key from the state file. The deletion is retried after a crash or
+# write failure; once it succeeds, aqg.json is the sole source of priority.
 # Bootstrap seed only. On the FIRST start (no aqg.json yet) the gateway reads
 # these AQG_POOL_* vars + any existing state file to generate aqg.json, then
 # never consults the environment again. Safe to leave in place (ignored once
