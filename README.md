@@ -1422,6 +1422,47 @@ block the proxy path or trigger probe storms. The flush-on-unpark goes
 through the persister, so a restart cannot resurrect a stale park the
 recovery probe has cleared.
 
+**Background recovery of parked non-active members.** A plain pool whose
+parked nick is no longer the active sticky backend — because a healthy
+sibling (possibly added after the park) has taken over — falls outside
+both the all-exhausted probe above and the priority preemptor (which
+only visits higher-priority members). For that shape the gateway runs a
+bounded-cadence background loop that re-checks every parked non-active
+probe-eligible member (issue #242):
+
+- **Scope.** Any pool, any parked member whose base URL matches a
+  registered proprietary provider (z.ai / MiniMaxi / Ark). The active
+  sticky member is skipped — probing it would duplicate the request-path
+  all-exhausted recovery and race its in-flight bookkeeping. Anthropic is
+  skipped for the same reason as the request-path probe: its `429`s
+  carry precise resets and organic traffic refreshes the store.
+- **Cadence.** The loop ticks every 5 minutes, matching the preemptor's
+  idle fallback interval. The per-member `30s` probe cooldown still
+  bounds concurrent overlaps with request-path probes (the two paths
+  share one cooldown / coalescing window).
+- **Effect on the active member.** None. The loop only clears the live
+  park via the same decision as the request-path probe (`snapRejects`
+  shared, freshness predicate shared). It never moves the sticky
+  pointer — the healthy active member is left alone, matching the
+  "without force-switching away from the current healthy active nick"
+  requirement. The recovered member rejoins rotation on the next
+  selection event.
+- **Safety guards.** Identical to the request-path probe: failed probe
+  (network error, non-`200`, no provider match) leaves the park intact;
+  a probe whose snapshot still satisfies `snapRejects` leaves the park
+  intact; a frozen / stale store entry never produces a decision (the
+  store-driven reconciliation path above is what covers that case).
+- **No-op when healthy.** A pool with no parked non-active member
+  performs zero upstream probes per tick — the "healthy pool pays no
+  extra probe traffic" property is load-bearing and tested.
+- **Store display.** The recovery probe does not `Merge` the recovered
+  snapshot into the store (matching the existing `tryRecoverParked`
+  contract); a recovered member's `/_gateway/pool` snapshot cell may
+  briefly show the previously-frozen data until organic traffic
+  refreshes the store. The recovery decision and the displayed
+  snapshot are independent signals — the cell is informational, the
+  pool's eligibility is what the routing path uses.
+
 ## Why a thin proxy
 
 The proxy is the trust boundary — it owns the credentials and resolves a

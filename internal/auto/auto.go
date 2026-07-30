@@ -2395,6 +2395,37 @@ func (c *Controller) SetProbeHTTPClient(client *http.Client) {
 // lock); the probe itself runs without c.mu so a stalled upstream does
 // not block other pool operations.
 func (c *Controller) tryRecoverParked() string {
+	return c.recoverParked(false)
+}
+
+// tryRecoverParkedNonActive mirrors tryRecoverParked but skips the
+// currently active sticky member, so the recovery loop can probe parked
+// members without ever probing the backend the pool is already serving
+// (issue #242). The skip is a no-op in the stranded shape — the healthy
+// active nick is not in c.exhausted — so its only real effect is
+// avoiding a redundant probe when the background loop's tick overlaps
+// with a request-driven allExhausted recovery. The eligibility,
+// snapshot-decision, and in-flight bookkeeping are otherwise identical
+// to tryRecoverParked, so the request-path and background-path probes
+// share one cooldown / coalescing window.
+//
+// Caller does NOT hold c.mu.
+func (c *Controller) tryRecoverParkedNonActive() string {
+	return c.recoverParked(true)
+}
+
+// recoverParked is the shared body behind tryRecoverParked (skipActive
+// false, the request-path allExhausted recovery) and
+// tryRecoverParkedNonActive (skipActive true, the background recovery of
+// parked non-active members from issue #242). Both call paths share one
+// in-flight / cooldown bookkeeping so concurrent request-path and
+// background probes coalesce on the same quota key.
+//
+// When no probe-eligible member exists, the returned nick is "" (a
+// no-op) — the same contract tryRecoverParked always had.
+//
+// Caller does NOT hold c.mu.
+func (c *Controller) recoverParked(skipActive bool) string {
 	type probeTarget struct {
 		nick     string
 		quotaKey string
@@ -2408,6 +2439,15 @@ func (c *Controller) tryRecoverParked() string {
 		return ""
 	}
 	for nick := range c.exhausted {
+		// Skip the active sticky member when requested by the background
+		// loop — see tryRecoverParkedNonActive (issue #242). The healthy
+		// active nick is not in c.exhausted in the stranded shape, so this
+		// filter only matters when the loop's tick overlaps with an
+		// allExhausted request that just recorded a 429 against the sticky
+		// member; avoiding the redundant probe is the only effect.
+		if skipActive && nick == c.curNick {
+			continue
+		}
 		// Skip disabled / removed members — they are unreachable regardless
 		// of upstream state.
 		if c.disabled[nick] {
@@ -2491,7 +2531,8 @@ func (c *Controller) tryRecoverParked() string {
 }
 
 // clearProbeInFlight clears the in-flight flag for quotaKey under c.mu.
-// Used by the error path of tryRecoverParked.
+// Used by the error path of recoverParked (shared by tryRecoverParked
+// and tryRecoverParkedNonActive).
 func (c *Controller) clearProbeInFlight(quotaKey string) {
 	c.mu.Lock()
 	c.probeInFlight[quotaKey] = false

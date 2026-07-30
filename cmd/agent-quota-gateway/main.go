@@ -281,6 +281,18 @@ func run(configFlag string) error {
 	pre := auto.NewPreemptor(pools, store, 0, nil, nil)
 	go pre.Run(ctx)
 
+	// The recovery loop re-checks parked non-active members on a bounded
+	// cadence (issue #242). It fills the gap left by tryRecoverParked
+	// (allExhausted only) and the preemptor (priority pools only): a plain
+	// pool whose parked nick is no longer the active sticky backend — e.g.
+	// because a healthy sibling has taken over, including one added after
+	// the park — had no remaining self-heal path. It only clears the live
+	// park; it never moves the sticky pointer. It is a no-op when no
+	// controller has a parked non-active member, so a healthy pool pays no
+	// extra probe traffic. It shares the shutdown context.
+	rec := auto.NewRecovery(pools, 0, nil)
+	go rec.Run(ctx)
+
 	errCh := make(chan error, 1)
 	go func() {
 		err := srv.ListenAndServe()
