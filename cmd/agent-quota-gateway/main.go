@@ -425,6 +425,7 @@ func migrateSnapshotKeys(state persist.GatewayState, registry *backend.Registry)
 //   - clean persisted:      {"status":"ok"}
 //   - persisted, unsaved:   {"status":"ok","unsaved_config_changes":true}
 //   - env-only:             {"status":"ok","persistence":"env_only"}
+//
 // Status code stays 200 in every case; a readiness probe asserts on
 // "status", not on a byte-for-byte body match (README §Health).
 func healthHandler(persistence configfile.PersistenceState) http.HandlerFunc {

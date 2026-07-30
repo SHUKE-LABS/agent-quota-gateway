@@ -1158,101 +1158,91 @@ func TestConfigEndpoint_threeStates(t *testing.T) {
 // mutation body (issue #246 review note #2): every {"status":"ok"} response
 // gains the "persistence" body field and the persistence header in
 // env-only mode, and stays byte-identical in persisted mode.
+//
+// Each case drives its own mutation and asserts on the captured response
+// body — no re-fire of a single endpoint as a stand-in. That way an
+// enable/priority handler that silently dropped the field would fail
+// here instead of passing because the test was reading a disable body.
 func TestMutationHandler_envOnly_statusOKShape(t *testing.T) {
 	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
 	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
 
 	cases := []struct {
-		name        string
-		mutate      func(t *testing.T, srv *httptest.Server)
-		wantInBody  string
-		mustContain string // persisted body must contain this and must NOT contain "persistence"
+		name       string
+		method     string
+		path       string
+		body       string
+		wantStatus int
 	}{
-		{
-			name: "disable member",
-			mutate: func(t *testing.T, srv *httptest.Server) {
-				post(t, srv.URL+"/_gateway/pool/auto/member/a/disable", http.StatusOK)
-			},
-			wantInBody:  `"persistence":"env_only"`,
-			mustContain: `"status":"ok"`,
-		},
-		{
-			name: "enable member",
-			mutate: func(t *testing.T, srv *httptest.Server) {
-				post(t, srv.URL+"/_gateway/pool/auto/member/a/enable", http.StatusOK)
-			},
-			wantInBody:  `"persistence":"env_only"`,
-			mustContain: `"status":"ok"`,
-		},
-		{
-			name: "set priority",
-			mutate: func(t *testing.T, srv *httptest.Server) {
-				postJSON(t, srv.URL+"/_gateway/pool/auto/priority", `["b","a"]`, http.StatusOK)
-			},
-			wantInBody:  `"persistence":"env_only"`,
-			mustContain: `"status":"ok"`,
-		},
+		{name: "disable member", method: http.MethodPost, path: "/_gateway/pool/auto/member/a/disable", wantStatus: http.StatusOK},
+		{name: "enable member", method: http.MethodPost, path: "/_gateway/pool/auto/member/a/enable", wantStatus: http.StatusOK},
+		{name: "set priority", method: http.MethodPost, path: "/_gateway/pool/auto/priority", body: `["b","a"]`, wantStatus: http.StatusOK},
 	}
 
 	for _, tc := range cases {
 		t.Run("env-only/"+tc.name, func(t *testing.T) {
-			pools := loadPools(t)
-			srv := configMuxWithPersistence(t, pools, envOnlyState())
-			tc.mutate(t, srv)
-
-			// Re-fire one mutation directly to capture the response body,
-			// because the helpers above discard the response. The shared
-			// state is unchanged so this is safe — the mutation is idempotent
-			// (re-disable is the same observable state).
-			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/_gateway/pool/auto/member/a/disable", nil)
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatalf("post: %v", err)
+			srv := configMuxWithPersistence(t, loadPools(t), envOnlyState())
+			body, status, header := doMutation(t, srv.URL, tc.method, tc.path, tc.body)
+			if status != tc.wantStatus {
+				t.Fatalf("status=%d, want %d", status, tc.wantStatus)
 			}
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("status=%d, want 200", resp.StatusCode)
+			if !strings.Contains(body, `"status":"ok"`) {
+				t.Errorf("env-only body missing status field: %s", body)
 			}
-			if !strings.Contains(string(body), tc.wantInBody) {
-				t.Errorf("env-only body missing %q: %s", tc.wantInBody, body)
+			if !strings.Contains(body, `"persistence":"env_only"`) {
+				t.Errorf("env-only body missing persistence field: %s", body)
 			}
-			if got := resp.Header.Get(configfile.HeaderPersistence); got != "env_only" {
+			if got := header.Get(configfile.HeaderPersistence); got != "env_only" {
 				t.Errorf("%s=%q, want \"env_only\"", configfile.HeaderPersistence, got)
 			}
 		})
 
 		t.Run("persisted/"+tc.name, func(t *testing.T) {
-			// Reload pools for each subtest: env-only mutations above mutates
-			// the shared registry in-memory only, but the persisted re-fires
-			// below need a clean state.
-			pools := loadPools(t)
-			srv := configMuxWithPersistence(t, pools, persistedCleanState())
-
-			// Drive a status-style mutation against the persisted mux and
-			// assert the body stays byte-identical to the pre-#246 shape:
-			// no "persistence" field, no env-only header.
-			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/_gateway/pool/auto/member/a/disable", nil)
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatalf("post: %v", err)
+			srv := configMuxWithPersistence(t, loadPools(t), persistedCleanState())
+			body, status, header := doMutation(t, srv.URL, tc.method, tc.path, tc.body)
+			if status != tc.wantStatus {
+				t.Fatalf("status=%d, want %d", status, tc.wantStatus)
 			}
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("status=%d, want 200", resp.StatusCode)
+			if !strings.Contains(body, `"status":"ok"`) {
+				t.Errorf("persisted body missing status field: %s", body)
 			}
-			if !strings.Contains(string(body), tc.mustContain) {
-				t.Errorf("persisted body missing %q: %s", tc.mustContain, body)
-			}
-			if strings.Contains(string(body), `"persistence"`) {
+			if strings.Contains(body, `"persistence"`) {
 				t.Errorf("persisted body unexpectedly carries persistence field: %s", body)
 			}
-			if got := resp.Header.Get(configfile.HeaderPersistence); got != "persisted" {
+			if got := header.Get(configfile.HeaderPersistence); got != "persisted" {
 				t.Errorf("%s=%q, want \"persisted\"", configfile.HeaderPersistence, got)
 			}
 		})
 	}
+}
+
+// doMutation fires method/path against baseURL, returning the body as a
+// string, the status code, and the response headers. Shared helper for
+// the env-only mutation tests so each case captures its own response
+// (the existing post/postJSON helpers discard the body).
+func doMutation(t *testing.T, baseURL, method, path, body string) (string, int, http.Header) {
+	t.Helper()
+	var req *http.Request
+	var err error
+	if body == "" {
+		req, err = http.NewRequest(method, baseURL+path, nil)
+	} else {
+		req, err = http.NewRequest(method, baseURL+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if err != nil {
+		t.Fatalf("new request %s %s: %v", method, path, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do %s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	bs, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(bs), resp.StatusCode, resp.Header
 }
 
 // TestMutationHandler_envOnly_poolNamedShape covers AC3 for the second
@@ -1339,22 +1329,19 @@ func TestMutationHandler_envOnly_poolNamedShape(t *testing.T) {
 
 // TestMutationHandler_envOnly_fullFamily is a sanity sweep over every
 // mutation handler (issue #246 review note #2): each one returns a 200
-// or 201 in env-only mode and carries the persistence header. Picking one
-// representative per family member, exercising its happy path, and
-// asserting the header proves AC3 across all 9 handlers without the
-// combinatorial expense of wiring up every domain case. The two shape
-// tests above (status-ok + pool-named) already cover the body contract;
-// this test confirms the header is uniformly applied.
+// or 201 in env-only mode and carries the persistence header. Together
+// with the body-shape tests above, this confirms AC3 across all 9
+// mutation handlers.
 //
-// The sweep uses TWO pools so the priority mutation on `auto` doesn't
-// turn it into a priority target that then rejects the runtime
-// add/remove of member c with a placement-required error. Each pool
-// carries its own state, so the header assertion covers every handler
-// path without that entanglement.
+// The sweep uses two pre-configured pools plus two more set up at
+// runtime so deletePool (which needs an empty pool) and moveMember
+// (which needs a source + target) have the state their happy paths
+// require without the setup leaking into the other assertions.
 func TestMutationHandler_envOnly_fullFamily(t *testing.T) {
 	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
 	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
 	t.Setenv("AQG_POOL_PLAIN_BACKEND_X", "sk-ant-x")
+	t.Setenv("AQG_POOL_TARGET_BACKEND_T", "sk-ant-t")
 
 	srv := configMuxWithPersistence(t, loadPools(t), envOnlyState())
 
@@ -1371,27 +1358,38 @@ func TestMutationHandler_envOnly_fullFamily(t *testing.T) {
 		{"DELETE", "/_gateway/pool/plain/member/y", ``, 200},
 	}
 	for _, hp := range happyPaths {
-		var req *http.Request
-		var err error
-		if hp.body == "" {
-			req, err = http.NewRequest(hp.method, srv.URL+hp.path, nil)
-		} else {
-			req, err = http.NewRequest(hp.method, srv.URL+hp.path, strings.NewReader(hp.body))
-			req.Header.Set("Content-Type", "application/json")
+		body, status, header := doMutation(t, srv.URL, hp.method, hp.path, hp.body)
+		if status != hp.want {
+			t.Errorf("%s %s status=%d, want %d (body=%s)", hp.method, hp.path, status, hp.want, body)
 		}
-		if err != nil {
-			t.Fatalf("new request %s %s: %v", hp.method, hp.path, err)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("do %s %s: %v", hp.method, hp.path, err)
-		}
-		if resp.StatusCode != hp.want {
-			t.Errorf("%s %s status=%d, want %d", hp.method, hp.path, resp.StatusCode, hp.want)
-		}
-		if got := resp.Header.Get(configfile.HeaderPersistence); got != "env_only" {
+		if got := header.Get(configfile.HeaderPersistence); got != "env_only" {
 			t.Errorf("%s %s: %s=%q, want \"env_only\"", hp.method, hp.path, configfile.HeaderPersistence, got)
 		}
-		resp.Body.Close()
+	}
+
+	// deletePool: drain the plain pool's only member, then delete the pool.
+	// The pool was created by `loadPools` from env; member x is the only
+	// member, so removing it leaves the pool empty.
+	body, status, header := doMutation(t, srv.URL, http.MethodDelete, "/_gateway/pool/plain/member/x", "")
+	if status != http.StatusOK {
+		t.Errorf("drain plain/member/x status=%d, want 200 (body=%s)", status, body)
+	}
+	body, status, header = doMutation(t, srv.URL, http.MethodDelete, "/_gateway/pool/plain", "")
+	if status != http.StatusOK {
+		t.Errorf("delete pool plain status=%d, want 200 (body=%s)", status, body)
+	}
+	if got := header.Get(configfile.HeaderPersistence); got != "env_only" {
+		t.Errorf("delete pool plain: %s=%q, want \"env_only\"", configfile.HeaderPersistence, got)
+	}
+
+	// moveMember: target already exists (env-declared with member t). Move
+	// a runtime member y from auto to target; the env-only signal must
+	// fire on the 200 response.
+	body, status, header = doMutation(t, srv.URL, http.MethodPost, "/_gateway/pool/auto/member/a/move", `{"to":"target"}`)
+	if status != http.StatusOK {
+		t.Fatalf("move auto/a -> target status=%d, want 200 (body=%s)", status, body)
+	}
+	if got := header.Get(configfile.HeaderPersistence); got != "env_only" {
+		t.Errorf("move auto/a -> target: %s=%q, want \"env_only\"", configfile.HeaderPersistence, got)
 	}
 }
