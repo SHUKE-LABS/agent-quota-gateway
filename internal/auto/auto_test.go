@@ -479,6 +479,15 @@ func TestModifyResponse_zaiThrottleAbsorbed(t *testing.T) {
 	if strings.Contains(string(gotBody), "1302") {
 		t.Errorf("503 body leaked the upstream 1302 message: %q", gotBody)
 	}
+	// Body must declare "throttled; same member", never the switching flavour
+	// (issue #245). A 503 stream that claims "backend switching" while no
+	// switch is attempted is the misdiagnosis bait the issue calls out.
+	if !strings.Contains(string(gotBody), "backend throttled; same member") {
+		t.Errorf("z.ai absorb 503 body=%q, want the throttle/same-member object", gotBody)
+	}
+	if strings.Contains(string(gotBody), "backend switching") {
+		t.Errorf("z.ai absorb 503 body still claims a switch: %q", gotBody)
+	}
 	// Retry-After is the longer z.ai backoff, not the 1s switch default.
 	ra, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
 	if ra < zaiThrottleRetryAfterSeconds {
@@ -521,6 +530,14 @@ func TestModifyResponse_rateLimit429HonoursUpstreamRetryAfter(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if strings.Contains(string(body), "rate_limit_error") {
 		t.Errorf("503 body leaked the upstream rate-limit body: %q", body)
+	}
+	// Body must declare the throttle/same-member outcome, never claim a
+	// switch (issue #245). Same-member back-off is the deliberate action.
+	if !strings.Contains(string(body), "backend throttled; same member") {
+		t.Errorf("rate-limit 429 503 body=%q, want the throttle/same-member object", body)
+	}
+	if strings.Contains(string(body), "backend switching") {
+		t.Errorf("rate-limit 429 503 body still claims a switch: %q", body)
 	}
 	if got := resp.Header.Get("anthropic-ratelimit-requests-remaining"); got != "" {
 		t.Errorf("legacy rate-limit header not stripped: %q", got)
@@ -576,6 +593,16 @@ func TestModifyResponse_rateLimit429LegacyHeaderNoRetryAfter(t *testing.T) {
 	if ra := resp.Header.Get("Retry-After"); ra != strconv.Itoa(rateLimitBackoffMaxSeconds) {
 		t.Errorf("Retry-After=%q, want %d (band default when no upstream retry-after)", ra, rateLimitBackoffMaxSeconds)
 	}
+	// Same body as the other non-switching 503 flavours — assert here too so
+	// a future helper regression can't quietly route this branch through
+	// rewriteTo503 (issue #245).
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "backend throttled; same member") {
+		t.Errorf("legacy-header rate-limit 503 body=%q, want the throttle/same-member object", body)
+	}
+	if strings.Contains(string(body), "backend switching") {
+		t.Errorf("legacy-header rate-limit 503 body still claims a switch: %q", body)
+	}
 	if got := c.Current(); got != "a" {
 		t.Errorf("Current()=%q, want a (not parked)", got)
 	}
@@ -585,6 +612,97 @@ func TestModifyResponse_rateLimit429LegacyHeaderNoRetryAfter(t *testing.T) {
 	if log := logBuf.String(); !strings.Contains(log, "transient throttle") {
 		t.Errorf("rate-limit 429 not logged as transient throttle; got %q", log)
 	}
+}
+
+// TestModifyResponse_nonSwitching503Body is the focused regression for
+// issue #245: both non-switching 503 paths (z.ai absorb, Anthropic
+// transient-throttle back-off) must emit a body that names the outcome
+// (throttle / same member) and never the switching flavour's body. The
+// switching flavour keeps its own distinct body so the two cannot
+// converge on a future refactor — assert both directions in one pass so
+// a single test failure pinpoints which helper drifted.
+func TestModifyResponse_nonSwitching503Body(t *testing.T) {
+	const want = "backend throttled; same member"
+	const banned = "backend switching; retry"
+
+	t.Run("zai absorb", func(t *testing.T) {
+		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+		c := zaiController(t, clock, io.Discard, "ccz")
+		ctx := backend.WithBackend(context.Background(), c.resolve(t, "ccz"))
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
+		h := http.Header{}
+		h.Set("Content-Type", "application/json")
+		body := `{"error":{"code":"1302","message":"Rate limit reached for requests"}}`
+		resp := &http.Response{
+			StatusCode:    http.StatusTooManyRequests,
+			Header:        h,
+			Request:       req,
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+		}
+		if err := c.ModifyResponse(resp); err != nil {
+			t.Fatalf("ModifyResponse: %v", err)
+		}
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status=%d, want 503", resp.StatusCode)
+		}
+		if ra := resp.Header.Get("Retry-After"); ra != strconv.Itoa(zaiThrottleRetryAfterSeconds) {
+			t.Errorf("Retry-After=%q, want %d (zaiThrottleRetryAfterSeconds)", ra, zaiThrottleRetryAfterSeconds)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		gs := string(got)
+		if !strings.Contains(gs, want) {
+			t.Errorf("z.ai absorb body=%q, want contains %q", gs, want)
+		}
+		if strings.Contains(gs, banned) {
+			t.Errorf("z.ai absorb body=%q must not contain the switching flavour %q", gs, banned)
+		}
+		// The upstream 1302 body must still be suppressed (pre-existing
+		// invariant from issue #153).
+		if strings.Contains(gs, "1302") {
+			t.Errorf("z.ai absorb body leaked the upstream 1302 message: %q", gs)
+		}
+	})
+
+	t.Run("anthropic transient throttle", func(t *testing.T) {
+		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+		c := newController(t, 0, clock, io.Discard, "a", "b")
+		resp := resp429RateLimit(c.resolve(t, "a"), "2", false)
+		if err := c.ModifyResponse(resp); err != nil {
+			t.Fatalf("ModifyResponse: %v", err)
+		}
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status=%d, want 503", resp.StatusCode)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		gs := string(got)
+		if !strings.Contains(gs, want) {
+			t.Errorf("rate-limit 429 503 body=%q, want contains %q", gs, want)
+		}
+		if strings.Contains(gs, banned) {
+			t.Errorf("rate-limit 429 503 body=%q must not contain the switching flavour %q", gs, banned)
+		}
+	})
+
+	t.Run("genuine 429 keeps switching body", func(t *testing.T) {
+		// Pin the inverse direction: a genuine-exhaustion 429 still uses the
+		// switching flavour. If a refactor accidentally routes ALL 503s
+		// through rewriteTo503Throttle, this subtest catches it.
+		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+		c := newController(t, 0, clock, io.Discard, "a", "b")
+		resp := resp429(c.resolve(t, "a"), clock, time.Hour)
+		if err := c.ModifyResponse(resp); err != nil {
+			t.Fatalf("ModifyResponse: %v", err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		gs := string(got)
+		if !strings.Contains(gs, banned) {
+			t.Errorf("genuine 429 503 body=%q, want contains the switching flavour %q", gs, banned)
+		}
+		if strings.Contains(gs, want) {
+			t.Errorf("genuine 429 503 body=%q must not contain the throttle flavour %q", gs, want)
+		}
+	})
 }
 
 // TestModifyResponse_rejected429BelowCapParks is the regression for the

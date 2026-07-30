@@ -2068,8 +2068,7 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 		// misclassify the 1302 as genuine exhaustion and over-park.
 		if isZaiBackend(b) {
 			fmt.Fprintf(c.logOut, "auto[%s]: %s z.ai 429 concurrency throttle — absorbing as transient, not parking\n", c.name(), b.Nick)
-			rewriteTo503(resp)
-			setRetryAfter(resp.Header, zaiThrottleRetryAfterSeconds)
+			rewriteTo503Throttle(resp, zaiThrottleRetryAfterSeconds)
 			return nil
 		}
 		respSnap := quota.Extract(resp)
@@ -2102,8 +2101,7 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 			// also without parking.
 			if secs, ok := transientRateLimit429(resp); ok {
 				fmt.Fprintf(c.logOut, "auto[%s]: %s rate-limit 429 (transient throttle) — backing off %ds, not parking\n", c.name(), b.Nick, secs)
-				rewriteTo503(resp)
-				setRetryAfter(resp.Header, secs)
+				rewriteTo503Throttle(resp, secs)
 				return nil
 			}
 			fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.name(), b.Nick)
@@ -3070,6 +3068,40 @@ func rewriteTo503(resp *http.Response) {
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	h.Del("Content-Encoding")
 	h.Set("Retry-After", strconv.Itoa(switchRetryAfterSeconds))
+}
+
+// rewriteTo503Throttle turns an upstream 429 the gateway has decided NOT to
+// switch on into the transient 503 a client should retry against the SAME
+// member — the z.ai/Zhipu concurrency-throttle absorb (issue #153) and the
+// Anthropic per-minute rate-limit back-off (issue #191). Distinct from
+// rewriteTo503 in two ways:
+//
+//   - body: "backend throttled; same member" — declares the action the code
+//     actually took (back off the active member, no failover), so a sustained
+//     stream of these responses cannot be misread as a stuck failover (issue
+//     #245). A future refactor that points one of these call sites at
+//     rewriteTo503 would be a behaviour change, not a cosmetic one.
+//   - Retry-After is the caller-supplied secs — the absorb/backoff band is
+//     deliberately longer than the 1 s switch hint so a retry lets the
+//     throttle window clear before re-hitting it.
+func rewriteTo503Throttle(resp *http.Response, secs int) {
+	body := []byte(`{"error":"backend throttled; same member"}`)
+
+	resp.StatusCode = http.StatusServiceUnavailable
+	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+
+	h := resp.Header
+	for k := range h {
+		if strings.HasPrefix(strings.ToLower(k), "anthropic-ratelimit-") {
+			h.Del(k)
+		}
+	}
+	h.Set("Content-Type", "application/json")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	h.Del("Content-Encoding")
+	setRetryAfter(h, secs)
 }
 
 // rewriteTo503DryPool turns the upstream 429 that exhausted the last member

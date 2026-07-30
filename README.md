@@ -539,65 +539,72 @@ declaring a preference order with `AQG_POOL_<POOL>_PRIORITY` — see
 *which* healthy member is picked; the sticky, reactive, zero-probe model is
 otherwise unchanged.
 
-### What the client sees on a switch
+### What the client sees on a 429
 
 On a `429` from the current member the gateway does **not** forward the
 `429`. Anthropic's `429` is a pre-stream rejection, so the gateway handles
 it on the response side — no request body is buffered; the *client* replays
-its own body:
+its own body. The four `503` flavours the gateway can emit, each with its
+own body and `Retry-After`, are summarised below — bodies are deliberately
+distinct so a sustained stream cannot be misread as a stuck failover
+(issue #245).
 
-- **A member is still available →** the response is rewritten to `503`
-  with `Retry-After: 1`. The gateway has already advanced the sticky
-  pointer to another member, so the client's retry resolves to it and
-  succeeds, rebuilding the cache once on the new account. `503` is a
-  transient "retry" signal, deliberately distinct from a `429` — Claude
-  Code and any non-trivial client retry it.
-- **Every member is exhausted →** there is nothing to switch to, so the
-  gateway returns a `503` with `Retry-After` set to the precise wait until
-  the soonest member resets (read from the upstream
-  `anthropic-ratelimit-unified-reset` header when present, otherwise a
-  conservative 5-hour window). It is a `503`, not a `429`, on purpose: a
-  `429` surfaces to Claude Code as a hard rate-limit error that ends the
-  turn, whereas a `503` is a transient signal it retries — so the agent
-  auto-resumes once the advertised window elapses instead of the client
-  giving up while the gateway already knows exactly when a member recovers.
-  The `Retry-After` here is the *long precise* value, distinct from the
-  switch case's `Retry-After: 1`. The sticky pointer is pre-pointed at that
-  soonest member so the client's post-wait retry lands on it. An exhausted
-  mark clears automatically once its reset time passes — or earlier, the
-  moment the polled quota store reports the member fresh and non-blocking
-  (see [Store-driven reconciliation](#recovery-probing-for-parked-members)).
-  This matters for backends whose `429` reset overshoots the real quota
-  window (Z.ai's `unified-reset` runs hours past its dashboard 5-hour reset):
-  the live park no longer holds the pool in `429` until that stale reset. The
-  reconciliation is backend-agnostic and self-correcting — if a forwarded
-  request still genuinely `429`s, its blocking headers refresh the store and
-  the member re-parks.
-- **A z.ai/Zhipu member `429`s →** this is always a transient concurrency
-  throttle (z.ai's `1302` "Rate limit reached for requests", emitted when the
-  GLM Coding Plan concurrency cap — often as low as 1 — is hit), never quota
-  exhaustion: z.ai exhaustion is tracked out-of-band by the poller (5h /
-  monthly windows), never signalled by a proxy `429`. The gateway absorbs it
-  as a clean `503` with a short backoff `Retry-After` (a few seconds, longer
-  than the 1 s switch hint so a single-member pool's retry lets the
-  concurrency window free up), leaves the member in rotation, and never lets
-  the upstream `1302` message reach the client. Claude Code retries the `503`
-  transparently instead of stopping on the passed-through `429`.
-- **An Anthropic member hits a per-minute rate-limit `429`** (a
-  `rate_limit_error` for the RPM/ITPM/OTPM throughput limit, distinct from the
-  5h/7d quota window) **→** this is transient and clears in seconds, and the
-  *same* member serves again, so the gateway backs off without switching or
-  parking: it rewrites to `503` with `Retry-After` taken from the upstream
-  `retry-after` header clamped to a 1–3 s band (defaulting to 3 s when the
-  header is absent), and leaves the member in rotation. It is identified by the
-  rate-limit signature — an upstream `retry-after` and/or the legacy
-  `anthropic-ratelimit-requests-*` / `-tokens-*` per-minute headers — which
-  separates it from a genuine quota-window `429` (`unified-status: rejected`,
-  which parks) and from a policy `429` (no rate-limit headers, e.g. an
-  "unsupported third-party client" rejection, which forwards the body on a
-  `503` with the fixed 1 s hint). The per-minute headers are read only to
-  classify the response; they are never stored (they are a throughput rate, not
-  the subscription budget).
+| Flavour | Body | `Retry-After` | Lands on |
+|---|---|---|---|
+| **Switch** — a member is still available, the sticky pointer has already advanced | `{"error":"backend switching; retry"}` | `1` (fixed) | another member |
+| **Pool dry** — every member is exhausted; the sticky pointer is pre-pointed at the soonest-resetting member | `{"error":"all backends rate-limited"}` | precise wait until the soonest member resets (or a conservative 5-hour window) | the soonest-resetting member |
+| **Z.ai/Zhipu throttle absorbed** (issue #153) — proxy `429` is the `1302` concurrency throttle, never quota exhaustion | `{"error":"backend throttled; same member"}` | `3` (fixed; longer than the switch hint so a single-member z.ai pool's retry lets the concurrency window free up) | the same member |
+| **Anthropic per-minute rate-limit back-off** (issue #191) — transient RPM/ITPM/OTPM throttle, clears in seconds | `{"error":"backend throttled; same member"}` | upstream `retry-after` clamped to `[1, 3]` s, defaulting to `3` | the same member |
+
+The **switch** flavour: the gateway has already advanced the sticky pointer
+to another member, so the client's retry resolves to it and succeeds,
+rebuilding the cache once on the new account. `503` is a transient "retry"
+signal, deliberately distinct from a `429` — Claude Code and any
+non-trivial client retry it.
+
+The **pool dry** flavour: there is nothing to switch to, so the gateway
+returns the precise wait until the soonest member resets (read from the
+upstream `anthropic-ratelimit-unified-reset` header when present, otherwise
+a conservative 5-hour window). It is a `503`, not a `429`, on purpose: a
+`429` surfaces to Claude Code as a hard rate-limit error that ends the
+turn, whereas a `503` is a transient signal it retries — so the agent
+auto-resumes once the advertised window elapses instead of the client
+giving up while the gateway already knows exactly when a member recovers.
+An exhausted mark clears automatically once its reset time passes — or
+earlier, the moment the polled quota store reports the member fresh and
+non-blocking (see [Store-driven reconciliation](#recovery-probing-for-parked-members)).
+This matters for backends whose `429` reset overshoots the real quota
+window (Z.ai's `unified-reset` runs hours past its dashboard 5-hour reset):
+the live park no longer holds the pool in `429` until that stale reset. The
+reconciliation is backend-agnostic and self-correcting — if a forwarded
+request still genuinely `429`s, its blocking headers refresh the store and
+the member re-parks.
+
+The **z.ai throttle absorbed** flavour: a z.ai proxy `429` is always the
+`1302` "Rate limit reached for requests" concurrency throttle (emitted when
+the GLM Coding Plan concurrency cap — often as low as 1 — is hit), never
+quota exhaustion — z.ai exhaustion is tracked out-of-band by the poller
+(5h / monthly windows), never signalled by a proxy `429`. The gateway
+absorbs it, leaves the member in rotation, and never lets the upstream
+`1302` message reach the client. Claude Code retries the `503`
+transparently instead of stopping on the passed-through `429`. The body
+text is what prevents the operator misdiagnosis in issue #245: a sustained
+stream of these is not a failover loop, because no failover is being
+attempted.
+
+The **Anthropic rate-limit back-off** flavour: a transient per-minute
+throttle (`rate_limit_error` for the RPM/ITPM/OTPM throughput limit,
+distinct from the 5h/7d quota window) clears in seconds and the *same*
+member serves again, so the gateway backs off without switching or
+parking. It is identified by the rate-limit signature — an upstream
+`retry-after` and/or the legacy `anthropic-ratelimit-requests-*` /
+`-tokens-*` per-minute headers — which separates it from a genuine
+quota-window `429` (`unified-status: rejected`, which parks) and from a
+policy `429` (no rate-limit headers, e.g. an "unsupported third-party
+client" rejection, which forwards the upstream body on a `503` with the
+fixed 1 s hint). The per-minute headers are read only to classify the
+response; they are never stored (they are a throughput rate, not the
+subscription budget).
 
 Each switch is logged server-side as one line — `auto[auto]: a -> b (a hit
 429)`, prefixed with the pool name — naming members only, never
