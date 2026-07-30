@@ -2073,7 +2073,24 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 			return nil
 		}
 		respSnap := quota.Extract(resp)
-		if !c.isGenuineExhaustionSignal(b.Nick, respSnap) {
+		// Resolve the member entry under c.mu so a concurrent
+		// reconcileLocked (AddMember/RemoveMember/SetMemberDisabled/SetPriority/
+		// CreatePool) cannot tear c.members's header out from under the
+		// exhaustion classifier (issue #244). isGenuineExhaustionSignal used
+		// to call indexOf and backendAt without c.mu, which races the whole-
+		// header reassignment in reconcileLocked and either panics inside the
+		// proxy's ResponseWriter (no gateway log line, http.Server recovers)
+		// or — when the racing read yields idx<0 — silently classifies a
+		// genuine 429 as not-genuine and leaves the member un-parked.
+		c.mu.Lock()
+		var entry memberEntry
+		var entryOK bool
+		if idx := c.indexOf(b.Nick); idx >= 0 {
+			entry = c.members[idx]
+			entryOK = true
+		}
+		c.mu.Unlock()
+		if !c.isGenuineExhaustionSignal(entry, entryOK, respSnap) {
 			// Not genuine exhaustion. Split the two remaining cases by the
 			// rate-limit signature: a transient per-minute throttle
 			// (RPM/ITPM/OTPM) carries an upstream retry-after and/or the legacy
@@ -2246,10 +2263,22 @@ func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset tim
 	return nil
 }
 
-// isGenuineExhaustionSignal reports whether a 429 response for nick represents
-// real quota exhaustion (park it) versus a policy/punishment 429 such as an
-// "unsupported third-party client" rejection (leave it in rotation, forward
-// the body).
+// isGenuineExhaustionSignal reports whether a 429 response for a member
+// represents real quota exhaustion (park it) versus a policy/punishment 429
+// such as an "unsupported third-party client" rejection (leave it in rotation,
+// forward the body).
+//
+// entry is the already-resolved controller member for the request (carrying
+// Nick/Credential/BaseURL). The caller resolves entry under c.mu in
+// ModifyResponse so this function never reads c.members itself — that is the
+// shape #244 requires: any reader of c.members racing reconcileLocked's
+// whole-header reassignment can tear the slice header and either panic
+// inside the proxy or — when the racing read yields idx<0 — silently drop the
+// store-snapshot check, misclassifying a genuine 429 as not-genuine and
+// leaving the member un-parked. ok=false means the nick is no longer a member
+// of the pool (runtime-removed between request and response): the function
+// still honours the response itself but cannot consult the per-member store
+// snapshot, since there is no member entry to key it by.
 //
 // The discriminator is the rate-limit *status*, not utilization. Utilization
 // is an unreliable proxy in both directions — Anthropic has rejected at 0.99
@@ -2270,22 +2299,26 @@ func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset tim
 // parked. The reset-freshness guard lives in windowBlocks for the no-status
 // branch, mirroring storeExhaustedUntilLocked's behaviour on the recovery
 // side (#125).
-func (c *Controller) isGenuineExhaustionSignal(nick string, respSnap quota.Snapshot) bool {
+func (c *Controller) isGenuineExhaustionSignal(entry memberEntry, ok bool, respSnap quota.Snapshot) bool {
 	now := c.now()
-	// Resolve the backend once to key the long-window predicate. Fail closed
-	// (longBlocks=true) when the nick can't be resolved — a runtime-removed
-	// member should still honour a genuine 7d rejection rather than have it
-	// silently dropped (issue #192).
+	// Fail closed (longBlocks=true) when the nick can't be resolved — a
+	// runtime-removed member should still honour a genuine 7d rejection
+	// rather than have it silently dropped (issue #192). baseURL on the
+	// already-resolved entry is the only state needed for the long-window
+	// predicate; the response path's store-snapshot branch is gated on ok
+	// so a runtime-removed nick never mis-keys the shared quota store.
 	longBlocks := true
-	idx := c.indexOf(nick)
-	if idx >= 0 {
-		longBlocks = poller.LongWindowBlocksExhaustion(c.backendAt(idx).BaseURL)
+	if ok {
+		longBlocks = poller.LongWindowBlocksExhaustion(entry.BaseURL)
 	}
 	if snapRejects(respSnap, now, longBlocks) {
 		return true
 	}
-	if c.store != nil && idx >= 0 {
-		if snapRejects(c.store.Get(c.backendAt(idx).QuotaKey()), now, longBlocks) {
+	if c.store != nil && ok {
+		// The quota store is keyed by nick alone (issue #115 — one
+		// account, one exhaustion record across pools), so entry.Nick is
+		// the correct key and avoids re-resolving via c.backendAt.
+		if snapRejects(c.store.Get(entry.Nick), now, longBlocks) {
 			return true
 		}
 	}

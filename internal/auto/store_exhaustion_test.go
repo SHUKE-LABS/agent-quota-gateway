@@ -384,7 +384,15 @@ func TestIsGenuineExhaustionSignal_zaiLongWindowIsNotGenuine(t *testing.T) {
 		Unified7dReset:       &reset,
 		AsOf:                 clock.now(),
 	}
-	if c.isGenuineExhaustionSignal("a", long7dOnly) {
+	// Mirrors ModifyResponse's lock-then-resolve pattern: isGenuineExhaustionSignal
+	// now takes the already-resolved member entry, not a bare nick (issue #244).
+	c.mu.Lock()
+	var entryA memberEntry
+	if idx := c.indexOf("a"); idx >= 0 {
+		entryA = c.members[idx]
+	}
+	c.mu.Unlock()
+	if c.isGenuineExhaustionSignal(entryA, true, long7dOnly) {
 		t.Error("z.ai 7d-only reject treated as genuine exhaustion; want false (monthly slot is a tool quota)")
 	}
 
@@ -393,7 +401,7 @@ func TestIsGenuineExhaustionSignal_zaiLongWindowIsNotGenuine(t *testing.T) {
 		Unified5hReset:       &reset,
 		AsOf:                 clock.now(),
 	}
-	if !c.isGenuineExhaustionSignal("a", fifthHour) {
+	if !c.isGenuineExhaustionSignal(entryA, true, fifthHour) {
 		t.Error("z.ai 5h at-cap not treated as genuine exhaustion; want true (real chat quota)")
 	}
 }
