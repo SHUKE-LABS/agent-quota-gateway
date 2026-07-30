@@ -297,6 +297,79 @@ func (p *Poller) IsTracked(name string) bool {
 	return ok
 }
 
+// PoolTracked reports whether the named pool is configured for
+// poller-tracking — a stable property of the pool's current active
+// backend's base URL against the registered proprietary providers,
+// independent of whether the poller has ticked yet. This is the
+// single "is this pool tracked?" signal the admin surfaces should
+// use, so a never-polled tracked pool surfaces the same shape
+// (last_success:null, stale:true) on every endpoint instead of
+// diverging between view-layer and state-map gates (review of #267).
+//
+// The gate splits cleanly:
+//   - untracked (Anthropic): no poller block, no polled field, as_of
+//     passes through unchanged
+//   - tracked-but-never-polled (boot, no tick yet): poller block
+//     present with last_success:null and stale:true; quota view
+//     suppresses as_of
+//   - tracked-and-polled: full state surface
+//
+// Returns false when pl is nil (tests bypass the poller).
+func (p *Poller) PoolTracked(name, activeBaseURL string) bool {
+	if p == nil {
+		return false
+	}
+	_, ok := providerFor(activeBaseURL)
+	if !ok {
+		return false
+	}
+	return true
+}
+
+// StatusForPool returns the per-pool status entry for the named pool
+// if it is a tracked pool (per PoolTracked). The boolean is the
+// "tracked" verdict — false means "no poller signal at all", and the
+// caller should omit the poller block entirely. Tracked pools whose
+// state map has no entry yet (boot, before first tick) return a
+// zero-valued status with Stale=true so the on-wire shape matches
+// the never-polled contract from issue #247 / plan AC9.
+func (p *Poller) StatusForPool(name, activeBaseURL string) (PoolStatus, bool) {
+	if p == nil || !p.PoolTracked(name, activeBaseURL) {
+		return PoolStatus{}, false
+	}
+	return p.lookupStatus(name)
+}
+
+// LookupStatus is the map-aware variant of StatusForPool: callers that
+// already have a pre-built poller status map (AllPoolStatuses builds
+// one per request, review of #267) pass it in to skip the per-pool
+// mutex acquisition that Status() would otherwise repeat.
+func (p *Poller) LookupStatus(prebuilt map[string]PoolStatus, name, activeBaseURL string) (PoolStatus, bool) {
+	if p == nil || !p.PoolTracked(name, activeBaseURL) {
+		return PoolStatus{}, false
+	}
+	if st, ok := prebuilt[name]; ok {
+		return st, true
+	}
+	return p.lookupStatus(name)
+}
+
+// lookupStatus is the per-pool state-map read used by both the
+// lazy-builder path (StatusForPool) and the map-aware path
+// (LookupStatus). For a tracked pool with no state yet, returns a
+// synthesised never-polled entry whose Stale verdict derives from
+// the poller's current time and interval threshold — so callers do
+// not need a clock of their own.
+func (p *Poller) lookupStatus(name string) (PoolStatus, bool) {
+	statuses := p.Status()
+	if st, ok := statuses[name]; ok {
+		return st, true
+	}
+	now := p.now()
+	threshold := p.interval * StaleAfterIntervals
+	return poolStatusFrom(&poolState{}, now, threshold), true
+}
+
 // Status returns a copy of the per-pool liveness observation map keyed
 // by pool name. Pools the poller has never touched are absent from the
 // returned map; callers that need to iterate every pool consult the

@@ -751,7 +751,7 @@ func TestReconcile_poolStatusFlipsNonStickyMember(t *testing.T) {
 
 	byNick := func() map[string]MemberStatus {
 		m := make(map[string]MemberStatus)
-		for _, ms := range c.poolStatus(store, nil).Members {
+		for _, ms := range c.poolStatus(store, nil, nil).Members {
 			m[ms.Nick] = ms
 		}
 		return m

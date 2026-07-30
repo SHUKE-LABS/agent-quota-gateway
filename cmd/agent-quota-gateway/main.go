@@ -493,18 +493,6 @@ func WindowLabelsFor(baseURL string) WindowLabels {
 	return poller.WindowLabelsFor(baseURL)
 }
 
-// pollerProviderMatch reports whether the given base URL matches one of
-// the poller's registered proprietary providers. It is a stable
-// configuration property (independent of whether the poller has ticked),
-// which is what makes it usable from quotaHandler to discriminate a
-// "tracked but never polled" pool from an "untracked (Anthropic)" pool
-// when the poller's state map is empty for the pool. quotaHandler is
-// the only caller; nothing else in this package needs it.
-func pollerProviderMatch(baseURL string) bool {
-	_, ok := poller.ProviderFor(baseURL)
-	return ok
-}
-
 // quotaViewNoAsOf is the same shape as poolQuotaView but with AsOf
 // re-declared as *time.Time so json.Marshal skips it on the zero value
 // (the standard omitempty convention). Used only when quotaHandler
@@ -591,33 +579,24 @@ func quotaHandler(store *quota.Store, pools *auto.Pools, pl *poller.Poller) http
 					ActiveBackend: b.Nick,
 					WindowLabels:  WindowLabelsFor(b.BaseURL),
 				}
-				// AC5: a tracked pool with no successful poll yet would
-				// otherwise present Store.Get's read-time stamp as data.
-				// "Tracked" here means the pool's current active backend's
-				// BaseURL matches a registered poller provider — a stable
-				// configuration property the poller state map cannot answer
-				// for pools the poller has never ticked. Suppress AsOf for
-				// the (tracked && !polled) case; tracked+polled and
-				// untracked (Anthropic, etc.) pools keep their real AsOf
-				// and never set Polled, preserving the AC2 "no delta for
-				// untracked pools" contract.
-				suppressAsOf := false
-				if pl != nil && pollerProviderMatch(b.BaseURL) {
-					if ps, ok := pl.Status()[key]; ok && ps.LastSuccess != nil {
+				// AC5 (issue #247) and review of #267: use the same
+				// config-based "is this pool tracked?" signal as
+				// /_gateway/pool — the active backend's BaseURL matches
+				// a registered poller provider. The two surfaces must
+				// agree on the never-polled case: tracked pool with no
+				// successful poll yet → suppress AsOf and set Polled
+				// only when a LastSuccess exists. Untracked (Anthropic)
+				// pools see no Polled key and forward AsOf unchanged.
+				if ps, ok := pl.StatusForPool(key, b.BaseURL); ok {
+					if ps.LastSuccess != nil {
 						view.Polled = true
 					} else {
-						suppressAsOf = true
+						// Tracked but never polled — suppress the
+						// read-time stamp (Snapshot.AsOf has no
+						// `omitempty` tag, so re-marshal without it).
+						_ = encodeViewWithoutAsOf(w, view)
+						return
 					}
-				}
-				// Snapshot.AsOf has no `omitempty` tag (changing it would
-				// break quota.Snapshot's own callers and the Store.Get
-				// contract — AC6). When the view suppresses AsOf it
-				// re-marshals the view with AsOf stripped, so the wire
-				// shape stays clean and the AC5 contract ("no as_of for
-				// never-polled tracked pool") holds.
-				if suppressAsOf {
-					_ = encodeViewWithoutAsOf(w, view)
-					return
 				}
 				_ = json.NewEncoder(w).Encode(view)
 				return

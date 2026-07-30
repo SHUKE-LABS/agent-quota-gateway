@@ -658,7 +658,7 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
 {
   "pool": "auto",
   "active": "b",
-  "poller": { "last_success": "2026-07-13T11:58:42Z", "last_error": "", "last_error_at": null, "consecutive_failures": 0, "stale": false },
+  "poller": { "last_success": "2026-07-13T11:58:42Z", "consecutive_failures": 0, "stale": false },
   "members": [
     { "nick": "a", "status": "exhausted", "exhausted_until": "2026-06-15T18:00:00Z", "snapshot": { ... }, "disabled": false, "parked": true  },
     { "nick": "b", "status": "active",    "exhausted_until": null,                   "snapshot": { ... }, "disabled": false, "parked": false },

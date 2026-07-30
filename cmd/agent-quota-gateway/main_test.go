@@ -797,7 +797,7 @@ func TestPoolHandler_pollerField_omittedForAnthropic(t *testing.T) {
 func TestPoolHandler_pollerField_staleAfterFailure(t *testing.T) {
 	clk := &livenessClock{now: time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)}
 	var failNext atomic.Bool
-	p, _ := seededPoller(t, clk, &failNext)
+	p, srv := seededPoller(t, clk, &failNext)
 	// Seed success.
 	p.PollAllForTest(context.Background())
 
@@ -809,19 +809,23 @@ func TestPoolHandler_pollerField_staleAfterFailure(t *testing.T) {
 	// Advance past the threshold (StaleAfterIntervals × 1h = 3h).
 	clk.Advance(3 * time.Hour)
 
-	// Register a tracked "chn" pool by hand for the handler. We
-	// bypass auto.NewPools by using a stub that returns a tracked
-	// backend for "chn".
-	registry, err := backend.Load("https://api.anthropic.com")
+	// Register a tracked "chn" pool by hand for the handler. The
+	// BuildFromSpec path avoids reading ambient AQG_POOL_* env vars
+	// (backend.Load would fail in a clean env without them); the test
+	// is therefore self-contained and survives CI's bare env.
+	spec := backend.Spec{Pools: map[string]backend.PoolSpec{
+		"chn": {Members: map[string]backend.MemberSpec{"key-a": {Credential: "zkey"}}},
+	}}
+	registry, err := backend.BuildFromSpec(spec, srv.URL)
 	if err != nil {
-		t.Fatalf("backend.Load: %v", err)
+		t.Fatalf("BuildFromSpec: %v", err)
 	}
 	pools := auto.NewPools(registry, nil, nil, io.Discard)
 
-	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools, p))
-	t.Cleanup(srv.Close)
+	srv2 := httptest.NewServer(poolHandler(quota.NewStore(), pools, p))
+	t.Cleanup(srv2.Close)
 
-	resp, err := http.Get(srv.URL + "/_gateway/pool?pool=chn")
+	resp, err := http.Get(srv2.URL + "/_gateway/pool?pool=chn")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

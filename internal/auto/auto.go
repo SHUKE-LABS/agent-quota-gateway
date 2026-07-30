@@ -425,7 +425,9 @@ func (p *Pools) PoolStatus(poolName string, store *quota.Store, pl *poller.Polle
 	if !ok {
 		return PoolStatus{}, false
 	}
-	return c.poolStatus(store, pl), true
+	// nil map — the single-pool path goes through LookupStatus's
+	// fallback which calls pl.Status() under the poller's mutex once.
+	return c.poolStatus(store, pl, nil), true
 }
 
 // AllPoolStatuses returns status for every pool in sorted order.
@@ -436,9 +438,18 @@ func (p *Pools) AllPoolStatuses(store *quota.Store, pl *poller.Poller) []PoolSta
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	out := make([]PoolStatus, 0, len(names))
+	// Pre-build the per-pool poller map once (review of #267): each
+	// Controller.poolStatus would otherwise rebuild it under the
+	// poller's mutex N times per call, which compounds under UI polling.
+	// The map is empty for a nil poller, in which case every pool
+	// view simply carries no `poller` key (preserving AC2).
+	var pollerMap map[string]poller.PoolStatus
+	if pl != nil {
+		pollerMap = pl.Status()
+	}
+	out := make([]PoolStatus, 0, len(snapshot))
 	for _, name := range names {
-		out = append(out, snapshot[name].poolStatus(store, pl))
+		out = append(out, snapshot[name].poolStatus(store, pl, pollerMap))
 	}
 	return out
 }
@@ -1844,8 +1855,11 @@ func (c *Controller) setActiveMemberLocked(nick string) {
 // snapshot gets snapshot:null. pl is consulted for the per-pool poller
 // liveness observation (issue #247); pl may be nil (handlers in some
 // tests construct without one), in which case the poller field is left
-// nil and omitempty drops it from the wire. Caller must not hold c.mu.
-func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller) PoolStatus {
+// nil and omitempty drops it from the wire. pollerMap is a pre-built
+// snapshot of pl.Status() to avoid repeating the lock acquisition per
+// pool in the AllPoolStatuses path (review of #267). Caller must not
+// hold c.mu.
+func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller, pollerMap map[string]poller.PoolStatus) PoolStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.clearExpiredLocked()
@@ -1907,17 +1921,37 @@ func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller) PoolStatu
 		members = append(members, ms)
 	}
 	out := PoolStatus{Pool: c.name(), Active: c.curNick, Members: members}
-	// Per-pool poller liveness (issue #247): omitted entirely (key absent,
-	// not "poller":null) for pools the poller does not track — Anthropic,
-	// and a tracked pool that has never been polled or is currently sticky
-	// on an untracked backend. The poller's IsTracked gate collapses all
-	// "no signal" cases into one, so a caller reading the JSON sees no
-	// `poller` key at all when there is no signal to surface.
-	if pl != nil && pl.IsTracked(c.name()) {
-		st := pl.Status()[c.name()]
-		out.Poller = &st
+	// Per-pool poller liveness (issue #247, review of #267): the gate
+	// is config-based (the active backend's BaseURL matches a
+	// registered proprietary provider), not the poller's state map.
+	// A tracked pool that has never been polled surfaces the never-
+	// polled shape (last_success:null, stale:true) on this endpoint
+	// so it agrees with the quota view; an untracked pool (Anthropic,
+	// any unrecognised upstream) carries no `poller` key at all.
+	// LookupStatus consults the prebuilt map when present and falls
+	// back to a fresh Status() call for the single-pool path.
+	if pl != nil {
+		if baseURL, ok := c.activeBaseURLLocked(); ok {
+			if ps, ok := pl.LookupStatus(pollerMap, c.name(), baseURL); ok {
+				out.Poller = &ps
+			}
+		}
 	}
 	return out
+}
+
+// activeBaseURLLocked returns the current active backend's base URL,
+// or ok=false when the controller has no resolvable active backend.
+// Caller must hold c.mu.
+func (c *Controller) activeBaseURLLocked() (string, bool) {
+	if c.curNick == "" {
+		return "", false
+	}
+	b, ok := c.backendByNickLocked(c.curNick)
+	if !ok {
+		return "", false
+	}
+	return b.BaseURL, true
 }
 
 // loadState applies persisted routing state. Exhausted entries whose reset

@@ -1159,7 +1159,7 @@ func TestController_ClearExhaustedNick_storeUntouched(t *testing.T) {
 	putSnap(store, c, "a", fptr(1.0), nil, tptr(reset), nil)
 	c.record429("a", reset)
 
-	if got := c.poolStatus(store, nil); !memberParked(got, "a") {
+	if got := c.poolStatus(store, nil, nil); !memberParked(got, "a") {
 		t.Fatalf("before clear: a Parked=false, want true (live park active)")
 	}
 
@@ -1175,7 +1175,7 @@ func TestController_ClearExhaustedNick_storeUntouched(t *testing.T) {
 	if !aExhausted {
 		t.Fatalf("after ClearExhaustedNick(a), a healthy, want still store-exhausted")
 	}
-	got := c.poolStatus(store, nil)
+	got := c.poolStatus(store, nil, nil)
 	if memberParked(got, "a") {
 		t.Fatalf("after clear: a Parked=true, want false (only store exhaustion remains)")
 	}
@@ -1990,7 +1990,7 @@ func TestController_poolStatus_disabledField(t *testing.T) {
 	c := newController(t, 0, clock, io.Discard, "a", "b")
 
 	// Baseline: nobody disabled.
-	for _, m := range c.poolStatus(store, nil).Members {
+	for _, m := range c.poolStatus(store, nil, nil).Members {
 		if m.Disabled {
 			t.Fatalf("before disable: %q Disabled=true, want false", m.Nick)
 		}
@@ -2001,7 +2001,7 @@ func TestController_poolStatus_disabledField(t *testing.T) {
 	c.setDisabledLocked("b", true)
 	c.mu.Unlock()
 
-	got := c.poolStatus(store, nil)
+	got := c.poolStatus(store, nil, nil)
 	for _, m := range got.Members {
 		wantDisabled := m.Nick == "b"
 		if m.Disabled != wantDisabled {
@@ -2212,7 +2212,7 @@ func TestRuntimeConfig_removedMemberRoundTripAndReanchor(t *testing.T) {
 	if got := c2.Current(); got == "a" {
 		t.Errorf("after reload Current()=%q, want a surviving member", got)
 	}
-	ps := c2.poolStatus(quota.NewStore(), nil)
+	ps := c2.poolStatus(quota.NewStore(), nil, nil)
 	if ps.Active == "a" {
 		t.Errorf("poolStatus Active=%q, want a surviving member", ps.Active)
 	}
