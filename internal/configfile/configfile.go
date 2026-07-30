@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"sync"
 
@@ -183,10 +184,45 @@ func Marshal(cfg config.Config, reg *backend.Registry) ([]byte, error) {
 // roll back the in-memory mutation (which already took effect). It logs
 // loudly and sets Unsaved so /_gateway/health and /_gateway/config can
 // surface that on-disk config lags memory until the next successful flush.
+//
+// Mode is immutable after NewWriter: it is decided by whether path was
+// non-empty at construction. Surface handlers (issue #246) read Mode to
+// distinguish "no persistence configured" from "persisted but lagging" —
+// the env-only case cannot fail a flush, so its Unsaved() is always false
+// in normal operation; the two signals together describe all three states
+// (clean / unsaved / env_only).
+type Mode int
+
+const (
+	// ModePersisted means a config file is configured and the Writer will
+	// flush mutations to disk (debounced atomic 0600). Unsaved may flip on
+	// flush failure.
+	ModePersisted Mode = iota
+
+	// ModeEnvOnly means no config file is configured (path was ""). The
+	// Writer is a no-op; nothing is ever persisted; Unsaved is always
+	// false in normal operation.
+	ModeEnvOnly
+)
+
+// String returns the wire form consumed by the X-AQG-Persistence header
+// and the "persistence" body field on /_gateway/* responses. The values
+// are intentionally lowercase + underscore to keep the field shape stable
+// and grep-friendly.
+func (m Mode) String() string {
+	switch m {
+	case ModeEnvOnly:
+		return "env_only"
+	default:
+		return "persisted"
+	}
+}
+
 type Writer struct {
 	path    string
 	snapFn  func() ([]byte, error)
 	flusher *debounce.Flusher
+	mode    Mode
 
 	mu      sync.Mutex
 	unsaved bool
@@ -194,11 +230,16 @@ type Writer struct {
 
 // NewWriter returns a Writer that serializes to path via snapFn. snapFn is
 // called from the Run goroutine, so it must be safe for concurrent use with
-// the registry it reads. An empty path makes the Writer a no-op.
+// the registry it reads. An empty path makes the Writer a no-op and sets
+// Mode to ModeEnvOnly; a non-empty path sets Mode to ModePersisted.
 func NewWriter(path string, snapFn func() ([]byte, error)) *Writer {
 	w := &Writer{
 		path:   path,
 		snapFn: snapFn,
+		mode:   ModePersisted,
+	}
+	if path == "" {
+		w.mode = ModeEnvOnly
 	}
 	w.flusher = debounce.New(path != "", debounce.DefaultDebounce, w.flush)
 	return w
@@ -216,12 +257,93 @@ func (w *Writer) Unsaved() bool {
 	return w.unsaved
 }
 
+// Mode reports whether the Writer is configured to flush to disk
+// (ModePersisted) or is a no-op (ModeEnvOnly). Immutable after NewWriter.
+func (w *Writer) Mode() Mode { return w.mode }
+
+// PersistenceState bundles the two signals a /_gateway/* handler needs to
+// render its response surface (issue #246). Mode is immutable; Unsaved is
+// a method value that reads the latest flush latch.
+//
+// The struct is intentionally a tiny view type (not an interface) so the
+// HTTP wiring can pass it by value and tests can construct one without a
+// real Writer — every field is plain data.
+type PersistenceState struct {
+	Mode    Mode
+	Unsaved func() bool
+}
+
+// PersistenceStateOf captures a Writer's current Mode and an Unsaved method
+// value into a self-contained struct. The HTTP layer hands this to every
+// handler that reports config durability.
+func (w *Writer) PersistenceStateOf() PersistenceState {
+	return PersistenceState{Mode: w.Mode(), Unsaved: w.Unsaved}
+}
+
 // Run drives the debounced flush loop until ctx is done, then performs one
 // final flush so any mutation observed up to context cancellation is
 // persisted. The caller (main.run) cancels this context only after the HTTP
 // server has drained, so a mutation acked 200 during the shutdown grace
 // window is still captured by the final flush (issue #201).
 func (w *Writer) Run(ctx interface{ Done() <-chan struct{} }) { w.flusher.Run(ctx) }
+
+// HeaderPersistence is the response header every /_gateway/* surface uses
+// to advertise the persistence mode (issue #246). Value space is the
+// Mode.String() wire form ("persisted" or "env_only"). Mirrors the body
+// field name "persistence" so an operator can correlate header ↔ body
+// without a translation table.
+const HeaderPersistence = "X-AQG-Persistence"
+
+// HeaderUnsavedConfig is the legacy response header on /_gateway/config
+// that signals a failed (or pending) flush of the config file. Unchanged
+// by issue #246; new code should pair it with HeaderPersistence.
+const HeaderUnsavedConfig = "X-AQG-Unsaved-Config"
+
+// ApplyPersistenceHeader stamps the persistence header (and the legacy
+// unsaved header, when applicable) onto w. Every /_gateway/* handler that
+// reports config durability calls this once before writing its body so the
+// three-state contract is enforced uniformly.
+//
+// In ModeEnvOnly, only HeaderPersistence is set. In ModePersisted the
+// legacy unsaved header is set when the flush latch is tripped; the
+// persistence header is always set so consumers can rely on it being
+// present in either mode.
+func ApplyPersistenceHeader(w http.ResponseWriter, st PersistenceState) {
+	if st.Mode == ModeEnvOnly {
+		w.Header().Set(HeaderPersistence, ModeEnvOnly.String())
+		return
+	}
+	w.Header().Set(HeaderPersistence, ModePersisted.String())
+	if st.Unsaved != nil && st.Unsaved() {
+		w.Header().Set(HeaderUnsavedConfig, "true")
+	}
+}
+
+// IsEnvOnly reports whether the persistence state is the env-only mode.
+// HTTP handlers use it to decide whether to add the "persistence" body
+// field to a successful response.
+func (st PersistenceState) IsEnvOnly() bool { return st.Mode == ModeEnvOnly }
+
+// PersistenceField is the body field name every /_gateway/* response uses
+// to advertise the persistence mode. Kept in sync with HeaderPersistence
+// (both surface the same wire value, lowercased).
+const PersistenceField = "persistence"
+
+// ApplyEnvOnlyBodyField stamps the persistence body field onto the
+// in-memory body map when (and only when) st is env-only. In persisted
+// mode the field is omitted — that mode is the documented default and
+// adding a "persistence":"persisted" field to every response would be
+// visual noise that buys nothing.
+//
+// The helper is the single source of truth for the mutation-family body
+// shape: every handler that returns a 200 OK body in env-only mode calls
+// it, and the tests cover the helper directly so the contract has a single
+// line of code to inspect.
+func ApplyEnvOnlyBodyField(body map[string]any, st PersistenceState) {
+	if st.IsEnvOnly() {
+		body[PersistenceField] = ModeEnvOnly.String()
+	}
+}
 
 // flush atomically writes the current config to disk at 0600.
 func (w *Writer) flush() {

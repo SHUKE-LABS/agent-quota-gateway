@@ -202,22 +202,23 @@ func run(configFlag string) error {
 	activityStore := activity.New()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/health", healthHandler(configWriter.Unsaved))
+	persistence := configWriter.PersistenceStateOf()
+	mux.HandleFunc("/_gateway/health", healthHandler(persistence))
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
 	mux.HandleFunc("/_gateway/activity", activityHandler(activityStore))
 	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
-	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools))
-	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/rename", renamePoolHandler(pools))
+	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools, persistence))
+	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/rename", renamePoolHandler(pools, persistence))
 	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
-	mux.HandleFunc("/_gateway/config", configHandler(pools, configWriter.Unsaved))
+	mux.HandleFunc("/_gateway/config", configHandler(pools, persistence))
 	mux.HandleFunc("/_gateway/ui", uiHandler())
-	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/move", moveMemberHandler(pools))
-	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools))
-	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools))
+	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/move", moveMemberHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools, persistence))
+	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools, persistence))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
 	// activity.Middleware sits innermost (closest to the mux) so it observes
@@ -418,10 +419,16 @@ func migrateSnapshotKeys(state persist.GatewayState, registry *backend.Registry)
 // callers can tell "process is alive" from "upstream is reachable".
 // Method is GET only; non-GET requests receive 405 — matching
 // quotaHandler's policy so the two /_gateway/* endpoints agree.
-// unsaved reports whether the config writer has changes it could not flush to
-// disk (issue #198 decision 3). nil means "no config write-through" (env-only
-// mode), which never reports unsaved.
-func healthHandler(unsaved func() bool) http.HandlerFunc {
+//
+// persistence (issue #246) carries the three-state config-durability
+// signal on a single additive body field:
+//   - clean persisted:      {"status":"ok"}
+//   - persisted, unsaved:   {"status":"ok","unsaved_config_changes":true}
+//   - env-only:             {"status":"ok","persistence":"env_only"}
+//
+// Status code stays 200 in every case; a readiness probe asserts on
+// "status", not on a byte-for-byte body match (README §Health).
+func healthHandler(persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -429,12 +436,16 @@ func healthHandler(unsaved func() bool) http.HandlerFunc {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
-		if unsaved != nil && unsaved() {
+		switch {
+		case persistence.IsEnvOnly():
+			_, _ = w.Write([]byte(`{"status":"ok","persistence":"env_only"}`))
+		case persistence.Unsaved != nil && persistence.Unsaved():
 			_, _ = w.Write([]byte(`{"status":"ok","unsaved_config_changes":true}`))
-			return
+		default:
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		}
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}
 }
 

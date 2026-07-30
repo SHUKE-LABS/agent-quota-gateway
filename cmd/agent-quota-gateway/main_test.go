@@ -19,6 +19,7 @@ import (
 
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
 	"github.com/shukebeta/agent-quota-gateway/internal/persist"
 	"github.com/shukebeta/agent-quota-gateway/internal/proxy"
@@ -143,7 +144,7 @@ func TestIntegration_fullStack(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/_gateway/health", healthHandler(nil))
+	mux.HandleFunc("/_gateway/health", healthHandler(configfile.PersistenceState{}))
 	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))
 
@@ -476,7 +477,7 @@ func TestQuotaHandler_unknownPoolEmptySnapshot(t *testing.T) {
 // TestHealthHandler_methodGuard pins the GET-only contract on
 // /_gateway/health: GET works, other verbs get 405 + Allow: GET.
 func TestHealthHandler_methodGuard(t *testing.T) {
-	srv := httptest.NewServer(healthHandler(nil))
+	srv := httptest.NewServer(healthHandler(configfile.PersistenceState{}))
 	defer srv.Close()
 
 	getResp, err := http.Get(srv.URL + "/_gateway/health")
