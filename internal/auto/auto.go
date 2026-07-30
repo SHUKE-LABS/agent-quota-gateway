@@ -367,6 +367,18 @@ type PoolStatus struct {
 	Pool    string         `json:"pool"`
 	Active  string         `json:"active"`
 	Members []MemberStatus `json:"members"`
+
+	// Poller carries the per-pool liveness observation (issue #247):
+	// last successful poll, last error and its time, consecutive-
+	// failure count, and a derived staleness verdict. It is omitted
+	// entirely (the JSON key is absent, not "poller":null) for pools
+	// the poller does not track — Anthropic and any other untracked
+	// backend see no delta, so a caller can tell "this pool has no
+	// poller signal at all" from "this pool's poller signal is stale
+	// or failing". The poller package is the source of truth for
+	// tracking and staleness math (it owns the StaleAfterIntervals
+	// constant); auto only wires the result through.
+	Poller *poller.PoolStatus `json:"poller,omitempty"`
 }
 
 // PoolConfigView is the /_gateway/config response for one pool.
@@ -408,16 +420,16 @@ type PoolMemberConfigView struct {
 }
 
 // PoolStatus returns the current status of the named pool, or ok=false for an unknown pool.
-func (p *Pools) PoolStatus(poolName string, store *quota.Store) (PoolStatus, bool) {
+func (p *Pools) PoolStatus(poolName string, store *quota.Store, pl *poller.Poller) (PoolStatus, bool) {
 	c, ok := p.controller(poolName)
 	if !ok {
 		return PoolStatus{}, false
 	}
-	return c.poolStatus(store), true
+	return c.poolStatus(store, pl), true
 }
 
 // AllPoolStatuses returns status for every pool in sorted order.
-func (p *Pools) AllPoolStatuses(store *quota.Store) []PoolStatus {
+func (p *Pools) AllPoolStatuses(store *quota.Store, pl *poller.Poller) []PoolStatus {
 	snapshot := p.controllersSnapshot()
 	names := make([]string, 0, len(snapshot))
 	for name := range snapshot {
@@ -426,7 +438,7 @@ func (p *Pools) AllPoolStatuses(store *quota.Store) []PoolStatus {
 	sort.Strings(names)
 	out := make([]PoolStatus, 0, len(names))
 	for _, name := range names {
-		out = append(out, snapshot[name].poolStatus(store))
+		out = append(out, snapshot[name].poolStatus(store, pl))
 	}
 	return out
 }
@@ -1829,8 +1841,11 @@ func (c *Controller) setActiveMemberLocked(nick string) {
 
 // poolStatus builds the /_gateway/pool response for this controller. store
 // is consulted for each member's latest snapshot; a member with no recorded
-// snapshot gets snapshot:null. Caller must not hold c.mu.
-func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
+// snapshot gets snapshot:null. pl is consulted for the per-pool poller
+// liveness observation (issue #247); pl may be nil (handlers in some
+// tests construct without one), in which case the poller field is left
+// nil and omitempty drops it from the wire. Caller must not hold c.mu.
+func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller) PoolStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.clearExpiredLocked()
@@ -1891,7 +1906,18 @@ func (c *Controller) poolStatus(store *quota.Store) PoolStatus {
 		}
 		members = append(members, ms)
 	}
-	return PoolStatus{Pool: c.name(), Active: c.curNick, Members: members}
+	out := PoolStatus{Pool: c.name(), Active: c.curNick, Members: members}
+	// Per-pool poller liveness (issue #247): omitted entirely (key absent,
+	// not "poller":null) for pools the poller does not track — Anthropic,
+	// and a tracked pool that has never been polled or is currently sticky
+	// on an untracked backend. The poller's IsTracked gate collapses all
+	// "no signal" cases into one, so a caller reading the JSON sees no
+	// `poller` key at all when there is no signal to surface.
+	if pl != nil && pl.IsTracked(c.name()) {
+		st := pl.Status()[c.name()]
+		out.Poller = &st
+	}
+	return out
 }
 
 // loadState applies persisted routing state. Exhausted entries whose reset

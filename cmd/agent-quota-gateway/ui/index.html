@@ -131,6 +131,22 @@
   .pool .badge { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
   .pool .updated { margin-left: auto; font-size: 12px; color: var(--muted); font-family: var(--mono); }
 
+  /* Per-pool poller liveness indicator (issue #247). Three states:
+       .ok      — last poll within StaleAfterIntervals
+       .stale   — no recent successful poll (stale=true or never polled)
+       .failing — last poll failed (consecutive_failures > 0)
+     The textual label is rendered by JS from view.poller; the class
+     drives the colour so all three states share the same layout. */
+  .pool .poller {
+    font-size: 11px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.04em; padding: 2px 8px; border: 1px solid var(--muted);
+    border-radius: 999px;
+  }
+  .pool .poller[data-state="ok"]      { color: var(--ok);     border-color: var(--ok); }
+  .pool .poller[data-state="stale"]   { color: var(--danger); border-color: var(--danger); }
+  .pool .poller[data-state="failing"] { color: var(--danger); border-color: var(--danger); }
+  .pool .poller[data-state="never"]   { color: var(--muted);  border-color: var(--muted); }
+
   .col {
     padding: 12px 16px;
     /* Allow this block to be narrower than its (wide) content so the members
@@ -609,6 +625,33 @@
     return !!view.balance_mode && view.balance_mode.length > 0;
   }
 
+  // pollerState / pollerLabel render the per-pool poller liveness
+  // indicator (issue #247). State precedence: failing > stale > ok >
+  // never. A failing pool has at least one consecutive failure; a
+  // stale pool has a stale:true flag but no recent failure; an ok pool
+  // has a recent successful poll; a never-polled pool has no
+  // last_success at all.
+  function pollerState(p) {
+    if (!p) return 'never';
+    if ((p.consecutive_failures || 0) > 0) return 'failing';
+    if (p.stale) return 'stale';
+    if (p.last_success) return 'ok';
+    return 'never';
+  }
+
+  function pollerLabel(p, state) {
+    if (state === 'failing') {
+      return 'poller failing (' + (p.consecutive_failures || 0) + 'x)';
+    }
+    if (state === 'stale') {
+      return 'poller stale';
+    }
+    if (state === 'ok') {
+      return 'poller ok';
+    }
+    return 'never polled';
+  }
+
   function sanitizeView(view) {
     // Defensive: drop any member field that is not on the allowlist.
     var members = (view.members || []).map(function (m) {
@@ -686,6 +729,23 @@
       badge2.className = 'badge';
       badge2.textContent = 'priority pool';
       head.appendChild(badge2);
+    }
+
+    // Per-pool poller liveness (issue #247). Renders only when the
+    // server provided a poller block — Anthropic / untracked pools see
+    // no delta. State drives both the colour (CSS data-state hook) and
+    // the human-readable label.
+    if (view.poller) {
+      var pollerBadge = document.createElement('span');
+      pollerBadge.className = 'poller';
+      var state = pollerState(view.poller);
+      pollerBadge.setAttribute('data-state', state);
+      pollerBadge.setAttribute('data-role', 'poller');
+      pollerBadge.textContent = pollerLabel(view.poller, state);
+      if (view.poller.last_error) {
+        pollerBadge.title = 'Last poll error: ' + view.poller.last_error;
+      }
+      head.appendChild(pollerBadge);
     }
 
     var updated = document.createElement('span');

@@ -201,12 +201,23 @@ func run(configFlag string) error {
 	// memory only, lost on restart (issue #217).
 	activityStore := activity.New()
 
+	// The poller fills the quota store for backends that never emit
+	// Anthropic rate-limit headers (Z.ai / ZhipuAI, MiniMaxi) by polling
+	// each provider's proprietary quota API for the active member of each
+	// pool. It is a no-op for Anthropic and any other untracked backend.
+	// NewDynamic (not New): the pool set is re-read from pools each tick, so a
+	// pool created at runtime via POST /_gateway/pool is polled without a
+	// restart (issue #202). Constructed here (before the mux wiring) so the
+	// pool handler can attach per-pool poller liveness to its response
+	// (issue #247); Run is started below.
+	qp := poller.NewDynamic(pools.PoolNames, pools.Current, pools.MarkLocalSnapshot, store, nil, 0, nil, nil)
+
 	mux := http.NewServeMux()
 	persistence := configWriter.PersistenceStateOf()
-	mux.HandleFunc("/_gateway/health", healthHandler(persistence))
-	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools))
+	mux.HandleFunc("/_gateway/health", healthHandler(persistence, qp))
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools, qp))
 	mux.HandleFunc("/_gateway/activity", activityHandler(activityStore))
-	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools))
+	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools, qp))
 	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools, persistence))
 	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/rename", renamePoolHandler(pools, persistence))
@@ -268,10 +279,9 @@ func run(configFlag string) error {
 	// each provider's proprietary quota API for the active member of each
 	// pool. It is a no-op for Anthropic and any other untracked backend.
 	// It shares the shutdown context, so it stops when the process does.
-	// NewDynamic (not New): the pool set is re-read from pools each tick, so a
-	// pool created at runtime via POST /_gateway/pool is polled without a
-	// restart (issue #202).
-	qp := poller.NewDynamic(pools.PoolNames, pools.Current, pools.MarkLocalSnapshot, store, nil, 0, nil, nil)
+	// qp is constructed earlier in this function so the pool/quota/health
+	// handlers can attach per-pool poller liveness to their responses
+	// (issue #247).
 	go qp.Run(ctx)
 
 	// The preemptor returns a priority pool to a higher-priority member once
@@ -426,9 +436,17 @@ func migrateSnapshotKeys(state persist.GatewayState, registry *backend.Registry)
 //   - persisted, unsaved:   {"status":"ok","unsaved_config_changes":true}
 //   - env-only:             {"status":"ok","persistence":"env_only"}
 //
+// poller_health (issue #247) is emitted conditionally as the additive
+// "poller_health":"stale" field when the poller reports at least one
+// tracked pool as stale. It mirrors unsaved_config_changes (also
+// conditional) — absence of the field means "ok". The poller is the
+// source of truth for the staleness math (owning the StaleAfterIntervals
+// constant); the handler just reads the aggregate. pl may be nil in
+// tests, in which case the field is never emitted.
+//
 // Status code stays 200 in every case; a readiness probe asserts on
 // "status", not on a byte-for-byte body match (README §Health).
-func healthHandler(persistence configfile.PersistenceState) http.HandlerFunc {
+func healthHandler(persistence configfile.PersistenceState, pl *poller.Poller) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -438,14 +456,26 @@ func healthHandler(persistence configfile.PersistenceState) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		configfile.ApplyPersistenceHeader(w, persistence)
 		w.WriteHeader(http.StatusOK)
+		var body string
 		switch {
 		case persistence.IsEnvOnly():
-			_, _ = w.Write([]byte(`{"status":"ok","persistence":"env_only"}`))
+			body = `{"status":"ok","persistence":"env_only"`
 		case persistence.Unsaved != nil && persistence.Unsaved():
-			_, _ = w.Write([]byte(`{"status":"ok","unsaved_config_changes":true}`))
+			body = `{"status":"ok","unsaved_config_changes":true`
 		default:
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			body = `{"status":"ok"`
 		}
+		// poller_health is additive and conditional. Emit only when stale,
+		// matching unsaved_config_changes / persistence — absence means
+		// "ok". The polled-pool count and stale count are kept internal
+		// to the poller package; the wire shape is the same either way.
+		if pl != nil {
+			if _, stale := pl.HealthSummary(); stale > 0 {
+				body += `,"poller_health":"stale"`
+			}
+		}
+		body += `}`
+		_, _ = w.Write([]byte(body))
 	}
 }
 
@@ -463,6 +493,45 @@ func WindowLabelsFor(baseURL string) WindowLabels {
 	return poller.WindowLabelsFor(baseURL)
 }
 
+// pollerProviderMatch reports whether the given base URL matches one of
+// the poller's registered proprietary providers. It is a stable
+// configuration property (independent of whether the poller has ticked),
+// which is what makes it usable from quotaHandler to discriminate a
+// "tracked but never polled" pool from an "untracked (Anthropic)" pool
+// when the poller's state map is empty for the pool. quotaHandler is
+// the only caller; nothing else in this package needs it.
+func pollerProviderMatch(baseURL string) bool {
+	_, ok := poller.ProviderFor(baseURL)
+	return ok
+}
+
+// quotaViewNoAsOf is the same shape as poolQuotaView but with AsOf
+// re-declared as *time.Time so json.Marshal skips it on the zero value
+// (the standard omitempty convention). Used only when quotaHandler
+// suppresses AsOf for a tracked never-polled pool (AC5). The field name
+// matches quota.Snapshot's `json:"as_of"` tag so the on-wire shape is
+// identical when present and cleanly absent when suppressed.
+type quotaViewNoAsOf struct {
+	quota.Snapshot
+	ActiveBackend string       `json:"active_backend"`
+	WindowLabels  WindowLabels `json:"window_labels"`
+	Polled        bool         `json:"polled,omitempty"`
+	// AsOf shadows the embedded Snapshot.AsOf so the json tag wins.
+	AsOf *time.Time `json:"as_of,omitempty"`
+}
+
+// encodeViewWithoutAsOf marshals the view to w with AsOf suppressed.
+// Used only for the AC5 "tracked never-polled pool" branch.
+func encodeViewWithoutAsOf(w http.ResponseWriter, view poolQuotaView) error {
+	return json.NewEncoder(w).Encode(quotaViewNoAsOf{
+		Snapshot:      view.Snapshot,
+		ActiveBackend: view.ActiveBackend,
+		WindowLabels:  view.WindowLabels,
+		Polled:        view.Polled,
+		// AsOf intentionally nil — omitempty drops the key.
+	})
+}
+
 // poolQuotaView is the /_gateway/quota?backend=<pool> response: the
 // pool's active sticky member's snapshot with an added active_backend
 // field naming the member nick. The embedded Snapshot promotes its
@@ -476,10 +545,20 @@ func WindowLabelsFor(baseURL string) WindowLabels {
 // and MiniMaxi, a monthly window for Z.AI (issue #138). The snapshot
 // struct's 5h/7d field names stay — they are the right data shape; only
 // the human-facing label changes.
+//
+// Polled (issue #247) reports whether this pool has ever been polled
+// successfully. It is omitted entirely (key absent) for pools the
+// poller does not track — Anthropic and any other untracked backend.
+// The known-pool branch in quotaHandler uses Polled to decide whether
+// to forward Snapshot.AsOf: for a tracked never-polled pool the field
+// is dropped (Store.Get's read-time stamp is not data, issue #121
+// framing); for a tracked polled pool or any untracked pool AsOf is
+// forwarded as today.
 type poolQuotaView struct {
 	quota.Snapshot
 	ActiveBackend string       `json:"active_backend"`
 	WindowLabels  WindowLabels `json:"window_labels"`
+	Polled        bool         `json:"polled,omitempty"`
 }
 
 // quotaHandler returns the JSON snapshot for the requested pool.
@@ -487,11 +566,13 @@ type poolQuotaView struct {
 // Method is GET only — POSTing here would suggest the endpoint mutates
 // state, which it does not. The pool name comes from the `?backend=`
 // query param. A known pool resolves to its active sticky member and adds
-// active_backend. An unknown pool (or a missing param) returns 200 with
-// an empty snapshot (just backend + as_of) — the distinction the caller
-// cares about ("did I get quota data?") is answered by which fields are
-// present in the JSON body, not by the status code.
-func quotaHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
+// active_backend; the embedded Snapshot's AsOf is suppressed when this
+// is a tracked never-polled pool (Store.Get's read-time stamp is not
+// data for that case — issue #247). An unknown pool (or a missing
+// param) returns 200 with a bare quota.Snapshot; that branch is left
+// untouched on purpose (AC5 targets known pools with no snapshot, not
+// unknown pool names — see plan review).
+func quotaHandler(store *quota.Store, pools *auto.Pools, pl *poller.Poller) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -504,11 +585,41 @@ func quotaHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		if pools != nil {
 			if b, ok := pools.Current(key); ok {
-				_ = json.NewEncoder(w).Encode(poolQuotaView{
-					Snapshot:      store.Get(b.QuotaKey()),
+				snap := store.Get(b.QuotaKey())
+				view := poolQuotaView{
+					Snapshot:      snap,
 					ActiveBackend: b.Nick,
 					WindowLabels:  WindowLabelsFor(b.BaseURL),
-				})
+				}
+				// AC5: a tracked pool with no successful poll yet would
+				// otherwise present Store.Get's read-time stamp as data.
+				// "Tracked" here means the pool's current active backend's
+				// BaseURL matches a registered poller provider — a stable
+				// configuration property the poller state map cannot answer
+				// for pools the poller has never ticked. Suppress AsOf for
+				// the (tracked && !polled) case; tracked+polled and
+				// untracked (Anthropic, etc.) pools keep their real AsOf
+				// and never set Polled, preserving the AC2 "no delta for
+				// untracked pools" contract.
+				suppressAsOf := false
+				if pl != nil && pollerProviderMatch(b.BaseURL) {
+					if ps, ok := pl.Status()[key]; ok && ps.LastSuccess != nil {
+						view.Polled = true
+					} else {
+						suppressAsOf = true
+					}
+				}
+				// Snapshot.AsOf has no `omitempty` tag (changing it would
+				// break quota.Snapshot's own callers and the Store.Get
+				// contract — AC6). When the view suppresses AsOf it
+				// re-marshals the view with AsOf stripped, so the wire
+				// shape stays clean and the AC5 contract ("no as_of for
+				// never-polled tracked pool") holds.
+				if suppressAsOf {
+					_ = encodeViewWithoutAsOf(w, view)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(view)
 				return
 			}
 		}
@@ -570,7 +681,13 @@ func clearHandler(pools *auto.Pools) http.HandlerFunc {
 // poolHandler serves GET /_gateway/pool — the per-member health view for
 // every configured pool. With ?pool=<name> it returns a single pool; without
 // the param it returns all pools in sorted order. Non-GET returns 405.
-func poolHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
+//
+// pl carries the per-pool poller liveness observation (issue #247). It may
+// be nil (e.g. tests that bypass the poller goroutine), in which case the
+// poller field is omitted from every response — same behaviour as the
+// handler omitting it for untracked pools. Handler-owned: it does not own
+// the poller goroutine; the caller wires that.
+func poolHandler(store *quota.Store, pools *auto.Pools, pl *poller.Poller) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -580,10 +697,10 @@ func poolHandler(store *quota.Store, pools *auto.Pools) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		poolName := backend.NormalizeName(r.URL.Query().Get("pool"))
 		if poolName == "" {
-			_ = json.NewEncoder(w).Encode(pools.AllPoolStatuses(store))
+			_ = json.NewEncoder(w).Encode(pools.AllPoolStatuses(store, pl))
 			return
 		}
-		status, ok := pools.PoolStatus(poolName, store)
+		status, ok := pools.PoolStatus(poolName, store, pl)
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool not found"})

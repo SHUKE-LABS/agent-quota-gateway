@@ -658,6 +658,7 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
 {
   "pool": "auto",
   "active": "b",
+  "poller": { "last_success": "2026-07-13T11:58:42Z", "last_error": "", "last_error_at": null, "consecutive_failures": 0, "stale": false },
   "members": [
     { "nick": "a", "status": "exhausted", "exhausted_until": "2026-06-15T18:00:00Z", "snapshot": { ... }, "disabled": false, "parked": true  },
     { "nick": "b", "status": "active",    "exhausted_until": null,                   "snapshot": { ... }, "disabled": false, "parked": false },
@@ -699,6 +700,20 @@ out-of-band disable (another tab, the API, another operator).
 state is learned only from real proxied responses. An idle or never-active
 member will have `snapshot: null` or a stale value. This is intentional:
 probing would start a new session and consume quota.
+
+**`poller`** is the per-pool liveness observation (issue #247) for pools
+the background poller tracks (Z.ai / ZhipuAI, MiniMaxi, Volcengine Ark).
+It is **omitted entirely** for untracked pools — Anthropic and any
+provider without a registered proprietary quota endpoint carry no `poller`
+key, so an Anthropic-only deployment sees no delta. `last_success` is
+`null` for a never-polled pool and an RFC 3339 timestamp after the first
+successful poll. `last_error` / `last_error_at` populate only after a
+failure; `consecutive_failures` resets to zero on success. `stale` is
+the derived verdict — `true` when no successful poll has arrived in
+`StaleAfterIntervals × poll_interval` (default 3 × 2 minutes), or when
+the pool has never been polled. The UI renders a per-pool badge whose
+colour and label track this state ("poller ok" / "poller stale" /
+"poller failing (Nx)" / "never polled").
 
 `?pool=<unknown>` returns HTTP 404. The endpoint is `GET`-only; non-GET
 returns `405` with `Allow: GET`.
@@ -1041,10 +1056,21 @@ the operator's signal that the gateway is in env-only mode and that
 runtime mutations will be lost on the next restart; the body is the
 canonical surface for this state, and `GET /_gateway/config` advertises
 the same state via the `X-AQG-Persistence` response header (see
-"Watching for a lagging flush" above). A strict readiness probe should
-assert on `status` rather than a byte-for-byte body match. Like
-`/_gateway/quota`, it is `GET`-only; any other method returns `405` with
-an `Allow: GET` response header.
+"Watching for a lagging flush" above).
+
+When the background poller (issue #247) detects at least one tracked pool
+with no successful poll for `StaleAfterIntervals × poll_interval` (default
+3 × 2 minutes), the response gains the additive field
+`"poller_health":"stale"`. The field is **omitted** when every tracked
+pool is healthy — its absence means "ok". A tracked pool that has never
+been polled, or that is currently sticky on an untracked backend (Anthropic
+or any other provider the poller does not recognise), reads stale the same
+way: no fresh out-of-band exhaustion signal has arrived. Anthropic-only
+deployments carry no `poller_health` field at all (no tracked pools).
+
+A strict readiness probe should assert on `status` rather than a byte-for-byte
+body match. Like `/_gateway/quota`, it is `GET`-only; any other method
+returns `405` with an `Allow: GET` response header.
 
 ## Security model
 
