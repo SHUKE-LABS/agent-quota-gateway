@@ -328,7 +328,7 @@ Declaring both is a startup error.
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
-| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file's `config` / `added_pools` keys are ignored on load (the first-deploy bootstrap reads them once; see [Config file](#config-file)). |
+| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles and removes only a legacy `priority_override` as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
 | `AQG_DEBUG_LOG_REQUESTS` | _(unset)_ | Set to `1` to dump every inbound request and outbound upstream request to stderr for debugging; any other value (or unset) leaves it off. Credentials are always redacted — the `Authorization` and `x-api-key` headers are never logged — but the inbound request body is dumped and may contain user message content, so enable only in dev/debug runs. |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
@@ -382,6 +382,38 @@ separate persisted overlay: the state file holds only runtime *observation*
   `./aqg.json`), the gateway runs in **env-only mode**: pools come from the
   environment, nothing is written to disk (zero credentials on disk — the local
   dev default), and UI mutations are in-memory only.
+
+**Legacy state-file operator intent (issue #241):**
+
+When the deploy pins `AQG_CONFIG` to a fixed path under the systemd
+`StateDirectory`, `aqg.json` is never overwritten by a redeploy — so a
+pre-existing `aqg.json` survives every upgrade. A legacy operator who adjusted
+a pool's priority through the pre-#198 runtime API may still have that adjustment
+recorded as `config.<pool>.priority_override` in the state file.
+
+On every config-file start the gateway reconciles that legacy priority into
+`aqg.json` before serving, then removes the consumed `priority_override` key
+from the state file. The deletion is the migration lock: after it succeeds,
+`aqg.json` is the sole source of priority intent and later UI changes are not
+reverted on restart. A crash after the config write but before key deletion is
+safe — the next start sees the same exact order, leaves `aqg.json` untouched,
+and retries the deletion. A state-file deletion failure is logged but does not
+prevent startup; cleanup is retried on the next start.
+
+If `aqg.json` declares no `state_file`, this migration alone probes
+`AQG_STATE_FILE` and then `$STATE_DIRECTORY/state.json` for a legacy overlay.
+The discovered location is not written into `aqg.json` and does not re-enable
+runtime persistence. A non-empty configured `state_file` is always used as-is;
+the gateway never probes past it to a possibly stale file.
+
+Legacy priority nicks are normalized, filtered to current pool members, and
+deduplicated before migration. A priority with no surviving member fails
+startup and names the state/config paths that need repair. A missing pool is
+logged and skipped. A pool that now uses balance mode keeps that newer mode and
+has the superseded legacy priority key consumed. Other legacy overlay keys are
+not replayed on this existing-file path. Hand-adding a new
+`priority_override` after it has been consumed does not create a supported live
+overlay; priority changes belong in `aqg.json` or the UI/API.
 
 A malformed file, an unknown JSON key, or a file with looser-than-0600
 permissions causes startup to fail closed — no silent fallback to env.
