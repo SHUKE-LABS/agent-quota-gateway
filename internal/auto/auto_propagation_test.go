@@ -1,6 +1,8 @@
 package auto
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"testing"
@@ -279,8 +281,8 @@ func TestCredentialPark_halfOpenPickerSkipsPropagatedPark(t *testing.T) {
 
 	c.mu.Lock()
 	c.curNick = "x"
-	c.credentialPark["x"] = clock.now().Add(time.Hour) // still future — must be skipped
-	c.exhausted["y"] = clock.now().Add(-time.Minute)   // live-429 reset already elapsed
+	c.credentialPark["x"] = credentialParkEntry{reset: clock.now().Add(time.Hour)} // still future — must be skipped
+	c.exhausted["y"] = clock.now().Add(-time.Minute)                               // live-429 reset already elapsed
 	c.mu.Unlock()
 
 	nick, ok := c.nextParkedButResetPassed()
@@ -359,8 +361,12 @@ func TestCredentialPark_persistRoundTrip(t *testing.T) {
 	}
 	saved := p1.PersistState()
 
-	if len(saved["b"].CredentialPark) != 1 || saved["b"].CredentialPark["ccz"].IsZero() {
+	entry, ok := saved["b"].CredentialPark["ccz"]
+	if len(saved["b"].CredentialPark) != 1 || !ok || entry.Reset.IsZero() {
 		t.Fatalf("PersistState()[b].CredentialPark=%v, want a future ccz entry", saved["b"].CredentialPark)
+	}
+	if entry.WindowFact {
+		t.Errorf("PersistState()[b].CredentialPark[ccz].WindowFact=true, want false (401/403 subclass)")
 	}
 
 	p2 := loadMovePools(t, clock, propagationEnv())
@@ -381,10 +387,10 @@ func TestCredentialPark_loadCredentialParkDropsAbsentNick(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, nil, "x", "y")
 
-	c.loadCredentialPark(map[string]time.Time{
-		"x":       clock.now().Add(time.Hour),  // present member — kept
-		"removed": clock.now().Add(time.Hour),  // not a member — dropped
-		"y":       clock.now().Add(-time.Hour), // present but already expired — dropped
+	c.loadCredentialPark(map[string]CredentialParkPersist{
+		"x":       {Reset: clock.now().Add(time.Hour)},  // present member — kept
+		"removed": {Reset: clock.now().Add(time.Hour)},  // not a member — dropped
+		"y":       {Reset: clock.now().Add(-time.Hour)}, // present but already expired — dropped
 	})
 
 	c.mu.Lock()
@@ -452,15 +458,256 @@ func TestParkSameNickTwoPoolsRace(t *testing.T) {
 
 	ca, cb, cc := p.byPool["a"], p.byPool["b"], p.byPool["c"]
 	ca.mu.Lock()
-	resetA := ca.credentialPark["ccz"]
+	entryA, okA := ca.credentialPark["ccz"]
 	ca.mu.Unlock()
 	cb.mu.Lock()
-	resetB := cb.credentialPark["ccz"]
+	entryB, okB := cb.credentialPark["ccz"]
 	cb.mu.Unlock()
 	cc.mu.Lock()
-	resetC := cc.credentialPark["ccz"]
+	entryC, okC := cc.credentialPark["ccz"]
 	cc.mu.Unlock()
-	if !resetA.Equal(resetB) || !resetA.Equal(resetC) {
-		t.Errorf("credentialPark reset diverged across pools: a=%v b=%v c=%v", resetA, resetB, resetC)
+	// Presence, not just equality, is the real assertion here: a fixedClock
+	// means every record429WithSource call computes the identical
+	// now+defaultExhaustionWindow bound, so comparing only the values would
+	// pass just as well if propagation silently wrote nothing at all (three
+	// zero-value reads are "equal" too).
+	if !okA || !okB || !okC {
+		t.Fatalf("credentialPark[ccz] missing somewhere: a=%v b=%v c=%v", okA, okB, okC)
+	}
+	if entryA.reset.IsZero() || entryB.reset.IsZero() || entryC.reset.IsZero() {
+		t.Fatalf("credentialPark[ccz] reset is zero somewhere: a=%v b=%v c=%v", entryA.reset, entryB.reset, entryC.reset)
+	}
+	if !entryA.reset.Equal(entryB.reset) || !entryA.reset.Equal(entryC.reset) {
+		t.Errorf("credentialPark reset diverged across pools: a=%v b=%v c=%v", entryA.reset, entryB.reset, entryC.reset)
+	}
+}
+
+// TestCredentialPark_headerlessResidueRetiredByFreshStore is a regression for
+// a #254 rescue-review finding: credentialPark's read-path used to exempt
+// BOTH subclasses from storeReconcilesParkLocked (#145), but only the 401/403
+// subclass deserves that exemption. The header-less-429 residue (windowFact
+// true) is a real quota-window fact, so a fresh healthy store snapshot must
+// retire it early exactly like an ordinary c.exhausted entry — otherwise it
+// over-parks for the full defaultExhaustionWindow even after the account is
+// demonstrably fine again.
+func TestCredentialPark_headerlessResidueRetiredByFreshStore(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	c.record429WithSource("a", clock.now().Add(5*time.Hour), true, true) // headerless-429 residue
+
+	if _, ok := c.exhaustedUntil("a"); !ok {
+		t.Fatalf("a should be parked before the store goes fresh+healthy")
+	}
+
+	putUtil(t, store, c, "a", 0.1, clock.now().Add(2*time.Hour))
+
+	if until, ok := c.exhaustedUntil("a"); ok {
+		t.Errorf("a still exhaustedUntil=%v after a fresh healthy store snapshot, want retired (#145 applies to the header-less-429 residue)", until)
+	}
+}
+
+// TestCredentialPark_authFatalNotRetiredByFreshStore is the 401/403
+// counterpart: a fresh healthy store snapshot must NOT retire that subclass
+// early — it proves the account isn't quota-exhausted, not that a
+// since-revoked credential authenticates again.
+func TestCredentialPark_authFatalNotRetiredByFreshStore(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	c.record429WithSource("a", clock.now().Add(5*time.Hour), true, false) // 401/403
+
+	putUtil(t, store, c, "a", 0.1, clock.now().Add(2*time.Hour))
+
+	if _, ok := c.exhaustedUntil("a"); !ok {
+		t.Errorf("a retired by a fresh healthy store snapshot, want still parked (401/403 is never store-reconciled)")
+	}
+}
+
+// TestCredentialPark_recoveryProbeClearsCredentialPark is a regression for a
+// #254 rescue-review finding: recoverParked's successful-probe branch used to
+// delete only c.exhausted, leaving a mirrored credentialPark entry in place —
+// so a nick parked via record429WithSource (either store-unrepresentable
+// subclass) stayed unavailable (isUnavailableLocked unions both maps) even
+// after a live health probe proved it recovered, while the caller still
+// reported the nick "recovered" and pointed sticky at it.
+func TestCredentialPark_recoveryProbeClearsCredentialPark(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newRecoverFixture(t, clock, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":{"limits":[
+			{"type":"TOKENS_LIMIT","percentage":50,"nextResetTime":4102444800000},
+			{"type":"TIME_LIMIT","percentage":30,"nextResetTime":4105046400000}
+		]}}`)
+	})
+
+	c.record429WithSource("a", clock.now().Add(5*time.Hour), true, false) // 401/403-style
+
+	c.mu.Lock()
+	_, hadCP := c.credentialPark["a"]
+	c.mu.Unlock()
+	if !hadCP {
+		t.Fatalf("credentialPark[a] missing before probe")
+	}
+
+	got := c.tryRecoverParked()
+	if got != "a" {
+		t.Fatalf("tryRecoverParked = %q, want %q (probe returned healthy)", got, "a")
+	}
+	if _, ok := c.exhaustedUntil("a"); ok {
+		t.Errorf("a still exhaustedUntil after successful recovery probe")
+	}
+
+	c.mu.Lock()
+	_, stillCP := c.credentialPark["a"]
+	c.mu.Unlock()
+	if stillCP {
+		t.Errorf("credentialPark[a] still present after recovery probe — member remains unavailable despite being reported recovered")
+	}
+}
+
+// TestNoteRecovered_clearsWindowFactNotAuthFatal is a regression for a #254
+// rescue-review finding: the preemptor's noteRecovered used to delete only
+// c.exhausted, so a precise store-reset supersession never actually made a
+// credentialPark'd member selectable again. It must clear the
+// header-less-429 residue (windowFact true — a real quota-window fact the
+// precise reset is entitled to supersede) but must never clear a 401/403
+// entry (windowFact false — a precise quota reset proves nothing about
+// whether a since-revoked credential authenticates again).
+func TestNoteRecovered_clearsWindowFactNotAuthFatal(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, nil, "x", "y")
+
+	c.mu.Lock()
+	c.exhausted["x"] = clock.now().Add(5 * time.Hour)
+	c.credentialPark["x"] = credentialParkEntry{reset: clock.now().Add(5 * time.Hour), windowFact: true}
+	c.exhausted["y"] = clock.now().Add(5 * time.Hour)
+	c.credentialPark["y"] = credentialParkEntry{reset: clock.now().Add(5 * time.Hour), windowFact: false}
+	c.mu.Unlock()
+
+	c.noteRecovered("x")
+	c.noteRecovered("y")
+
+	c.mu.Lock()
+	_, xCP := c.credentialPark["x"]
+	_, yCP := c.credentialPark["y"]
+	_, xExh := c.exhausted["x"]
+	_, yExh := c.exhausted["y"]
+	c.mu.Unlock()
+
+	if xCP {
+		t.Errorf("credentialPark[x] present after noteRecovered, want cleared (windowFact residue — precise reset supersedes it)")
+	}
+	if !yCP {
+		t.Errorf("credentialPark[y] cleared after noteRecovered, want retained (401/403 — a quota reset proves nothing about credential liveness)")
+	}
+	if xExh || yExh {
+		t.Errorf("exhausted map not cleared by noteRecovered for x or y: x=%v y=%v", xExh, yExh)
+	}
+}
+
+// TestCredentialPark_clearDoesNotWipeSiblingsOwnWindowedPark is a regression
+// for a #254 rescue-review finding: propagateCredentialParkClear used to drop
+// a sibling's c.exhausted entry unconditionally whenever the sibling held a
+// credentialPark entry for the same nick, even when that exhausted entry was
+// a genuinely unrelated, independently-observed windowed 429 (a different
+// reset). Only an exhausted entry that is the exact mirror of the
+// credentialPark entry being released (same reset) may be dropped alongside
+// it.
+func TestCredentialPark_clearDoesNotWipeSiblingsOwnWindowedPark(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	p := loadMovePools(t, clock, propagationEnv())
+	reg := p.CurrentRegistry()
+	bCCZinA, _ := reg.ResolveIn("a", "ccz")
+
+	if err := p.ModifyResponse(respAuth(bCCZinA, http.StatusUnauthorized)); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+
+	// Pool b independently observes its own genuine windowed 429 for ccz —
+	// unrelated to the propagated credential park, with a different reset.
+	cb := p.byPool["b"]
+	genuineReset := clock.now().Add(30 * time.Minute)
+	cb.record429WithSource("ccz", genuineReset, false, false)
+
+	if _, _, ok := p.ClearExhaustedNick("a", "ccz"); !ok {
+		t.Fatalf("ClearExhaustedNick(a, ccz) ok=false")
+	}
+
+	cb.mu.Lock()
+	_, hasCP := cb.credentialPark["ccz"]
+	exhReset, hasExh := cb.exhausted["ccz"]
+	cb.mu.Unlock()
+	if hasCP {
+		t.Errorf("pool b: credentialPark[ccz] still present after clear on a")
+	}
+	if !hasExh || !exhReset.Equal(genuineReset) {
+		t.Errorf("pool b: exhausted[ccz]=%v ok=%v, want the genuine independently-observed reset %v preserved", exhReset, hasExh, genuineReset)
+	}
+}
+
+// TestClearAllExhausted_deterministicReport is a regression for a #254
+// rescue-review finding: ClearAllExhausted used to report each pool's
+// cleared nicks from ClearExhausted's own return value, which depends on
+// controllersSnapshot()'s nondeterministic map iteration order — a pool
+// visited after its propagator had already had the nick cleared out from
+// under it by propagation, and reported nothing for a nick it demonstrably
+// held. Repeated runs must report every pool's parked nick consistently
+// regardless of visit order.
+func TestClearAllExhausted_deterministicReport(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+		p := loadMovePools(t, clock, propagationEnv())
+		reg := p.CurrentRegistry()
+		bCCZinA, _ := reg.ResolveIn("a", "ccz")
+		if err := p.ModifyResponse(respAuth(bCCZinA, http.StatusUnauthorized)); err != nil {
+			t.Fatalf("ModifyResponse: %v", err)
+		}
+
+		out := p.ClearAllExhausted()
+		for _, pool := range []string{"a", "b", "c"} {
+			nicks := out[pool]
+			if len(nicks) != 1 || nicks[0] != "ccz" {
+				t.Fatalf("iteration %d: ClearAllExhausted()[%s]=%v, want [ccz] regardless of controller visit order", i, pool, nicks)
+			}
+		}
+	}
+}
+
+// TestNoteRecovered_propagatesWindowFactClearToSiblings is a regression for a
+// #254 rescue-review finding surfaced on re-verification: noteRecovered only
+// dropped its own controller's windowFact credentialPark entry, never
+// propagating the clear. The preemptor's trigger (tick, preempt.go) accepts a
+// frozen store snapshot as long as its precise reset has passed — looser than
+// storeReconcilesParkLocked's freshness gate — so a sibling reading the same
+// frozen snapshot cannot always reconcile the entry away on its own next
+// read, and would keep reporting the nick Parked after a sibling's
+// noteRecovered released it, violating AC4 (no pool may disagree on parked
+// for a store-unrepresentable park).
+func TestNoteRecovered_propagatesWindowFactClearToSiblings(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	p := loadMovePools(t, clock, propagationEnv())
+	reg := p.CurrentRegistry()
+	bCCZinA, _ := reg.ResolveIn("a", "ccz")
+
+	// Headerless 429 residue on a, propagated into b and c.
+	if err := p.ModifyResponse(resp429(bCCZinA, clock, 0)); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+	for _, pool := range []string{"a", "b", "c"} {
+		status, _ := p.PoolStatus(pool, quota.NewStore(), nil)
+		if !memberParked(status, "ccz") {
+			t.Fatalf("pool %s: ccz Parked=false before noteRecovered, want true", pool)
+		}
+	}
+
+	p.byPool["a"].noteRecovered("ccz")
+
+	for _, pool := range []string{"a", "b", "c"} {
+		status, _ := p.PoolStatus(pool, quota.NewStore(), nil)
+		if memberParked(status, "ccz") {
+			t.Errorf("pool %s: ccz still Parked=true after noteRecovered on a, want released everywhere", pool)
+		}
 	}
 }

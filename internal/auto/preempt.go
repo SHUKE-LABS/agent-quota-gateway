@@ -329,11 +329,38 @@ func (c *Controller) PreemptTo(nick string) bool {
 // carried no reset header) has not yet elapsed: the precise signal
 // supersedes the default. Clearing the mark lets the following PreemptTo —
 // and any request-path resolve — treat the member as selectable again.
+//
+// Also drops nick's credentialPark entry (issue #254), but only when
+// windowFact is true — the header-less-429 residue this comment describes
+// is exactly that subclass, a real quota-window fact the precise store
+// reset is entitled to supersede. A 401/403 entry (windowFact false) is left
+// untouched: a precise quota-window reset says nothing about whether a
+// since-revoked credential authenticates again, so it must never clear that
+// subclass.
+//
+// Propagates the clear to sibling pools when it drops a windowFact entry,
+// same as an explicit operator clear (AC4/AC5): the preemptor's trigger
+// (tick, above) accepts a frozen store snapshot as long as its reset has
+// passed, which is looser than storeReconcilesParkLocked's freshness gate —
+// so a sibling reading the same frozen snapshot cannot always reconcile the
+// entry away on its own next read, and would otherwise disagree on `parked`
+// with the pool that just cleared it. Safe to call with c.mu released: tick's
+// caller (p.controllers(), i.e. Pools.sortedControllers) already returns its
+// slice after releasing p.mu, so no lock is held here to invert against.
 func (c *Controller) noteRecovered(nick string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	delete(c.exhausted, nick)
+	var clearedWindowFact bool
+	if entry, ok := c.credentialPark[nick]; ok && entry.windowFact {
+		delete(c.credentialPark, nick)
+		clearedWindowFact = true
+	}
 	c.notifyMutate()
+	c.mu.Unlock()
+
+	if clearedWindowFact && c.propagateParkClear != nil {
+		c.propagateParkClear(nick)
+	}
 }
 
 // rankLocked returns nick's position in the pool's priority order (lower is
