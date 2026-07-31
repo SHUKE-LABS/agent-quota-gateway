@@ -391,24 +391,6 @@ type PoolConfigView struct {
 	BalanceDwell string                 `json:"balance_dwell,omitempty"`
 	Priority     []string               `json:"priority,omitempty"`
 	Members      []PoolMemberConfigView `json:"members"`
-	// WindowLabels is the per-pool column-header hint the UI consumes to
-	// render the second rolling-window cell. Anthropic and MiniMaxi label
-	// it "7d"; Z.AI labels it "monthly" because its long window is monthly
-	// (issue #138). The label is derived from the first member's BaseURL
-	// because every member in a pool shares the same upstream provider.
-	WindowLabels *PoolWindowLabels `json:"window_labels,omitempty"`
-}
-
-// PoolWindowLabels is the per-pool rolling-window label hint the UI
-// consumes to render the long-window column. The field names are
-// `short` / `long` to match the JSON the UI reads (it is the same hint
-// /_gateway/config surfaces in the `window_labels` object). The
-// mapping itself lives in poller.WindowLabelsFor; this local type
-// exists so the auto package can keep the JSON shape independent of
-// any future field additions in poller.WindowLabels.
-type PoolWindowLabels struct {
-	Short string `json:"short"` // e.g. "5h"
-	Long  string `json:"long"`  // e.g. "7d" or "monthly"
 }
 
 // PoolMemberConfigView describes one pool member in the config view.
@@ -642,20 +624,32 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 	}
 	// Resolve base_url to a concrete value so the config record is
 	// self-describing. An unresolved (new-nick) base_url falls back to the
-	// first member's URL; a pool with no members has no default to borrow, so
-	// a genuinely new nick must supply base_url explicitly. (WithMemberSet
-	// would otherwise inherit the pool default, but keeping the explicit
-	// fallback preserves the documented cross-pool-add ergonomics.)
+	// pool's members' URL only when every member already agrees on one
+	// effective upstream — a mixed-provider pool cannot lend its first
+	// member's URL because that member's upstream is alphabetical, not
+	// authoritative (issue #248). A pool with no members has no default to
+	// borrow, so a genuinely new nick must supply base_url explicitly.
+	// (WithMemberSet would otherwise inherit the pool default, but keeping
+	// the explicit fallback preserves the documented cross-pool-add
+	// ergonomics.)
 	if resolvedURL == "" {
-		if len(c.members) > 0 {
-			resolvedURL = c.members[0].BaseURL
-		} else {
+		switch len(c.members) {
+		case 0:
 			// A genuinely new nick in an empty pool has no default to borrow;
 			// require an explicit base_url rather than silently inheriting the
 			// gateway default (which could point a vendor key at the wrong
 			// upstream).
 			c.mu.Unlock()
 			return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no members")
+		default:
+			base := c.members[0].BaseURL
+			for i := 1; i < len(c.members); i++ {
+				if c.members[i].BaseURL != base {
+					c.mu.Unlock()
+					return http.StatusBadRequest, fmt.Errorf("base_url for nick %s is ambiguous across this pool's members; specify it explicitly", normalized)
+				}
+			}
+			resolvedURL = base
 		}
 	}
 	// Placement: a priority target needs an explicit order including nick; a
@@ -905,17 +899,6 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 		allMembers := c.allMemberNicksLocked()
 
 		view.Members = make([]PoolMemberConfigView, 0, len(allMembers))
-
-		// Per-pool window-label hint (issue #138). Every member in a pool
-		// shares the same upstream provider, so the first member's
-		// BaseURL is the right input. An empty pool leaves the field
-		// nil, in which case the UI falls back to "5h"/"7d".
-		if len(allMembers) > 0 {
-			if b, ok := c.backendByNickLocked(allMembers[0]); ok {
-				labels := poolWindowLabelsFor(b.BaseURL)
-				view.WindowLabels = &labels
-			}
-		}
 
 		for _, nick := range allMembers {
 			member := PoolMemberConfigView{
@@ -2194,8 +2177,8 @@ func isCredentialRejected(code int) bool {
 // detected out-of-band by the poller (5h / monthly windows via the quota
 // endpoint), never by a proxy 429. So a z.ai proxy 429 is never a
 // park-worthy exhaustion signal (issue #153). Detection reuses the same
-// URL-keyed provider registry as poolWindowLabelsFor; ProviderFor is a pure
-// match with no network call.
+// URL-keyed provider registry; ProviderFor is a pure match with no network
+// call.
 func isZaiBackend(b backend.Backend) bool {
 	prov, ok := poller.ProviderFor(b.BaseURL)
 	return ok && prov.Name() == "z.ai/zhipu"
@@ -3240,20 +3223,4 @@ func randIndex(n int) int {
 		return 0
 	}
 	return rand.Intn(n)
-}
-
-// poolWindowLabelsFor returns the per-pool rolling-window label hint the
-// UI consumes to render the long-window column. The default is the
-// Anthropic-style "5h" / "7d". Z.AI's long window is monthly (issue
-// #138), so a Z.AI backend gets "5h" / "monthly". Unknown providers fall
-// back to the default; an empty base URL is treated as no provider.
-//
-// This is duplicated with main.WindowLabelsFor so the auto package does
-// not have to import the main package. The two mappings are intentionally
-// identical: they are both a one-line switch on the provider name, and
-// adding a new provider touches both at once. A test in
-// cmd/agent-quota-gateway/main_test.go covers the consumer side.
-func poolWindowLabelsFor(baseURL string) PoolWindowLabels {
-	l := poller.WindowLabelsFor(baseURL)
-	return PoolWindowLabels{Short: l.Short, Long: l.Long}
 }

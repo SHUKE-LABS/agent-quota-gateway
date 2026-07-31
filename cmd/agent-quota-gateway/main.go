@@ -479,20 +479,6 @@ func healthHandler(persistence configfile.PersistenceState, pl *poller.Poller) h
 	}
 }
 
-// WindowLabels is a local alias for poller.WindowLabels so the JSON
-// shape stays package-local. The mapping itself (z.ai/zhipu → monthly,
-// everything else → 7d) lives in poller.WindowLabelsFor — adding a new
-// provider with a non-7d long window is a one-line change there, and
-// both this server and the auto package pick it up automatically.
-type WindowLabels = poller.WindowLabels
-
-// WindowLabelsFor returns the per-pool rolling-window label hint the UI
-// consumes to render the long-window column. Wraps poller.WindowLabelsFor
-// so the JSON-tagged alias above can stay a one-liner.
-func WindowLabelsFor(baseURL string) WindowLabels {
-	return poller.WindowLabelsFor(baseURL)
-}
-
 // quotaViewNoAsOf is the same shape as poolQuotaView but with AsOf
 // re-declared as *time.Time so json.Marshal skips it on the zero value
 // (the standard omitempty convention). Used only when quotaHandler
@@ -501,9 +487,8 @@ func WindowLabelsFor(baseURL string) WindowLabels {
 // identical when present and cleanly absent when suppressed.
 type quotaViewNoAsOf struct {
 	quota.Snapshot
-	ActiveBackend string       `json:"active_backend"`
-	WindowLabels  WindowLabels `json:"window_labels"`
-	Polled        bool         `json:"polled,omitempty"`
+	ActiveBackend string `json:"active_backend"`
+	Polled        bool   `json:"polled,omitempty"`
 	// AsOf shadows the embedded Snapshot.AsOf so the json tag wins.
 	AsOf *time.Time `json:"as_of,omitempty"`
 }
@@ -514,7 +499,6 @@ func encodeViewWithoutAsOf(w http.ResponseWriter, view poolQuotaView) error {
 	return json.NewEncoder(w).Encode(quotaViewNoAsOf{
 		Snapshot:      view.Snapshot,
 		ActiveBackend: view.ActiveBackend,
-		WindowLabels:  view.WindowLabels,
 		Polled:        view.Polled,
 		// AsOf intentionally nil — omitempty drops the key.
 	})
@@ -528,12 +512,6 @@ func encodeViewWithoutAsOf(w http.ResponseWriter, view poolQuotaView) error {
 // zero knowledge of pool membership, and the 99%->5% jump on a switch is
 // self-explained because active_backend changes alongside it.
 //
-// WindowLabels is per-pool because the long-window column means different
-// things for different providers: a 7-day rolling window for Anthropic
-// and MiniMaxi, a monthly window for Z.AI (issue #138). The snapshot
-// struct's 5h/7d field names stay — they are the right data shape; only
-// the human-facing label changes.
-//
 // Polled (issue #247) reports whether this pool has ever been polled
 // successfully. It is omitted entirely (key absent) for pools the
 // poller does not track — Anthropic and any other untracked backend.
@@ -544,9 +522,8 @@ func encodeViewWithoutAsOf(w http.ResponseWriter, view poolQuotaView) error {
 // forwarded as today.
 type poolQuotaView struct {
 	quota.Snapshot
-	ActiveBackend string       `json:"active_backend"`
-	WindowLabels  WindowLabels `json:"window_labels"`
-	Polled        bool         `json:"polled,omitempty"`
+	ActiveBackend string `json:"active_backend"`
+	Polled        bool   `json:"polled,omitempty"`
 }
 
 // quotaHandler returns the JSON snapshot for the requested pool.
@@ -577,7 +554,6 @@ func quotaHandler(store *quota.Store, pools *auto.Pools, pl *poller.Poller) http
 				view := poolQuotaView{
 					Snapshot:      snap,
 					ActiveBackend: b.Nick,
-					WindowLabels:  WindowLabelsFor(b.BaseURL),
 				}
 				// AC5 (issue #247) and review of #267: use the same
 				// config-based "is this pool tracked?" signal as
