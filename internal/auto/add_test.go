@@ -2,6 +2,7 @@ package auto
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
@@ -213,5 +214,63 @@ func TestAdd_configNickReAddAfterRemove(t *testing.T) {
 	}
 	if am.Credential != "cred-x" {
 		t.Errorf("credential=%q, want cred-x", am.Credential)
+	}
+}
+
+// TestAdd_memberBaseURLNotUnanimous proves that AddMember with an omitted
+// base_url is rejected when the target pool already holds members on
+// different effective upstreams (issue #248). The first member's URL is
+// alphabetical, not authoritative: in a mixed-provider pool a new member
+// cannot inherit it without being pointed at the wrong upstream, so the
+// only acceptable input is an explicit base_url. The pool here is set up
+// so the alphabetically first member's BaseURL is the value the legacy
+// fallback would have picked — the test must fail against pre-#248 code.
+func TestAdd_memberBaseURLNotUnanimous(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		// Pool default is z.ai. "a" inherits it (BaseURL = z.ai);
+		// "b" carries a per-member Anthropic override. With
+		// "new" absent, the legacy fallback (c.members[0].BaseURL)
+		// would return the z.ai URL — the test asserts that path is
+		// now blocked.
+		backend.EnvPrefix + "MIX_BASE_URL":  "https://api.z.ai/anthropic",
+		backend.EnvPrefix + "MIX_BACKEND_A": "cred-a",
+		backend.EnvPrefix + "MIX_BACKEND_B": "cred-b|https://api.anthropic.com",
+	})
+
+	status, err := p.AddMember("mix", "new", "cred-new", "", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("mixed pool AddMember without base_url: status=%d err=%v, want 400", status, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "ambiguous across this pool's members") {
+		t.Fatalf("error=%v, want mention of in-pool ambiguity", err)
+	}
+	if _, ok := addedMember(t, p, "mix", "new"); ok {
+		t.Errorf("new was added to mixed pool despite ambiguity")
+	}
+}
+
+// TestAdd_memberBaseURLUnanimous proves the unanimity fallback still fires
+// when every existing member shares one effective base_url — a
+// single-provider pool is unchanged by #248. Mirrors the legacy behavior
+// for the safe case so the migration is invisible to existing operators.
+func TestAdd_memberBaseURLUnanimous(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		// Both members inherit the pool's z.ai default — unanimity holds.
+		backend.EnvPrefix + "SAME_BASE_URL":  "https://api.z.ai/anthropic",
+		backend.EnvPrefix + "SAME_BACKEND_A": "cred-a",
+		backend.EnvPrefix + "SAME_BACKEND_B": "cred-b",
+	})
+
+	if status, err := p.AddMember("same", "new", "cred-new", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("unanimous pool AddMember without base_url: status=%d err=%v, want 200", status, err)
+	}
+	am, ok := addedMember(t, p, "same", "new")
+	if !ok {
+		t.Fatalf("new not added to same pool")
+	}
+	if am.BaseURL != "https://api.z.ai/anthropic" {
+		t.Errorf("inherited base_url=%q, want https://api.z.ai/anthropic", am.BaseURL)
 	}
 }

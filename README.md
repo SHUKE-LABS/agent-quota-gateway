@@ -883,10 +883,15 @@ adds a runtime member. The JSON body is `{"credential": "...", "base_url": "..."
   credential for a nick that already exists elsewhere is rejected with `400`.
 - `base_url` — optional with the same fallback chain as before: omitting it falls
   back to the other-pool resolution (same logic), then to the pool's first static
-  member's URL. Returns `400` if the base_url is ambiguous across other pools;
-  falls back to the pool default when no other pool has a URL for this nick
-  (equivalent to omitting it in a static config). Required only when the pool has
-  no members and no other pool resolves a URL for this nick.
+  member's URL **only when every existing member already agrees on one effective
+  upstream**. In a mixed-provider pool (issue #248) the first member's URL is
+  alphabetical, not authoritative, so an omitted `base_url` is rejected with `400
+  base_url for nick <nick> is ambiguous across this pool's members; specify it
+  explicitly` — the new member would otherwise be silently pointed at whichever
+  provider happened to sort first. Returns `400` if the base_url is ambiguous
+  across other pools; falls back to the pool default when no other pool has a URL
+  for this nick (equivalent to omitting it in a static config). Required only when
+  the pool has no members and no other pool resolves a URL for this nick.
 - `placement` — a JSON array of nicks, highest priority first; **must include**
   the added nick. Required when the target pool is in priority mode — there is no
   implicit insertion position. Rejected with `400` for plain/balanced-mode targets.
@@ -896,6 +901,7 @@ credential* (mode `0600`) and re-read at startup. Status codes: `200` on
 success; `400` on a missing or empty nick, invalid JSON body, missing credential
 (nick not in any other pool), a credential conflicting with the nick's existing
 credential (bijection), invalid `base_url`, ambiguous `base_url` across pools,
+ambiguous `base_url` across the target pool's existing members (issue #248),
 missing `base_url` for a pool with no members and no resolvable URL, missing
 `placement` for a priority target with no existing slot, unknown nick in
 `placement`, `placement` not containing the added nick, duplicate nick in

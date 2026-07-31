@@ -663,22 +663,16 @@
       });
       return out;
     });
-    // window_labels is a pool-level hint (issue #138): Z.AI's long
-    // window is monthly, others are 7d. Pass it through as-is when
-    // present; UI consumers fall back to "5h"/"7d" when missing.
-    var windowLabels = null;
-    if (view.window_labels && typeof view.window_labels === 'object') {
-      windowLabels = {
-        short: String(view.window_labels.short || '5h'),
-        long: String(view.window_labels.long || '7d'),
-      };
-    }
+    // window_labels is gone from the server response (issue #248): the
+    // label was the first member's BaseURL's hint, which flipped across
+    // failover in mixed-provider pools. The column header is now a fixed
+    // string (see renderMembers), so the sanitized view no longer carries
+    // the field.
     return {
       pool: String(view.pool || ''),
       balance_mode: view.balance_mode || '',
       priority: Array.isArray(view.priority) ? view.priority.slice() : [],
       members: members,
-      window_labels: windowLabels,
     };
   }
 
@@ -830,13 +824,14 @@
 
     // Provider-agnostic column headers (issue #154): the long-window
     // header used to be inferred from the active member's base URL via
-    // view.window_labels.long (issue #138), so it flipped across failover
-    // (z.ai monthly <-> Anthropic 7d) and had no single correct value for
-    // a mixed pool — while the cell data always lives in unified_7d_*
-    // regardless. A pool name carries no window semantics, so the header
-    // is now a fixed string. The provider switch still drives lead-routing
-    // math (poller.LongWindowFor, issue #140); only this UI label dropped
-    // its dependency on it. CSS text-transform:uppercase renders these.
+    // the server's window_labels hint (issue #138), so it flipped across
+    // failover (z.ai monthly <-> Anthropic 7d) and had no single correct
+    // value for a mixed pool — while the cell data always lives in
+    // unified_7d_* regardless. A pool name carries no window semantics, so
+    // the header is now a fixed string. The provider switch still drives
+    // lead-routing math (poller.LongWindowFor, issue #140); only this UI
+    // label dropped its dependency on it (issue #248). CSS
+    // text-transform:uppercase renders these.
     var thead = document.createElement('thead');
     var trh = document.createElement('tr');
     ['Nick', 'Status', '5H', '5H reset', '7/30D', '7/30D reset', ''].forEach(function (h) {
@@ -1186,6 +1181,39 @@
     form.appendChild(cred);
     form.appendChild(pool);
     form.appendChild(poolName);
+
+    // Mark base_url required when the chosen pool's existing members do
+    // not unanimously share one effective base URL (issue #248): a
+    // mixed-provider pool cannot lend its first member's URL to a new
+    // member, so the only acceptable input is an explicit value. The
+    // currentViews entry already carries each member's base_url; the check
+    // is local and runs on build + on every pool selector change.
+    function membersAgree(v) {
+      var ms = v && v.members;
+      if (!ms || !ms.length) return true;
+      var base = ms[0].base_url;
+      for (var i = 1; i < ms.length; i++) {
+        if (ms[i].base_url !== base) return false;
+      }
+      return true;
+    }
+    function refreshBaseUrlRequirement() {
+      var creating = pool.value === NEW_POOL;
+      if (creating) {
+        base.required = false;
+        base.placeholder = 'base_url (optional)';
+        return;
+      }
+      var target = null;
+      for (var i = 0; i < views.length; i++) {
+        if (views[i].pool === pool.value) { target = views[i]; break; }
+      }
+      var ambiguous = target && !membersAgree(target);
+      base.required = !!ambiguous;
+      base.placeholder = ambiguous ? 'base_url (required: members disagree)' : 'base_url (optional)';
+    }
+    pool.addEventListener('change', refreshBaseUrlRequirement);
+    refreshBaseUrlRequirement();
 
     // toggleNewPool reveals/hides the new-pool field and adjusts the nick
     // placeholder (nick is optional when creating a pool). Called on build and

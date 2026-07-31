@@ -481,18 +481,6 @@ func (p *Poller) pollOne(ctx context.Context, prov provider, b backend.Backend) 
 // is monthly for z.ai/zhipu, weekly for everything else).
 func (p provider) Name() string { return p.name }
 
-// WindowLabels describes how the UI should label the two rolling-window
-// columns in the pool table. The short window is always the 5h-equivalent
-// ("5h"). The long window is provider-aware: most providers report a
-// 7-day rolling window ("7d"); Z.AI's long window is monthly ("monthly",
-// see issue #138) because its upstream TIME_LIMIT entry is the monthly
-// quota. The snapshot's unified_7d_* fields are still the right data
-// shape for any long window; only the human label moves.
-type WindowLabels struct {
-	Short string // "5h"
-	Long  string // "7d" or "monthly"
-}
-
 const (
 	// longWindow7d is the default long-window length: the Anthropic-style
 	// 7-day rolling window.
@@ -505,12 +493,12 @@ const (
 	longWindowMonthly = 30 * 24 * time.Hour
 )
 
-// longWindowSpec bundles the per-provider long-window label, length, and
-// whether the window is a genuine chat-blocking signal, so the three cannot
-// drift: all are produced by the single switch in longWindowSpecFor. The
-// label feeds the UI column header; the length feeds the lead-routing
-// elapsed-fraction math (issue #140); blocksExhaustion feeds the auto
-// package's exhaustion/failover/balance decisions (issue #192).
+// longWindowSpec bundles the per-provider long-window length and whether
+// the window is a genuine chat-blocking signal, so the two cannot drift:
+// both are produced by the single switch in longWindowSpecFor. The length
+// feeds the lead-routing elapsed-fraction math (issue #140);
+// blocksExhaustion feeds the auto package's exhaustion/failover/balance
+// decisions (issue #192).
 //
 // blocksExhaustion is true for the default 7d window (Anthropic's real
 // weekly window, and MiniMaxi's / Ark's weekly caps, are genuine chat
@@ -518,49 +506,42 @@ const (
 // TIME_LIMIT value, which is Z.AI's Total Monthly Web Search / Reader /
 // Zread tool quota — Z.AI has no weekly/monthly *chat* quota at all — so
 // letting it park a member would pull a chat-healthy backend out of
-// rotation for a reason unrelated to chat throughput (issue #192). The
-// snapshot/UI data path is unaffected: parseZhipu still fills the
-// unified_7d_* slot and the column is still labeled "monthly".
+// rotation for a reason unrelated to chat throughput (issue #192).
 type longWindowSpec struct {
-	label            string
 	length           time.Duration
 	blocksExhaustion bool
 }
 
-// longWindowSpecFor is the single provider switch behind WindowLabelsFor,
-// LongWindowFor, and LongWindowBlocksExhaustion. The default is the
-// Anthropic-style "7d" / 7-day / chat-blocking window. Z.AI's long window
-// is monthly (issues #138/#140) and is NOT a chat-blocking signal (issue
-// #192), so a Z.AI backend gets "monthly" / ~30-day / non-blocking. Adding
-// a new provider with a non-default long window is a one-line change here —
-// the only switch on provider name for window shape.
+// longWindowSpecFor is the single provider switch behind LongWindowFor
+// and LongWindowBlocksExhaustion. The default is the Anthropic-style
+// 7-day / chat-blocking window. Z.AI's long window is monthly (issues
+// #138/#140) and is NOT a chat-blocking signal (issue #192), so a Z.AI
+// backend gets ~30-day / non-blocking. Adding a new provider with a
+// non-default long window is a one-line change here — the only switch on
+// provider name for window shape.
+//
+// The pre-#248 label half of the spec was retired together with the
+// window_labels hint: every member in a pool was assumed to share one
+// upstream provider, so the first member's BaseURL fed the UI column
+// header. In a mixed pool the label flipped across failover (issue
+// #154), and the UI fixed the header to "7/30D". The hint now has no
+// consumer, and `label` was dropped from this struct alongside it.
 func longWindowSpecFor(baseURL string) longWindowSpec {
 	if p, ok := ProviderFor(baseURL); ok {
 		switch p.Name() {
 		case "z.ai/zhipu":
-			return longWindowSpec{label: "monthly", length: longWindowMonthly, blocksExhaustion: false}
+			return longWindowSpec{length: longWindowMonthly, blocksExhaustion: false}
 		}
 	}
-	return longWindowSpec{label: "7d", length: longWindow7d, blocksExhaustion: true}
-}
-
-// WindowLabelsFor returns the per-pool rolling-window label hint the UI
-// consumes to render the long-window column. The default is the
-// Anthropic-style "5h" / "7d". Z.AI's long window is monthly (issue
-// #138), so a Z.AI backend gets "5h" / "monthly". Unknown providers and
-// an empty base URL fall back to the default.
-//
-// Centralised here so both the auto package (building PoolConfigView)
-// and the main package (building poolQuotaView) can share one mapping.
-func WindowLabelsFor(baseURL string) WindowLabels {
-	return WindowLabels{Short: "5h", Long: longWindowSpecFor(baseURL).label}
+	return longWindowSpec{length: longWindow7d, blocksExhaustion: true}
 }
 
 // LongWindowFor returns the per-pool long-window length used for the
 // lead-routing elapsed-fraction (issue #140). It shares the single
-// provider switch with WindowLabelsFor so the routing math and the UI
-// label always agree on which window a pool's long slot represents:
-// ~30-day for Z.AI/Zhipu (its monthly TIME_LIMIT), 7-day otherwise.
+// provider switch with LongWindowBlocksExhaustion so the routing math
+// and the exhaustion gate always agree on which window a pool's long
+// slot represents: ~30-day for Z.AI/Zhipu (its monthly TIME_LIMIT),
+// 7-day otherwise.
 func LongWindowFor(baseURL string) time.Duration {
 	return longWindowSpecFor(baseURL).length
 }
@@ -568,12 +549,12 @@ func LongWindowFor(baseURL string) time.Duration {
 // LongWindowBlocksExhaustion reports whether a pool's long (7d/monthly)
 // window is a genuine chat-blocking signal that the auto package should let
 // drive exhaustion/failover/balance decisions. It shares the single
-// provider switch with LongWindowFor / WindowLabelsFor. True for the
-// default 7-day window (Anthropic/MiniMaxi/Ark weekly caps are real chat
-// quotas); false for Z.AI/Zhipu, whose monthly TIME_LIMIT slot is a
-// web-search/reader/zread tool quota, not chat throughput (issue #192).
-// Unknown providers and an empty base URL fall back to the blocking
-// default — fail closed rather than silently drop a real cap.
+// provider switch with LongWindowFor. True for the default 7-day window
+// (Anthropic/MiniMaxi/Ark weekly caps are real chat quotas); false for
+// Z.AI/Zhipu, whose monthly TIME_LIMIT slot is a web-search/reader/zread
+// tool quota, not chat throughput (issue #192). Unknown providers and an
+// empty base URL fall back to the blocking default — fail closed rather
+// than silently drop a real cap.
 func LongWindowBlocksExhaustion(baseURL string) bool {
 	return longWindowSpecFor(baseURL).blocksExhaustion
 }
@@ -907,8 +888,7 @@ func hmacSHA256(key []byte, data string) []byte {
 // Z.AI's TIME_LIMIT is the **monthly** quota, not a 7-day rolling window
 // (issue #138). We keep storing it in the Unified7d* snapshot slot — that
 // is the right data shape for a long-window utilization + reset — and let
-// the UI label the column "monthly" for Z.AI pools (see
-// poolQuotaView.WindowLabels in cmd/agent-quota-gateway/main.go).
+// the UI label the column "monthly" for Z.AI pools.
 //
 // Any limit type that is not one of the two explicitly recognised ones
 // (e.g. an upstream "MONTHLY_LIMIT" or "MONTH_LIMIT" string Z.AI may add
