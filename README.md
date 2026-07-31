@@ -580,6 +580,25 @@ reconciliation is backend-agnostic and self-correcting — if a forwarded
 request still genuinely `429`s, its blocking headers refresh the store and
 the member re-parks.
 
+**Store-derived park from a polled snapshot at the cap** (issue #251). The
+quota store tracks each member's `as_of` timestamp; when the poller's
+most recent measurement lands a member at utilization 1.0 (or `rejected`
+status), the gateway asserts the member into an exhausted mark once on
+the next routing decision. If the snapshot carries a usable future
+reset, the park ends at that reset. If it carries no reset (the
+upstream `429` omitted it, or the poller's prior 5h field is the only
+data), the park runs for `defaultExhaustionWindow` (5 h) from
+`snap.AsOf` — a deliberate over-park rather than a probe. The
+as-of-anchored bound is deterministic across reads (it does not re-arm
+on each query), and the assert-once prevents a flap on the poll cycle
+where the parked member's snapshot ages out minutes later. The
+operator escape hatch is `POST /_gateway/clear` (and the per-nick
+clear); clearing a store-derived park while a fresh at-cap snapshot is
+on file does not move the member — the next routing decision
+re-asserts the park from the store. See the comment at
+`auto.go:windowBlocks` for the freshness threshold and the
+poll-interval coupling the rule depends on.
+
 The **z.ai throttle absorbed** flavour: a z.ai proxy `429` is always the
 `1302` "Rate limit reached for requests" concurrency throttle (emitted when
 the GLM Coding Plan concurrency cap — often as low as 1 — is hit), never
