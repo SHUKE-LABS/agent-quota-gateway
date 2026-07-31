@@ -618,7 +618,7 @@ member serves again, so the gateway backs off without switching or
 parking. It is identified by the rate-limit signature — an upstream
 `retry-after` and/or the legacy `anthropic-ratelimit-requests-*` /
 `-tokens-*` per-minute headers — which separates it from a genuine
-quota-window `429` (`unified-status: rejected`, which parks) and from a
+quota-window `429` (`unified-5h-status` / `unified-7d-status` is `rejected`, which parks) and from a
 policy `429` (no rate-limit headers, e.g. an "unsupported third-party
 client" rejection, which forwards the upstream body on a `503` with the
 fixed 1 s hint). The per-minute headers are read only to classify the

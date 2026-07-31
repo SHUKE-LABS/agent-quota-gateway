@@ -579,11 +579,76 @@ func TestSnapRejects_rejectedStatusRespectsReset(t *testing.T) {
 		t.Errorf("snapRejects(rejected, nil reset) = false, want true (no reset to bound)")
 	}
 
-	// Overall rejected status (UnifiedStatus, the wrapper field) still
-	// blocks via the first OR clause of snapRejects — that path does
-	// not go through windowBlocks and is intentionally unchanged.
-	if !snapRejects(quota.Snapshot{UnifiedStatus: unifiedStatusRejected}, clock.now(), true) {
-		t.Errorf("snapRejects(overall rejected) = false, want true")
+	// Post-#253: the top-level UnifiedStatus is intentionally NOT a routing
+	// input — it has no reset of its own, and a poller-tracked provider that
+	// emits the header only when rejecting (z.ai for `ccz`, 2026-07-29) would
+	// otherwise plant an unlatchable value. The per-window branches cover
+	// every populated case.
+	if snapRejects(quota.Snapshot{UnifiedStatus: unifiedStatusRejected}, clock.now(), true) {
+		t.Errorf("snapRejects(overall rejected) = true, want false (top-level status is not a routing input — see #253)")
+	}
+}
+
+// TestSnapRejects_liveCczShape pins the production instance from #253: a
+// snapshot with a top-level "rejected", no per-window status, 5h
+// utilization at 0, and a recent AsOf is read as *not* blocking — the
+// member stays available, the live-429 park retirement path stays live,
+// and a 429 carrying that response snapshot is not classified as genuine
+// exhaustion. The per-window branches carry the routing decision.
+func TestSnapRejects_liveCczShape(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	util := 0.0
+	live := quota.Snapshot{
+		UnifiedStatus:       unifiedStatusRejected,
+		Unified5hUtilization: &util,
+		Unified7dUtilization: &util,
+		AsOf:                clock.now().Add(-30 * time.Second),
+	}
+
+	for _, longBlocks := range []bool{true, false} {
+		if snapRejects(live, clock.now(), longBlocks) {
+			t.Errorf("snapRejects(live ccz, longBlocks=%v) = true, want false (no per-window signal)", longBlocks)
+		}
+	}
+
+	// storeReconcilesParkLocked is !snapRejects — returns true for the
+	// live shape post-fix, which is the #145 retirement path becoming
+	// live (was permanently dead pre-fix).
+	store := quota.NewStore()
+	store.Put("ccz", live)
+	c := NewController(testRegistry(t, "ccz"), "auto", 0, store, clock.now, io.Discard)
+	if !c.storeReconcilesParkLocked("ccz") {
+		t.Errorf("storeReconcilesParkLocked(ccz) = false, want true (#145 retirement path now live for the live ccz shape)")
+	}
+
+	// isGenuineExhaustionSignal directly: a 429 carrying the live ccz
+	// snapshot must NOT be classified as genuine exhaustion, even for
+	// MiniMaxi/Ark where the absorb branch does not cover (#253 caller
+	// enumeration).
+	entry := memberEntry{Nick: "ccz", BaseURL: "https://api.MiniMax.com"}
+	if c.isGenuineExhaustionSignal(entry, true, live) {
+		t.Errorf("isGenuineExhaustionSignal(live ccz, respSnap=lively) = true, want false")
+	}
+}
+
+// TestSnapRejects_softCapAllowedWarningStillServes pins the soft-cap
+// regression from #253 AC #3: an Anthropic window at utilization above
+// the cap with status `allowed_warning` and a future reset must NOT
+// block — Anthropic serves the soft-cap/overage zone, and treating it
+// as exhausted wrongly parks the member and (with every member in that
+// state) reports the whole pool exhausted.
+func TestSnapRejects_softCapAllowedWarningStillServes(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	util := 1.01 // above the 1.0 cap
+	future := clock.now().Add(time.Hour)
+	snap := quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      "allowed_warning",
+		Unified5hReset:       &future,
+		AsOf:                 clock.now(),
+	}
+	if snapRejects(snap, clock.now(), true) {
+		t.Errorf("snapRejects(soft-cap allowed_warning @1.01, future reset) = true, want false (Anthropic still serves — do not park)")
 	}
 }
 

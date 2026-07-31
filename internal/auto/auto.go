@@ -1409,6 +1409,15 @@ type Controller struct {
 	// wait for the first observation before their cell shows data. Accessed
 	// only under c.mu.
 	poolLocalSnapshots map[string]struct{}
+
+	// topStatusLogged records nicks we've already announced for the
+	// #253 latched top-level UnifiedStatus: when the store carries a
+	// top-level "rejected" and no per-window status, log one line per
+	// nick — the field is non-routing post-fix (snapRejects no longer
+	// reads it), so this log is the only trace that a poller-tracked
+	// provider ever set it. Pruned on reconcileLocked so a re-added
+	// member can re-trigger; accessed only under c.mu.
+	topStatusLogged map[string]struct{}
 }
 
 // NewController builds the sticky selector over the members of poolName
@@ -1472,6 +1481,7 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		lastSelectedSeq:    make(map[string]uint64),
 		disabled:           make(map[string]bool),
 		poolLocalSnapshots: local,
+		topStatusLogged:    make(map[string]struct{}),
 	}
 	// Initialise the atomic pool-name pointer before any other path can observe
 	// the controller. NewController hands the *Controller back to the caller
@@ -1558,6 +1568,11 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	for nick := range c.poolLocalSnapshots {
 		if !present[nick] {
 			delete(c.poolLocalSnapshots, nick)
+		}
+	}
+	for nick := range c.topStatusLogged {
+		if !present[nick] {
+			delete(c.topStatusLogged, nick)
 		}
 	}
 
@@ -2384,14 +2399,16 @@ func (c *Controller) isGenuineExhaustionSignal(entry memberEntry, ok bool, respS
 }
 
 // snapRejects reports whether snap shows the backend actually rate-limited:
-// an overall "rejected" unified status, or either unified window blocking
-// (see windowBlocks — a per-window "rejected", or, absent a status, a
-// utilization at the cap with a reset still in the future).
+// either unified window blocking (see windowBlocks — a per-window
+// "rejected", or, absent a status, a utilization at the cap with a reset
+// still in the future).
 //
 // now is the controller's clock reading; it gates the no-status util-only
 // branch so a frozen at-cap snapshot whose reset has already passed reads
-// not blocking. The status branch ignores now — an explicit "rejected" is
-// authoritative regardless of reset arithmetic.
+// not blocking. The status branch is bounded by the window's reset field —
+// an explicit "rejected" reads as not blocking once its reset has passed,
+// so a frozen post-#134 snapshot can't keep a recovered backend parked
+// forever.
 //
 // longBlocks reports whether the backend's long (7d/monthly) window is a
 // genuine chat-blocking signal (poller.LongWindowBlocksExhaustion). When
@@ -2399,9 +2416,18 @@ func (c *Controller) isGenuineExhaustionSignal(entry memberEntry, ok bool, respS
 // quota, not chat throughput (issue #192) — the 7d term is dropped so a
 // filled tool quota can't park a chat-healthy member. Callers fail closed
 // (pass true) when the backend can't be resolved.
+//
+// Boundedness invariant (issue #253): no unbounded snapshot field
+// participates in this predicate. The top-level UnifiedStatus is
+// deliberately not consulted — a poller-tracked provider that emits the
+// header only when rejecting (z.ai's observed behaviour on the `ccz`
+// instance, 2026-07-29) plants the field with no per-window reset to age
+// it out, and mergeSnapshot's carry-forward in quota.go:220-222 keeps it
+// pinned forever. Every remaining input is gated by its window's reset
+// or by AsOf freshness in windowBlocks, so a recovered backend cannot be
+// held hostage by stale data.
 func snapRejects(snap quota.Snapshot, now time.Time, longBlocks bool) bool {
-	return snap.UnifiedStatus == unifiedStatusRejected ||
-		windowBlocks(snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset, snap.AsOf, now) ||
+	return windowBlocks(snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset, snap.AsOf, now) ||
 		(longBlocks && windowBlocks(snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset, snap.AsOf, now))
 }
 
@@ -2924,6 +2950,22 @@ func (c *Controller) storeBlockBoundLocked(nick string) (time.Time, bool) {
 	snap := c.store.Get(b.QuotaKey())
 	now := c.now()
 	longBlocks := poller.LongWindowBlocksExhaustion(b.BaseURL)
+	// #253 diagnostic: a poller-tracked provider that emits the top-level
+	// anthropic-ratelimit-unified-status header only when rejecting
+	// (observed on z.ai for `ccz`, 2026-07-29) plants a top-level
+	// "rejected" with no per-window status to age it out — the field is
+	// non-routing post-fix, so this log is the only trace that any
+	// poller-tracked provider ever set it. Log once per nick; cleared on
+	// reconcileLocked so a re-added member re-triggers. Skipped when the
+	// per-window branches carry status (a real Anthropic response), which
+	// is the supported path and would log spam.
+	if snap.UnifiedStatus == unifiedStatusRejected &&
+		snap.Unified5hStatus == "" && snap.Unified7dStatus == "" {
+		if _, dup := c.topStatusLogged[nick]; !dup {
+			c.topStatusLogged[nick] = struct{}{}
+			fmt.Fprintf(c.logOut, "auto[%s]: %s stored snapshot carries unified_status=rejected with no per-window status — post-#253 non-routing; field kept operator-visible\n", c.name(), nick)
+		}
+	}
 	windows := [...]struct {
 		util   *float64
 		status string
