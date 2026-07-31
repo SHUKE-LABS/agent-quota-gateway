@@ -83,10 +83,16 @@ request dump (`internal/reqlog`, credentials redacted).
    method+path passthrough** — the selector/auth boundary gates, not a
    route table; `/` is the catch-all, `/_gateway/*` mounts directly with
    no selector.
-4. Response observer calls `quota.Extract` (headers only) and files the
-   snapshot under the backend's `QuotaKey()` — but only if it carries a
-   quota window. An empty / org-id-only Put would wipe the last known
-   resets (issue #121), so `hasQuotaWindow` gates it.
+4. Response observer calls `quota.Extract` (headers only) and **merges**
+   the snapshot under the backend's `QuotaKey()` — but only if it carries
+   a quota window. `mergeSnapshot` (`internal/quota/quota.go:218-247`)
+   carries absent fields forward, so a response reporting only the windows
+   it touched never blanks resets it taught us last time (issue #163).
+   `hasQuotaWindow` is the **write** gate — `cmd/agent-quota-gateway/main.go`
+   drops an empty snapshot before it ever reaches the store (issue #121's
+   admission guard). `HasData()` is the **read** gate, used on `Store.Get`
+   for a missing key — that returns a stamped-but-empty snapshot, never an
+   admitted one.
 5. `pools.ModifyResponse` dispatches per-pool failover: upstream **429**
    → synthetic **503** (switch member — short `Retry-After`) or **503**
    with the precise long `Retry-After` (pool dry, issue #203; the two 503
