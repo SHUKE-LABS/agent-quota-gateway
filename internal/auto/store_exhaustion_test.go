@@ -1365,7 +1365,7 @@ func TestStoreFreshnessBlocks_operatorSurface(t *testing.T) {
 
 	// (2) Operator clear path returns true (a park was present) and
 	// drops the entry from c.exhausted.
-	if cleared := c.ClearExhaustedNick("a"); !cleared {
+	if cleared, _ := c.ClearExhaustedNick("a"); !cleared {
 		t.Fatalf("ClearExhaustedNick(a) = false, want true (AC #5: operator-clear drops the store-derived park)")
 	}
 	c.mu.Lock()

@@ -136,6 +136,18 @@ account can be shared across pools without the cross-pool staleness where one
 pool's "fresh-looking" copy gets picked after the other has already exhausted
 it.
 
+A park the quota store cannot represent follows the same rule (issue #254). A
+`401`/`403` credential rejection, or a `429` with no usable reset, is a fact
+about the credential itself — no quota-window field can carry it, so no
+sibling pool could ever re-derive it from the shared store the way a
+window-backed park is derived. The gateway copies that park directly into
+every pool holding the nick the moment one pool observes it, so a revoked or
+expired account stops being selected everywhere at once rather than being
+discovered separately, pool by pool, on each one's own next `401`. Clearing it
+— via `POST /_gateway/clear` or the per-nick clear — is symmetric: releasing
+it from any one pool releases it everywhere it was propagated (see
+[Clearing live-429 parks](#clearing-live-429-parks)).
+
 Two corollaries keep that sharing honest:
 
 - **The same nick may appear in multiple pools** to share a single
@@ -523,9 +535,12 @@ zero-probe**, per pool:
   credential was revoked, expired, or the account pulled) is parked for the
   conservative default window and the pool fails over — a dead account never
   emits a `429`, so without this the pool would stick to it and return the
-  auth error to every client. The park is cleared by `POST /_gateway/clear`
-  once the account is restored, or retried automatically when the window
-  elapses.
+  auth error to every client. If the same nick is a member of other pools,
+  the park is copied into every one of them immediately (issue #254) — the
+  credential is equally dead there, and no sibling pool would otherwise learn
+  that fact until its own next `401`. The park is cleared, everywhere it was
+  copied to, by `POST /_gateway/clear` once the account is restored, or
+  retried automatically when the window elapses.
 - **Zero probe.** The starting member is chosen at random on startup (or by
   declared priority — see below) and its quota fills in from the first real
   response. No member is ever contacted just to measure it. This is also why
@@ -1022,6 +1037,24 @@ operator override complementary to the automatic recovery in
 [Recovery probing for parked members](#recovery-probing-for-parked-members):
 use it when the store itself is stale, poll lag holds a park through a recovery
 window, or you simply know the member is fine.
+
+**Cross-pool release (issue #254).** A credential-fatal park (`401`/`403`, or
+a `429` with no usable reset) is copied to every pool sharing the nick when it
+is first observed, so clearing it is symmetric: a clear issued against *any*
+one of those pools releases it in all of them, not only the pool addressed —
+scoping the release to one pool would leave the operator no way to act on the
+fact they just corrected. This does not change *selectability*: a nick still
+blocked by a polled quota window in a given pool stays unavailable there after
+the clear (only the reactive part was ever in scope). Both the pool-level and per-nick responses gain a `released_in` field naming
+the sibling pools a clear also freed a nick in, present only when a
+propagated park actually released elsewhere. The per-nick response names the
+pools directly; the pool-level response maps each released nick to the pools
+it was freed in (a whole-pool clear can release several nicks at once):
+
+```json
+{"pool":"auto","nick":"ccz","cleared":true,"released_in":["chn","minimax"]}
+{"pool":"auto","cleared":["ccz"],"released_in":{"ccz":["chn","minimax"]}}
+```
 
 A single-file management page is served at `GET /_gateway/ui`. Open it in a
 browser to view every pool, its priority order, the active member, and each

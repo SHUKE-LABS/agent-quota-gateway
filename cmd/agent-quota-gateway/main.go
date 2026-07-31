@@ -590,7 +590,12 @@ func quotaHandler(store *quota.Store, pools *auto.Pools, pl *poller.Poller) http
 // clears only that one member's park (issue #147) — the per-nick escape hatch
 // for an over-parked member when the rest of the pool should stay parked. Only
 // the reactive 429 parks are cleared — store-sourced exhaustion reflects polled
-// reality and is left alone. Non-POST returns 405.
+// reality and is left alone. A credential-fatal park (401/403, or a
+// header-less 429 fallback) is shared across every pool holding the nick, so
+// clearing it from the addressed pool also releases it in any sibling pool
+// that held a propagated copy; the response's released_in field names those
+// pools (issue #254 AC5/AC12) — omitted when nothing propagated. Non-POST
+// returns 405.
 func clearHandler(pools *auto.Pools) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -610,26 +615,40 @@ func clearHandler(pools *auto.Pools) http.HandlerFunc {
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "nick requires pool"})
 				return
 			}
-			cleared, ok := pools.ClearExhaustedNick(poolName, nick)
+			cleared, releasedElsewhere, ok := pools.ClearExhaustedNick(poolName, nick)
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool not found"})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"pool": poolName, "nick": nick, "cleared": cleared})
+			body := map[string]any{"pool": poolName, "nick": nick, "cleared": cleared}
+			// released_in names the sibling pools a propagated credential
+			// park (401/403, or a header-less 429 fallback) was also
+			// released in — populated only when this clear actually
+			// propagated (issue #254 AC5/AC12).
+			if len(releasedElsewhere) > 0 {
+				body["released_in"] = releasedElsewhere
+			}
+			_ = json.NewEncoder(w).Encode(body)
 			return
 		}
 		if poolName == "" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"cleared": pools.ClearAllExhausted()})
 			return
 		}
-		cleared, ok := pools.ClearExhausted(poolName)
+		cleared, releasedElsewhere, ok := pools.ClearExhausted(poolName)
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool not found"})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"pool": poolName, "cleared": cleared})
+		body := map[string]any{"pool": poolName, "cleared": cleared}
+		// released_in maps each cleared nick to the sibling pools its
+		// propagated credential park was also released in (issue #254 AC12).
+		if len(releasedElsewhere) > 0 {
+			body["released_in"] = releasedElsewhere
+		}
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
