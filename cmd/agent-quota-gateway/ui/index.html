@@ -1346,6 +1346,18 @@
       if (!el) return;
       el.value = captured.values[f];
     });
+    // Programmatic .value = above does not fire 'change', so the pool
+    // select's dependent state (pool_name visibility, nick placeholder,
+    // base_url required flag — all set by toggleNewPool /
+    // refreshBaseUrlRequirement on build + on the 'change' event)
+    // still reflects the build-time default pool after a reconcile
+    // rebuild. Re-derive: a no-op for an existing pool, and reveals
+    // pool_name for NEW_POOL. Dispatched before focus so a refocused
+    // pool_name is visible when it lands.
+    var poolSel = document.querySelector('form.add-member [data-field="pool"]');
+    if (poolSel) {
+      try { poolSel.dispatchEvent(new Event('change')); } catch (e) { /* older browser */ }
+    }
     if (captured.focus) {
       var tgt = document.querySelector(
         'form.add-member [data-field="' + captured.focus + '"]');
