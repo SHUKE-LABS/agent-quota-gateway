@@ -167,13 +167,17 @@ func NewPools(reg *backend.Registry, store *quota.Store, now func() time.Time, l
 	for _, name := range reg.PoolNames() {
 		byPool[name] = NewController(reg, name, -1, store, now, logOut)
 	}
-	return &Pools{
+	p := &Pools{
 		byPool: byPool,
 		reg:    reg,
 		store:  store,
 		now:    now,
 		logOut: logOut,
 	}
+	for _, c := range byPool {
+		p.wireCredentialParkPropagation(c)
+	}
+	return p
 }
 
 // controller resolves a pool's controller under the read lock. The returned
@@ -302,34 +306,55 @@ func (p *Pools) Current(poolName string) (backend.Backend, bool) {
 
 // ClearExhausted drops the named pool's live-429 parks (see
 // Controller.ClearExhausted). ok is false for an unknown pool.
-func (p *Pools) ClearExhausted(poolName string) (cleared []string, ok bool) {
+// releasedElsewhere names, per nick, the sibling pools a propagated
+// credential park was also released in (issue #254 AC5/AC12).
+func (p *Pools) ClearExhausted(poolName string) (cleared []string, releasedElsewhere map[string][]string, ok bool) {
 	c, ok := p.controller(poolName)
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
-	return c.ClearExhausted(), true
+	cleared, releasedElsewhere = c.ClearExhausted()
+	return cleared, releasedElsewhere, true
 }
 
 // ClearExhaustedNick drops one member's live-429 park in the named pool (see
 // Controller.ClearExhaustedNick). ok is false for an unknown pool; cleared
 // reports whether a live park was actually present for the nick.
-func (p *Pools) ClearExhaustedNick(poolName, nick string) (cleared bool, ok bool) {
+// releasedElsewhere names the sibling pools a propagated credential park was
+// also released in (issue #254 AC5/AC12).
+func (p *Pools) ClearExhaustedNick(poolName, nick string) (cleared bool, releasedElsewhere []string, ok bool) {
 	c, ok := p.controller(poolName)
 	if !ok {
-		return false, false
+		return false, nil, false
 	}
-	return c.ClearExhaustedNick(nick), true
+	cleared, releasedElsewhere = c.ClearExhaustedNick(nick)
+	return cleared, releasedElsewhere, true
 }
 
 // ClearAllExhausted drops live-429 parks across every pool, returning a
 // map of pool name to the nicks cleared (pools with nothing parked are
-// omitted).
+// omitted). Clearing every pool already releases every propagated credential
+// park by construction, so there is no separate cross-pool surface to report
+// here (contrast ClearExhausted / ClearExhaustedNick, issue #254 AC12).
+//
+// The reported set is taken from a snapshot of each pool's parked nicks
+// BEFORE any pool's clear runs, not from ClearExhausted's own return value.
+// p.controllersSnapshot() is a map, so visit order is nondeterministic;
+// ClearExhausted's cross-pool propagation deletes a nick from a sibling's
+// maps as a side effect, so a pool visited after its propagator would
+// otherwise report nothing for a nick it demonstrably had — the observed
+// result would depend on iteration order rather than on what was actually
+// parked. Snapshotting first removes that dependency.
 func (p *Pools) ClearAllExhausted() map[string][]string {
-	out := make(map[string][]string)
-	for name, c := range p.controllersSnapshot() {
-		if cleared := c.ClearExhausted(); len(cleared) > 0 {
-			out[name] = cleared
+	controllers := p.controllersSnapshot()
+	out := make(map[string][]string, len(controllers))
+	for name, c := range controllers {
+		if nicks := c.parkedNicksSnapshot(); len(nicks) > 0 {
+			out[name] = nicks
 		}
+	}
+	for _, c := range controllers {
+		c.ClearExhausted()
 	}
 	return out
 }
@@ -441,12 +466,29 @@ func (p *Pools) AllPoolStatuses(store *quota.Store, pl *poller.Poller) []PoolSta
 	return out
 }
 
+// CredentialParkPersist is the persisted shape of one credentialPark entry
+// (issue #254 AC7). WindowFact mirrors credentialParkEntry.windowFact so a
+// reload keeps applying store-reconciliation (#145) and the preemptor's
+// precise-reset supersession to the header-less-429 residue, without ever
+// treating a reloaded 401/403 entry as reconcilable by either.
+type CredentialParkPersist struct {
+	Reset      time.Time `json:"reset"`
+	WindowFact bool      `json:"window_fact,omitempty"`
+}
+
 // PoolPersistState is the serializable routing state for one pool.
 // It is exported so the persist package can embed it in GatewayState.
 type PoolPersistState struct {
-	Sticky            string               `json:"sticky"`
-	Exhausted         map[string]time.Time `json:"exhausted"`
-	LastBalanceSwitch time.Time            `json:"last_balance_switch,omitempty"`
+	Sticky    string               `json:"sticky"`
+	Exhausted map[string]time.Time `json:"exhausted"`
+	// CredentialPark persists a store-unrepresentable park (401/403, or a
+	// header-less 429 fallback) — local or propagated from a sibling pool —
+	// so it survives a restart in every pool it held (issue #254 AC7).
+	// Absent/empty in older state files; a missing key loads as no
+	// propagated park, which is safe (the parking pool's own restart
+	// re-asserts and re-propagates on its next failure).
+	CredentialPark    map[string]CredentialParkPersist `json:"credential_park,omitempty"`
+	LastBalanceSwitch time.Time                        `json:"last_balance_switch,omitempty"`
 	// BalanceSeq and LastSelectedSeq persist the selection-recency tiebreaker
 	// state for balanced pools. Absent in older state files; treated as zero /
 	// never-selected on load (backward-compatible).
@@ -475,6 +517,7 @@ func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 	for name, s := range states {
 		if c, ok := p.controller(name); ok {
 			c.loadState(s.Sticky, s.Exhausted, s.LastBalanceSwitch, s.BalanceSeq, s.LastSelectedSeq, s.LocalSnapshotNicks)
+			c.loadCredentialPark(s.CredentialPark)
 		}
 	}
 }
@@ -1024,6 +1067,7 @@ func (p *Pools) CreatePoolWithMember(name, mode, nick, credential, baseURL strin
 	p.reg = next
 	c := NewController(next, normalized, -1, p.store, p.now, p.logOut)
 	c.onMutate = p.onMutate
+	p.wireCredentialParkPropagation(c)
 	p.byPool[normalized] = c
 	p.markConfigDirtyLocked()
 	return http.StatusCreated, nil
@@ -1061,6 +1105,7 @@ func (p *Pools) AddPool(name, mode string) (int, error) {
 	p.reg = next
 	c := NewController(next, normalized, -1, p.store, p.now, p.logOut)
 	c.onMutate = p.onMutate
+	p.wireCredentialParkPropagation(c)
 	p.byPool[normalized] = c
 	p.markConfigDirtyLocked()
 	fmt.Fprintf(p.logOut, "auto: created runtime pool %s\n", normalized)
@@ -1284,6 +1329,114 @@ func crossPoolResolve(reg *backend.Registry, skipPool, nick string) (creds, base
 	return creds, baseURLs
 }
 
+// propagateCredentialPark mirrors a store-unrepresentable park (401/403, or
+// a header-less 429 fallback) into every sibling pool holding nick, so a
+// park caught by one pool is immediately visible everywhere the credential
+// is shared (issue #254 AC1/AC2/AC4). originPool is excluded — its own
+// controller already wrote the entry itself.
+//
+// It never holds two Controller.mu locks at once: each sibling is locked,
+// written, and released before the next is touched, and reg is read
+// lock-free (immutable-after-build). So two pools parking the same nick
+// concurrently cannot deadlock regardless of pool-name ordering — each
+// caller just serializes briefly, one sibling at a time, on whichever
+// controller it happens to be writing (issue #254 AC6).
+func (p *Pools) propagateCredentialPark(originPool, nick string, reset time.Time, windowFact bool) {
+	reg := p.CurrentRegistry()
+	for _, name := range reg.PoolNames() {
+		if name == originPool {
+			continue
+		}
+		if _, ok := reg.ResolveIn(name, nick); !ok {
+			continue
+		}
+		c, ok := p.controller(name)
+		if !ok {
+			continue
+		}
+		c.mu.Lock()
+		c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact}
+		c.notifyMutate()
+		c.mu.Unlock()
+	}
+}
+
+// propagateCredentialParkClear releases nick's propagated credential park in
+// every sibling pool holding it (issue #254 AC5/AC12), returning the sibling
+// pool names actually released. Same one-lock-at-a-time discipline as
+// propagateCredentialPark.
+func (p *Pools) propagateCredentialParkClear(originPool, nick string) []string {
+	reg := p.CurrentRegistry()
+	var released []string
+	for _, name := range reg.PoolNames() {
+		if name == originPool {
+			continue
+		}
+		if _, ok := reg.ResolveIn(name, nick); !ok {
+			continue
+		}
+		c, ok := p.controller(name)
+		if !ok {
+			continue
+		}
+		c.mu.Lock()
+		if entry, had := c.credentialPark[nick]; had {
+			delete(c.credentialPark, nick)
+			// Also drop this sibling's own c.exhausted entry, but only when
+			// it is the exact mirror record429WithSource wrote alongside
+			// this credentialPark entry (same reset) — i.e. the sibling is
+			// itself an origin that independently observed this same
+			// credential-fatal park. A sibling can also hold a genuinely
+			// unrelated, independently-observed windowed 429 in c.exhausted
+			// for the same nick (different reset); deleting unconditionally
+			// would wipe that real park too. The equality guard tells the
+			// two cases apart without a provenance tag.
+			if ev, hasE := c.exhausted[nick]; hasE && ev.Equal(entry.reset) {
+				delete(c.exhausted, nick)
+			}
+			c.notifyMutate()
+			released = append(released, name)
+		}
+		c.mu.Unlock()
+	}
+	return released
+}
+
+// wireCredentialParkPropagation installs c's cross-pool propagation
+// callbacks (issue #254). It closes over c itself rather than a captured
+// pool-name string, so a later rename (RenamePool) is picked up via c.name()
+// at call time instead of propagating under a stale name.
+func (p *Pools) wireCredentialParkPropagation(c *Controller) {
+	c.propagatePark = func(nick string, reset time.Time, windowFact bool) {
+		p.propagateCredentialPark(c.name(), nick, reset, windowFact)
+	}
+	c.propagateParkClear = func(nick string) []string {
+		return p.propagateCredentialParkClear(c.name(), nick)
+	}
+}
+
+// credentialParkEntry is one Controller.credentialPark value (issue #254):
+// reset is the wall-clock time the park ages out. windowFact distinguishes
+// the two store-unrepresentable subclasses the map holds, because they
+// disagree on which retirement paths besides wall-clock aging, an explicit
+// clear, and a successful recovery probe may drop the entry early:
+//
+//   - windowFact == false: a 401/403 credential rejection. This is a fact
+//     about the credential itself, not a quota window — a fresh, healthy
+//     store snapshot proves nothing about whether a since-revoked credential
+//     still authenticates (the snapshot could easily predate the
+//     revocation), so storeReconcilesParkLocked (#145) and the preemptor's
+//     precise-reset supersession (noteRecovered) must never touch it.
+//   - windowFact == true: a 429 whose resetFrom fell back to
+//     defaultExhaustionWindow (the AC2 residue) — a real quota-window fact
+//     the gateway simply lacks a precise bound for. The store or a later
+//     precise reset CAN retire this early, exactly as it would for an
+//     ordinary c.exhausted entry, so both mechanisms apply.
+type credentialParkEntry struct {
+	reset      time.Time
+	windowFact bool
+}
+
 // Controller is the sticky selector for one pool. The zero value is not
 // usable; call NewController.
 type Controller struct {
@@ -1418,6 +1571,44 @@ type Controller struct {
 	// provider ever set it. Pruned on reconcileLocked so a re-added
 	// member can re-trigger; accessed only under c.mu.
 	topStatusLogged map[string]struct{}
+
+	// credentialPark maps a nick to a store-unrepresentable park — a 401/403
+	// credential rejection, or a 429 whose resetFrom fell back to
+	// defaultExhaustionWindow because the response carried no usable reset —
+	// keeping it unselectable in THIS pool, whether the park was asserted
+	// here or propagated in from a sibling pool that shares the nick (issue
+	// #254). Unlike c.exhausted, no store snapshot will ever teach a sibling
+	// pool about this bound, so it cannot be re-derived on read; it must be
+	// copied. Populated in two ways: locally, by record429WithSource under
+	// c.mu when storeUnrepresentable is true; and remotely, by
+	// (*Pools).propagateCredentialPark writing directly into this map under
+	// c.mu from another controller's assertion. Read alongside c.exhausted by
+	// exhaustedUntilLocked (routing), liveParkActiveLocked (MemberStatus.Parked
+	// / the clear button), and nextParkedButResetPassedLocked (the half-open
+	// probe, which must never forward live traffic to a credential-dead
+	// member). recoverParked's candidate scan does not range this map
+	// directly — it ranges c.exhausted, which record429WithSource always
+	// populates alongside credentialPark for a local assertion — but on a
+	// successful probe it now clears both maps together (a live health-check
+	// response is decisive evidence for either subclass) and propagates the
+	// clear. Accessed only under c.mu.
+	credentialPark map[string]credentialParkEntry
+
+	// propagatePark, when set, mirrors a just-asserted store-unrepresentable
+	// park into every sibling pool holding the same nick (issue #254 AC1/AC2).
+	// Wired once by Pools at controller construction (NewPools/AddPool/
+	// CreatePoolWithMember); nil for a bare Controller built directly by a
+	// test via NewController, where there is no sibling to reach. Always
+	// called with c.mu NOT held — see record429WithSource's doc for why
+	// holding it here would risk a lock-order inversion.
+	propagatePark func(nick string, reset time.Time, windowFact bool)
+
+	// propagateParkClear, when set, releases nick's propagated credential
+	// park in every sibling pool holding it (issue #254 AC5/AC12), returning
+	// the sibling pool names actually released so the operator-facing
+	// response can name them. Wired alongside propagatePark; nil for a bare
+	// Controller. Always called with c.mu NOT held.
+	propagateParkClear func(nick string) []string
 }
 
 // NewController builds the sticky selector over the members of poolName
@@ -1471,6 +1662,7 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		priority:           effectiveOrder(reg.PoolPriority(poolName), nicks),
 		store:              store,
 		exhausted:          make(map[string]time.Time),
+		credentialPark:     make(map[string]credentialParkEntry),
 		lastProbeAttempt:   make(map[string]time.Time),
 		probeInFlight:      make(map[string]bool),
 		probeHTTPClient:    http.DefaultClient,
@@ -1558,6 +1750,11 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	for nick := range c.exhausted {
 		if !present[nick] {
 			delete(c.exhausted, nick)
+		}
+	}
+	for nick := range c.credentialPark {
+		if !present[nick] {
+			delete(c.credentialPark, nick)
 		}
 	}
 	for nick := range c.lastSelectedSeq {
@@ -1728,50 +1925,113 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	return backend.Backend{}, 0, true
 }
 
-// ClearExhausted drops every live-429 park for this pool, making each
-// member immediately selectable again (still subject to the quota store's
-// own fully-consumed window check). It exists to undo parks written by a
-// transient or erroneous upstream 429 — e.g. an account that got 429'd by
-// a misconfigured request but in fact still has quota. It does NOT touch
-// store-sourced exhaustion, which reflects polled reality and clears on its
-// own reset. Returns the nicks whose park was cleared, sorted.
-func (c *Controller) ClearExhausted() []string {
+// parkedNicksSnapshot returns the sorted, deduplicated union of nicks
+// currently held in c.exhausted and c.credentialPark, without clearing
+// anything — the non-destructive read ClearAllExhausted uses to compute a
+// deterministic per-pool report before any pool's clear can run (issue #254).
+func (c *Controller) parkedNicksSnapshot() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.exhausted) == 0 {
+	if len(c.exhausted) == 0 && len(c.credentialPark) == 0 {
 		return nil
 	}
-	cleared := make([]string, 0, len(c.exhausted))
+	seen := make(map[string]bool, len(c.exhausted)+len(c.credentialPark))
+	var nicks []string
 	for nick := range c.exhausted {
+		seen[nick] = true
+		nicks = append(nicks, nick)
+	}
+	for nick := range c.credentialPark {
+		if !seen[nick] {
+			seen[nick] = true
+			nicks = append(nicks, nick)
+		}
+	}
+	sort.Strings(nicks)
+	return nicks
+}
+
+// ClearExhausted drops every live-429 park for this pool, including any
+// store-unrepresentable credential park — local or propagated from a sibling
+// pool (issue #254) — making each member immediately selectable again (still
+// subject to the quota store's own fully-consumed window check). It exists to
+// undo parks written by a transient or erroneous upstream 429 — e.g. an
+// account that got 429'd by a misconfigured request but in fact still has
+// quota. It does NOT touch store-sourced exhaustion, which reflects polled
+// reality and clears on its own reset. Returns the nicks whose park was
+// cleared, sorted, plus — for any of those nicks that carried a propagated
+// credential park — the sibling pools the clear also released it in (issue
+// #254 AC5/AC12); nil when nothing here was ever propagated.
+func (c *Controller) ClearExhausted() (cleared []string, releasedElsewhere map[string][]string) {
+	c.mu.Lock()
+	if len(c.exhausted) == 0 && len(c.credentialPark) == 0 {
+		c.mu.Unlock()
+		return nil, nil
+	}
+	seen := make(map[string]bool, len(c.exhausted)+len(c.credentialPark))
+	for nick := range c.exhausted {
+		seen[nick] = true
 		cleared = append(cleared, nick)
 	}
+	var propagate []string
+	for nick := range c.credentialPark {
+		if !seen[nick] {
+			seen[nick] = true
+			cleared = append(cleared, nick)
+		}
+		propagate = append(propagate, nick)
+	}
 	sort.Strings(cleared)
+	sort.Strings(propagate)
 	c.exhausted = make(map[string]time.Time)
+	c.credentialPark = make(map[string]credentialParkEntry)
 	c.lastProbeAttempt = make(map[string]time.Time)
 	c.probeInFlight = make(map[string]bool)
 	c.notifyMutate()
-	return cleared
+	c.mu.Unlock()
+
+	if c.propagateParkClear != nil {
+		for _, nick := range propagate {
+			if released := c.propagateParkClear(nick); len(released) > 0 {
+				if releasedElsewhere == nil {
+					releasedElsewhere = make(map[string][]string)
+				}
+				releasedElsewhere[nick] = released
+			}
+		}
+	}
+	return cleared, releasedElsewhere
 }
 
-// ClearExhaustedNick drops a single member's live-429 park (issue #147), the
-// per-nick counterpart to ClearExhausted: an operator escape hatch to un-stick
-// one over-parked member without clearing the whole pool. Same "live-park only,
-// never store" contract — store-sourced exhaustion is left untouched and a
-// genuinely-exhausted member simply re-parks via record429 on its next 429.
-// Returns whether a live park was actually present (false is a harmless no-op
-// for an unknown or un-parked nick). notifyMutate fires only when something
-// changed.
-func (c *Controller) ClearExhaustedNick(nick string) bool {
+// ClearExhaustedNick drops a single member's live-429 park (issue #147),
+// including any store-unrepresentable credential park (issue #254) — the
+// per-nick counterpart to ClearExhausted: an operator escape hatch to
+// un-stick one over-parked member without clearing the whole pool. Same
+// "live-park only, never store" contract — store-sourced exhaustion is left
+// untouched and a genuinely-exhausted member simply re-parks via record429 on
+// its next 429. Returns whether a live park was actually present (false is a
+// harmless no-op for an unknown or un-parked nick), plus the sibling pools
+// the clear also released the propagated park in (issue #254 AC5/AC12).
+// notifyMutate fires only when something changed.
+func (c *Controller) ClearExhaustedNick(nick string) (cleared bool, releasedElsewhere []string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.exhausted[nick]; !ok {
-		return false
+	_, inExhausted := c.exhausted[nick]
+	_, inCredentialPark := c.credentialPark[nick]
+	if !inExhausted && !inCredentialPark {
+		c.mu.Unlock()
+		return false, nil
 	}
 	delete(c.exhausted, nick)
+	delete(c.credentialPark, nick)
 	delete(c.lastProbeAttempt, nick)
 	delete(c.probeInFlight, nick)
 	c.notifyMutate()
-	return true
+	c.mu.Unlock()
+
+	if inCredentialPark && c.propagateParkClear != nil {
+		releasedElsewhere = c.propagateParkClear(nick)
+	}
+	return true, releasedElsewhere
 }
 
 // Current returns the nick of the active sticky backend, or "" for a
@@ -2038,6 +2298,29 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, la
 	c.reanchorLocked()
 }
 
+// loadCredentialPark restores a persisted propagated/local credential park
+// (issue #254 AC7), dropping any entry whose reset has already passed or
+// that no longer names a current member — the same pruning loadState applies
+// to c.exhausted, kept as a separate method so loadState's signature (and
+// its existing call sites) stay untouched.
+func (c *Controller) loadCredentialPark(credentialPark map[string]CredentialParkPersist) {
+	if len(credentialPark) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	for nick, persisted := range credentialPark {
+		if !persisted.Reset.After(now) {
+			continue
+		}
+		if c.indexOf(nick) < 0 {
+			continue
+		}
+		c.credentialPark[nick] = credentialParkEntry{reset: persisted.Reset, windowFact: persisted.WindowFact}
+	}
+}
+
 // persistState snapshots the controller's routing state for serialisation.
 func (c *Controller) persistState() PoolPersistState {
 	c.mu.Lock()
@@ -2052,6 +2335,13 @@ func (c *Controller) persistState() PoolPersistState {
 		Sticky:            sticky,
 		Exhausted:         ex,
 		LastBalanceSwitch: c.lastBalanceSwitch,
+	}
+	if len(c.credentialPark) > 0 {
+		cp := make(map[string]CredentialParkPersist, len(c.credentialPark))
+		for k, v := range c.credentialPark {
+			cp[k] = CredentialParkPersist{Reset: v.reset, WindowFact: v.windowFact}
+		}
+		ps.CredentialPark = cp
 	}
 	if c.balanceGap > 0 && c.balanceSeq > 0 {
 		ps.BalanceSeq = c.balanceSeq
@@ -2184,13 +2474,26 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 			return nil
 		}
 		// A genuine 429 carries a precise window reset; park until then.
-		return c.parkAndFailover(resp, b.Nick, c.resetFrom(resp), "hit 429")
+		// reset is store-unrepresentable when resetFrom fell back to
+		// defaultExhaustionWindow (no usable response reset) — that bound
+		// exists only here, so sibling pools sharing the nick need it
+		// propagated too (issue #254 AC2). This subclass is a real
+		// quota-window fact (windowFact=true), unlike a 401/403 below, so
+		// storeReconcilesParkLocked and the preemptor may still retire it early.
+		reset, storeUnrepresentable := c.resetFrom(resp)
+		return c.parkAndFailoverWithSource(resp, b.Nick, reset, "hit 429", storeUnrepresentable, storeUnrepresentable)
 	case isCredentialRejected(resp.StatusCode):
 		// An auth rejection has no reset — the credential is simply dead — so
 		// park for the conservative default window: long enough to keep the
 		// pool off the dead account, short enough that a restored account is
 		// retried without an operator restart (or an immediate /_gateway/clear).
-		return c.parkAndFailover(resp, b.Nick, c.now().Add(defaultExhaustionWindow), fmt.Sprintf("returned %d", resp.StatusCode))
+		// Always store-unrepresentable: no quota-window field means "this
+		// credential is dead", so no sibling pool can ever rederive this park
+		// from the shared store — it must be propagated (issue #254 AC1).
+		// windowFact=false: no quota window is involved at all, so neither
+		// the store's freshness reconciliation nor the preemptor's precise
+		// reset may ever retire this park early.
+		return c.parkAndFailoverWithSource(resp, b.Nick, c.now().Add(defaultExhaustionWindow), fmt.Sprintf("returned %d", resp.StatusCode), true, false)
 	default:
 		return nil
 	}
@@ -2296,7 +2599,15 @@ func hasLegacyRateLimitHeader(h http.Header) bool {
 // see the real auth status, not a transient 503 (the dry-pool failover itself
 // is #124).
 func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset time.Time, reason string) error {
-	res := c.record429(nick, reset)
+	return c.parkAndFailoverWithSource(resp, nick, reset, reason, false, false)
+}
+
+// parkAndFailoverWithSource is parkAndFailover plus the storeUnrepresentable
+// and windowFact flags threaded through to record429WithSource (issue #254)
+// — see that method's doc for what the flags mean and how propagation is
+// kept deadlock-free.
+func (c *Controller) parkAndFailoverWithSource(resp *http.Response, nick string, reset time.Time, reason string, storeUnrepresentable, windowFact bool) error {
+	res := c.record429WithSource(nick, reset, storeUnrepresentable, windowFact)
 
 	if res.allExhausted {
 		if recovered := c.tryRecoverParked(); recovered != "" {
@@ -2447,26 +2758,60 @@ type record429Result struct {
 // backend is exhausted it points the sticky pointer at the soonest to
 // reset.
 func (c *Controller) record429(nick string, reset time.Time) record429Result {
+	return c.record429WithSource(nick, reset, false, false)
+}
+
+// record429WithSource is record429 plus explicit flags for whether the bound
+// is representable in the shared quota store (issue #254). When
+// storeUnrepresentable is true — the 401/403 credential-fatal park, or a 429
+// whose resetFrom fell back to defaultExhaustionWindow — the park is also
+// written into c.credentialPark and propagated to every sibling pool holding
+// the nick, since no store-derived signal will ever teach them about it.
+// windowFact (meaningful only when storeUnrepresentable is true) distinguishes
+// the header-less-429 subclass (true — a real quota-window fact eligible for
+// storeReconcilesParkLocked and the preemptor's precise-reset supersession)
+// from the 401/403 subclass (false — a credential fact neither may retire
+// early); see credentialParkEntry's doc for the full reasoning.
+//
+// Propagation happens AFTER c.mu is released. c.propagatePark, when set,
+// reaches into sibling controllers' own mu one at a time; taking a second
+// controller's lock while still holding this one would risk a lock-order
+// inversion the moment two pools park the same nick concurrently (this
+// method never holds Pools.mu, so the package's usual Pools.mu ->
+// Controller.mu order does not apply here — the invariant this method
+// upholds instead is "never hold two Controller.mu locks at once", which
+// (*Pools).propagateCredentialPark also honours by locking one sibling at a
+// time). See that function's doc for the full argument.
+func (c *Controller) record429WithSource(nick string, reset time.Time, storeUnrepresentable, windowFact bool) record429Result {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	c.exhausted[nick] = reset
+	if storeUnrepresentable {
+		c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact}
+	}
 	c.clearExpiredLocked() // housekeeping; never clears the future reset just set
 
 	// Another request may have already rotated off the failed backend; if
 	// the current sticky is healthy, keep it.
 	prev := c.curNick
+	var result record429Result
 	if !c.isUnavailableLocked(prev) {
 		c.notifyMutate()
-		return record429Result{to: prev}
-	}
-	if next, ok := c.firstHealthyNickLocked(); ok {
+		result = record429Result{to: prev}
+	} else if next, ok := c.firstHealthyNickLocked(); ok {
 		c.setActiveMemberLocked(next)
-		return record429Result{to: next, switched: next != prev}
+		result = record429Result{to: next, switched: next != prev}
+	} else {
+		next, soonest := c.soonestNickLocked()
+		c.setActiveMemberLocked(next)
+		result = record429Result{to: next, retryAfter: c.waitUntil(soonest), allExhausted: true}
 	}
-	next, soonest := c.soonestNickLocked()
-	c.setActiveMemberLocked(next)
-	return record429Result{to: next, retryAfter: c.waitUntil(soonest), allExhausted: true}
+	c.mu.Unlock()
+
+	if storeUnrepresentable && c.propagatePark != nil {
+		c.propagatePark(nick, reset, windowFact)
+	}
+	return result
 }
 
 // probeCooldown bounds how often the same parked member's quota endpoint
@@ -2631,8 +2976,21 @@ func (c *Controller) recoverParked(skipActive bool) string {
 		// thrash until the cooldown.
 		c.mu.Lock()
 		recoveredNow := c.now()
+		var hadCredPark bool
 		if !snapRejects(snap, recoveredNow, poller.LongWindowBlocksExhaustion(b.BaseURL)) {
 			delete(c.exhausted, t.nick)
+			// A live, successful health-check response is decisive evidence
+			// the member works — for either credentialPark subclass, not
+			// just the header-less-429 residue: it proves the credential
+			// itself authenticates, which is exactly what a 401/403 entry
+			// doubts. Clear it too, and propagate the release the same way
+			// an explicit operator clear would (issue #254) — otherwise a
+			// sibling pool's mirrored copy would outlive the very probe that
+			// disproved it, and this pool would report "recovered" while
+			// still refusing the nick via credentialPark (isUnavailableLocked
+			// unions both maps).
+			_, hadCredPark = c.credentialPark[t.nick]
+			delete(c.credentialPark, t.nick)
 			c.notifyMutate()
 			if recovered == "" {
 				recovered = t.nick
@@ -2643,6 +3001,10 @@ func (c *Controller) recoverParked(skipActive bool) string {
 		}
 		c.probeInFlight[t.quotaKey] = false
 		c.mu.Unlock()
+
+		if hadCredPark && c.propagateParkClear != nil {
+			c.propagateParkClear(t.nick)
+		}
 	}
 	return recovered
 }
@@ -2667,6 +3029,11 @@ func (c *Controller) clearExpiredLocked() {
 	for nick, reset := range c.exhausted {
 		if !now.Before(reset) { // now >= reset
 			delete(c.exhausted, nick)
+		}
+	}
+	for nick, entry := range c.credentialPark {
+		if !now.Before(entry.reset) {
+			delete(c.credentialPark, nick)
 		}
 	}
 }
@@ -2742,9 +3109,9 @@ func (c *Controller) refreshStoreParksLocked() {
 		// the assert-once width mirrors the read predicate exactly.
 		var blocks bool
 		for _, w := range [...]struct {
-			util   *float64
-			reset  *time.Time
-			use    bool
+			util  *float64
+			reset *time.Time
+			use   bool
 		}{
 			{snap.Unified5hUtilization, snap.Unified5hReset, true},
 			{snap.Unified7dUtilization, snap.Unified7dReset, poller.LongWindowBlocksExhaustion(b.BaseURL)},
@@ -2792,12 +3159,23 @@ func (c *Controller) isExhaustedLocked(nick string) bool {
 
 // liveParkActiveLocked reports whether a live-429 park is currently holding
 // nick out of rotation: an entry in c.exhausted whose reset has not elapsed and
-// which the fresh store has not reconciled away (issue #145). It is the gate
-// for MemberStatus.Parked / the per-nick clear button (issue #147) — the exact
-// condition under which ClearExhaustedNick has a park to drop AND that park is
-// what is keeping the member parked. Store-sourced exhaustion is deliberately
-// excluded: clearing the live park cannot move it. Caller holds c.mu.
+// which the fresh store has not reconciled away (issue #145), OR a still-future
+// entry in c.credentialPark — local or propagated from a sibling pool (issue
+// #254). It is the gate for MemberStatus.Parked / the per-nick clear button
+// (issue #147) — the exact condition under which ClearExhaustedNick has a park
+// to drop AND that park is what is keeping the member parked. Store-sourced
+// exhaustion is deliberately excluded: clearing the live park cannot move it.
+// A credentialPark entry with windowFact true (the header-less-429 residue) is
+// still subject to storeReconcilesParkLocked, same as c.exhausted — it is a
+// quota-window fact the store can retire early. windowFact false (401/403) is
+// never reconciled by the store: it only ages out by wall-clock or an explicit
+// clear. Caller holds c.mu.
 func (c *Controller) liveParkActiveLocked(nick string) bool {
+	if entry, ok := c.credentialPark[nick]; ok && c.now().Before(entry.reset) {
+		if !entry.windowFact || !c.storeReconcilesParkLocked(nick) {
+			return true
+		}
+	}
 	reset, ok := c.exhausted[nick]
 	if !ok || !c.now().Before(reset) {
 		return false
@@ -2806,11 +3184,13 @@ func (c *Controller) liveParkActiveLocked(nick string) bool {
 }
 
 // exhaustedUntilLocked returns the time nick stays unselectable and whether
-// it is exhausted at all, unifying the two exhaustion signals: the explicit
-// park set by a live 429 (record429, in c.exhausted) and the quota store's
-// fully-consumed window (poller- or header-sourced, computed on read via
-// storeExhaustedUntilLocked). When both apply the later reset wins, so a
-// member is never re-selected while either signal still blocks it.
+// it is exhausted at all, unifying three exhaustion signals: the explicit
+// park set by a live 429 (record429, in c.exhausted), a store-unrepresentable
+// credential park local to or propagated into this pool (c.credentialPark,
+// issue #254), and the quota store's fully-consumed window (poller- or
+// header-sourced, computed on read via storeExhaustedUntilLocked). When more
+// than one applies the later reset wins, so a member is never re-selected
+// while any signal still blocks it.
 //
 // issue #251: refreshStoreParksLocked asserts no-status at-cap store
 // blocks into c.exhausted once per resolve. Those entries live in the
@@ -2842,6 +3222,19 @@ func (c *Controller) exhaustedUntilLocked(nick string) (time.Time, bool) {
 	if ok && c.storeReconcilesParkLocked(nick) {
 		ok = false
 		reset = time.Time{}
+	}
+	// A credential park (401/403, or a header-less 429 fallback) contributes
+	// its bound to the union unless it is the header-less-429 subclass
+	// (windowFact) AND the store has reconciled it away (#145) — that
+	// subclass is a real quota-window fact, so it is retirable exactly like
+	// c.exhausted. A 401/403 (windowFact false) is never reconciled by the
+	// store — it is not a fact about a quota window at all — so it only ages
+	// out by wall-clock or an explicit clear (issue #254).
+	if cp, cpOK := c.credentialPark[nick]; cpOK && now.Before(cp.reset) {
+		retired := cp.windowFact && c.storeReconcilesParkLocked(nick)
+		if !retired && (!ok || cp.reset.After(reset)) {
+			reset, ok = cp.reset, true
+		}
 	}
 	if sReset, sOK := c.storeExhaustedUntilLocked(nick); sOK {
 		if !ok || sReset.After(reset) {
@@ -3338,6 +3731,15 @@ func (c *Controller) nextParkedButResetPassedLocked() (string, bool) {
 		if reset, ok := c.exhausted[nick]; ok && now.Before(reset) {
 			continue
 		}
+		// A credential park (401/403, or a header-less 429 fallback) — local
+		// or propagated from a sibling pool — means the credential is dead,
+		// not merely rate-limited. Forwarding a real client request to it
+		// would not refresh anything the store can use (issue #254 AC8): it
+		// would just hand the client another auth failure. Skip it exactly
+		// like a live c.exhausted park.
+		if entry, ok := c.credentialPark[nick]; ok && now.Before(entry.reset) {
+			continue
+		}
 		return nick, true
 	}
 	return "", false
@@ -3358,13 +3760,20 @@ func (c *Controller) waitUntil(reset time.Time) time.Duration {
 // it is the authoritative value. A missing or already-past timestamp has
 // no precise meaning, so we park the backend for the conservative default
 // window instead — this keeps failover working against a sparse 429.
-func (c *Controller) resetFrom(resp *http.Response) time.Time {
+//
+// storeUnrepresentable reports whether the returned reset came from that
+// fallback rather than a real response reset (issue #254 AC2): a 429 with a
+// genuine window reset is store-derivable — sibling pools rederive the same
+// block from the shared quota store — but the fallback bound exists only in
+// this call, so the caller must propagate it the same way a 401/403 park is
+// propagated.
+func (c *Controller) resetFrom(resp *http.Response) (reset time.Time, storeUnrepresentable bool) {
 	now := c.now()
 	snap := quota.Extract(resp)
 	if snap.UnifiedReset != nil && snap.UnifiedReset.After(now) {
-		return *snap.UnifiedReset
+		return *snap.UnifiedReset, false
 	}
-	return now.Add(defaultExhaustionWindow)
+	return now.Add(defaultExhaustionWindow), true
 }
 
 // rewriteTo503 turns an upstream 429 into the transient 503 a pool hands

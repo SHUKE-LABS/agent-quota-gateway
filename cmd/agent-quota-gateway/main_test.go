@@ -1061,6 +1061,68 @@ func TestClearHandler_nickRouting(t *testing.T) {
 	}
 }
 
+// TestClearHandler_crossPoolRelease verifies the operator-visible surface of
+// issue #254 AC12: clearing a credential-fatal park (401/403) from the pool
+// that caught it reports, via the released_in field, every sibling pool the
+// same clear also released the propagated park in.
+func TestClearHandler_crossPoolRelease(t *testing.T) {
+	scrubPoolEnv(t)
+	t.Setenv("AQG_POOL_A_BACKEND_CCZ", "cred-ccz")
+	t.Setenv("AQG_POOL_A_BACKEND_A2", "cred-a2")
+	t.Setenv("AQG_POOL_A_PRIORITY", "ccz")
+	t.Setenv("AQG_POOL_B_BACKEND_CCZ", "cred-ccz")
+	t.Setenv("AQG_POOL_B_BACKEND_B2", "cred-b2")
+	t.Setenv("AQG_POOL_B_PRIORITY", "ccz")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+
+	bCCZinA, ok := registry.ResolveIn("a", "ccz")
+	if !ok {
+		t.Fatalf("ResolveIn(a, ccz) not found")
+	}
+	ctx := backend.WithBackend(context.Background(), bCCZinA)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header:     http.Header{},
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"authentication_error"}}`)),
+	}
+	if err := pools.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+
+	srv := httptest.NewServer(clearHandler(pools))
+	t.Cleanup(srv.Close)
+
+	r, err := http.Post(srv.URL+"/_gateway/clear?pool=a&nick=ccz", "", nil)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer r.Body.Close()
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("clear: status=%d body=%v", r.StatusCode, body)
+	}
+	if cleared, _ := body["cleared"].(bool); !cleared {
+		t.Fatalf("clear cleared=%v, want true", body["cleared"])
+	}
+	releasedRaw, ok := body["released_in"]
+	if !ok {
+		t.Fatalf("response missing released_in, body=%v", body)
+	}
+	released, ok := releasedRaw.([]any)
+	if !ok || len(released) != 1 || released[0] != "b" {
+		t.Fatalf(`released_in=%v, want ["b"]`, releasedRaw)
+	}
+}
+
 // TestPersist_roundTrip verifies that persisted state survives a simulated
 // restart: write state to a file, reload it, and confirm sticky + snapshots
 // are restored.

@@ -1085,7 +1085,7 @@ func TestController_ClearExhausted(t *testing.T) {
 	c.record429("b", reset)
 	c.record429("c", reset)
 
-	cleared := c.ClearExhausted()
+	cleared, _ := c.ClearExhausted()
 	if want := []string{"b", "c"}; len(cleared) != 2 || cleared[0] != want[0] || cleared[1] != want[1] {
 		t.Fatalf("ClearExhausted returned %v, want %v", cleared, want)
 	}
@@ -1100,7 +1100,7 @@ func TestController_ClearExhausted(t *testing.T) {
 	}
 
 	// A second clear with nothing parked returns nil.
-	if again := c.ClearExhausted(); again != nil {
+	if again, _ := c.ClearExhausted(); again != nil {
 		t.Fatalf("second ClearExhausted returned %v, want nil", again)
 	}
 }
@@ -1118,7 +1118,7 @@ func TestController_ClearExhaustedNick(t *testing.T) {
 	c.record429("c", reset)
 
 	// Clearing b reports a park was present and frees only b.
-	if cleared := c.ClearExhaustedNick("b"); !cleared {
+	if cleared, _ := c.ClearExhaustedNick("b"); !cleared {
 		t.Fatalf("ClearExhaustedNick(b) = false, want true (park was present)")
 	}
 	c.mu.Lock()
@@ -1133,11 +1133,11 @@ func TestController_ClearExhaustedNick(t *testing.T) {
 	}
 
 	// Clearing b again — now un-parked — is a no-op.
-	if again := c.ClearExhaustedNick("b"); again {
+	if again, _ := c.ClearExhaustedNick("b"); again {
 		t.Fatalf("second ClearExhaustedNick(b) = true, want false (nothing to clear)")
 	}
 	// An unknown nick is a no-op too.
-	if unknown := c.ClearExhaustedNick("zzz"); unknown {
+	if unknown, _ := c.ClearExhaustedNick("zzz"); unknown {
 		t.Fatalf("ClearExhaustedNick(zzz) = true, want false (unknown nick)")
 	}
 }
@@ -1166,7 +1166,7 @@ func TestController_ClearExhaustedNick_storeUntouched(t *testing.T) {
 		t.Fatalf("before clear: a Parked=false, want true (live park active)")
 	}
 
-	if cleared := c.ClearExhaustedNick("a"); !cleared {
+	if cleared, _ := c.ClearExhaustedNick("a"); !cleared {
 		t.Fatalf("ClearExhaustedNick(a) = false, want true (live park was present)")
 	}
 
