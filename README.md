@@ -1014,7 +1014,10 @@ gateway's own judgment), clears that one nick, and re-fetches the view. A
 "Delete pool" control appears in a pool's header only once that pool is empty
 (no members): it calls `DELETE /_gateway/pool/{name}`, confirms, and refreshes
 the view — matching the empty-only API, which returns `409` for a pool that
-still has members. It
+still has members. The per-pool member list self-reconciles with the server on
+the status poll (issue #250), so a member added or removed in another tab or
+via the API shows up here within one tick without a manual refresh; any text
+already typed into the add-subscription form survives the re-render. The page
 contains no auth and no build step — it inherits the gateway's trust boundary. In shared mode this exposes
 write controls to any tailnet member that can reach the port; a Tailscale
 ACL restricting the port is the only gate.

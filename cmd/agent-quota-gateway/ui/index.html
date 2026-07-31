@@ -1264,6 +1264,137 @@
     });
   }
 
+  // liveRoster returns { poolName: Set<nick> } from the /_gateway/pool
+  // payload, the authoritative per-pool member set the gateway itself
+  // publishes on every poll (Controller.poolStatus in internal/auto/auto.go
+  // appends every member — including disabled ones — unconditionally).
+  // renderedRoster walks the same shape from the DOM (section[data-pool]
+  // → tr[data-nick]). applyLiveStatus diffs the two via rosterEqual and
+  // triggers loadConfig().then(renderAll) via scheduleReconcile when they
+  // disagree (issue #250): a membership change made outside this tab —
+  // another session, a curl, a restart that drops unsaved runtime
+  // mutations — would otherwise keep rendering here as if it hadn't
+  // happened, with an "updated HH:MM:SS" stamp advertising a stale view
+  // as seconds-fresh.
+  function liveRoster(statuses) {
+    var out = {};
+    (statuses || []).forEach(function (s) {
+      var set = {};
+      (s.members || []).forEach(function (m) { if (m && m.nick) set[m.nick] = true; });
+      out[s.pool] = set;
+    });
+    return out;
+  }
+  function renderedRoster() {
+    var out = {};
+    root.querySelectorAll('section.pool').forEach(function (section) {
+      var pool = section.getAttribute('data-pool');
+      var set = {};
+      section.querySelectorAll('table.members tbody tr[data-nick]').forEach(function (tr) {
+        set[tr.getAttribute('data-nick')] = true;
+      });
+      out[pool] = set;
+    });
+    return out;
+  }
+  function rosterEqual(a, b) {
+    var ap = Object.keys(a); var bp = Object.keys(b);
+    if (ap.length !== bp.length) return false;
+    for (var i = 0; i < ap.length; i++) {
+      var k = ap[i]; if (!b.hasOwnProperty(k)) return false;
+      var an = Object.keys(a[k]); var bn = Object.keys(b[k]);
+      if (an.length !== bn.length) return false;
+      for (var j = 0; j < an.length; j++) {
+        if (!b[k].hasOwnProperty(an[j])) return false;
+      }
+    }
+    return true;
+  }
+
+  // captureInputState / restoreInputState preserve whatever the operator
+  // was typing into the add-subscription form across an unscheduled
+  // re-render triggered by scheduleReconcile (issue #250 AC 5). renderAll
+  // tears the form down and renderAddSubscription rebuilds it; the same
+  // data-field attribute names the build path uses key the survivors.
+  // Only fields that held a non-empty value or focus are restored —
+  // blank fields would otherwise reappear and look like operator input,
+  // and refocusing a blank field is more disruptive than not.
+  var INPUT_FIELDS = ['nick', 'base_url', 'credential', 'pool', 'pool_name'];
+  function captureInputState() {
+    var captured = null;
+    var focusedField = null;
+    var active = document.activeElement;
+    if (active && active.getAttribute && active.getAttribute('data-field')) {
+      focusedField = active.getAttribute('data-field');
+    }
+    var values = {};
+    var any = false;
+    INPUT_FIELDS.forEach(function (f) {
+      var el = document.querySelector('form.add-member [data-field="' + f + '"]');
+      if (!el) return;
+      var v = (el.value || '');
+      if (v.length > 0) { values[f] = v; any = true; }
+    });
+    if (any || focusedField) { captured = { values: values, focus: focusedField }; }
+    return captured;
+  }
+  function restoreInputState(captured) {
+    if (!captured) return;
+    INPUT_FIELDS.forEach(function (f) {
+      if (!captured.values.hasOwnProperty(f)) return;
+      var el = document.querySelector('form.add-member [data-field="' + f + '"]');
+      if (!el) return;
+      el.value = captured.values[f];
+    });
+    // Programmatic .value = above does not fire 'change', so the pool
+    // select's dependent state (pool_name visibility, nick placeholder,
+    // base_url required flag — all set by toggleNewPool /
+    // refreshBaseUrlRequirement on build + on the 'change' event)
+    // still reflects the build-time default pool after a reconcile
+    // rebuild. Re-derive: a no-op for an existing pool, and reveals
+    // pool_name for NEW_POOL. Dispatched before focus so a refocused
+    // pool_name is visible when it lands.
+    var poolSel = document.querySelector('form.add-member [data-field="pool"]');
+    if (poolSel) {
+      try { poolSel.dispatchEvent(new Event('change')); } catch (e) { /* older browser */ }
+    }
+    if (captured.focus) {
+      var tgt = document.querySelector(
+        'form.add-member [data-field="' + captured.focus + '"]');
+      if (tgt && typeof tgt.focus === 'function') {
+        try { tgt.focus(); } catch (e) { /* not focusable after re-render */ }
+      }
+    }
+  }
+
+  // reconcileInFlight guards against a second reconcile being scheduled
+  // while the first is still in flight. Each tick has exactly one
+  // applyLiveStatus call, so the within-tick case is moot; the real value
+  // is cross-tick — a slow /_gateway/config (or a fresh divergence in
+  // the 3s window before the in-flight fetch resolves) would otherwise
+  // stack a second renderAll on top, double-rebuilding the tree and
+  // clobbering whatever restoreInputState had just put back. The flag is
+  // set when scheduling, cleared in the same chain after renderAll and
+  // restoreInputState have both run, so a divergence detected while a
+  // reconcile is in flight is dropped — the next tick's poll will catch
+  // it. That's the right tradeoff: an in-flight reconcile already
+  // re-fetched config, so any further server-side change in the same
+  // ~3s window will resurface on the next poll.
+  var reconcileInFlight = false;
+  function scheduleReconcile() {
+    if (reconcileInFlight) return;
+    reconcileInFlight = true;
+    var captured = captureInputState();
+    loadConfig().then(function (views) {
+      renderAll(views);
+      restoreInputState(captured);
+    }).then(function () {
+      reconcileInFlight = false;
+    }).catch(function () {
+      reconcileInFlight = false;
+    });
+  }
+
   function applyLiveStatus(statuses) {
     if (!statuses) return;
     var byPool = {};
@@ -1345,6 +1476,15 @@
         }
       });
     });
+
+    // Reconcile when the polled roster disagrees with the rendered one.
+    // Diff runs from the already-selected sections / statuses — no extra
+    // DOM walk in the steady state. Schedules a single re-render; the
+    // in-flight guard above coalesces any further divergence the
+    // re-render would otherwise miss.
+    if (!rosterEqual(liveRoster(statuses), renderedRoster())) {
+      scheduleReconcile();
+    }
   }
 
   function renderAll(views) {
