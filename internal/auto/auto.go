@@ -157,7 +157,12 @@ type Pools struct {
 // member reported fully consumed (poller- or header-sourced) even without a
 // live 429; a nil store disables that signal and keeps pure 429-driven
 // failover. now defaults to time.Now and logOut to os.Stderr when nil.
+// logOut is non-nil after construction (issue #252): callers may write to
+// it without a nil guard.
 func NewPools(reg *backend.Registry, store *quota.Store, now func() time.Time, logOut io.Writer) *Pools {
+	if logOut == nil {
+		logOut = os.Stderr
+	}
 	byPool := make(map[string]*Controller)
 	for _, name := range reg.PoolNames() {
 		byPool[name] = NewController(reg, name, -1, store, now, logOut)
@@ -532,7 +537,10 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 // The target nick must be a present (non-removed) member — static or
 // runtime-added — mirroring RemoveMember's semantics. Re-enabling a member that
 // was operator-removed is rejected, matching the rest of the runtime-member
-// surface. Returns (httpStatus, error) with error containing a
+// surface. The post-mutation log line names the resulting state (issue #252)
+// rather than the verb, so an operator reading the journal can tell whether a
+// member was disabled or re-enabled without knowing which endpoint was
+// called. Returns (httpStatus, error) with error containing a
 // credential-free message.
 func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) {
 	name := backend.NormalizeName(poolName)
@@ -561,6 +569,11 @@ func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) 
 	}
 	p.applyRegistryLocked(next, name)
 	p.markConfigDirtyLocked()
+	state := "enabled"
+	if off {
+		state = "disabled"
+	}
+	fmt.Fprintf(c.logOut, "auto[%s]: %s %s\n", name, normalized, state)
 	return http.StatusOK, nil
 }
 
@@ -1050,9 +1063,7 @@ func (p *Pools) AddPool(name, mode string) (int, error) {
 	c.onMutate = p.onMutate
 	p.byPool[normalized] = c
 	p.markConfigDirtyLocked()
-	if p.logOut != nil {
-		fmt.Fprintf(p.logOut, "auto: created runtime pool %s\n", normalized)
-	}
+	fmt.Fprintf(p.logOut, "auto: created runtime pool %s\n", normalized)
 	return http.StatusCreated, nil
 }
 
@@ -1093,9 +1104,7 @@ func (p *Pools) RemovePool(name string) (int, error) {
 	p.reg = next
 	delete(p.byPool, normalized)
 	p.markConfigDirtyLocked()
-	if p.logOut != nil {
-		fmt.Fprintf(p.logOut, "auto: removed runtime pool %s\n", normalized)
-	}
+	fmt.Fprintf(p.logOut, "auto: removed runtime pool %s\n", normalized)
 	return http.StatusOK, nil
 }
 
@@ -1183,9 +1192,7 @@ func (p *Pools) RenamePool(oldName, newName string) (int, error) {
 	if p.onMutate != nil {
 		p.onMutate()
 	}
-	if p.logOut != nil {
-		fmt.Fprintf(p.logOut, "auto: renamed pool %s -> %s\n", oldNorm, newNorm)
-	}
+	fmt.Fprintf(p.logOut, "auto: renamed pool %s -> %s\n", oldNorm, newNorm)
 	return http.StatusOK, nil
 }
 
