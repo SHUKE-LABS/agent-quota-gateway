@@ -2670,3 +2670,77 @@ func TestBalance_runtimeAddedMemberParticipates(t *testing.T) {
 		t.Fatalf("balance switch stayed on over-budget a, want b or extra")
 	}
 }
+
+// TestNewPools_defaultsLogOutToStderr locks the documented nil-default for
+// Pools.logOut (issue #252): a nil logOut at construction becomes os.Stderr.
+// The test is in-package so it can compare the field directly — no
+// process-global stderr swap, no -race risk.
+func TestNewPools_defaultsLogOutToStderr(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	reg := testRegistry(t, "a")
+	p := NewPools(reg, nil, clock.now, nil)
+	if p.logOut != os.Stderr {
+		t.Fatalf("Pools.logOut after NewPools(..., nil)=%p, want os.Stderr (%p)", p.logOut, os.Stderr)
+	}
+}
+
+// TestPools_addRemovePool_logsCreatedAndRemoved proves the pool-create and
+// pool-remove log lines land for a process constructed the way main.go
+// builds Pools (issue #252): NewPools with nil logOut, then AddPool/
+// RemovePool must write to the default logOut. The test reassigns
+// p.logOut to a buffer after the nil-default assertion so the lines are
+// captured deterministically without racing on the shared stderr.
+func TestPools_addRemovePool_logsCreatedAndRemoved(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	reg := testRegistry(t, "a")
+	p := NewPools(reg, nil, clock.now, nil)
+
+	buf := &bytes.Buffer{}
+	p.logOut = buf
+
+	if status, err := p.AddPool("rt", "plain"); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool: status=%d err=%v, want 201", status, err)
+	}
+	if status, err := p.RemovePool("rt"); status != http.StatusOK || err != nil {
+		t.Fatalf("RemovePool: status=%d err=%v, want 200", status, err)
+	}
+
+	got := buf.String()
+	wantCreated := "auto: created runtime pool rt\n"
+	wantRemoved := "auto: removed runtime pool rt\n"
+	if !strings.Contains(got, wantCreated) {
+		t.Errorf("log missing %q; got=%q", wantCreated, got)
+	}
+	if !strings.Contains(got, wantRemoved) {
+		t.Errorf("log missing %q; got=%q", wantRemoved, got)
+	}
+}
+
+// TestSetMemberDisabled_logsState proves SetMemberDisabled writes one line
+// per call naming the resulting state (issue #252). The line uses the
+// auto[<pool>]: <nick> <state> shape used by AddMember/RemoveMember so an
+// operator reading the journal can tell disable from enable without
+// knowing which endpoint was called.
+func TestSetMemberDisabled_logsState(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	buf := &bytes.Buffer{}
+	c := newController(t, 0, clock, buf, "a", "b")
+	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg, store: quota.NewStore()}
+
+	if status, err := p.SetMemberDisabled("auto", "b", true); status != http.StatusOK || err != nil {
+		t.Fatalf("SetMemberDisabled disable: status=%d err=%v", status, err)
+	}
+	if status, err := p.SetMemberDisabled("auto", "b", false); status != http.StatusOK || err != nil {
+		t.Fatalf("SetMemberDisabled enable: status=%d err=%v", status, err)
+	}
+
+	got := buf.String()
+	wantDisabled := "auto[auto]: b disabled\n"
+	wantEnabled := "auto[auto]: b enabled\n"
+	if !strings.Contains(got, wantDisabled) {
+		t.Errorf("log missing %q; got=%q", wantDisabled, got)
+	}
+	if !strings.Contains(got, wantEnabled) {
+		t.Errorf("log missing %q; got=%q", wantEnabled, got)
+	}
+}
