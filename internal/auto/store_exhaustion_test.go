@@ -1,6 +1,7 @@
 package auto
 
 import (
+	"bytes"
 	"io"
 	"strings"
 	"testing"
@@ -628,6 +629,88 @@ func TestSnapRejects_liveCczShape(t *testing.T) {
 	entry := memberEntry{Nick: "ccz", BaseURL: "https://api.MiniMax.com"}
 	if c.isGenuineExhaustionSignal(entry, true, live) {
 		t.Errorf("isGenuineExhaustionSignal(live ccz, respSnap=lively) = true, want false")
+	}
+}
+
+// TestStoreExhaustedUntil_topStatusRejectionDiagnostic pins the once-per-
+// nick log in storeBlockBoundLocked (auto.go:2953-2968). It is the only
+// trace that any poller-tracked provider ever set the top-level
+// anthropic-ratelimit-unified-status header post-#253 (snapRejects no
+// longer reads the field, but extraction, HasData, and mergeSnapshot
+// keep it operator-visible on /_gateway/pool — and only this log tells
+// the operator the field is non-routing because nothing can clear it).
+// The harness precedent is TestStoreExhaustedUntil_asOfAnchoredBound at
+// store_exhaustion_test.go:761, which also drives storeBlockBoundLocked
+// directly under c.mu.
+func TestStoreExhaustedUntil_topStatusRejectionDiagnostic(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "ccz"), "auto", 0, store, clock.now, &logBuf)
+
+	util := 0.0
+	live := quota.Snapshot{
+		UnifiedStatus:        unifiedStatusRejected,
+		Unified5hUtilization: &util,
+		Unified7dUtilization: &util,
+		AsOf:                 clock.now().Add(-30 * time.Second),
+	}
+	store.Put("ccz", live)
+
+	// (a) first call — log line appears, once.
+	c.mu.Lock()
+	_, _ = c.storeBlockBoundLocked("ccz")
+	c.mu.Unlock()
+	if !strings.Contains(logBuf.String(), "ccz") {
+		t.Errorf("first read: log missing ccz; got %q", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "unified_status=rejected") {
+		t.Errorf("first read: log missing unified_status=rejected; got %q", logBuf.String())
+	}
+	first := logBuf.String()
+
+	// (b) second call — same nick, same shape: NO new line (once-per-nick).
+	c.mu.Lock()
+	_, _ = c.storeBlockBoundLocked("ccz")
+	c.mu.Unlock()
+	if logBuf.Len() != len(first) {
+		t.Errorf("second read: log appended %d bytes; want no new lines (once-per-nick): %q", logBuf.Len()-len(first), logBuf.String()[len(first):])
+	}
+
+	// (c) per-window status present (the supported Anthropic path): silent.
+	store.Put("ccz", quota.Snapshot{
+		UnifiedStatus:        unifiedStatusRejected,
+		Unified5hStatus:      unifiedStatusRejected,
+		Unified5hUtilization: &util,
+		AsOf:                 clock.now().Add(-30 * time.Second),
+	})
+	logBuf.Reset()
+	c.mu.Lock()
+	_, _ = c.storeBlockBoundLocked("ccz")
+	c.mu.Unlock()
+	if logBuf.Len() != 0 {
+		t.Errorf("per-window-status path: log should be silent; got %q", logBuf.String())
+	}
+
+	// (d) reconcileLocked re-arms: remove ccz from the registry, log
+	// resets; re-add ccz and the diagnostic fires again.
+	reg2, err := backend.BuildFromSpec(backend.Spec{}, testDefaultBaseURL) // empty registry
+	if err != nil {
+		t.Fatalf("backend.BuildFromSpec: %v", err)
+	}
+	c.reconcileLocked(reg2)
+	if _, present := c.topStatusLogged["ccz"]; present {
+		t.Errorf("reconcileLocked(prune): topStatusLogged[ccz] still set; want pruned")
+	}
+	logBuf.Reset()
+	reg3 := testRegistry(t, "ccz")
+	c.reconcileLocked(reg3)
+	store.Put("ccz", live)
+	c.mu.Lock()
+	_, _ = c.storeBlockBoundLocked("ccz")
+	c.mu.Unlock()
+	if !strings.Contains(logBuf.String(), "ccz") {
+		t.Errorf("after reconcile re-add: log missing ccz; got %q", logBuf.String())
 	}
 }
 
