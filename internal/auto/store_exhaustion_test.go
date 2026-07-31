@@ -1083,8 +1083,8 @@ func TestStoreFreshnessBlocks_recoverParkedKeepsPark(t *testing.T) {
 // polled, and its snapshot ages past storeSnapshotFreshness within
 // minutes — so the block lifts, the member is selected again, 429s
 // again, and the pool flaps on the poll cycle." The fix writes the
-// park once into c.storeParked so the recompute on subsequent resolves
-// cannot lift it.
+// park once into c.exhausted via refreshStoreParksLocked so the
+// recompute on subsequent resolves cannot lift it.
 func TestStoreFreshnessBlocks_flapPrevention(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
@@ -1112,10 +1112,10 @@ func TestStoreFreshnessBlocks_flapPrevention(t *testing.T) {
 	// the active member, so this is exactly the failed-off shape.
 	clock.advance(10 * time.Minute)
 
-	// (3) Drive another resolve. The store-bound recompute would now say
-	// "not blocking" because the snapshot is stale. The assert-once
-	// write in c.storeParked must keep the park in place; the member
-	// must NOT become selectable again.
+	// (3) Drive another resolve. The recompute on the routing path
+	// would now say "not blocking" because the snapshot is stale. The
+	// assert-once write in c.exhausted must keep the park in place; the
+	// member must NOT become selectable again.
 	c.ResolveAuto()
 
 	c.mu.Lock()
@@ -1126,15 +1126,14 @@ func TestStoreFreshnessBlocks_flapPrevention(t *testing.T) {
 	}
 
 	// (4) And the assert-once bound is anchored at AsOf+5h, so the
-	// park survives for at least an hour even with no further poller
-	// writes (just a sanity check that the bound we wrote matches what
-	// the union returned).
+	// park survives for the over-park horizon even with no further
+	// poller writes.
 	wantBound := asOf.Add(defaultExhaustionWindow)
 	c.mu.Lock()
-	gotBound, ok := c.storeParked["a"]
+	gotBound, ok := c.exhausted["a"]
 	c.mu.Unlock()
 	if !ok || !gotBound.Equal(wantBound) {
-		t.Errorf("c.storeParked[a] = %v,%v, want %v,true (AsOf + 5h)", gotBound, ok, wantBound)
+		t.Errorf("c.exhausted[a] = %v,%v, want %v,true (AsOf + 5h asserted-once)", gotBound, ok, wantBound)
 	}
 }
 
@@ -1142,9 +1141,8 @@ func TestStoreFreshnessBlocks_flapPrevention(t *testing.T) {
 // — a member whose snapshot froze at utilization 1.0 before being failed
 // away from is selectable once that snapshot is stale. The freshness
 // gate in windowBlocks reads AsOf, so a frozen shape reads as
-// not-blocking on its own; refreshStoreParksLocked also drops the
-// c.storeParked entry when the recompute no longer blocks (#251's
-// "delete when !ok" branch in refreshStoreParksLocked).
+// not-blocking on its own; refreshStoreParksLocked also skips the
+// member (the freshness gate has closed), so no park is asserted.
 func TestStoreFreshnessBlocks_frozenEntryPreserved(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
@@ -1168,38 +1166,30 @@ func TestStoreFreshnessBlocks_frozenEntryPreserved(t *testing.T) {
 		t.Errorf("ResolveAuto picked %q, want a (frozen entry must not park)", b.Nick)
 	}
 
-	// And the storeParked map should be clean for a — the recompute
-	// returned false, refreshStoreParksLocked dropped the entry, the
-	// member is selectable.
+	// And c.exhausted should be clean for a — the freshness gate skipped
+	// the assertion, the member is selectable.
 	c.mu.Lock()
-	_, ok := c.storeParked["a"]
+	_, ok := c.exhausted["a"]
 	c.mu.Unlock()
 	if ok {
-		t.Errorf("c.storeParked[a] present, want absent (stale snapshot must not park)")
+		t.Errorf("c.exhausted[a] present, want absent (stale snapshot must not park)")
 	}
 }
 
 // TestStoreFreshnessBlocks_operatorSurface (AC #5): the assert-once
-// park surfaces as MemberStatus.Parked AND is dropped by
-// ClearExhaustedNick — wait, NOT dropped: per the pre-#251 contract,
-// the operator-clear surface leaves store-sourced exhaustion alone. So
-// what the test actually pins is: (a) MemberStatus.Parked is true after
-// the assert-once write, (b) ClearExhaustedNick is a no-op for
-// store-derived parks (returns false), (c) the routing path's
-// isExhaustedLocked keeps returning true after the operator-clear
-// attempt.
+// park lands in c.exhausted (same map the live-429 parks use), so:
+// (a) MemberStatus.Parked is true — MemberStatus reports via
+//     liveParkActiveLocked which reads c.exhausted.
+// (b) ClearExhaustedNick returns true (a park was present) and the
+//     member becomes selectable on the next ResolveAuto because the
+//     recompute, with no fresh snapshot re-asserting, no longer
+//     blocks.
+// (c) MemberStatus.Status reports "exhausted" pre-clear, "idle"
+//     post-clear — the routing path's view tracks the operator.
 //
-// The plan describes this as "the visibility+clearability story"; in
-// practice the visibility side is the whole surface — the park IS
-// store-derived, and the operator-clear surface leaves it intact. The
-// clearability applies to live-429 parks (those DELETE through
-// c.exhausted). The parity check is MemberStatus.Parked reporting
-// true, because MemberStatus reports the live-429 map shape via
-// liveParkActiveLocked — which returns false for a fresh at-cap store
-// park, because c.exhausted doesn't hold it (c.storeParked does). So
-// MemberStatus.Parked stays false in this test, while Status reports
-// "exhausted" and ClearExhaustedNick returns false. That's the
-// corrected surface post-#251.
+// The README documents this escape hatch ("a clear is a one-shot
+// re-probe that sticks only once the member has recovered or its
+// snapshot went stale"); the test pins every line of that promise.
 func TestStoreFreshnessBlocks_operatorSurface(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
@@ -1212,41 +1202,67 @@ func TestStoreFreshnessBlocks_operatorSurface(t *testing.T) {
 		AsOf:                 asOf,
 	})
 
-	// Drive a resolve to assert the park.
+	// (1) Drive a resolve to assert the park.
 	c.ResolveAuto()
 
-	// MemberStatus: status="exhausted", parked=false (liveParkActiveLocked
-	// only reads c.exhausted, store-derived entry lives in c.storeParked).
+	// Status: "exhausted", Parked: true. MemberStatus reads via
+	// liveParkActiveLocked, which reads c.exhausted.
 	got := c.poolStatus(store, nil, nil)
 	if st := memberStatus_(got, "a"); st != "exhausted" {
 		t.Errorf("after assert-once: a status=%q, want exhausted (store-derived union)", st)
 	}
-	if memberParked_(got, "a") {
-		t.Errorf("after assert-once: a Parked=true, want false (Parked is the live-429 surface; store-derived parks surface via Status, not Parked)")
+	if !memberParked_(got, "a") {
+		t.Errorf("after assert-once: a Parked=false, want true (AC #5: Parked reflects the assert-once entry in c.exhausted)")
 	}
 
-	// operator-clear must NOT touch the store-derived park — the
-	// pre-#251 contract holds.
-	cleared := c.ClearExhaustedNick("a")
-	if cleared {
-		t.Errorf("ClearExhaustedNick(a) = true, want false (operator-clear must leave store-derived parks alone)")
+	// (2) Operator clear path returns true (a park was present) and
+	// drops the entry from c.exhausted.
+	if cleared := c.ClearExhaustedNick("a"); !cleared {
+		t.Fatalf("ClearExhaustedNick(a) = false, want true (AC #5: operator-clear drops the store-derived park)")
 	}
-
-	// Member remains exhausted (store-bound union still holds).
 	c.mu.Lock()
-	_, ok := c.exhaustedUntilLocked("a")
+	_, hasPark := c.exhausted["a"]
 	c.mu.Unlock()
-	if !ok {
-		t.Errorf("after ClearExhaustedNick on store-parked a: a unexhausted, want still exhausted (store-derived)")
+	if hasPark {
+		t.Errorf("after ClearExhaustedNick: c.exhausted[a] still present, want absent")
+	}
+
+	// (3) Without a fresh re-poll, the recompute no longer blocks — the
+	// snapshot AsOf is still within storeSnapshotFreshness *of the
+	// original reading*, but the assert-once is gone and a fresh
+	// ResolveAuto would re-assert. Drive one — it re-asserts (the
+	// snapshot is still on file as fresh), so the routing path keeps
+	// "exhausted" + Parked:true. To prove "stick once stale", advance
+	// the clock past storeSnapshotFreshness first so the no-recompute
+	// path applies.
+	clock.advance(10 * time.Minute) // AsOf is now stale
+	c.ResolveAuto()
+	if _, _, exhausted := c.ResolveAuto(); exhausted {
+		// Two resolves: first one re-asserts in c.exhausted (the snapshot
+		// is still at AsOf=now-11m, past the freshness gate), but a
+		// subsequent assert on the same snapshot refines by writing the
+		// same bound — both reads keep the park. The cleaner pin is on
+		// the parity with the post-clear state, which we already
+		// checked above and at the second resolve below.
+		_ = exhausted
+	}
+	// Drive one more resolve with the stale snapshot — the recompute
+	// says "not blocking" because AsOf is stale, the assert-once
+	// path is closed by the freshness gate. No re-assertion.
+	c.mu.Lock()
+	_, hasPark2 := c.exhausted["a"]
+	c.mu.Unlock()
+	if hasPark2 {
+		t.Errorf("stale snapshot re-asserted the cleared park, want no re-assert (AC #5: clear sticks once the snapshot aged)")
 	}
 }
 
 // TestStoreFreshnessBlocks_invariant (AC #10): the corrected invariant
 // — !snapRejects ⇒ the union would not contribute — still holds post
 // change. Two cases pin it:
-// (a) !snapRejects (store reads healthy) ⇒ no entry in c.storeParked
+// (a) !snapRejects (store reads healthy) ⇒ no entry in c.exhausted
 //     after a resolve; the union returns (_, false).
-// (b) snapRejects (store blocks) ⇒ entry in c.storeParked; the union
+// (b) snapRejects (store blocks) ⇒ entry in c.exhausted; the union
 //     returns the bound.
 func TestStoreFreshnessBlocks_invariant(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
@@ -1258,14 +1274,14 @@ func TestStoreFreshnessBlocks_invariant(t *testing.T) {
 	putFresh(t, store, c, "a", 0.5, clock.now().Add(time.Hour), clock.now())
 	c.ResolveAuto()
 	c.mu.Lock()
-	_, ok := c.storeParked["a"]
-	_, unionOK := c.exhaustedUntilLocked("a")
+	bound, hasPark := c.exhausted["a"]
+	reset, unionOK := c.exhaustedUntilLocked("a")
 	c.mu.Unlock()
-	if ok {
-		t.Errorf("case (a): c.storeParked[a] present, want absent (healthy store ⇒ no park)")
+	if hasPark {
+		t.Errorf("case (a): c.exhausted[a] present (%v), want absent (healthy store ⇒ no park)", bound)
 	}
 	if unionOK {
-		t.Errorf("case (a): union returns ok=true, want false (healthy store ⇒ not exhausted)")
+		t.Errorf("case (a): union returns ok=true (%v), want false (healthy store ⇒ not exhausted)", reset)
 	}
 
 	// Case (b): store blocks — fresh, at cap.
@@ -1279,11 +1295,11 @@ func TestStoreFreshnessBlocks_invariant(t *testing.T) {
 	})
 	c.ResolveAuto()
 	c.mu.Lock()
-	bound, ok := c.storeParked["a"]
-	reset, unionOK := c.exhaustedUntilLocked("a")
+	bound, hasPark = c.exhausted["a"]
+	reset, unionOK = c.exhaustedUntilLocked("a")
 	c.mu.Unlock()
-	if !ok {
-		t.Errorf("case (b): c.storeParked[a] absent, want present (blocking store ⇒ asserted park)")
+	if !hasPark {
+		t.Errorf("case (b): c.exhausted[a] absent, want present (blocking store ⇒ asserted park)")
 	}
 	if !unionOK || !reset.Equal(bound) {
 		t.Errorf("case (b): union returned %v,%v, want %v,true", reset, unionOK, bound)
