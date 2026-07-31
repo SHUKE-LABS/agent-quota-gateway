@@ -1155,8 +1155,11 @@ func TestController_ClearExhaustedNick_storeUntouched(t *testing.T) {
 	c.store = store
 
 	// a is at cap with a future reset (store-exhausted) AND live-parked.
+	// putUtil (rather than putSnap) sets AsOf: the freshness gate the new
+	// no-status branch reads (issue #251) — a zero-AsOf snapshot reads as
+	// stale and not blocking, which would defeat the test's premise.
 	reset := clock.now().Add(time.Hour)
-	putSnap(store, c, "a", fptr(1.0), nil, tptr(reset), nil)
+	putUtil(t, store, c, "a", 1.0, reset)
 	c.record429("a", reset)
 
 	if got := c.poolStatus(store, nil, nil); !memberParked(got, "a") {
@@ -2450,22 +2453,22 @@ func TestWindowBlocks_rejectedRespectsReset(t *testing.T) {
 	util := 0.4
 
 	// future reset — still blocking
-	if !windowBlocks(&util, unifiedStatusRejected, &future, now) {
+	if !windowBlocks(&util, unifiedStatusRejected, &future, now, now) {
 		t.Errorf("windowBlocks(rejected, future reset) = false, want true")
 	}
 	// past reset — no longer blocking (issue #134)
-	if windowBlocks(&util, unifiedStatusRejected, &past, now) {
+	if windowBlocks(&util, unifiedStatusRejected, &past, now, now) {
 		t.Errorf("windowBlocks(rejected, past reset) = true, want false")
 	}
 	// nil reset — still blocking (no reset to bound)
-	if !windowBlocks(&util, unifiedStatusRejected, nil, now) {
+	if !windowBlocks(&util, unifiedStatusRejected, nil, now, now) {
 		t.Errorf("windowBlocks(rejected, nil reset) = false, want true")
 	}
 	// non-rejected status — never blocking
-	if windowBlocks(&util, "allowed", &future, now) {
+	if windowBlocks(&util, "allowed", &future, now, now) {
 		t.Errorf("windowBlocks(allowed, future reset) = true, want false")
 	}
-	if windowBlocks(&util, "allowed_warning", &future, now) {
+	if windowBlocks(&util, "allowed_warning", &future, now, now) {
 		t.Errorf("windowBlocks(allowed_warning, future reset) = true, want false")
 	}
 }
