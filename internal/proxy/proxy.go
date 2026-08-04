@@ -43,10 +43,11 @@ type ResponseObserver func(*http.Response)
 // ResponseModifier runs in ModifyResponse after the observer and may
 // mutate the response (status, headers, body) before the proxy streams
 // it to the client — the supported httputil.ReverseProxy mechanism for
-// rewriting a response. It is the pool failover hook: an upstream 429
-// becomes a 503 (switchable) or a Retry-After 429 (pool dry). A returned
-// error surfaces as a 502, so implementations should return nil for the
-// pass-through case. nil disables the hook.
+// rewriting a response. It is the pool response hook: an upstream 429
+// becomes a 503 (switchable) or a Retry-After 429 (pool dry), and a native
+// Anthropic 529 overload may become a same-member 503 with a fixed retry
+// delay. A returned error surfaces as a 502, so implementations should return
+// nil for the pass-through case. nil disables the hook.
 type ResponseModifier func(*http.Response) error
 
 // New builds the proxy http.Handler.

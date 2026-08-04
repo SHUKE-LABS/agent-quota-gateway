@@ -93,12 +93,13 @@ request dump (`internal/reqlog`, credentials redacted).
    admission guard). `HasData()` is the **read** gate, used on `Store.Get`
    for a missing key — that returns a stamped-but-empty snapshot, never an
    admitted one.
-5. `pools.ModifyResponse` dispatches per-pool failover: upstream **429**
-   → synthetic **503** (switch member — short `Retry-After`) or **503**
-   with the precise long `Retry-After` (pool dry, issue #203; the two 503
-   flavors differ only in `Retry-After`); **401/403** → park the dead
-   credential and fail over (a revoked account never 429s, so without this
-   the pool would stick to it).
+5. `pools.ModifyResponse` dispatches per-pool response handling: upstream
+   **429** → synthetic **503** for a member switch, a precise pool-dry wait,
+   or a same-member transient throttle depending on the classifier; native
+   Anthropic **529** overload → synthetic same-member **503** with
+   `Retry-After: 60`; **401/403** → park the dead credential and fail over (a
+   revoked account never 429s, so without this the pool would stick to it).
+   The 529 path does not change pool state.
 
 ### Packages
 
