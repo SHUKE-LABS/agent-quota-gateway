@@ -50,14 +50,13 @@ func newGateway(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *http
 	return gwSrv, upstream
 }
 
-func TestProxy_messagesStreamsWithoutBuffering(t *testing.T) {
+func TestProxy_responsesStreamsWithoutBuffering(t *testing.T) {
 	// Upstream writes three SSE events with a 100ms gap between them.
 	// If the proxy buffers the full response, the client will not see
 	// the first event until ~300ms after the request starts.
 	var writes atomic.Int32
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("anthropic-version", "2023-06-01")
 		w.WriteHeader(http.StatusOK)
 
 		flusher, ok := w.(http.Flusher)
@@ -66,7 +65,7 @@ func TestProxy_messagesStreamsWithoutBuffering(t *testing.T) {
 		}
 
 		for i := 0; i < 3; i++ {
-			fmt.Fprintf(w, "event: message\ndata: {\"chunk\":%d}\n\n", i)
+			fmt.Fprintf(w, "event: response.output_text.delta\ndata: {\"chunk\":%d}\n\n", i)
 			flusher.Flush()
 			writes.Add(1)
 			time.Sleep(100 * time.Millisecond)
@@ -74,7 +73,7 @@ func TestProxy_messagesStreamsWithoutBuffering(t *testing.T) {
 	})
 	gw, _ := newGateway(t, upstream)
 
-	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/messages", strings.NewReader("{}"))
+	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/responses", strings.NewReader("{\"input\":\"opaque\"}"))
 	if err != nil {
 		t.Fatalf("req: %v", err)
 	}
@@ -98,10 +97,14 @@ func TestProxy_messagesStreamsWithoutBuffering(t *testing.T) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	var firstAt time.Duration
+	var events int
 	for scanner.Scan() {
 		line := scanner.Text()
-		if firstAt == 0 && strings.HasPrefix(line, "event: message") {
+		if firstAt == 0 && strings.HasPrefix(line, "event: response.output_text.delta") {
 			firstAt = time.Since(start)
+		}
+		if strings.HasPrefix(line, "event: response.output_text.delta") {
+			events++
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -112,6 +115,9 @@ func TestProxy_messagesStreamsWithoutBuffering(t *testing.T) {
 	}
 	if firstAt > 250*time.Millisecond {
 		t.Errorf("first event arrived at %v; proxy appears to buffer (want < 250ms)", firstAt)
+	}
+	if events != 3 || writes.Load() != 3 {
+		t.Errorf("streamed events = %d, upstream writes = %d, want 3 each", events, writes.Load())
 	}
 }
 
@@ -313,12 +319,11 @@ func TestProxy_perBackendBaseURLAndPathPrefix(t *testing.T) {
 	}
 }
 
-// TestProxy_normalizeLeadingV1 covers the /v1 prefix normalization
-// (issue #157): for root-mounted upstreams the inbound path is rewritten
-// to carry exactly one leading /v1 segment, while a non-root upstream
-// (base URL with its own path prefix) is left untouched. The cases mirror
-// the issue's table.
-func TestProxy_normalizeLeadingV1(t *testing.T) {
+// TestProxy_normalizeRequestPath covers the generic /v1 prefix normalization
+// (issue #157): root-mounted upstreams receive exactly one leading /v1
+// segment, while a base URL ending in /v1 consumes inbound /v1 segments before
+// joining. Other base-path prefixes retain their existing join behavior.
+func TestProxy_normalizeRequestPath(t *testing.T) {
 	cases := []struct {
 		name     string
 		basePath string // appended to the fake upstream URL; "" = root-mounted
@@ -332,6 +337,8 @@ func TestProxy_normalizeLeadingV1(t *testing.T) {
 		{"native_triple_v1", "", "/v1/v1/v1/messages", "/v1/messages"},
 		// 4. OpenCode / Codex consume /v1 from the base URL → gains it back.
 		{"native_bare_messages", "", "/messages", "/v1/messages"},
+		{"native_bare_responses", "", "/responses", "/v1/responses"},
+		{"native_responses", "", "/v1/responses", "/v1/responses"},
 		// 5. A bare subpath gains the prefix.
 		{"native_bare_subpath", "", "/some/random/path", "/v1/some/random/path"},
 		// 6. Only the duplicate prefix collapses; the suffix passes through.
@@ -339,9 +346,14 @@ func TestProxy_normalizeLeadingV1(t *testing.T) {
 		// 8. A root-mounted Anthropic-compat vendor (not native) gets the
 		// same fix — locks in the wide scope.
 		{"compat_root_bare_messages", "", "/messages", "/v1/messages"},
-		// 7. Non-root upstream: the operator's base path is preserved and
-		// no /v1 rule fires — behaviour identical to today.
+		// A non-version base path is preserved and no /v1 rule fires.
 		{"non_root_unchanged", "/anthropic", "/v1/messages", "/anthropic/v1/messages"},
+		// A versioned base path accepts both client spellings without
+		// duplicating /v1, including the Responses endpoint.
+		{"versioned_base_bare_responses", "/api/v1", "/responses", "/api/v1/responses"},
+		{"versioned_base_responses", "/api/v1", "/v1/responses", "/api/v1/responses"},
+		{"versioned_base_double_responses", "/api/v1", "/v1/v1/responses", "/api/v1/responses"},
+		{"versioned_base_messages", "/api/v1", "/v1/messages", "/api/v1/messages"},
 		// 9. Segment-aware boundary: a leading token that merely starts
 		// with "v1" is not the /v1 segment, so it gains the prefix rather
 		// than collapsing. "v1beta" is synthetic (no Anthropic-compat
@@ -375,6 +387,103 @@ func TestProxy_normalizeLeadingV1(t *testing.T) {
 
 			if gotPath != tc.want {
 				t.Errorf("upstream saw path %q, want %q", gotPath, tc.want)
+			}
+		})
+	}
+}
+
+// TestProxy_responsesJSONPassesThroughOpaque proves that an OpenAI-compatible
+// Responses request is only an HTTP exchange at the gateway boundary: the
+// path is joined, the configured Bearer credential replaces the selector, and
+// the method, query, headers, body, status, and response bytes are untouched.
+func TestProxy_responsesJSONPassesThroughOpaque(t *testing.T) {
+	const credential = "responses-provider-secret"
+	const requestBody = `{"model":"opaque-model","input":[{"role":"user","content":"hello"}]}`
+	const responseBody = `{"id":"resp_opaque","output":[{"type":"message"}]}`
+
+	tests := []string{"/responses", "/v1/responses"}
+	for _, inbound := range tests {
+		t.Run(strings.TrimPrefix(inbound, "/"), func(t *testing.T) {
+			var gotMethod, gotPath, gotQuery, gotAuth, gotAPIKey, gotCustom, gotBody string
+			upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotPath = r.URL.Path
+				gotQuery = r.URL.RawQuery
+				gotAuth = r.Header.Get("Authorization")
+				gotAPIKey = r.Header.Get("x-api-key")
+				gotCustom = r.Header.Get("X-Opaque-Header")
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read request body: %v", err)
+				}
+				gotBody = string(body)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = io.WriteString(w, responseBody)
+			})
+			upSrv := httptest.NewServer(upstream)
+			t.Cleanup(upSrv.Close)
+
+			gw, err := proxy.New(nil, nil)
+			if err != nil {
+				t.Fatalf("proxy.New: %v", err)
+			}
+			b := backend.Backend{
+				Pool:       "responses",
+				Nick:       "provider",
+				Credential: credential,
+				BaseURL:    upSrv.URL + "/api/v1",
+			}
+			gwSrv := httptest.NewServer(injectBackend(b, gw))
+			t.Cleanup(gwSrv.Close)
+
+			req, err := http.NewRequest(http.MethodPost, gwSrv.URL+inbound+"?stream=false", strings.NewReader(requestBody))
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer client-pool-selector")
+			req.Header.Set("x-api-key", "client-placeholder")
+			req.Header.Set("X-Opaque-Header", "preserve-me")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("do: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusCreated {
+				t.Errorf("status = %d, want 201", resp.StatusCode)
+			}
+			if got := resp.Header.Get("Content-Type"); got != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", got)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
+			if string(body) != responseBody {
+				t.Errorf("response body = %q, want %q", body, responseBody)
+			}
+			if gotMethod != http.MethodPost {
+				t.Errorf("method = %q, want POST", gotMethod)
+			}
+			if gotPath != "/api/v1/responses" {
+				t.Errorf("upstream path = %q, want /api/v1/responses", gotPath)
+			}
+			if gotQuery != "stream=false" {
+				t.Errorf("query = %q, want stream=false", gotQuery)
+			}
+			if gotAuth != "Bearer "+credential {
+				t.Errorf("Authorization = %q, want Bearer credential", gotAuth)
+			}
+			if gotAPIKey != "" {
+				t.Errorf("x-api-key = %q, want empty", gotAPIKey)
+			}
+			if gotCustom != "preserve-me" {
+				t.Errorf("opaque header = %q, want preserve-me", gotCustom)
+			}
+			if gotBody != requestBody {
+				t.Errorf("request body = %q, want %q", gotBody, requestBody)
 			}
 		})
 	}

@@ -1,21 +1,24 @@
 # agent-quota-gateway
 
-Loopback-only reverse proxy for the Anthropic Messages API, sized for
-local Claude Code workflows.
+Loopback-only reverse proxy for opaque HTTP/SSE APIs, sized for local
+Anthropic Messages and OpenAI-compatible Responses workflows.
 
 ## What it is
 
 A single-binary Go server that listens on `127.0.0.1` and forwards any
-`POST` to an Anthropic-compatible upstream (Claude Code uses
-`/v1/messages` and `/v1/messages/count_tokens`), preserving streaming and
-the `anthropic-*` headers Claude Code sends. For multiple machines that
+method and path to the selected upstream (Anthropic clients use
+`/v1/messages`; OpenAI-compatible clients use `/responses` or
+`/v1/responses`), preserving streaming and headers. Request and response
+payloads are opaque to the gateway: it performs no body inspection,
+translation, or provider detection. For multiple machines that
 share one set of pool credentials, an opt-in
 [shared mode](#shared-mode-over-tailscale) binds a Tailscale address so
 they ride one authoritative instance.
 
 The gateway owns one or more named **pools**. A pool is a set of
-*interchangeable* backends — same protocol, same quota semantics — each
-holding a real upstream credential. A client never sends a real token: it
+*interchangeable* backends — one client-facing application contract and the
+same quota semantics — each holding a real upstream credential. A client
+never sends a real token: it
 sends a **pool name** (via `ANTHROPIC_AUTH_TOKEN`, which Claude Code puts
 on the `Authorization` header), and the gateway picks a backend from that
 pool and swaps in its credential before forwarding. The gateway
@@ -24,17 +27,17 @@ local user can ride several authorized accounts from a single endpoint
 without any client ever seeing a credential.
 
 Everything is a pool. There is no non-pool mode: even a single account is
-declared inside a pool. Pools let you keep different *kinds* of account
-apart — native Claude subscriptions, non-native Claude-compatible
-vendors, and pay-as-you-go API keys each live in their own pool, because
-mixing kinds breaks the assumptions auto-rotation relies on (a switch
-across vendors loses the prompt cache, and quota semantics differ).
+declared inside a pool. The client-facing pool selector is the application
+boundary: Anthropic Messages clients and OpenAI-compatible Responses clients
+must use different pool names, and operators must not place members from
+different application/protocol classes in one pool. AQG does not infer that
+contract from nick, token prefix, hostname, or request body.
 
 ## Scope
 
-- Anthropic protocol only. No OpenAI / Google / other protocols. Pools
-  may point at non-Anthropic *hosts* as long as they speak the Anthropic
-  Messages API (e.g. a Claude-compatible vendor).
+- Opaque HTTP/SSE passthrough for Anthropic Messages and OpenAI-compatible
+  Responses. AQG does not translate or validate provider-specific schemas;
+  any additional protocol support is an upstream/client contract.
 - Full method + path passthrough. Any method on any path is forwarded to
   the upstream — the upstream is the authority on what it serves, so new
   or compatible-API endpoints (e.g. `GET /v1/models`, batch polling, the
@@ -68,7 +71,8 @@ across vendors loses the prompt cache, and quota semantics differ).
 
 Out of scope:
 
-- Non-Anthropic *protocols*.
+- Protocol detection, request/response body inspection, and protocol
+  translation.
 - Quota-watermark or concurrency-aware load spreading. A pool fails off a
   member on a real `429`, or once the quota store reports its window
   **blocking** — a `rejected` status for an Anthropic backend, or (for a
@@ -114,14 +118,15 @@ ANTHROPIC_AUTH_TOKEN=auto \
 claude
 ```
 
-The gateway normalizes the leading `/v1` on the request path, so the
-client base URL works either way: set it to the gateway root
+The gateway joins request paths without inspecting their payloads. It
+normalizes the leading `/v1` where needed, so a client base URL works either
+way: set it to the gateway root
 (`http://127.0.0.1:8080`, what Claude Code uses) **or** with a `/v1`
 suffix (`http://127.0.0.1:8080/v1`, what OpenCode / Codex and SDKs that
 hardcode `baseURL/v1` require). Both reach the upstream's `/v1` surface
-correctly. (This applies to every pool whose upstream is mounted at the
-host root, including Anthropic-compat vendors; a pool whose base URL
-carries its own path prefix is left untouched.)
+correctly. A pool whose upstream base URL already ends in `/v1` likewise
+accepts both `/responses` and `/v1/responses` without duplicating the version
+segment.
 
 The pool name replaces what used to be a real token — the consumer side
 changes only its *value*, not its wiring. Pool and member names are
@@ -166,6 +171,20 @@ The runtime add-member API (see [Runtime pool configuration](#runtime-pool-confi
 is unaffected — it resolves a known subscription's credential and base URL
 across pools and keeps its own same-nick-slot overwrite/conflict rules.
 
+For an OpenAI-compatible Responses client, use a separate selector and pool:
+
+```bash
+AQG_POOL_RESPONSES_BASE_URL=https://openai-compatible.example/api/v1 \
+AQG_POOL_RESPONSES_BACKEND_RESPONSES_KEY=openai-compatible-token \
+OPENAI_BASE_URL=http://127.0.0.1:8080 \
+OPENAI_API_KEY=responses \
+your-client
+```
+
+The pool name (`responses` here) is the only application-class boundary.
+Keep Anthropic members in Anthropic-facing pools and Responses members in
+Responses-facing pools; AQG treats both payloads as opaque HTTP/SSE data.
+
 ### Auth schemes
 
 The gateway picks the outbound auth scheme per credential, by prefix:
@@ -202,6 +221,10 @@ AQG_POOL_Z_AI_BASE_URL=https://open.example/anthropic
 AQG_POOL_Z_AI_BACKEND_X=vendor-key-x
 AQG_POOL_Z_AI_BACKEND_Y=vendor-key-y|https://mirror.example/anthropic
 
+# OpenAI-compatible Responses clients — a separate application pool.
+AQG_POOL_RESPONSES_BASE_URL=https://openai-compatible.example/api/v1
+AQG_POOL_RESPONSES_BACKEND_RESPONSES_KEY=openai-compatible-token
+
 # A mixed pool that prefers one member over another. PRIORITY makes the
 # pool start on (and fail over toward) the highest-priority healthy member
 # instead of a random one — drain the preferred backend first, fall to the
@@ -211,8 +234,11 @@ AQG_POOL_CHN_BACKEND_M3=m3-key
 AQG_POOL_CHN_PRIORITY=zai,m3
 ```
 
-Clients then select `auto`, `api`, `z-ai`, or `chn`. Each pool rotates
-independently; the gateway does not move traffic between pools on its own.
+Clients then select `auto`, `api`, `z-ai`, `responses`, or `chn`. Each pool
+rotates independently; the gateway does not move traffic between pools on
+its own. Do not put Anthropic-facing and Responses-facing members in the
+same pool: pool selection is the client/operator contract, not an inferred
+protocol classification.
 
 ### Priority within a pool
 
@@ -328,6 +354,10 @@ that trade.
 Declaring both is a startup error.
 
 ## Environment variables
+
+There is deliberately no pool protocol field or `AQG_POOL_<POOL>_PROTOCOL`
+variable. Use different client-facing pool names for different application
+classes and configure each pool's `BASE_URL` and members accordingly.
 
 | Variable | Default | Notes |
 |----------|---------|-------|
@@ -473,6 +503,10 @@ permissions causes startup to fail closed — no silent fallback to env.
 }
 ```
 
+The file format has no protocol marker. Keep a pool such as `responses`
+separate from Anthropic-facing pools and let each client select its matching
+pool name.
+
 **Env ↔ File mapping table:**
 
 | Env var | JSON path | Notes |
@@ -502,7 +536,7 @@ chmod 600 aqg.json   # required: gateway rejects looser permissions
 ./agent-quota-gateway   # or: --config aqg.json
 ```
 
-The sample file contains placeholder credentials (`sk-ant-oat-PLACEHOLDER-*`);
+The sample file contains placeholder credentials (`*-PLACEHOLDER-*`);
 replace them with your real credentials. The repository gitignores `aqg.json`
 so your real file is never committed by default.
 
@@ -524,6 +558,10 @@ You should see streaming SSE events back. The `-N` flag is required so
 `curl` does not buffer the response itself. An unknown or missing selector
 returns `403 {"error":"unknown backend selector"}` without any upstream
 round-trip.
+
+An OpenAI-compatible client uses its separate pool selector (for example,
+`responses`) and may call either `/responses` or `/v1/responses`; the gateway
+forwards the opaque JSON or SSE exchange to that pool's configured upstream.
 
 ## Pools and selectors
 

@@ -460,6 +460,44 @@ func TestModifyResponse_policy429NotParked(t *testing.T) {
 	}
 }
 
+// TestModifyResponse_statusConversionIsIdempotent guards the proxy retry
+// boundary: once a 429 has become a client-facing 503, a repeated response
+// hook must leave the status and body alone rather than re-entering failover.
+// This keeps a synthetic 503 from becoming a conversion loop if another
+// wrapper invokes the hook more than once.
+func TestModifyResponse_statusConversionIsIdempotent(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+	resp := resp429Policy(c.resolve(t, "a"))
+
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("first ModifyResponse: %v", err)
+	}
+	firstBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read first body: %v", err)
+	}
+	firstCurrent := c.Current()
+
+	resp.Body = io.NopCloser(bytes.NewReader(firstBody))
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("second ModifyResponse: %v", err)
+	}
+	secondBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read second body: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status after second conversion = %d, want 503", resp.StatusCode)
+	}
+	if !bytes.Equal(secondBody, firstBody) {
+		t.Errorf("body changed on repeated conversion: first=%q second=%q", firstBody, secondBody)
+	}
+	if got := c.Current(); got != firstCurrent {
+		t.Errorf("current member changed on repeated conversion: first=%q second=%q", firstCurrent, got)
+	}
+}
+
 // TestModifyResponse_anthropic529OverloadAbsorbed proves a native Anthropic
 // capacity overload becomes a same-member transient 503 instead of reaching
 // the client as a terminal 529. The path must not park, switch, or leak the
