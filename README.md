@@ -662,10 +662,16 @@ quota store tracks each member's `as_of` timestamp; when the poller's
 most recent measurement lands a member at utilization 1.0 (or `rejected`
 status), the gateway asserts the member into an exhausted mark once on
 the next routing decision. If the snapshot carries a usable future
-reset, the park ends at that reset. If it carries no reset (the
-upstream `429` omitted it, or the poller's prior 5h field is the only
-data), the park runs for `defaultExhaustionWindow` (5 h) from
-`snap.AsOf` — a deliberate over-park rather than a probe. The
+reset, the park ends at that reset — and once a `rejected` window's 5h
+reset has elapsed the store-derived signal stops blocking, so the member
+leaves `exhausted` and becomes selectable again without a re-poll (issue
+#286), the same way an elapsed non-status window already recovers. If the
+snapshot carries no reset (the upstream `429` omitted it, or the poller's
+prior 5h field is the only data), the park runs for
+`defaultExhaustionWindow` (5 h) from `snap.AsOf` — a deliberate over-park
+rather than a probe — but that fallback stays bounded and expires: once
+`snap.AsOf + 5 h` is in the past the member is available and the elapsed
+bound is never recreated on a later read. The
 as-of-anchored bound is deterministic across reads (it does not re-arm
 on each query), and the assert-once prevents a flap on the poll cycle
 where the parked member's snapshot ages out minutes later. The

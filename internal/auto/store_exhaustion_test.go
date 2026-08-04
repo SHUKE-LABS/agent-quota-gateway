@@ -773,14 +773,16 @@ func TestSnapRejects_7dFreshAtCapWithPastResetIsBlocking(t *testing.T) {
 	}
 }
 
-// TestStoreExhaustedUntil_rejectedStatusWithNoUsableResetSynthesizesBound
-// pins #251 AC #2: a "rejected" window with no usable reset (nil OR past)
-// still contributes a bound — anchored at snap.AsOf + defaultExhaustionWindow,
-// the deliberate over-park. Pre-#251 this case contributed nothing because
-// the union required `reset != nil && now.Before(*reset)`; #251 closes that
-// gap so a member the store just measured at the cap parks even when the
-// upstream 429 carried no reset header.
-func TestStoreExhaustedUntil_rejectedStatusWithNoUsableResetSynthesizesBound(t *testing.T) {
+// TestStoreExhaustedUntil_rejectedStatusNilResetSynthesizesBound
+// pins #251 AC #2 as narrowed by #286: a "rejected" window with NO reset
+// still contributes a bound anchored at snap.AsOf + defaultExhaustionWindow,
+// the deliberate over-park for a 429 that carried no reset header. #286
+// split the old "no usable reset (nil OR past)" case in two — an elapsed
+// reset now reads as recovered rather than re-parking to AsOf+5h (see
+// TestStoreExhaustedUntil_rejectedFutureResetThenElapsedClears); only the
+// nil reset keeps the synthesized fallback, and even that is bounded (it
+// ages out — TestStoreExhaustedUntil_rejectedNilResetPastFallbackNotRecreated).
+func TestStoreExhaustedUntil_rejectedStatusNilResetSynthesizesBound(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
 	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
@@ -799,18 +801,6 @@ func TestStoreExhaustedUntil_rejectedStatusWithNoUsableResetSynthesizesBound(t *
 	})
 	if got, ok := c.exhaustedUntil("a"); !ok || !got.Equal(want) {
 		t.Errorf("exhaustedUntil(nil reset) = %v,%v, want %v,true (AC #2 synthesize)", got, ok, want)
-	}
-
-	// past reset — synthesizes AsOf+5h, NOT the past reset.
-	past := clock.now().Add(-time.Hour)
-	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
-		Unified5hUtilization: &util,
-		Unified5hStatus:      unifiedStatusRejected,
-		Unified5hReset:       &past,
-		AsOf:                 asOf,
-	})
-	if got, ok := c.exhaustedUntil("a"); !ok || !got.Equal(want) {
-		t.Errorf("exhaustedUntil(past reset) = %v,%v, want %v,true (AC #2 synthesize)", got, ok, want)
 	}
 }
 
@@ -1473,4 +1463,170 @@ func memberParked_(ps PoolStatus, nick string) bool {
 		}
 	}
 	return false
+}
+
+// memberExhaustedUntil_ returns the ExhaustedUntil pointer reported for nick,
+// or nil when the member is absent or carries no bound.
+func memberExhaustedUntil_(ps PoolStatus, nick string) *time.Time {
+	for _, m := range ps.Members {
+		if m.Nick == nick {
+			return m.ExhaustedUntil
+		}
+	}
+	return nil
+}
+
+// TestStoreExhaustedUntil_rejectedFutureResetThenElapsedClears is the core
+// issue #286 regression: a member whose stored snapshot carries
+// unified_5h_status "rejected" with a future 5h reset reports exhausted until
+// that reset, then — with no independent live/credential park — reads as
+// recovered the moment the reset elapses, across exhaustedUntil, poolStatus,
+// and ResolveAuto. Pre-#286 storeBlockBoundLocked bypassed windowBlocks for a
+// rejected status and re-parked the member to snap.AsOf + 5h past its own
+// reset, so it never left "exhausted".
+func TestStoreExhaustedUntil_rejectedFutureResetThenElapsedClears(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard) // sticky on a
+
+	reset := clock.now().Add(time.Hour)
+	util := 1.0
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		Unified5hReset:       &reset,
+		AsOf:                 clock.now(),
+	})
+
+	// Before the reset: exhausted, with the future reset as the bound.
+	if got, ok := c.exhaustedUntil("a"); !ok || !got.Equal(reset) {
+		t.Fatalf("pre-reset exhaustedUntil(a) = %v,%v, want %v,true", got, ok, reset)
+	}
+	ps := c.poolStatus(store, nil, nil)
+	if s := memberStatus_(ps, "a"); s != "exhausted" {
+		t.Errorf("pre-reset poolStatus a = %q, want exhausted", s)
+	}
+	if eu := memberExhaustedUntil_(ps, "a"); eu == nil || !eu.Equal(reset.UTC()) {
+		t.Errorf("pre-reset a.ExhaustedUntil = %v, want %v", eu, reset.UTC())
+	}
+
+	// Advance past the 5h reset. With no live/credential park the member is
+	// selectable again: the elapsed reject no longer contributes a bound.
+	clock.advance(2 * time.Hour)
+	if got, ok := c.exhaustedUntil("a"); ok {
+		t.Fatalf("post-reset exhaustedUntil(a) = %v,%v, want _,false (reset elapsed)", got, ok)
+	}
+	ps = c.poolStatus(store, nil, nil)
+	if s := memberStatus_(ps, "a"); s != "active" { // a is the sticky (curNick) member
+		t.Errorf("post-reset poolStatus a = %q, want active (sticky member recovered)", s)
+	}
+	if eu := memberExhaustedUntil_(ps, "a"); eu != nil {
+		t.Errorf("post-reset a.ExhaustedUntil = %v, want nil", eu)
+	}
+	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "a" {
+		t.Errorf("post-reset ResolveAuto = %q,exhausted=%v, want a,false (selectable again)", b.Nick, exhausted)
+	}
+}
+
+// TestPoolStatus_rejectedElapsedResetNonStickyIdle covers the AC #2 non-sticky
+// arm of issue #286: a recovered member that is not the sticky one reports
+// "idle" (not "active") on /_gateway/pool, with no exhausted_until.
+func TestPoolStatus_rejectedElapsedResetNonStickyIdle(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+	c.setCur("b") // a is a non-sticky member
+
+	reset := clock.now().Add(time.Hour)
+	util := 1.0
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		Unified5hReset:       &reset,
+		AsOf:                 clock.now(),
+	})
+
+	clock.advance(2 * time.Hour) // past the reset
+	ps := c.poolStatus(store, nil, nil)
+	if s := memberStatus_(ps, "a"); s != "idle" {
+		t.Errorf("poolStatus a = %q, want idle (non-sticky member recovered)", s)
+	}
+	if eu := memberExhaustedUntil_(ps, "a"); eu != nil {
+		t.Errorf("a.ExhaustedUntil = %v, want nil", eu)
+	}
+}
+
+// TestStoreExhaustedUntil_rejectedNilResetPastFallbackNotRecreated pins the
+// issue #286 past-bound guard (AC #3): a "rejected" snapshot with no reset
+// synthesizes snap.AsOf + 5h, but once that fallback bound itself lies in the
+// past the member is available and no repeated read recreates an
+// already-elapsed exhausted_until.
+func TestStoreExhaustedUntil_rejectedNilResetPastFallbackNotRecreated(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	util := 0.4
+	asOf := clock.now().Add(-6 * time.Hour) // AsOf+5h is already an hour in the past
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		// Unified5hReset deliberately nil — the fallback path.
+		AsOf: asOf,
+	})
+
+	// The bound helper must refuse an already-past bound outright...
+	c.mu.Lock()
+	bound, ok := c.storeBlockBoundLocked("a")
+	c.mu.Unlock()
+	if ok {
+		t.Errorf("storeBlockBoundLocked(a) = %v,true, want _,false (AsOf+5h already elapsed)", bound)
+	}
+	// ...and the union must never surface a past exhausted_until, on any read.
+	for i := 0; i < 3; i++ {
+		if got, ok := c.exhaustedUntil("a"); ok {
+			t.Errorf("read %d: exhaustedUntil(a) = %v,true, want _,false (past bound must not be recreated)", i, got)
+		}
+	}
+	if _, _, exhausted := c.ResolveAuto(); exhausted {
+		t.Errorf("ResolveAuto exhausted=%v, want false (member available after elapsed fallback)", exhausted)
+	}
+}
+
+// TestExhaustedUntil_independentParkSurvivesStoreClear pins issue #286 AC #5:
+// clearing the store-derived signal must not clear an independent park. A
+// member carries both a "rejected" store snapshot (future 5h reset) and a
+// 401/403 credential park with a LATER reset; once the store reset elapses the
+// member stays exhausted until the credential park's own bound, then clears.
+func TestExhaustedUntil_independentParkSurvivesStoreClear(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
+
+	storeReset := clock.now().Add(time.Hour)
+	parkReset := clock.now().Add(3 * time.Hour) // outlives the store reset
+	util := 1.0
+	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		Unified5hReset:       &storeReset,
+		AsOf:                 clock.now(),
+	})
+	// A 401/403 credential park (windowFact false) — never reconciled by the
+	// store, so it is the clean independent-signal fixture.
+	c.mu.Lock()
+	c.credentialPark["a"] = credentialParkEntry{reset: parkReset, windowFact: false}
+	c.mu.Unlock()
+
+	// Past the store reset but before the credential park reset: still blocked,
+	// by the credential park's own later bound.
+	clock.advance(2 * time.Hour)
+	if got, ok := c.exhaustedUntil("a"); !ok || !got.Equal(parkReset) {
+		t.Fatalf("exhaustedUntil(a) = %v,%v, want %v,true (credential park outlives the store signal)", got, ok, parkReset)
+	}
+	// Past the credential park reset too — now fully clear.
+	clock.advance(2 * time.Hour)
+	if got, ok := c.exhaustedUntil("a"); ok {
+		t.Errorf("exhaustedUntil(a) = %v,true, want _,false (both signals elapsed)", got)
+	}
 }
