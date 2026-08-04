@@ -482,6 +482,60 @@ func TestParkSameNickTwoPoolsRace(t *testing.T) {
 	}
 }
 
+// TestCredentialPark_propagationRetainsLatestReset covers issue #275: an
+// older propagation delayed behind a newer local park must not shorten the
+// credential park in any sibling, and must not replace the retained entry's
+// windowFact classification.
+func TestCredentialPark_propagationRetainsLatestReset(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	p := loadMovePools(t, clock, propagationEnv())
+
+	olderReset := clock.now().Add(5 * time.Hour)
+	newerReset := olderReset.Add(30 * time.Minute)
+	ca, cb := p.byPool["a"], p.byPool["b"]
+
+	// Hold pool a's propagation callback so its local write completes before
+	// the delayed sibling update is delivered.
+	originalAPropagation := ca.propagatePark
+	var delayedAPropagation func()
+	ca.propagatePark = func(nick string, reset time.Time, windowFact bool) {
+		delayedAPropagation = func() {
+			originalAPropagation(nick, reset, windowFact)
+		}
+	}
+	ca.record429WithSource("ccz", olderReset, true, true)
+	ca.propagatePark = originalAPropagation
+	if delayedAPropagation == nil {
+		t.Fatal("pool a propagation callback was not captured")
+	}
+
+	// Pool b observes a later credential-fatal park. Suppress its callback so
+	// the test can deliver the newer propagation and then a's delayed older
+	// propagation in a controlled order.
+	originalBPropagation := cb.propagatePark
+	cb.propagatePark = nil
+	cb.record429WithSource("ccz", newerReset, true, false)
+	cb.propagatePark = originalBPropagation
+	p.propagateCredentialPark("b", "ccz", newerReset, false)
+	delayedAPropagation()
+
+	for _, pool := range []string{"a", "b", "c"} {
+		c := p.byPool[pool]
+		c.mu.Lock()
+		entry, ok := c.credentialPark["ccz"]
+		c.mu.Unlock()
+		if !ok {
+			t.Fatalf("pool %s: credentialPark[ccz] missing", pool)
+		}
+		if !entry.reset.Equal(newerReset) {
+			t.Errorf("pool %s: credentialPark[ccz].reset=%v, want newer reset %v", pool, entry.reset, newerReset)
+		}
+		if entry.windowFact {
+			t.Errorf("pool %s: credentialPark[ccz].windowFact=true, want retained credential-fatal classification", pool)
+		}
+	}
+}
+
 // TestCredentialPark_headerlessResidueRetiredByFreshStore is a regression for
 // a #254 rescue-review finding: credentialPark's read-path used to exempt
 // BOTH subclasses from storeReconcilesParkLocked (#145), but only the 401/403
