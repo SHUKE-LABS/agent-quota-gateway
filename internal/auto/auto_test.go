@@ -94,6 +94,25 @@ func resp429(b backend.Backend, clock *fixedClock, resetIn time.Duration) *http.
 	}
 }
 
+// resp529 builds a native Anthropic capacity-overload response. The upstream
+// text and quota header make the rewrite's body and header hygiene observable.
+func resp529(b backend.Backend) *http.Response {
+	ctx := backend.WithBackend(context.Background(), b)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	h.Set("Retry-After", "7")
+	h.Set("anthropic-ratelimit-unified-status", "rejected")
+	body := `{"type":"error","error":{"type":"overloaded_error","message":"Repeated 529 overloaded errors. The API is at capacity ..."}}`
+	return &http.Response{
+		StatusCode:    anthropicOverloadStatusCode,
+		Header:        h,
+		Request:       req,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+}
+
 // resp429Policy builds a policy/punishment 429 response for backend b.
 // It carries no utilization headers, so the classifier treats it as a
 // policy 429 (no park, no failover).
@@ -438,6 +457,81 @@ func TestModifyResponse_policy429NotParked(t *testing.T) {
 	// anthropic-ratelimit-* headers stripped.
 	if got := resp.Header.Get("anthropic-ratelimit-unified-status"); got != "" {
 		t.Errorf("anthropic-ratelimit header not stripped: %q", got)
+	}
+}
+
+// TestModifyResponse_anthropic529OverloadAbsorbed proves a native Anthropic
+// capacity overload becomes a same-member transient 503 instead of reaching
+// the client as a terminal 529. The path must not park, switch, or leak the
+// upstream overload response.
+func TestModifyResponse_anthropic529OverloadAbsorbed(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	var logBuf bytes.Buffer
+	c := newController(t, 0, clock, &logBuf, "a", "b")
+	before := c.Current()
+
+	resp := resp529(c.resolve(t, "a"))
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503", resp.StatusCode)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != strconv.Itoa(anthropicOverloadRetryAfterSeconds) {
+		t.Errorf("Retry-After=%q, want %d", ra, anthropicOverloadRetryAfterSeconds)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type=%q, want application/json", got)
+	}
+	if got := resp.Header.Get("anthropic-ratelimit-unified-status"); got != "" {
+		t.Errorf("anthropic-ratelimit header leaked: %q", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	gotBody := string(body)
+	if !strings.Contains(gotBody, "backend throttled; same member") {
+		t.Errorf("503 body=%q, want same-member transient body", gotBody)
+	}
+	if strings.Contains(gotBody, "Repeated 529 overloaded errors") {
+		t.Errorf("503 body leaked upstream overload text: %q", gotBody)
+	}
+	if strings.Contains(gotBody, "backend switching") {
+		t.Errorf("503 body claims a switch: %q", gotBody)
+	}
+	if got := c.Current(); got != before {
+		t.Errorf("Current()=%q, want %q (529 overload must not park/switch)", got, before)
+	}
+	if _, _, exhausted := c.ResolveAuto(); exhausted {
+		t.Errorf("ResolveAuto exhausted=true after 529 overload, want false")
+	}
+	if log := logBuf.String(); !strings.Contains(log, "Anthropic 529 overload") {
+		t.Errorf("529 overload not logged; got %q", log)
+	}
+}
+
+// TestModifyResponse_nonAnthropic529PassesThrough pins the backend-identity
+// guard: an Anthropic-compatible vendor's arbitrary 529 remains untouched.
+func TestModifyResponse_nonAnthropic529PassesThrough(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a")
+	b := c.resolve(t, "a")
+	b.BaseURL = "https://vendor.example/anthropic"
+	resp := resp529(b)
+	origBody, _ := io.ReadAll(resp.Body)
+	resp.Body = io.NopCloser(bytes.NewReader(origBody))
+
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+	if resp.StatusCode != anthropicOverloadStatusCode {
+		t.Errorf("status=%d, want untouched 529", resp.StatusCode)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "7" {
+		t.Errorf("Retry-After=%q, want untouched 7", ra)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != string(origBody) {
+		t.Errorf("body=%q, want untouched upstream body %q", body, origBody)
 	}
 }
 
