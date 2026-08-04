@@ -132,6 +132,62 @@ func TestResolveConfig_bootstrapsWhenAbsent(t *testing.T) {
 	}
 }
 
+func TestWarnIfPersistenceDisabled_startupOutput(t *testing.T) {
+	tests := []struct {
+		name       string
+		configPath string
+		statePath  string
+		wantWarn   bool
+	}{
+		{
+			name:       "config file with empty state file",
+			configPath: "/etc/agent-quota-gateway/aqg.json",
+			wantWarn:   true,
+		},
+		{
+			name:       "config file with state file",
+			configPath: "/etc/agent-quota-gateway/aqg.json",
+			statePath:  "/var/lib/agent-quota-gateway/state.json",
+		},
+		{
+			name: "env mode with empty state file",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			warnIfPersistenceDisabled(tc.configPath, tc.statePath, &output)
+			got := output.String()
+			if !tc.wantWarn {
+				if got != "" {
+					t.Fatalf("warning = %q, want no warning", got)
+				}
+				return
+			}
+
+			if strings.Count(got, "\n") != 1 {
+				t.Fatalf("warning = %q, want one line", got)
+			}
+			for _, want := range []string{
+				"agent-quota-gateway: ",
+				tc.configPath,
+				"runtime persistence is disabled",
+				"sticky pointers",
+				"exhausted maps",
+				"balance sequence",
+				"quota snapshots",
+				"do not survive a restart",
+				"state_file",
+				"restart",
+			} {
+				if !strings.Contains(got, want) {
+					t.Errorf("warning %q missing %q", got, want)
+				}
+			}
+		})
+	}
+}
+
 // --- loadLegacyOverlay -----------------------------------------------------
 
 func TestLoadLegacyOverlay(t *testing.T) {
