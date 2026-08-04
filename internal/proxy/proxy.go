@@ -1,4 +1,4 @@
-// Package proxy implements the Anthropic Messages reverse proxy.
+// Package proxy implements the reverse proxy.
 //
 // The proxy is intentionally thin: it forwards every request through Go's
 // standard httputil.ReverseProxy, derives the upstream and stamps the
@@ -99,14 +99,10 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 		r.Host = upstream.Host
 		basePath := strings.TrimRight(upstream.Path, "/")
 		reqPath := r.URL.Path
-		// Only root-mounted upstreams (the native Anthropic surface and
-		// every root-mounted Anthropic-compat vendor) get the /v1 prefix
-		// normalized. An upstream whose base URL carries its own path
-		// prefix owns its routing convention, so we leave its paths
-		// untouched (issue #157).
-		if basePath == "" {
-			reqPath = normalizeLeadingV1(reqPath)
-		}
+		// Normalize the version segment independently of the payload.
+		// Root-mounted upstreams receive exactly one leading /v1; a base
+		// URL ending in /v1 consumes inbound /v1.
+		reqPath = normalizeRequestPath(basePath, reqPath)
 		r.URL.Path = joinPath(basePath, reqPath)
 
 		stampAuth(r.Header, b.Credential)
@@ -237,6 +233,36 @@ func normalizeLeadingV1(path string) string {
 		break
 	}
 	return "/v1" + rest
+}
+
+// normalizeRequestPath applies the version-prefix rules at the generic HTTP
+// boundary. Root-mounted upstreams receive exactly one leading /v1 segment.
+// When the configured base path already ends in /v1, inbound leading /v1
+// segments are removed before joining, so /responses and /v1/responses agree.
+// Other non-root prefixes retain their existing join behavior.
+func normalizeRequestPath(basePath, path string) string {
+	if basePath == "" {
+		return normalizeLeadingV1(path)
+	}
+	trimmedBase := strings.TrimRight(basePath, "/")
+	if !strings.HasSuffix(trimmedBase, "/v1") {
+		return path
+	}
+	return trimLeadingV1(path)
+}
+
+func trimLeadingV1(path string) string {
+	rest := path
+	for {
+		if rest == "/v1" {
+			return "/"
+		}
+		if strings.HasPrefix(rest, "/v1/") {
+			rest = rest[len("/v1"):]
+			continue
+		}
+		return rest
+	}
 }
 
 // oauthBeta is the anthropic-beta opt-in Anthropic requires for OAuth

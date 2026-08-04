@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Loopback-only reverse proxy for the Anthropic Messages API, sized for local
-Claude Code workflows. Single Go binary (Go 1.24, **stdlib only — no
-third-party deps**). The gateway owns every upstream credential; clients
-address a **pool** by name and the gateway auto-rotates within it. Full
-context lives in `README.md` (~1500 lines, authoritative on behavior).
+Loopback-only reverse proxy for opaque HTTP/SSE APIs, including Anthropic
+Messages and OpenAI-compatible Responses. Single Go binary (Go 1.24,
+**stdlib only — no third-party deps**). The gateway owns every upstream
+credential; clients address a **pool** by name and the gateway auto-rotates
+within it. Full context lives in `README.md` (~1500 lines, authoritative on
+behavior).
 
 ## Commands
 
@@ -55,6 +56,10 @@ Env grammar (`internal/backend`):
 
 Pool/nick names are normalized (lowercased, `_`→`-`): `AQG_POOL_Z_AI_BACKEND_KEY_A`
 is pool `z-ai`, member `key-a`, selected by sending `z-ai` as the bearer token.
+There is deliberately no protocol field or protocol environment marker.
+Anthropic-facing and Responses-facing clients select separate pool names;
+the gateway does not infer application class from credentials, hosts, or
+payloads.
 
 Listen/behavior vars: `ANTHROPIC_BASE_URL` (upstream, default
 api.anthropic.com), `LISTEN_ADDR` (loopback, default 127.0.0.1:8080),
@@ -79,10 +84,12 @@ request dump (`internal/reqlog`, credentials redacted).
 3. `proxy.New`'s director reads the resolved backend, picks the auth
    scheme by credential prefix (`sk-ant-oat*`→`Bearer`+`oauth-2025-04-20`
    beta; `sk-ant-api*`→`x-api-key`; else `Bearer` no beta), and forwards
-   with response buffering disabled so SSE streams as it arrives. **Full
-   method+path passthrough** — the selector/auth boundary gates, not a
-   route table; `/` is the catch-all, `/_gateway/*` mounts directly with
-   no selector.
+   with response buffering disabled so SSE streams as it arrives. It joins
+   root and `/v1`-suffixed upstream paths generically, including
+   `/responses` and `/v1/responses`. **Full method+path passthrough** — the
+   selector/auth boundary gates, not a route table; `/` is the catch-all,
+   `/_gateway/*` mounts directly with no selector. Request and response
+   bodies remain opaque: no schema inspection or translation.
 4. Response observer calls `quota.Extract` (headers only) and **merges**
    the snapshot under the backend's `QuotaKey()` — but only if it carries
    a quota window. `mergeSnapshot` (`internal/quota/quota.go:218-247`)

@@ -10,10 +10,11 @@
 // Everything is a pool. There is no non-pool mode and no implicit
 // default pool: every backend is declared inside a named pool through
 // the process environment or an explicit, operator-protected (0600) JSON
-// config file. A pool groups *interchangeable* backends — same protocol,
-// same quota semantics — so the auto-rotation that fronts every pool can
-// fail over between its members without changing the observable model or
-// quota behaviour. The env path keeps zero credentials on disk; the file
+// config file. A pool groups *interchangeable* backends — one client-facing
+// application contract and the same quota semantics — so the auto-rotation
+// that fronts every pool can fail over between its members without changing
+// the observable model or quota behaviour. The env path keeps zero
+// credentials on disk; the file
 // path is an opt-in alternative for operators who prefer explicit
 // configuration.
 package backend

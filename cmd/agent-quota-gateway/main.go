@@ -1,5 +1,6 @@
-// Command agent-quota-gateway is a loopback-only reverse proxy for the
-// Anthropic Messages API. See the README for usage.
+// Command agent-quota-gateway is a loopback-only reverse proxy for opaque
+// HTTP/SSE APIs, including Anthropic Messages and OpenAI-compatible Responses.
+// See the README for usage.
 package main
 
 import (

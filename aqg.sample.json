@@ -47,6 +47,18 @@
       "balance": "",
       "balance_gap": 0,
       "balance_dwell": ""
+    },
+    "responses": {
+      "base_url": "https://openai-compatible.example/api/v1",
+      "members": {
+        "responses-key": {
+          "credential": "openai-compatible-PLACEHOLDER-RESPONSES"
+        }
+      },
+      "priority": [],
+      "balance": "",
+      "balance_gap": 0,
+      "balance_dwell": ""
     }
   }
 }
