@@ -66,6 +66,16 @@ func resolveConfig(configFlag string, logOut io.Writer) (config.Config, *backend
 	return cfg, reg, path, err
 }
 
+// warnIfPersistenceDisabled tells config-file operators when an empty
+// state_file leaves runtime state in memory only. Env-only mode intentionally
+// stays quiet because an empty state path is an ordinary local-dev setup.
+func warnIfPersistenceDisabled(configPath, statePath string, logOut io.Writer) {
+	if configPath == "" || statePath != "" {
+		return
+	}
+	fmt.Fprintf(logOut, "agent-quota-gateway: WARNING: config file %q has an empty state_file; runtime persistence is disabled, so sticky pointers, exhausted maps, balance sequence and quota snapshots do not survive a restart. Set state_file in %q and restart.\n", configPath, configPath)
+}
+
 type legacyPriorityVerdict struct {
 	pool     string
 	previous []string
