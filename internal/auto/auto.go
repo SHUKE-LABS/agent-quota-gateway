@@ -1353,7 +1353,11 @@ func crossPoolResolve(reg *backend.Registry, skipPool, nick string) (creds, base
 // lock-free (immutable-after-build). So two pools parking the same nick
 // concurrently cannot deadlock regardless of pool-name ordering — each
 // caller just serializes briefly, one sibling at a time, on whichever
-// controller it happens to be writing (issue #254 AC6).
+// controller it happens to be writing (issue #254 AC6). An existing later
+// reset wins, because propagation can be delayed behind a sibling's own
+// observation and overwriting it would shorten the active park. Equal resets
+// retain the existing entry so its windowFact classification is preserved
+// (issue #275).
 func (p *Pools) propagateCredentialPark(originPool, nick string, reset time.Time, windowFact bool) {
 	reg := p.CurrentRegistry()
 	for _, name := range reg.PoolNames() {
@@ -1368,8 +1372,10 @@ func (p *Pools) propagateCredentialPark(originPool, nick string, reset time.Time
 			continue
 		}
 		c.mu.Lock()
-		c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact}
-		c.notifyMutate()
+		if existing, ok := c.credentialPark[nick]; !ok || reset.After(existing.reset) {
+			c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact}
+			c.notifyMutate()
+		}
 		c.mu.Unlock()
 	}
 }
