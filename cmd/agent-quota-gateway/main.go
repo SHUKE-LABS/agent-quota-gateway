@@ -80,6 +80,7 @@ func run(configFlag string) error {
 	if err != nil {
 		return err
 	}
+	warnIfPersistenceDisabled(configPath, cfg.StateFile, os.Stderr)
 
 	store := quota.NewStore()
 
