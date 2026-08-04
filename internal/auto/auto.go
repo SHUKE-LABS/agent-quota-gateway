@@ -3338,25 +3338,25 @@ func (c *Controller) storeReconcilesParkLocked(nick string) bool {
 // snapshot cannot go fresh and the reconciliation short-circuit never
 // fires).
 //
-// A window "contributes" (a) when windowBlocks says it blocks via the
-// no-status fresh-AsOf gate, OR (b) when its status is the authoritative
-// "rejected" — even with a passed reset, status is read authoritatively
-// because it represents an explicit upstream verdict and we have no
-// freshness proxy in the no-reset case to lean on (#134). This is
-// strictly broader than the read predicate used by storeRejects /
-// isGenuineExhaustionSignal: those gate status on the reset being
-// ahead (or nil), and so would not classify a stale-rejected snapshot as
-// genuine exhaustion. The bound path agrees with that — a status that's
-// still authoritative implies a park — but the bound is anchored at
-// AsOf+5h, not the past reset, so the park still ages out within the
-// operator-tunable horizon.
+// A window "contributes" exactly when windowBlocks says it is still
+// blocking — the same read predicate used everywhere else. For a
+// "rejected" status that honours the per-window reset: a future or nil
+// reset blocks, an elapsed reset does not (issue #286). This deliberately
+// dropped the earlier "rejected is authoritative regardless of reset"
+// bypass, which anchored an elapsed-reset rejected window at AsOf+5h and
+// kept a recovered member parked past its own 5h reset. The no-reset
+// rejected snapshot still contributes with the AsOf+5h fallback — it has
+// no reset to honour and no freshness proxy to lean on (#134) — but that
+// fallback is bounded and ages out.
 //
-// The bound is anchored at snap.AsOf, NOT now — a now-anchored bound
-// recomputed per read re-arms on every call and parks the member
-// permanently with no entry to expire; the AsOf anchor pins the bound to
-// the moment the at-cap snapshot was taken, so a frozen entry's bound is
-// deterministic across reads until that AsOf+5h elapses (AC #3 / AC #11
-// in #251).
+// The AsOf+5h fallback bound is anchored at snap.AsOf, NOT now — a
+// now-anchored bound recomputed per read re-arms on every call and parks
+// the member permanently with no entry to expire; the AsOf anchor pins the
+// bound to the moment the snapshot was taken, so a frozen entry's bound is
+// deterministic across reads until that AsOf+5h elapses (AC #3 / AC #11 in
+// #251). Once even that bound is in the past, storeBlockBoundLocked returns
+// (_, false): a store-derived bound contributes only while future, so an
+// already-elapsed fallback is never recreated on the next read (#286).
 //
 // Combined across windows by taking the latest bound: never the 7d reset
 // for a 5h-only exhaustion, never vice versa. Z.AI/Zhipu's long window
@@ -3409,15 +3409,24 @@ func (c *Controller) storeBlockBoundLocked(nick string) (time.Time, bool) {
 		if !w.use {
 			continue
 		}
-		// status-driven authoritative block (Anthropic "rejected"):
-		// contributes regardless of reset state because the verdict is
-		// the snapshot's whole story.
-		if w.status != unifiedStatusRejected && !windowBlocks(w.util, w.status, w.reset, snap.AsOf, now) {
+		// A window contributes exactly when windowBlocks says it is still
+		// blocking. For a "rejected" status that means honouring the
+		// per-window reset: a future (or nil) reset blocks, an elapsed
+		// reset does not (issue #286). Gating rejected on windowBlocks
+		// here — rather than treating the verdict as authoritative
+		// regardless of reset — is what lets a member leave `exhausted`
+		// once its 5h window resets, instead of being re-parked to
+		// AsOf + 5h on every read. The no-status branch is unchanged: its
+		// status is "", so the reset gate was never the deciding factor.
+		if !windowBlocks(w.util, w.status, w.reset, snap.AsOf, now) {
 			continue
 		}
 		// Window contributes. Pick the bound: the snapshot's reset when
 		// it's still in the future, otherwise AsOf + 5h as the
-		// conservative over-park.
+		// conservative over-park. A rejected window reaches the fallback
+		// only when its reset is nil (an elapsed reset failed the gate
+		// above); the past-bound guard below then keeps a long-stale
+		// fallback from re-parking on every read.
 		var candidate time.Time
 		if w.reset != nil && now.Before(*w.reset) {
 			candidate = *w.reset
@@ -3437,6 +3446,16 @@ func (c *Controller) storeBlockBoundLocked(nick string) (time.Time, bool) {
 			bound, have = candidate, true
 		}
 	}
+	// A store-derived bound contributes to exhaustion only while it is still
+	// future (issue #286). The nil-reset AsOf + 5h fallback for a rejected
+	// snapshot can land in the past once the snapshot ages beyond 5h; without
+	// this guard exhaustedUntilLocked would merge that past bound and every
+	// status/routing read would report `exhausted` with an already-elapsed
+	// exhausted_until. Reset-derived and now+5h bounds are future by
+	// construction, so this only filters the stale nil-reset fallback.
+	if have && !bound.After(now) {
+		return time.Time{}, false
+	}
 	return bound, have
 }
 
@@ -3447,11 +3466,14 @@ func (c *Controller) storeBlockBoundLocked(nick string) (time.Time, bool) {
 // qualify, the later bound wins.
 //
 // ok is false when no window qualifies — no store, unknown nick, no
-// blocking window. A blocking window with a usable reset returns that
-// reset; a blocking window without a usable reset returns
-// snap.AsOf + defaultExhaustionWindow (the over-park, AC #2). The bound
-// is anchored at snap.AsOf, not now, so a frozen entry's bound is
-// deterministic across reads until that AsOf+5h elapses (AC #3).
+// blocking window (a rejected window whose reset has elapsed no longer
+// blocks, issue #286). A blocking window with a usable future reset
+// returns that reset; a blocking window with no reset returns
+// snap.AsOf + defaultExhaustionWindow (the over-park, AC #2). That
+// fallback is anchored at snap.AsOf, not now, so a frozen entry's bound is
+// deterministic across reads (AC #3), and once even the fallback has
+// elapsed the bound stops contributing rather than being recreated in the
+// past (issue #286).
 //
 // Checking 7d matters for poller-tracked backends (MiniMaxi / Ark),
 // which report a weekly cap through the dashboard API and emit no clean
