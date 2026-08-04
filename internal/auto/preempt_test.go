@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
@@ -353,6 +356,74 @@ func TestPreemptor_RunStopsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+// TestPreemptor_RunPicksUpRuntimePoolAfterZeroPoolStart covers issue #277:
+// the loop starts over a valid empty registry, then evaluates a pool created
+// after the first tick.
+func TestPreemptor_RunPicksUpRuntimePoolAfterZeroPoolStart(t *testing.T) {
+	clock := newMoveClock()
+	store := quota.NewStore()
+	reg, err := backend.BuildFromSpec(backend.Spec{Pools: map[string]backend.PoolSpec{}}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec(empty): %v", err)
+	}
+	pools := NewPools(reg, store, clock.now, io.Discard)
+
+	firstEmptyTick := make(chan struct{})
+	var emptyOnce sync.Once
+	pre := newPreemptorFunc(func() []*Controller {
+		controllers := pools.sortedControllers()
+		if len(controllers) == 0 {
+			emptyOnce.Do(func() { close(firstEmptyTick) })
+		}
+		return controllers
+	}, store, time.Millisecond, clock.now, io.Discard)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		pre.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	select {
+	case <-firstEmptyTick:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not evaluate the empty pool set")
+	}
+
+	if status, err := pools.AddPool("rt", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool: status=%d err=%v", status, err)
+	}
+	if status, err := pools.AddMember("rt", "a", "cred-a", "https://a.example", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember a: status=%d err=%v", status, err)
+	}
+	if status, err := pools.AddMember("rt", "b", "cred-b", "https://b.example", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember b: status=%d err=%v", status, err)
+	}
+	if status, err := pools.SetPriority("rt", []string{"a", "b"}); status != http.StatusOK || err != nil {
+		t.Fatalf("SetPriority: status=%d err=%v", status, err)
+	}
+	c, ok := pools.controller("rt")
+	if !ok {
+		t.Fatal("controller(rt) not found")
+	}
+	c.setCur("b")
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for c.Current() != "a" {
+		select {
+		case <-deadline.C:
+			t.Fatalf("Current(rt) = %q, want a after the runtime pool was added", c.Current())
+		case <-time.After(time.Millisecond):
+		}
 	}
 }
 

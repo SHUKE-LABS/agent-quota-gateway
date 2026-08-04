@@ -378,6 +378,62 @@ func TestRecover_backgroundLoopUnparksStrandedMember(t *testing.T) {
 	}
 }
 
+// TestRecovery_RunPicksUpRuntimePoolAfterZeroPoolStart covers issue #277:
+// the loop starts over a valid empty registry, then evaluates a pool created
+// after the first tick.
+func TestRecovery_RunPicksUpRuntimePoolAfterZeroPoolStart(t *testing.T) {
+	clock := newMoveClock()
+	reg, err := backend.BuildFromSpec(backend.Spec{Pools: map[string]backend.PoolSpec{}}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec(empty): %v", err)
+	}
+	pools := NewPools(reg, nil, clock.now, io.Discard)
+
+	firstEmptyTick := make(chan struct{})
+	runtimeTick := make(chan struct{})
+	var emptyOnce, runtimeOnce sync.Once
+	recovery := newRecoveryFunc(func() []*Controller {
+		controllers := pools.sortedControllers()
+		switch {
+		case len(controllers) == 0:
+			emptyOnce.Do(func() { close(firstEmptyTick) })
+		default:
+			runtimeOnce.Do(func() { close(runtimeTick) })
+		}
+		return controllers
+	}, time.Millisecond, io.Discard)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		recovery.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	select {
+	case <-firstEmptyTick:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not evaluate the empty pool set")
+	}
+
+	if status, err := pools.AddPool("rt", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool: status=%d err=%v", status, err)
+	}
+	if status, err := pools.AddMember("rt", "a", "cred-a", "https://a.example", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember a: status=%d err=%v", status, err)
+	}
+
+	select {
+	case <-runtimeTick:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not evaluate the runtime-created pool")
+	}
+}
+
 // TestRecover_backgroundLoopSkipsActiveMember covers the overlap with
 // the request-path allExhausted recovery: when the active sticky
 // member is ALSO parked (the allExhausted shape), the background loop
