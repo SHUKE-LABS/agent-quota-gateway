@@ -45,10 +45,12 @@ across vendors loses the prompt cache, and quota semantics differ).
 - Streaming (SSE) is forwarded without buffering — the first event
   reaches the client as soon as the upstream writes it.
 - Error responses from upstream propagate to the client with the original
-  status code, except those auto-rotation handles: a `429` (quota), and a
-  `401`/`403` (the backend's credential was rejected — revoked, expired, or
-  the account pulled), which fail the pool over to a healthy member rather
-  than stick to a dead account. See [Pools and selectors](#pools-and-selectors).
+  status code, except those response paths handle specially: a `429` (quota),
+  and a `401`/`403` (the backend's credential was rejected — revoked, expired,
+  or the account pulled), which fail the pool over to a healthy member rather
+  than stick to a dead account; a native Anthropic `529` overload becomes a
+  same-member `503` with `Retry-After: 60`. See
+  [Pools and selectors](#pools-and-selectors).
 - One log line per request (method, path, status, duration, request ID).
   Request bodies, response bodies, and credential headers are never
   logged.
@@ -554,15 +556,15 @@ declaring a preference order with `AQG_POOL_<POOL>_PRIORITY` — see
 *which* healthy member is picked; the sticky, reactive, zero-probe model is
 otherwise unchanged.
 
-### What the client sees on a 429
+### What the client sees on an upstream 429 or native Anthropic 529
 
 On a `429` from the current member the gateway does **not** forward the
 `429`. Anthropic's `429` is a pre-stream rejection, so the gateway handles
 it on the response side — no request body is buffered; the *client* replays
-its own body. The four `503` flavours the gateway can emit, each with its
+its own body. A native Anthropic `529` capacity overload follows a separate
+same-member path. The `503` flavours the gateway can emit, each with its
 own body and `Retry-After`, are summarised below — bodies are deliberately
-distinct so a sustained stream cannot be misread as a stuck failover
-(issue #245).
+distinct where the response paths take different actions (issue #245).
 
 | Flavour | Body | `Retry-After` | Lands on |
 |---|---|---|---|
@@ -570,6 +572,14 @@ distinct so a sustained stream cannot be misread as a stuck failover
 | **Pool dry** — every member is exhausted; the sticky pointer is pre-pointed at the soonest-resetting member | `{"error":"all backends rate-limited"}` | precise wait until the soonest member resets (or a conservative 5-hour window) | the soonest-resetting member |
 | **Z.ai/Zhipu throttle absorbed** (issue #153) — proxy `429` is the `1302` concurrency throttle, never quota exhaustion | `{"error":"backend throttled; same member"}` | `3` (fixed; longer than the switch hint so a single-member z.ai pool's retry lets the concurrency window free up) | the same member |
 | **Anthropic per-minute rate-limit back-off** (issue #191) — transient RPM/ITPM/OTPM throttle, clears in seconds | `{"error":"backend throttled; same member"}` | upstream `retry-after` clamped to `[1, 3]` s, defaulting to `3` | the same member |
+| **Native Anthropic overload** (issue #258) — upstream `529` capacity wobble, not quota exhaustion | `{"error":"backend throttled; same member"}` | `60` (fixed) | the same member |
+
+The **native Anthropic overload** flavour is selected by the upstream status and
+the backend's native `api.anthropic.com` host identity, not by reading the
+streaming response body. It leaves the active member and all exhaustion state
+unchanged, strips upstream rate-limit headers, and hides Anthropic's overload
+text behind the synthetic same-member body. The 60-second wait is long enough
+to let a capacity wobble clear while remaining a transient retry signal.
 
 The **switch** flavour: the gateway has already advanced the sticky pointer
 to another member, so the client's retry resolves to it and succeeds,

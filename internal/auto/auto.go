@@ -25,6 +25,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -81,6 +82,17 @@ const storeSnapshotFreshness = 5 * time.Minute
 // instantaneous server-side, so the client should retry almost
 // immediately and rebuild its cache on the new backend.
 const switchRetryAfterSeconds = 1
+
+// anthropicOverloadStatusCode is the non-standard status native Anthropic
+// uses for a capacity overload. It is handled only for the native Anthropic
+// host; compatible vendors remain pass-through for arbitrary 529 responses.
+const anthropicOverloadStatusCode = 529
+
+// anthropicOverloadRetryAfterSeconds gives native Anthropic capacity wobbles
+// a longer same-member retry window than the short 429 throttle back-off.
+const anthropicOverloadRetryAfterSeconds = 60
+
+const nativeAnthropicHost = "api.anthropic.com"
 
 // zaiThrottleRetryAfterSeconds is the Retry-After a z.ai/Zhipu concurrency
 // throttle (the 1302 "Rate limit reached for requests" 429) is absorbed
@@ -262,7 +274,8 @@ func (p *Pools) Route(poolName string) (backend.Backend, time.Duration, bool, bo
 
 // ModifyResponse is the proxy.ResponseModifier hook. It dispatches the
 // response to the controller of the pool the request resolved through,
-// so a 429 fails over within that pool only.
+// so a 429 fails over within that pool only and a native Anthropic 529
+// overload is absorbed without changing pool state.
 func (p *Pools) ModifyResponse(resp *http.Response) error {
 	if resp == nil || resp.Request == nil {
 		return nil
@@ -2395,9 +2408,12 @@ func (c *Controller) reanchorLocked() {
 	}
 }
 
-// ModifyResponse is the per-pool failover hook. It acts on two classes of
+// ModifyResponse is the per-pool response hook. It acts on three classes of
 // upstream response; everything else passes through untouched.
 //
+//   - Native Anthropic 529 overload: it is a transient capacity wobble, so the
+//     response becomes a synthetic same-member 503 with Retry-After: 60. The
+//     member is not parked and the pool does not fail over.
 //   - 429 Too Many Requests: it first classifies whether the 429 signals
 //     genuine quota exhaustion (a "rejected" rate-limit status) or is a
 //     policy/punishment 429 (no rate-limit headers). Policy 429s are not
@@ -2421,6 +2437,10 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 	}
 
 	switch {
+	case resp.StatusCode == anthropicOverloadStatusCode && isNativeAnthropicBackend(b):
+		fmt.Fprintf(c.logOut, "auto[%s]: %s Anthropic 529 overload — absorbing as transient, not parking\n", c.name(), b.Nick)
+		rewriteTo503AnthropicOverload(resp)
+		return nil
 	case resp.StatusCode == http.StatusTooManyRequests:
 		// A z.ai/Zhipu proxy-path 429 is always a transient concurrency
 		// throttle (the 1302 "Rate limit reached for requests"), never a
@@ -2504,6 +2524,15 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 // 429's recoverable quota exhaustion.
 func isCredentialRejected(code int) bool {
 	return code == http.StatusUnauthorized || code == http.StatusForbidden
+}
+
+// isNativeAnthropicBackend reports whether b points at Anthropic's native
+// API host. The host identity is the classifier for 529 overloads: response
+// bodies are deliberately not read on the streaming proxy path, and arbitrary
+// Anthropic-compatible vendors must keep their non-standard statuses intact.
+func isNativeAnthropicBackend(b backend.Backend) bool {
+	u, err := url.Parse(b.BaseURL)
+	return err == nil && strings.EqualFold(u.Hostname(), nativeAnthropicHost)
 }
 
 // isZaiBackend reports whether b is a z.ai/Zhipu backend. For these
@@ -3801,11 +3830,20 @@ func rewriteTo503(resp *http.Response) {
 	h.Set("Retry-After", strconv.Itoa(switchRetryAfterSeconds))
 }
 
-// rewriteTo503Throttle turns an upstream 429 the gateway has decided NOT to
-// switch on into the transient 503 a client should retry against the SAME
-// member — the z.ai/Zhipu concurrency-throttle absorb (issue #153) and the
-// Anthropic per-minute rate-limit back-off (issue #191). Distinct from
-// rewriteTo503 in two ways:
+// rewriteTo503AnthropicOverload turns native Anthropic's 529 capacity wobble
+// into the same-member transient response shape with its fixed 60-second
+// back-off. It delegates to the non-switching helper so the synthetic body
+// and header hygiene stay aligned with the other transient throttle paths.
+func rewriteTo503AnthropicOverload(resp *http.Response) {
+	rewriteTo503Throttle(resp, anthropicOverloadRetryAfterSeconds)
+}
+
+// rewriteTo503Throttle turns an upstream transient throttle or overload the
+// gateway has decided NOT to switch on into the transient 503 a client should
+// retry against the SAME member — the z.ai/Zhipu concurrency-throttle absorb
+// (issue #153), the Anthropic per-minute rate-limit back-off (issue #191), and
+// native Anthropic's 529 overload path. Distinct from rewriteTo503 in two
+// ways:
 //
 //   - body: "backend throttled; same member" — declares the action the code
 //     actually took (back off the active member, no failover), so a sustained
