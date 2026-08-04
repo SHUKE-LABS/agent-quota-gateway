@@ -3811,18 +3811,12 @@ func (c *Controller) resetFrom(resp *http.Response) (reset time.Time, storeUnrep
 	return now.Add(defaultExhaustionWindow), true
 }
 
-// rewriteTo503 turns an upstream 429 into the transient 503 a pool hands
-// a client during a switch. The body is replaced with a small JSON
-// object, Retry-After invites an almost-immediate retry, and the upstream
-// rate-limit headers are stripped so the synthetic response does not
-// carry the rejected backend's quota state out the pool channel.
-func rewriteTo503(resp *http.Response) {
-	body := []byte(`{"error":"backend switching; retry"}`)
-
+// rewriteTo503Response applies the shared synthetic-503 response shape. When
+// replaceBody is false, the upstream body, content type, and content length
+// remain untouched for policy responses that expose the original error.
+func rewriteTo503Response(resp *http.Response, body []byte, replaceBody bool, retryAfter int) {
 	resp.StatusCode = http.StatusServiceUnavailable
 	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
 
 	h := resp.Header
 	for k := range h {
@@ -3830,10 +3824,23 @@ func rewriteTo503(resp *http.Response) {
 			h.Del(k)
 		}
 	}
-	h.Set("Content-Type", "application/json")
-	h.Set("Content-Length", strconv.Itoa(len(body)))
+	if replaceBody {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		h.Set("Content-Type", "application/json")
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+	}
 	h.Del("Content-Encoding")
-	h.Set("Retry-After", strconv.Itoa(switchRetryAfterSeconds))
+	setRetryAfter(h, retryAfter)
+}
+
+// rewriteTo503 turns an upstream 429 into the transient 503 a pool hands
+// a client during a switch. The body is replaced with a small JSON
+// object, Retry-After invites an almost-immediate retry, and the upstream
+// rate-limit headers are stripped so the synthetic response does not
+// carry the rejected backend's quota state out the pool channel.
+func rewriteTo503(resp *http.Response) {
+	rewriteTo503Response(resp, []byte(`{"error":"backend switching; retry"}`), true, switchRetryAfterSeconds)
 }
 
 // rewriteTo503AnthropicOverload turns native Anthropic's 529 capacity wobble
@@ -3860,23 +3867,7 @@ func rewriteTo503AnthropicOverload(resp *http.Response) {
 //     deliberately longer than the 1 s switch hint so a retry lets the
 //     throttle window clear before re-hitting it.
 func rewriteTo503Throttle(resp *http.Response, secs int) {
-	body := []byte(`{"error":"backend throttled; same member"}`)
-
-	resp.StatusCode = http.StatusServiceUnavailable
-	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-
-	h := resp.Header
-	for k := range h {
-		if strings.HasPrefix(strings.ToLower(k), "anthropic-ratelimit-") {
-			h.Del(k)
-		}
-	}
-	h.Set("Content-Type", "application/json")
-	h.Set("Content-Length", strconv.Itoa(len(body)))
-	h.Del("Content-Encoding")
-	setRetryAfter(h, secs)
+	rewriteTo503Response(resp, []byte(`{"error":"backend throttled; same member"}`), true, secs)
 }
 
 // rewriteTo503DryPool turns the upstream 429 that exhausted the last member
@@ -3893,23 +3884,7 @@ func rewriteTo503Throttle(resp *http.Response, secs int) {
 // synthetic response must not carry the last-parked member's quota state out
 // the pool channel.
 func rewriteTo503DryPool(resp *http.Response, secs int) {
-	body := []byte(`{"error":"all backends rate-limited"}`)
-
-	resp.StatusCode = http.StatusServiceUnavailable
-	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-
-	h := resp.Header
-	for k := range h {
-		if strings.HasPrefix(strings.ToLower(k), "anthropic-ratelimit-") {
-			h.Del(k)
-		}
-	}
-	h.Set("Content-Type", "application/json")
-	h.Set("Content-Length", strconv.Itoa(len(body)))
-	h.Del("Content-Encoding")
-	setRetryAfter(h, secs)
+	rewriteTo503Response(resp, []byte(`{"error":"all backends rate-limited"}`), true, secs)
 }
 
 // rewriteTo503WithBody turns an upstream policy/punishment 429 into a 503
@@ -3918,17 +3893,7 @@ func rewriteTo503DryPool(resp *http.Response, secs int) {
 // The upstream rate-limit headers are stripped (they carry no useful quota
 // state for a policy 429), but Content-Type is preserved from the upstream.
 func rewriteTo503WithBody(resp *http.Response) {
-	resp.StatusCode = http.StatusServiceUnavailable
-	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
-
-	h := resp.Header
-	for k := range h {
-		if strings.HasPrefix(strings.ToLower(k), "anthropic-ratelimit-") {
-			h.Del(k)
-		}
-	}
-	h.Del("Content-Encoding")
-	h.Set("Retry-After", strconv.Itoa(switchRetryAfterSeconds))
+	rewriteTo503Response(resp, nil, false, switchRetryAfterSeconds)
 }
 
 // setRetryAfter sets the Retry-After header to whole seconds.
