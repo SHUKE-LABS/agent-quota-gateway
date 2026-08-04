@@ -103,15 +103,12 @@ func newRecoveryFunc(controllers func() []*Controller, interval time.Duration, l
 // Run drives the background recovery loop until ctx is cancelled. Each
 // pass tries to recover any parked non-active member and returns the
 // idle interval when nothing was found; Run then sleeps until then (or
-// until ctx is done). It returns immediately only when there are no
-// pools at all; a deployment with only healthy pools still idles at
-// the fallback interval doing nothing, since tick() is a no-op when no
-// parked non-active member exists. Run blocks; callers start it in a
-// goroutine.
+// until ctx is done). An empty pool set is an ordinary idle tick, so a
+// pool added later is picked up by the next pass. A deployment with only
+// healthy pools still idles at the fallback interval doing nothing, since
+// tick() is a no-op when no parked non-active member exists. Run blocks;
+// callers start it in a goroutine.
 func (r *Recovery) Run(ctx context.Context) {
-	if len(r.controllers()) == 0 {
-		return
-	}
 	for {
 		wait := r.tick()
 		timer := time.NewTimer(wait)

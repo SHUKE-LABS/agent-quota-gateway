@@ -104,19 +104,12 @@ func newPreemptorFunc(controllers func() []*Controller, store *quota.Store, inte
 
 // Run drives the preempt-back loop until ctx is cancelled. Each pass
 // performs any due switches and returns the duration until the next known
-// recovery; Run then sleeps until then (or until ctx is done). It returns
-// immediately only when there are no pools at all; a deployment with only
-// equal-strength pools still idles at the fallback interval doing nothing,
-// since tick() skips every non-priority pool. Run blocks; callers start it in
-// a goroutine.
+// recovery; Run then sleeps until then (or until ctx is done). An empty pool
+// set is an ordinary idle tick, so a pool added later is picked up by the next
+// pass. A deployment with only equal-strength pools also idles at the
+// fallback interval doing nothing, since tick() skips every non-priority pool.
+// Run blocks; callers start it in a goroutine.
 func (p *Preemptor) Run(ctx context.Context) {
-	// Evaluated once at entry: in production Pools always has >=1 pool at
-	// startup, so this never short-circuits away dynamic pickup of a
-	// runtime-created pool (issue #202); it only spares a zero-pool test the
-	// idle loop.
-	if len(p.controllers()) == 0 {
-		return
-	}
 	for {
 		wait := p.tick()
 		timer := time.NewTimer(wait)
