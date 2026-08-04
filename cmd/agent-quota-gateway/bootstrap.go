@@ -51,7 +51,7 @@ func resolveConfig(configFlag string, logOut io.Writer) (config.Config, *backend
 		if err != nil {
 			return config.Config{}, nil, "", err
 		}
-		reg, err = reconcileLegacyPriority(cfg, reg, path, logOut)
+		reg, err = reconcileLegacy(cfg, reg, path, logOut)
 		return cfg, reg, path, err
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return config.Config{}, nil, "", fmt.Errorf("config file %q: %w", path, err)
@@ -74,22 +74,63 @@ type legacyPriorityVerdict struct {
 	balanced bool
 }
 
-// reconcileLegacyPriority consumes a pre-#198 state-file priority_override into
-// an existing aqg.json (issue #241). aqg.json is written first; the consumed
-// priority keys are then removed from the state file. That write order makes a
-// crash between the two idempotent: the next start observes exact equality,
-// leaves aqg.json untouched, and retries only the state-file cleanup.
+// reconcileLegacy is the unified orchestrator for the existing-config-file
+// path (issues #241 and #259). It resolves the legacy state-file overlay
+// exactly once and runs every per-key migration against the same triple, so a
+// `priority_override` in $AQG_STATE_FILE and `disabled` in the same overlay
+// apply from one read; lower-precedence candidates are not silently merged in.
 //
-// This is intentionally priority-only. applyLegacyOverlay also replays legacy
-// members, credentials, removals, and disabled flags, which would overwrite
-// newer operator intent already stored in aqg.json. It remains confined to the
-// first-deploy bootstrap path.
-func reconcileLegacyPriority(cfg config.Config, reg *backend.Registry, configPath string, logOut io.Writer) (*backend.Registry, error) {
+// Per-key migrations each follow the same shape as the original issue #241
+// reconciler: aggregate-validation pass → registry update via copy-on-write
+// → Marshal+WriteAtomic of aqg.json if any update landed → log per applied
+// change → final atomic state-file cleanup removing every consumed key in
+// one write. A state-file cleanup failure is logged and startup continues; the
+// cleanup is retried on the next start.
+func reconcileLegacy(cfg config.Config, reg *backend.Registry, configPath string, logOut io.Writer) (*backend.Registry, error) {
 	statePath, stateData, legacy, ok := findLegacyOverlay(cfg, logOut)
 	if !ok {
 		return reg, nil
 	}
 
+	updated, err := reconcileLegacyPriority(cfg, reg, legacy, statePath, configPath, logOut)
+	if err != nil {
+		return reg, err
+	}
+	updated, _, err = reconcileLegacyDisabled(cfg, updated, legacy, configPath, logOut)
+	if err != nil {
+		return reg, err
+	}
+	reconcileLegacyReportOnly(legacy, statePath, logOut)
+
+	// Aggregate key cleanup: combine the handled pools for priority and
+	// disabled into one atomic state-file write so a crash between the two
+	// half-deletes does not leave a stale legacy key behind.
+	consumedPools := legacyKeyCleanup(updated, legacy)
+	if len(consumedPools) > 0 {
+		if err := consumeLegacyKeys(statePath, stateData, consumedPools); err != nil {
+			poolList := make([]string, 0, len(consumedPools))
+			for p := range consumedPools {
+				poolList = append(poolList, p)
+			}
+			sort.Strings(poolList)
+			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: aqg.json is current, but could not consume legacy config keys for pool(s) %s from %q: %v; deletion will be retried on the next start\n", strings.Join(poolList, ", "), statePath, err)
+		}
+	}
+	return updated, nil
+}
+
+// reconcileLegacyPriority consumes the pre-#198 state-file priority_override
+// into an existing aqg.json (issue #241). aqg.json is written first; the
+// consumed key is removed by the orchestrator's final cleanup pass. That write
+// order makes a crash between the two idempotent: the next start observes
+// exact equality, leaves aqg.json untouched, and retries only the state-file
+// cleanup.
+//
+// This is intentionally priority-only. applyLegacyOverlay also replays legacy
+// members, credentials, removals, and disabled flags, which would overwrite
+// newer operator intent already stored in aqg.json. It remains confined to the
+// first-deploy bootstrap path.
+func reconcileLegacyPriority(cfg config.Config, reg *backend.Registry, legacy legacyState, statePath, configPath string, logOut io.Writer) (*backend.Registry, error) {
 	spec := reg.Spec()
 	verdicts := make([]legacyPriorityVerdict, 0, len(legacy.Config))
 	var irreconcilable []string
@@ -131,9 +172,7 @@ func reconcileLegacyPriority(cfg config.Config, reg *backend.Registry, configPat
 
 	updated := reg
 	var migrated []legacyPriorityVerdict
-	var handled []string
 	for _, v := range verdicts {
-		handled = append(handled, v.pool)
 		if v.balanced {
 			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: pool %q declares balance mode in aqg.json; legacy priority mode is superseded and will be consumed\n", v.pool)
 			continue
@@ -163,13 +202,6 @@ func reconcileLegacyPriority(cfg config.Config, reg *backend.Registry, configPat
 			} else {
 				fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: pool %q priority %v -> %v migrated into %s; re-setting the order in the UI will not recur\n", v.pool, v.previous, v.order, configPath)
 			}
-		}
-	}
-
-	if len(handled) > 0 {
-		if err := consumeLegacyPriorities(statePath, stateData, handled); err != nil {
-			sort.Strings(handled)
-			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: aqg.json is current, but could not consume legacy priority_override for pool(s) %s from %q: %v; deletion will be retried on the next start\n", strings.Join(handled, ", "), statePath, err)
 		}
 	}
 	return updated, nil
@@ -219,11 +251,117 @@ func filteredLegacyPriority(reg *backend.Registry, pool string, rawOrder []strin
 	return order
 }
 
-// consumeLegacyPriorities removes only priority_override from each handled
-// pool's legacy config object. RawMessage keeps every unrelated JSON value
+type legacyDisabledVerdict struct {
+	pool   string
+	nick   string
+	already bool // true if the member was already disabled in aqg.json; no rewrite
+}
+
+// reconcileLegacyDisabled consumes the pre-#198 state-file `disabled` list
+// into aqg.json (issue #259). Each listed nick that is a configured,
+// currently-enabled member of the pool is disabled; non-member nicks are
+// logged and skipped; already-disabled members are recorded but produce no
+// `aqg.json` rewrite. The `disabled` key is removed by the orchestrator's
+// final cleanup pass over legacyKeyCleanup's output.
+//
+// The two-return form (handledDisabled slice) is a future hook for symmetry
+// with the priority reconciler; it is currently the slice of pools whose
+// legacy `disabled` list was processed (had at least one entry), independent
+// of whether any disable was actually applied.
+func reconcileLegacyDisabled(cfg config.Config, reg *backend.Registry, legacy legacyState, configPath string, logOut io.Writer) (*backend.Registry, []string, error) {
+	verdicts := make([]legacyDisabledVerdict, 0)
+	var handledPools []string
+	for rawPool, pc := range legacy.Config {
+		if len(pc.Disabled) == 0 {
+			continue
+		}
+		pool := backend.NormalizeName(rawPool)
+		if pool == "" {
+			continue
+		}
+		handledPools = append(handledPools, pool)
+		if !reg.HasPool(pool) {
+			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: skipping legacy disabled for pool %q (not in config)\n", pool)
+			continue
+		}
+		seen := make(map[string]bool, len(pc.Disabled))
+		for _, rawNick := range pc.Disabled {
+			nick := backend.NormalizeName(rawNick)
+			if nick == "" || seen[nick] {
+				continue
+			}
+			seen[nick] = true
+			b, ok := reg.ResolveIn(pool, nick)
+			if !ok {
+				fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: skipping legacy disabled nick %q for pool %q (not a current member)\n", nick, pool)
+				continue
+			}
+			verdicts = append(verdicts, legacyDisabledVerdict{pool: pool, nick: nick, already: b.Disabled})
+		}
+	}
+
+	updated := reg
+	for _, v := range verdicts {
+		if v.already {
+			continue
+		}
+		next, err := updated.WithMemberDisabled(v.pool, v.nick, true)
+		if err != nil {
+			return reg, nil, fmt.Errorf("reconcile: pool %q disable %q: %w", v.pool, v.nick, err)
+		}
+		updated = next
+		fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: pool %q member %q disabled and migrated into %s; re-enabling in the UI will not recur\n", v.pool, v.nick, configPath)
+	}
+	if updated == reg {
+		return updated, handledPools, nil
+	}
+	data, err := configfile.Marshal(cfg, updated)
+	if err != nil {
+		return reg, nil, fmt.Errorf("reconcile: marshal %q: %w", configPath, err)
+	}
+	if err := configfile.WriteAtomic(configPath, data); err != nil {
+		return reg, nil, fmt.Errorf("reconcile: write %q: %w", configPath, err)
+	}
+	return updated, handledPools, nil
+}
+
+// reconcileLegacyReportOnly logs the presence of legacy `removed_members`
+// and `added_members` without applying them (issue #259). Both keys are
+// credential-bearing and asymmetric-recoverable: applying a legacy removal
+// can lose a credential the operator still needs, applying a legacy addition
+// can re-inject a rotated credential. The first `persist.flush` is allowed to
+// erase them on its own schedule — the startup log is the durable record of
+// what was in the file.
+func reconcileLegacyReportOnly(legacy legacyState, statePath string, logOut io.Writer) {
+	for rawPool, pc := range legacy.Config {
+		pool := backend.NormalizeName(rawPool)
+		if pool == "" {
+			continue
+		}
+		if len(pc.RemovedMembers) > 0 {
+			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: state file %q contains legacy removed_members for pool %q (nicks: %s); not applied — clearing them via the UI is the supported path; these keys will be removed by the next state-file flush\n", statePath, pool, strings.Join(pc.RemovedMembers, ", "))
+		}
+		if len(pc.AddedMembers) > 0 {
+			nicks := make([]string, 0, len(pc.AddedMembers))
+			for rawNick := range pc.AddedMembers {
+				nicks = append(nicks, backend.NormalizeName(rawNick))
+			}
+			sort.Strings(nicks)
+			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: state file %q contains legacy added_members for pool %q (nicks: %s); not applied — re-adding via the UI/API is the supported path; these keys will be removed by the next state-file flush\n", statePath, pool, strings.Join(nicks, ", "))
+		}
+	}
+}
+
+// consumeLegacyKeys removes the listed legacy keys from each handled pool's
+// legacy config object. RawMessage keeps every unrelated JSON value
 // semantically unchanged; no live GatewayState decode is used because that
 // observation-only type deliberately omits legacy operator-intent fields.
-func consumeLegacyPriorities(path string, data []byte, pools []string) error {
+//
+// legacyKeys is {pool: [key1, key2, ...]} — per-pool key lists from
+// legacyKeyCleanup. A pool is skipped entirely if none of its keys are
+// actually present in the on-disk JSON (no rewritten empty object is written
+// for it). One atomic write removes every consumed key.
+func consumeLegacyKeys(path string, data []byte, legacyKeys map[string][]string) error {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(data, &root); err != nil {
 		return err
@@ -233,23 +371,27 @@ func consumeLegacyPriorities(path string, data []byte, pools []string) error {
 		return err
 	}
 
-	handled := make(map[string]bool, len(pools))
-	for _, pool := range pools {
-		handled[backend.NormalizeName(pool)] = true
-	}
 	changed := false
-	for rawPool, raw := range configs {
-		if !handled[backend.NormalizeName(rawPool)] {
+	for rawPool, keys := range legacyKeys {
+		raw, ok := configs[rawPool]
+		if !ok {
 			continue
 		}
 		var poolConfig map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &poolConfig); err != nil {
 			return fmt.Errorf("config.%s: %w", rawPool, err)
 		}
-		if _, ok := poolConfig["priority_override"]; !ok {
+		poolChanged := false
+		for _, key := range keys {
+			if _, ok := poolConfig[key]; !ok {
+				continue
+			}
+			poolConfig = withoutRawMessage(poolConfig, key)
+			poolChanged = true
+		}
+		if !poolChanged {
 			continue
 		}
-		poolConfig = withoutRawMessage(poolConfig, "priority_override")
 		updated, err := json.Marshal(poolConfig)
 		if err != nil {
 			return err
@@ -270,6 +412,36 @@ func consumeLegacyPriorities(path string, data []byte, pools []string) error {
 		return err
 	}
 	return configfile.WriteAtomic(path, updated)
+}
+
+// legacyKeyCleanup returns the legacy overlay's pool-by-key cleanup map for
+// pools that exist in the loaded registry. Every entry that *can* be consumed
+// (priority_override always; disabled when the per-pool legacy entry was
+// non-empty) shows up here, restricted to in-scope pools — out-of-scope pools
+// (not in the loaded registry and not runtime-created) are left entirely
+// alone so an operator who hand-edits a state file isn't quietly rewritten.
+//
+// The orchestrator uses this to drive a single atomic state-file rewrite
+// covering both migrations from one read.
+func legacyKeyCleanup(reg *backend.Registry, legacy legacyState) map[string][]string {
+	out := map[string][]string{}
+	for rawPool, pc := range legacy.Config {
+		pool := backend.NormalizeName(rawPool)
+		if pool == "" || !reg.HasPool(pool) {
+			continue
+		}
+		var keys []string
+		if len(pc.PriorityOverride) > 0 {
+			keys = append(keys, "priority_override")
+		}
+		if len(pc.Disabled) > 0 {
+			keys = append(keys, "disabled")
+		}
+		if len(keys) > 0 {
+			out[rawPool] = keys
+		}
+	}
+	return out
 }
 
 func withoutRawMessage(m map[string]json.RawMessage, key string) map[string]json.RawMessage {

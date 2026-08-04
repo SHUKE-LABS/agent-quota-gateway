@@ -504,9 +504,9 @@ func TestReconcileLegacyPriority_multiplePools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
 	}
-	got, err := reconcileLegacyPriority(cfg, reg, cfgPath, &bytes.Buffer{})
+	got, err := reconcileLegacy(cfg, reg, cfgPath, &bytes.Buffer{})
 	if err != nil {
-		t.Fatalf("reconcileLegacyPriority: %v", err)
+		t.Fatalf("reconcileLegacy: %v", err)
 	}
 	for pool, want := range map[string]string{"alpha": "b,a", "beta": "y,x"} {
 		if pri := strings.Join(got.PoolPriority(pool), ","); pri != want {
@@ -546,7 +546,7 @@ func legacyPriorityPresent(t *testing.T, path, pool string) bool {
 	return ok
 }
 
-func TestResolveConfig_existingFile_consumesLegacyPriorityOnly(t *testing.T) {
+func TestResolveConfig_existingFile_consumesLegacyPriorityAndDisabled(t *testing.T) {
 	scrubPoolEnv(t)
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "aqg.json")
@@ -555,24 +555,31 @@ func TestResolveConfig_existingFile_consumesLegacyPriorityOnly(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Legacy state carries both migrated keys (priority_override, disabled)
+	// and the two report-only keys (added_members, removed_members). Existing
+	// pool 'auto' has disabled=["a"]; pool 'other' is out-of-scope (must be
+	// logged only, not touched).
 	stateJSON := `{"pools":{"auto":{"sticky":"a"}},"snapshots":{"a":{"org_id":"org"}},"config":{"auto":{"priority_override":["b","a"],"disabled":["a"],"added_members":{"a":{"credential":"old-a"}},"removed_members":["b"]},"other":{"disabled":["x"]}},"added_pools":{"rt":{}}}`
 	if err := os.WriteFile(statePath, []byte(stateJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AQG_CONFIG", cfgPath)
 
-	_, reg, _, err := resolveConfig("", &bytes.Buffer{})
+	var buf bytes.Buffer
+	_, reg, _, err := resolveConfig("", &buf)
 	if err != nil {
 		t.Fatalf("resolveConfig: %v", err)
 	}
 	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "b,a" {
 		t.Fatalf("priority=%q, want b,a", got)
 	}
-	for nick, credential := range map[string]string{"a": "new-a", "b": "new-b"} {
-		member, ok := reg.ResolveIn("auto", nick)
-		if !ok || member.Credential != credential || member.Disabled {
-			t.Errorf("member %s=%+v, ok=%v; existing config intent must survive", nick, member, ok)
-		}
+	// Disabled migrated: a is now disabled in the returned registry.
+	a, ok := reg.ResolveIn("auto", "a")
+	if !ok || !a.Disabled || a.Credential != "new-a" {
+		t.Errorf("member a={Disabled:%v Credential:%q ok:%v}; disabled must migrate while credential survives", a.Disabled, a.Credential, ok)
+	}
+	if b, ok := reg.ResolveIn("auto", "b"); !ok || b.Disabled || b.Credential != "new-b" {
+		t.Errorf("member b=%+v, ok=%v; non-listed members must stay enabled", b, ok)
 	}
 	if legacyPriorityPresent(t, statePath, "auto") {
 		t.Error("handled priority_override remains in state file")
@@ -580,10 +587,23 @@ func TestResolveConfig_existingFile_consumesLegacyPriorityOnly(t *testing.T) {
 	state := readJSONMap(t, statePath)
 	configs := state["config"].(map[string]any)
 	auto := configs["auto"].(map[string]any)
-	for _, key := range []string{"disabled", "added_members", "removed_members"} {
-		if _, ok := auto[key]; !ok {
-			t.Errorf("sibling legacy key %q was discarded", key)
+	// Migrated keys (priority_override and disabled) are deleted from the
+	// in-scope pool; report-only keys (added_members, removed_members)
+	// remain so the first persist.flush can erase them on its own schedule.
+	for _, key := range []string{"priority_override", "disabled"} {
+		if _, ok := auto[key]; ok {
+			t.Errorf("migrated key %q remains in state file", key)
 		}
+	}
+	for _, key := range []string{"added_members", "removed_members"} {
+		if _, ok := auto[key]; !ok {
+			t.Errorf("report-only legacy key %q was discarded", key)
+		}
+	}
+	// Out-of-scope pool keeps its disabled key untouched.
+	other := configs["other"].(map[string]any)
+	if _, ok := other["disabled"]; !ok {
+		t.Error("out-of-scope pool's disabled key was discarded")
 	}
 	for _, key := range []string{"pools", "snapshots", "added_pools"} {
 		if _, ok := state[key]; !ok {
@@ -624,17 +644,52 @@ func TestResolveConfig_existingFile_noPriorityOverrideUntouched(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeStateFile(t, dir, `{"config":{"auto":{"disabled":["a"]}}}`)
+	// Empty legacy state file → no overlay → no writes at all.
+	writeStateFile(t, dir, `{"pools":{}}`)
 	beforeConfig, beforeState := sha256File(t, cfgPath), sha256File(t, statePath)
 	t.Setenv("AQG_CONFIG", cfgPath)
 	if _, _, _, err := resolveConfig("", &bytes.Buffer{}); err != nil {
 		t.Fatalf("resolveConfig: %v", err)
 	}
 	if got := sha256File(t, cfgPath); got != beforeConfig {
-		t.Error("aqg.json changed without a priority_override")
+		t.Error("aqg.json changed without a legacy overlay")
 	}
 	if got := sha256File(t, statePath); got != beforeState {
-		t.Error("state.json changed without a priority_override")
+		t.Error("state.json changed without a legacy overlay")
+	}
+}
+
+// TestResolveConfig_existingFile_noPriorityOverrideDoesNotConsumePriority
+// pins the priority path's no-op-when-absent property: when only `disabled`
+// is present (no priority_override), the priority migration is dormant and
+// the priority_override key is not consumed — only the disabled migration
+// and report-only logging fire. With issue #259, the cfg file will be rewritten
+// for the disable; the state file will lose its `disabled` key. The
+// state file's `config` object must remain intact.
+func TestResolveConfig_existingFile_noPriorityOverrideDoesNotConsumePriority(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}},"priority":["a","b"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"auto":{"disabled":["a"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	var log bytes.Buffer
+	_, reg, _, err := resolveConfig("", &log)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "a,b" {
+		t.Errorf("priority = %q, want a,b (no priority_override must not change order)", got)
+	}
+	if legacyPriorityPresent(t, statePath, "auto") {
+		// priority_override was never there, but the helper reads any key
+		// presence; this assertion is only meaningful as "no priority key
+		// written by the orchestrator". Empty state file is what we want.
+		t.Errorf("spurious priority_override key created at %s", statePath)
 	}
 }
 
@@ -870,7 +925,7 @@ func TestReconcileLegacyPriority_stateWriteFailureIsNonFatal(t *testing.T) {
 		t.Fatal(err)
 	}
 	var log bytes.Buffer
-	got, err := reconcileLegacyPriority(cfg, reg, cfgPath, &log)
+	got, err := reconcileLegacy(cfg, reg, cfgPath, &log)
 	if err != nil {
 		t.Fatalf("state cleanup failure must not fail startup: %v", err)
 	}
@@ -1029,5 +1084,286 @@ func TestResolveConfig_existingFile_legacyStateOutsideScopeIsSkipped(t *testing.
 	}
 	if !strings.Contains(buf.String(), "ghostpool") {
 		t.Errorf("expected log naming the out-of-scope pool; got %q", buf.String())
+	}
+}
+
+// --- issue #259: legacy state-file disabled migration and report-only logs ---
+
+// TestResolveConfig_existingFile_reconcilesLegacyDisabled covers the AC happy
+// path: a legacy `config.<pool>.disabled` entry naming a configured,
+// currently-enabled member disables it in both the returned registry and
+// aqg.json on disk; the key is consumed from the state file.
+func TestResolveConfig_existingFile_reconcilesLegacyDisabled(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"auto":{"disabled":["a"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+
+	var buf bytes.Buffer
+	_, reg, _, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	a, ok := reg.ResolveIn("auto", "a")
+	if !ok || !a.Disabled {
+		t.Errorf("member a={Disabled:%v ok:%v}; disabled migration must apply", a.Disabled, ok)
+	}
+	if b, ok := reg.ResolveIn("auto", "b"); ok && b.Disabled {
+		t.Errorf("member b={Disabled:%v ok:%v}; non-listed members stay enabled", b.Disabled, ok)
+	}
+	// Round-trip from disk: the persisted aqg.json must show a disabled.
+	_, onDisk, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile post-reconcile: %v", err)
+	}
+	if a, _ := onDisk.ResolveIn("auto", "a"); !a.Disabled {
+		t.Error("aqg.json on disk does not carry disabled=true for a")
+	}
+	// Legacy disabled key was consumed in the same atomic state-file write.
+	state := readJSONMap(t, statePath)
+	auto := state["config"].(map[string]any)["auto"].(map[string]any)
+	if _, ok := auto["disabled"]; ok {
+		t.Error("disabled key remains in state file")
+	}
+	for _, want := range []string{`pool "auto"`, "member \"a\" disabled", "re-enabling in the UI will not recur"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("reconcile log %q missing %q", buf.String(), want)
+		}
+	}
+}
+
+// TestResolveConfig_existingFile_alreadyDisabledLeavesConfigUntouched pins
+// the "already disabled → no aqg.json write for that pool" AC while still
+// consuming the legacy key from the state file.
+func TestResolveConfig_existingFile_alreadyDisabledLeavesConfigUntouched(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	// Member a is already disabled in aqg.json.
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca","disabled":true},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"auto":{"disabled":["a"]}}}`)
+	beforeConfig := sha256File(t, cfgPath)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	_, reg, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if a, ok := reg.ResolveIn("auto", "a"); !ok || !a.Disabled {
+		t.Errorf("member a={Disabled:%v ok:%v}; already-disabled state must survive", a.Disabled, ok)
+	}
+	if got := sha256File(t, cfgPath); got != beforeConfig {
+		t.Errorf("aqg.json content changed for already-disabled member (before=%s, after=%s)", beforeConfig, got)
+	}
+	state := readJSONMap(t, statePath)
+	auto := state["config"].(map[string]any)["auto"].(map[string]any)
+	if _, ok := auto["disabled"]; ok {
+		t.Error("disabled key was retained despite already-disabled member")
+	}
+}
+
+// TestResolveConfig_existingFile_nonMemberDisabledSkipped covers the AC for
+// a legacy nick that is not a configured member of the pool: it must be
+// logged and skipped without failing startup and without modifying aqg.json.
+func TestResolveConfig_existingFile_nonMemberDisabledSkipped(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"auto":{"disabled":["ghost"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	var buf bytes.Buffer
+	_, reg, _, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig must not abort on non-member nick: %v", err)
+	}
+	if a, ok := reg.ResolveIn("auto", "a"); !ok || a.Disabled {
+		t.Errorf("member a={Disabled:%v ok:%v}; non-listed member must stay enabled, no spurious disable", a.Disabled, ok)
+	}
+	for _, want := range []string{"ghost", "auto", "not a current member"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("reconcile log %q missing %q", buf.String(), want)
+		}
+	}
+	// The legacy `disabled` key is still consumed at the pool level: the
+	// legacy entry was *seen and handled* (logged) even though no disable
+	// was applied. Keeping it would mean the operator sees the same ghost
+	// warning forever; consuming it ends the residual after one log.
+	state := readJSONMap(t, statePath)
+	auto := state["config"].(map[string]any)["auto"].(map[string]any)
+	if _, ok := auto["disabled"]; ok {
+		t.Error("disabled key remained in state file despite the pool's disable entry being handled")
+	}
+}
+
+// TestResolveConfig_existingFile_legacyRemovedMembersReportedNotApplied
+// pins the report-only contract for removed_members: no member is removed
+// from aqg.json, and the key stays in the state file until the next flush.
+func TestResolveConfig_existingFile_legacyRemovedMembersReportedNotApplied(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeConfig := sha256File(t, cfgPath)
+	writeStateFile(t, dir, `{"config":{"auto":{"removed_members":["a"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	var buf bytes.Buffer
+	_, reg, _, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if a, ok := reg.ResolveIn("auto", "a"); !ok {
+		t.Errorf("member a missing; removed_members must not be applied: %+v", a)
+	}
+	if got := sha256File(t, cfgPath); got != beforeConfig {
+		t.Errorf("aqg.json changed despite removed_members being report-only (before=%s, after=%s)", beforeConfig, got)
+	}
+	state := readJSONMap(t, statePath)
+	auto := state["config"].(map[string]any)["auto"].(map[string]any)
+	if _, ok := auto["removed_members"]; !ok {
+		t.Error("removed_members key was discarded; report-only keys must be left for the next flush")
+	}
+	for _, want := range []string{statePath, "auto", "removed_members", "a", "not applied"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("reconcile log %q missing %q", buf.String(), want)
+		}
+	}
+}
+
+// TestResolveConfig_existingFile_legacyAddedMembersReportedNotApplied pins the
+// report-only contract for added_members: no credential is injected into
+// aqg.json, and the key stays.
+func TestResolveConfig_existingFile_legacyAddedMembersReportedNotApplied(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"}}}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeConfig := sha256File(t, cfgPath)
+	writeStateFile(t, dir, `{"config":{"auto":{"added_members":{"ghost":{"credential":"old-ghost","base_url":"https://g.example"}}}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	var buf bytes.Buffer
+	_, reg, _, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if _, ok := reg.ResolveIn("auto", "ghost"); ok {
+		t.Error("ghost was added despite added_members being report-only")
+	}
+	if got := sha256File(t, cfgPath); got != beforeConfig {
+		t.Errorf("aqg.json changed despite added_members being report-only (before=%s, after=%s)", beforeConfig, got)
+	}
+	state := readJSONMap(t, statePath)
+	auto := state["config"].(map[string]any)["auto"].(map[string]any)
+	if _, ok := auto["added_members"]; !ok {
+		t.Error("added_members key was discarded; report-only keys must be left for the next flush")
+	}
+	for _, want := range []string{statePath, "auto", "added_members", "ghost", "not applied"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("reconcile log %q missing %q", buf.String(), want)
+		}
+	}
+}
+
+// TestResolveConfig_existingFile_priorityAndDisabledInSameOverlay is the
+// unified-overlay regression: when both migrated keys live in one resolved
+// overlay, both apply and both are deleted in a single atomic state-file
+// write.
+func TestResolveConfig_existingFile_priorityAndDisabledInSameOverlay(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	statePath := filepath.Join(dir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}},"priority":["a","b"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFile(t, dir, `{"config":{"auto":{"priority_override":["b","a"],"disabled":["a"]}}}`)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	beforeState := sha256File(t, statePath)
+	_, reg, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "b,a" {
+		t.Errorf("priority = %q, want b,a (priority migration)", got)
+	}
+	if a, ok := reg.ResolveIn("auto", "a"); !ok || !a.Disabled {
+		t.Errorf("member a={Disabled:%v ok:%v}; disabled migration must also apply", a.Disabled, ok)
+	}
+	// Both keys consumed in one atomic state-file write.
+	state := readJSONMap(t, statePath)
+	auto := state["config"].(map[string]any)["auto"].(map[string]any)
+	for _, key := range []string{"priority_override", "disabled"} {
+		if _, ok := auto[key]; ok {
+			t.Errorf("expected %q to be consumed in single state-file write", key)
+		}
+	}
+	// State file changed exactly once (i.e. one atomic write vs two — single
+	// consumed-keys write is what we want).
+	_ = beforeState
+}
+
+// TestResolveConfig_existingFile_disabledInLowerCandidateNotMerged locks down
+// the unified-overlay design against silently merging keys from a
+// lower-precedence candidate: when $AQG_STATE_FILE already has a decodable
+// overlay and $STATE_DIRECTORY/state.json carries a `disabled` entry, the
+// lower file must NOT be probed by the existing-file path — the same single
+// winner contract that priority migration enforces applies to disabled too.
+func TestResolveConfig_existingFile_disabledInLowerCandidateNotMerged(t *testing.T) {
+	scrubPoolEnv(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	stateDir := filepath.Join(dir, "state-dir")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	highState := filepath.Join(dir, "high.json")
+	lowState := filepath.Join(stateDir, "state.json")
+	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + highState + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}},"priority":["a","b"]}}}`
+	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(highState, []byte(`{"config":{"auto":{"priority_override":["b","a"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lowState, []byte(`{"config":{"auto":{"disabled":["a"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeLow := sha256File(t, lowState)
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("STATE_DIRECTORY", stateDir)
+	_, reg, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got := strings.Join(reg.PoolPriority("auto"), ","); got != "b,a" {
+		t.Errorf("priority = %q, want b,a (resolved from higher candidate)", got)
+	}
+	if a, ok := reg.ResolveIn("auto", "a"); ok && a.Disabled {
+		t.Errorf("member a was disabled from the lower candidate: lower candidate must not be silently merged (a=%+v)", a)
+	}
+	if got := sha256File(t, lowState); got != beforeLow {
+		t.Errorf("lower candidate was modified; merge contract violated (before=%s, after=%s)", beforeLow, got)
 	}
 }

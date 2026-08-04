@@ -342,7 +342,7 @@ Declaring both is a startup error.
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
-| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles and removes only a legacy `priority_override` as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
+| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles legacy `priority_override` and `disabled` (issues #241, #259) and **reports only** legacy `removed_members` / `added_members` (the credential-bearing keys are never silently applied), as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
 | `AQG_DEBUG_LOG_REQUESTS` | _(unset)_ | Set to `1` to dump every inbound request and outbound upstream request to stderr for debugging; any other value (or unset) leaves it off. Credentials are always redacted — the `Authorization` and `x-api-key` headers are never logged — but the inbound request body is dumped and may contain user message content, so enable only in dev/debug runs. |
 
 Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
@@ -424,10 +424,24 @@ Legacy priority nicks are normalized, filtered to current pool members, and
 deduplicated before migration. A priority with no surviving member fails
 startup and names the state/config paths that need repair. A missing pool is
 logged and skipped. A pool that now uses balance mode keeps that newer mode and
-has the superseded legacy priority key consumed. Other legacy overlay keys are
-not replayed on this existing-file path. Hand-adding a new
-`priority_override` after it has been consumed does not create a supported live
-overlay; priority changes belong in `aqg.json` or the UI/API.
+has the superseded legacy priority key consumed. Legacy `disabled` entries are
+migrated the same way (issue #259): listed nicks that are configured and
+currently enabled are disabled in `aqg.json`; non-member nicks are logged and
+skipped; the key is consumed at the pool level once every listed nick has been
+handled. A disabled member already disabled in `aqg.json` produces no rewrite
+for that pool, but the key deletion is still attempted. `removed_members` and
+`added_members` are **reported only** — both are credential-bearing and
+asymmetric-recoverable (a stale removal can lose a credential the operator
+still needs; a stale addition can re-inject a rotated credential), so the
+gateway never applies them on the existing-file path; the startup log names
+the state-file path, the pool and the nicks, and the first `persist.flush`
+erases the key on its own schedule. The discover contract is unchanged: only
+the first candidate with a decodable overlay wins, so a `priority_override` in
+`$AQG_STATE_FILE` and `disabled` in `$STATE_DIRECTORY/state.json` are **not**
+silently merged — both keys must live in the resolved overlay for both
+migrations to apply. Hand-adding a legacy key after it has been consumed does
+not create a supported live overlay; the supported intent-channel is
+`aqg.json` and the UI/API.
 
 A malformed file, an unknown JSON key, or a file with looser-than-0600
 permissions causes startup to fail closed — no silent fallback to env.
