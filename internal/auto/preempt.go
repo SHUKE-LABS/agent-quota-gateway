@@ -26,11 +26,14 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
-// defaultPreemptInterval is the idle fallback cadence: when no priority
-// pool has a parked higher-priority member to wait for, the preemptor
-// re-checks at this interval rather than spinning. A concrete reset always
-// takes precedence — the loop sleeps until the earliest known recovery and
-// only falls back to this poll when no reset timestamp is available.
+// defaultPreemptInterval is the preemptor's polling cadence. When no priority
+// pool has a parked higher-priority member to wait for, the loop idles at this
+// interval rather than spinning. A scheduled reset within the interval still
+// takes precedence — the loop wakes at the exact reset — but a reset scheduled
+// farther out is capped at this interval (issue #288): sleeping until an
+// arbitrarily far reset would blind the loop to mid-sleep parks and recoveries
+// on every other pool, e.g. one 7d-window reset on a single pool suppressing
+// all preempt-back for the entire window.
 const defaultPreemptInterval = 5 * time.Minute
 
 // Preemptor returns a priority pool to a higher-priority member when that
@@ -103,12 +106,12 @@ func newPreemptorFunc(controllers func() []*Controller, store *quota.Store, inte
 }
 
 // Run drives the preempt-back loop until ctx is cancelled. Each pass
-// performs any due switches and returns the duration until the next known
-// recovery; Run then sleeps until then (or until ctx is done). An empty pool
-// set is an ordinary idle tick, so a pool added later is picked up by the next
-// pass. A deployment with only equal-strength pools also idles at the
-// fallback interval doing nothing, since tick() skips every non-priority pool.
-// Run blocks; callers start it in a goroutine.
+// performs any due switches and returns the duration until the next
+// evaluation; Run then sleeps until then (or until ctx is done). An empty
+// pool set is an ordinary idle tick, so a pool added later is picked up by
+// the next pass. A deployment with only equal-strength pools also idles at
+// the fallback interval doing nothing, since tick() skips every non-priority
+// pool. Run blocks; callers start it in a goroutine.
 func (p *Preemptor) Run(ctx context.Context) {
 	for {
 		wait := p.tick()
@@ -126,7 +129,11 @@ func (p *Preemptor) Run(ctx context.Context) {
 // returns how long to sleep before the next one. For each pool it walks the
 // members ranked strictly above the active one, highest priority first, and
 // either switches now (the member has recovered) or records when it will,
-// scheduling the loop to wake at the soonest such reset. With nothing to
+// scheduling the loop to wake at the soonest such reset. The returned wait is
+// capped at the interval: a reset within the interval is slept to exactly,
+// while a farther one is re-evaluated at each interval mark — so a member
+// that parks or recovers mid-sleep on any pool is seen within one interval,
+// not at some far reset another pool scheduled (issue #288). With nothing to
 // wait for it returns the idle interval.
 func (p *Preemptor) tick() time.Duration {
 	now := p.now()
@@ -219,7 +226,15 @@ func (p *Preemptor) tick() time.Duration {
 	if !scheduled {
 		return p.interval
 	}
-	return earliest.Sub(now)
+	// Cap the wait at the interval (issue #288): an arbitrarily far earliest
+	// reset must not blind the loop to mid-sleep parks and recoveries on other
+	// pools, so a farther reset only re-schedules at interval marks. A reset
+	// within the interval is still slept to exactly, so the precise switch
+	// time is preserved.
+	if d := earliest.Sub(now); d < p.interval {
+		return d
+	}
+	return p.interval
 }
 
 // preemptView is a read-only snapshot of a priority controller's state the
