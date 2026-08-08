@@ -267,14 +267,17 @@ A priority pool also **preempts back**: when a higher-priority member's
 quota window resets while a lower-priority member is active, the gateway
 switches the pool back to the recovered member so a freshly-reset preferred
 backend is drained promptly instead of riding the fallback until it `429`s.
-The switch happens within one timer cycle of the reset. It uses the precise
-`unified_5h_reset` when known (Anthropic via headers, other vendors via the
-quota poller), falls back to the member's parked reset otherwise, and only
-idles on a 5-minute poll when neither is available. A member that resets but
-is immediately rate-limited again is not switched to repeatedly — reactive
-`429` failover keeps precedence. Pools without a static `PRIORITY` declaration
-never preempt unless priority is set at runtime via `POST /_gateway/pool/{name}/priority`,
-so their prompt cache is never interrupted.
+It uses the precise `unified_5h_reset` when known (Anthropic via headers,
+other vendors via the quota poller), falls back to the member's parked reset
+otherwise, and re-evaluates every pool on a bounded cadence: a reset
+scheduled within the cadence is slept to exactly, while one farther out is
+re-checked at each cadence mark — so a mid-sleep park or recovery on any
+pool is never held up by a far-future reset scheduled elsewhere. A member
+that resets but is immediately rate-limited again is not switched to
+repeatedly — reactive `429` failover keeps precedence. Pools without a
+static `PRIORITY` declaration never preempt unless priority is set at runtime
+via `POST /_gateway/pool/{name}/priority`, so their prompt cache is never
+interrupted.
 
 ### Balanced routing within a pool
 
