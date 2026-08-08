@@ -123,10 +123,12 @@ func TestPreempt_schedulesThenSwitchesViaPreciseQuotaReset(t *testing.T) {
 
 	p := newPreemptor([]*Controller{c}, store, 0, clock.now, io.Discard)
 
-	// Before the precise reset: schedule a wake at it, no switch yet.
+	// Before the precise reset: no switch yet. The 1h reset is beyond the
+	// poll cadence, so the wait is capped at the interval (issue #288), not
+	// the precise reset.
 	wait := p.tick()
-	if wait != time.Hour {
-		t.Fatalf("tick wait = %v, want 1h (the precise quota reset, not the 5h park)", wait)
+	if wait != defaultPreemptInterval {
+		t.Fatalf("tick wait = %v, want %v (the far 1h reset capped at the poll cadence)", wait, defaultPreemptInterval)
 	}
 	if got := c.Current(); got != "m3" {
 		t.Fatalf("Current() = %q, want m3 (no switch before reset)", got)
@@ -150,8 +152,10 @@ func TestPreempt_fallsBackToParkResetWithoutQuota(t *testing.T) {
 	c.park("a", clock.now().Add(30*time.Minute)) // no quota data for a
 	p := newPreemptor([]*Controller{c}, quota.NewStore(), 0, clock.now, io.Discard)
 
-	if wait := p.tick(); wait != 30*time.Minute {
-		t.Fatalf("tick wait = %v, want 30m (the controller park reset)", wait)
+	// The 30m park is beyond the poll cadence, so the wait is capped at the
+	// interval (issue #288), not the controller park reset.
+	if wait := p.tick(); wait != defaultPreemptInterval {
+		t.Fatalf("tick wait = %v, want %v (the 30m park capped at the poll cadence)", wait, defaultPreemptInterval)
 	}
 	if got := c.Current(); got != "b" {
 		t.Fatalf("Current() = %q, want b (parked, no switch yet)", got)
@@ -194,9 +198,10 @@ func TestPreempt_noFlapOnStaleQuotaReset(t *testing.T) {
 	if got := c.Current(); got != "m3" {
 		t.Errorf("Current() = %q, want m3 (no flap on the stale reset)", got)
 	}
-	// And it waits on the fresh park, not the stale precise value.
-	if wait != defaultExhaustionWindow {
-		t.Errorf("tick wait = %v, want the fresh %v park (stale reset ignored)", wait, defaultExhaustionWindow)
+	// And it waits on the fresh park, not the stale precise value — capped at
+	// the poll cadence since the 5h park is beyond it (issue #288).
+	if wait != defaultPreemptInterval {
+		t.Errorf("tick wait = %v, want %v (fresh park capped at cadence)", wait, defaultPreemptInterval)
 	}
 }
 
@@ -227,8 +232,8 @@ func TestPreempt_noFlapViaSwitchNowPath(t *testing.T) {
 	if got := c.Current(); got != "m3" {
 		t.Errorf("Current() = %q, want m3 (no flap via the switch-now path)", got)
 	}
-	if wait != defaultExhaustionWindow {
-		t.Errorf("tick wait = %v, want the fresh %v park", wait, defaultExhaustionWindow)
+	if wait != defaultPreemptInterval {
+		t.Errorf("tick wait = %v, want %v (fresh park capped at cadence)", wait, defaultPreemptInterval)
 	}
 }
 
@@ -275,15 +280,15 @@ func TestPreempt_climbsIncrementally(t *testing.T) {
 	c.park("b", clock.now().Add(time.Hour))
 	p := newPreemptor([]*Controller{c}, quota.NewStore(), 0, clock.now, io.Discard)
 
-	// Earliest reset is b at 1h.
-	if wait := p.tick(); wait != time.Hour {
-		t.Fatalf("tick wait = %v, want 1h (b is the soonest higher reset)", wait)
+	// Earliest reset is b at 1h — beyond the cadence, so the wait is capped.
+	if wait := p.tick(); wait != defaultPreemptInterval {
+		t.Fatalf("tick wait = %v, want %v (b's 1h reset beyond the poll cadence)", wait, defaultPreemptInterval)
 	}
 
 	// b recovers first → climb to b (a is still parked).
 	clock.advance(time.Hour)
-	if wait := p.tick(); wait != time.Hour {
-		t.Errorf("tick wait = %v, want 1h remaining until a's reset", wait)
+	if wait := p.tick(); wait != defaultPreemptInterval {
+		t.Errorf("tick wait = %v, want %v (a's remaining reset beyond the cadence)", wait, defaultPreemptInterval)
 	}
 	if got := c.Current(); got != "b" {
 		t.Fatalf("Current() = %q, want b (first climb)", got)
@@ -586,8 +591,8 @@ func TestPreempt_rejectedStoreBlocksPreemptBack(t *testing.T) {
 	if got := c.Current(); got != "b" {
 		t.Errorf("Current() = %q, want b (rejected store should block preempt-back)", got)
 	}
-	if wait != 2*time.Hour {
-		t.Errorf("tick wait = %v, want 2h (the store reset for the rejected member)", wait)
+	if wait != defaultPreemptInterval {
+		t.Errorf("tick wait = %v, want %v (2h store reset capped at the poll cadence)", wait, defaultPreemptInterval)
 	}
 }
 
@@ -625,5 +630,72 @@ func TestPreemptor_runtimeAddedMemberPreemptBack(t *testing.T) {
 	}
 	if wait != 5*time.Minute {
 		t.Errorf("tick wait=%v, want 5m (idle interval, a selected immediately)", wait)
+	}
+}
+
+// TestPreemptor_boundedWaitSeesMidSleepRecovery is the issue #288 regression:
+// one pool scheduling a far-future (7d) reset must not blind the preemptor to
+// a mid-sleep park/recovery on another pool. Before the fix, tick() slept
+// until the earliest *scheduled* reset, so a single long-window reset kept
+// the loop asleep past every other pool's events. Now the wait is capped at
+// the interval: a member that parks mid-sleep is picked up at the next cadence
+// mark, and a recovery is switched back within one cadence of it.
+func TestPreemptor_boundedWaitSeesMidSleepRecovery(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+
+	// Pool A: priority a > b, riding the higher member a — nothing to schedule.
+	a := newPriorityController(t, -1, clock, io.Discard, "a,b", "a", "b")
+
+	// Pool B: priority x > y, on the lower member y with x parked behind a 7d
+	// reset. This is the only schedule in the system; under the old unbounded
+	// sleep it would keep the loop dormant for 7 days.
+	b := newPriorityController(t, -1, clock, io.Discard, "x,y", "x", "y")
+	b.setCur("y")
+	b.park("x", clock.now().Add(7*24*time.Hour))
+
+	p := newPreemptor([]*Controller{a, b}, quota.NewStore(), 0, clock.now, io.Discard)
+
+	// The 7d schedule must not extend the wait: it is capped at the interval,
+	// so mid-sleep events on other pools stay within one cadence of being seen.
+	if wait := p.tick(); wait != defaultPreemptInterval {
+		t.Fatalf("tick wait = %v, want %v (7d reset capped at the poll cadence)", wait, defaultPreemptInterval)
+	}
+
+	// Mid-sleep, on the request path: pool A's higher member a 429s, the pool
+	// fails over to b, then a recovers 30m later — both invisible to the tick
+	// just taken.
+	a.setCur("b")
+	a.park("a", clock.now().Add(30*time.Minute))
+	clock.advance(30*time.Minute + time.Minute) // past a's recovery
+
+	// The next tick re-evaluates both pools and switches pool A back to the
+	// recovered higher member, despite pool B's far-future schedule.
+	if wait := p.tick(); wait != defaultPreemptInterval {
+		t.Fatalf("tick wait = %v, want %v (b's 7d schedule still capped)", wait, defaultPreemptInterval)
+	}
+	if got := a.Current(); got != "a" {
+		t.Errorf("Current() = %q, want a (mid-sleep recovery seen despite the 7d schedule)", got)
+	}
+}
+
+// TestPreemptor_exactWaitWithinInterval proves the precise behavior is
+// preserved for a reset scheduled within the poll cadence (issue #288's
+// no-regression clause): the loop still sleeps to the exact reset, not a
+// rounded interval mark.
+func TestPreemptor_exactWaitWithinInterval(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newPriorityController(t, -1, clock, io.Discard, "a,b", "a", "b")
+	c.setCur("b")
+	c.park("a", clock.now().Add(2*time.Minute)) // within the 5m cadence
+	p := newPreemptor([]*Controller{c}, quota.NewStore(), 0, clock.now, io.Discard)
+
+	if wait := p.tick(); wait != 2*time.Minute {
+		t.Fatalf("tick wait = %v, want 2m (exact reset within the cadence)", wait)
+	}
+
+	clock.advance(2 * time.Minute)
+	p.tick()
+	if got := c.Current(); got != "a" {
+		t.Errorf("Current() = %q, want a (switched at the exact reset)", got)
 	}
 }

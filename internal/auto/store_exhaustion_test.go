@@ -250,9 +250,10 @@ func TestStoreExhaustion_priorityFailsOffAndPreemptsBack(t *testing.T) {
 
 	p := newPreemptor([]*Controller{c}, store, 0, clock.now, io.Discard)
 
-	// Before the reset: schedule a wake at it, stay on m3.
-	if wait := p.tick(); wait != time.Hour {
-		t.Fatalf("tick wait=%v, want 1h (zai's precise store reset)", wait)
+	// Before the reset: no switch yet. The 1h reset is beyond the poll
+	// cadence, so the wait is capped at the interval (issue #288).
+	if wait := p.tick(); wait != defaultPreemptInterval {
+		t.Fatalf("tick wait=%v, want %v (zai's precise reset capped at cadence)", wait, defaultPreemptInterval)
 	}
 	if got := c.Current(); got != "m3" {
 		t.Fatalf("Current()=%q, want m3 (no preempt before reset)", got)
@@ -1073,9 +1074,10 @@ func TestStoreExhaustion_runtimePriorityPreemptsBack(t *testing.T) {
 		t.Fatalf("Current()=%q, want b (after setCur)", got)
 	}
 
-	// Preemptor tick before the reset: schedule a wake at a's reset.
-	if wait := p.tick(); wait != time.Hour {
-		t.Fatalf("tick wait=%v, want 1h (a's reset)", wait)
+	// Preemptor tick before the reset: a's reset is beyond the poll cadence,
+	// so the wait is capped at the interval (issue #288).
+	if wait := p.tick(); wait != defaultPreemptInterval {
+		t.Fatalf("tick wait=%v, want %v (a's reset capped at cadence)", wait, defaultPreemptInterval)
 	}
 	if got := c.Current(); got != "b" {
 		t.Fatalf("Current()=%q, want b (no preempt before reset)", got)
