@@ -1420,6 +1420,29 @@ never reads the credential file directly. `Restart=always` covers the boot
 race where the Tailscale interface IP is not assigned yet — the bind
 retries until `tailscaled` brings it up.
 
+## Releasing
+
+Release tags are created automatically from conventional commits: every push
+to `main` runs `scripts/release-tag`, which takes the latest `v*` tag, classifies
+`HEAD`'s subject via `lib/release.sh`, computes the next version, tags it, and
+generates the changelog (`CHANGELOG.md`) from the inter-tag log range.
+
+Version arithmetic follows a feature-count rule (`lib/release.sh`):
+
+- a `feat` commit bumps **minor** and resets **patch**;
+- anything else bumps **patch** only.
+
+`major * 100 + minor` is the cumulative feature count, so the 100th feature
+bump carries into the major: `v0.99.x` → `v1.0.0`, `v1.99.x` → `v2.0.0`.
+**Major is a mechanical counter, not a breaking-change declaration** — `feat!`
+and `BREAKING CHANGE:` take no special path, and the feature count never
+distinguishes them from a plain `feat`.
+
+Existing tags are never rewritten: legacy `vX.Y.Z-beta` tags are still
+recognized as history inputs (so numbering continues unbroken), while all new
+tags are bare `vX.Y.Z`. Manual version steps are not part of the workflow —
+`git push` to `main` produces the tag and changelog automatically.
+
 ## Quota snapshots
 
 The gateway watches the `anthropic-ratelimit-unified-*` and

@@ -92,7 +92,14 @@ release_next_tag() {
 
     case "${bump_kind}" in
         minor)
+            # Feature-count versioning: one major covers 100 minor bumps, so
+            # major * 100 + minor is the cumulative feature count. The carry
+            # divides the *incremented* minor, so the 100th feat moves
+            # v0.99.x -> v1.0.0 and v1.99.x -> v2.0.0. Major is a mechanical
+            # counter, not a breaking-change declaration.
             minor=$((minor + 1))
+            major=$((major + minor / 100))
+            minor=$((minor % 100))
             patch=0
             ;;
         patch)

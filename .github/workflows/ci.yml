@@ -33,3 +33,6 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+
+      - name: Release scripts
+        run: bash scripts/test-release.sh
