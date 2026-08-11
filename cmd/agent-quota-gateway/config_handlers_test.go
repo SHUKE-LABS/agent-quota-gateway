@@ -811,6 +811,115 @@ func addJSON(t *testing.T, url, body string, wantStatus int) {
 	}
 }
 
+// postCapture issues a POST and returns the status and the response body.
+// A nil body means a genuinely bodyless request (no Content-Length payload at
+// all), which is what the issue #292 cases exercise; the other helpers assert
+// a status only and cannot distinguish two different 400s.
+func postCapture(t *testing.T, url string, body io.Reader) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body of %s: %v", url, err)
+	}
+	return resp.StatusCode, string(raw)
+}
+
+// TestAddMemberEndpoint_bodylessRequest pins issue #292: POST
+// /_gateway/pool/{name}/member/{nick} is the only mutation endpoint whose body
+// is entirely optional (README: re-adding a nick already known in another pool
+// supplies no required field), so a bodyless request must be read as "no fields
+// supplied" and not as malformed JSON. The distinction is observable in the
+// error text: an unresolvable nick has to reach AddMember's specific
+// credential-required message rather than the generic "invalid JSON body".
+func TestAddMemberEndpoint_bodylessRequest(t *testing.T) {
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
+	t.Setenv("AQG_POOL_GOOD_BACKEND_Z1", "sk-ant-z1")
+
+	// Bodyless add of a nick resolvable from another pool → 200.
+	poolsNoBody := loadPools(t)
+	srv := configMux(t, poolsNoBody)
+	status, body := postCapture(t, srv.URL+"/_gateway/pool/good/member/a", nil)
+	if status != http.StatusOK {
+		t.Fatalf("bodyless add status=%d body=%s, want 200", status, body)
+	}
+	if !strings.Contains(body, `"status":"ok"`) {
+		t.Errorf("bodyless add body=%s, want status ok", body)
+	}
+	if !memberPresent(t, srv.URL, "good", "a") {
+		t.Error("bodyless add returned 200 but member a is absent from pool good")
+	}
+
+	// It resolves to exactly what `-d '{}'` produces today. The credential is
+	// redacted in the config view, so compare the config specs of two
+	// independently built Pools — that is the operator intent actually written
+	// to aqg.json.
+	poolsEmptyObj := loadPools(t)
+	srvEmptyObj := configMux(t, poolsEmptyObj)
+	addJSON(t, srvEmptyObj.URL+"/_gateway/pool/good/member/a", `{}`, http.StatusOK)
+
+	got := poolsNoBody.CurrentRegistry().Spec().Pools["good"].Members["a"]
+	want := poolsEmptyObj.CurrentRegistry().Spec().Pools["good"].Members["a"]
+	if got != want {
+		t.Errorf("bodyless add wrote %+v, want %+v (same as `{}`)", got, want)
+	}
+	if got.Credential != "sk-ant-a" {
+		t.Errorf("bodyless add resolved credential %q, want the cross-pool sk-ant-a", got.Credential)
+	}
+
+	// Bodyless add of an unresolvable nick → 400 carrying the *specific*
+	// credential-required error, not the generic decode message.
+	status, body = postCapture(t, srv.URL+"/_gateway/pool/good/member/newbie", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("bodyless add of unknown nick status=%d body=%s, want 400", status, body)
+	}
+	if !strings.Contains(body, "credential is required") {
+		t.Errorf("bodyless add of unknown nick body=%s, want the credential-required error", body)
+	}
+	if strings.Contains(body, "invalid JSON body") {
+		t.Errorf("bodyless add of unknown nick reported a decode failure: %s", body)
+	}
+
+	// A syntactically malformed body is still a decode failure. json.Decode
+	// returns io.ErrUnexpectedEOF here, which must not be folded into the
+	// empty-body path.
+	status, body = postCapture(t, srv.URL+"/_gateway/pool/good/member/newbie", strings.NewReader(`{"credential":`))
+	if status != http.StatusBadRequest || !strings.Contains(body, "invalid JSON body") {
+		t.Errorf("malformed body status=%d body=%s, want 400 invalid JSON body", status, body)
+	}
+	status, body = postCapture(t, srv.URL+"/_gateway/pool/good/member/newbie", strings.NewReader(`not json`))
+	if status != http.StatusBadRequest || !strings.Contains(body, "invalid JSON body") {
+		t.Errorf("non-JSON body status=%d body=%s, want 400 invalid JSON body", status, body)
+	}
+
+	// A fully populated body is unchanged.
+	addJSON(t, srv.URL+"/_gateway/pool/good/member/m", `{"credential":"sk-ant-m","base_url":"https://m.example"}`, http.StatusOK)
+
+	// The leniency stops here: every other body-reading handler has a genuinely
+	// required field, so bodyless there stays a real client error.
+	for _, url := range []string{
+		srv.URL + "/_gateway/pool",
+		srv.URL + "/_gateway/pool/auto/rename",
+		srv.URL + "/_gateway/pool/auto/priority",
+		srv.URL + "/_gateway/pool/auto/member/a/move",
+	} {
+		status, body := postCapture(t, url, nil)
+		if status != http.StatusBadRequest || !strings.Contains(body, "invalid JSON body") {
+			t.Errorf("bodyless POST %s status=%d body=%s, want 400 invalid JSON body", url, status, body)
+		}
+	}
+}
+
 func delete(t *testing.T, url string, wantStatus int) {
 	t.Helper()
 	req, err := http.NewRequest("DELETE", url, nil)
