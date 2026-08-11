@@ -2,6 +2,7 @@ package auto
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -129,6 +130,65 @@ func resp429Policy(b backend.Backend) *http.Response {
 		Body:          io.NopCloser(strings.NewReader(body)),
 		ContentLength: int64(len(body)),
 	}
+}
+
+// gzipBytes compresses b the way an upstream that honoured the client's
+// Accept-Encoding: gzip would. internal/proxy sets DisableCompression, so
+// http.Transport never transparently gunzips such a body and it reaches the
+// rewriters still compressed (issue #291).
+func gzipBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		t.Fatalf("gzip.NewWriterLevel: %v", err)
+	}
+	if _, err := zw.Write(b); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// gunzipBytes reverses gzipBytes, so a test can assert what a client that
+// asked for gzip would actually decode.
+func gunzipBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v (body is not gzip: %x)", err, b)
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("gunzip read: %v", err)
+	}
+	return out
+}
+
+// resp429PolicyGzip is resp429Policy with the upstream body gzip-compressed
+// and declared via Content-Encoding, as an upstream replies when the client
+// asked for gzip. It returns the response and the original uncompressed body
+// so a test can assert what the client ends up able to decode.
+func resp429PolicyGzip(t *testing.T, b backend.Backend) (*http.Response, []byte) {
+	t.Helper()
+	ctx := backend.WithBackend(context.Background(), b)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(ctx)
+	plain := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"You are using an unsupported third-party client."}}`)
+	body := gzipBytes(t, plain)
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	h.Set("Content-Encoding", "gzip")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	return &http.Response{
+		StatusCode:    http.StatusTooManyRequests,
+		Header:        h,
+		Request:       req,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}, plain
 }
 
 // resp429RateLimit builds a transient Anthropic per-minute rate-limit 429 for
@@ -457,6 +517,102 @@ func TestModifyResponse_policy429NotParked(t *testing.T) {
 	// anthropic-ratelimit-* headers stripped.
 	if got := resp.Header.Get("anthropic-ratelimit-unified-status"); got != "" {
 		t.Errorf("anthropic-ratelimit header not stripped: %q", got)
+	}
+	// An uncompressed upstream body carries no Content-Encoding, and the
+	// pass-through must not invent one (issue #291 narrowed the delete, so
+	// this path no longer deletes anything — absence must come from upstream).
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding=%q, want empty (upstream body was uncompressed)", got)
+	}
+}
+
+// TestModifyResponse_policy429PreservesContentEncoding proves the one 429 path
+// that forwards the upstream body keeps the header describing those bytes.
+// The policy path exists so the operator can read the real upstream error
+// (e.g. an "unsupported third-party client" rejection); stripping
+// Content-Encoding off a still-compressed body handed them gzip labelled
+// application/json — binary noise instead of the reason (issue #291).
+func TestModifyResponse_policy429PreservesContentEncoding(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := newController(t, 0, clock, io.Discard, "a", "b")
+
+	resp, plain := resp429PolicyGzip(t, c.resolve(t, "a"))
+
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503", resp.StatusCode)
+	}
+	// The header must survive: the body was never decoded, so it still
+	// describes the forwarded bytes.
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding=%q, want gzip (pass-through body is still compressed)", got)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	// What the client actually decodes must be the upstream's error JSON.
+	if decoded := gunzipBytes(t, got); string(decoded) != string(plain) {
+		t.Errorf("decoded body=%q, want upstream body %q", decoded, plain)
+	}
+	// Content-Length must still match the bytes on the wire.
+	if want := strconv.Itoa(len(got)); resp.Header.Get("Content-Length") != want {
+		t.Errorf("Content-Length=%q, want %q (forwarded byte count)", resp.Header.Get("Content-Length"), want)
+	}
+}
+
+// TestRewriteTo503_bodyReplacersDropContentEncoding is the other half of
+// issue #291: narrowing the Content-Encoding delete must not leak a stale
+// encoding header onto the three rewriters that DO substitute a plain-JSON
+// body. For those, deleting it is required — the upstream's gzip declaration
+// no longer describes anything the gateway is sending.
+func TestRewriteTo503_bodyReplacersDropContentEncoding(t *testing.T) {
+	tests := []struct {
+		name     string
+		rewrite  func(*http.Response)
+		wantBody string
+	}{
+		{"switch", rewriteTo503, `{"error":"backend switching; retry"}`},
+		{"throttle", func(r *http.Response) { rewriteTo503Throttle(r, 5) }, `{"error":"backend throttled; same member"}`},
+		{"dryPool", func(r *http.Response) { rewriteTo503DryPool(r, 900) }, `{"error":"all backends rate-limited"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := gzipBytes(t, []byte(`{"type":"error","error":{"message":"upstream"}}`))
+			h := http.Header{}
+			h.Set("Content-Type", "application/json")
+			h.Set("Content-Encoding", "gzip")
+			h.Set("Content-Length", strconv.Itoa(len(body)))
+			resp := &http.Response{
+				StatusCode:    http.StatusTooManyRequests,
+				Header:        h,
+				Body:          io.NopCloser(bytes.NewReader(body)),
+				ContentLength: int64(len(body)),
+			}
+
+			tc.rewrite(resp)
+
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Errorf("status=%d, want 503", resp.StatusCode)
+			}
+			if got := resp.Header.Get("Content-Encoding"); got != "" {
+				t.Errorf("Content-Encoding=%q, want empty (body was replaced with plain JSON)", got)
+			}
+			// The synthetic body must be readable as-is, no decoding step.
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if string(got) != tc.wantBody {
+				t.Errorf("body=%q, want %q", got, tc.wantBody)
+			}
+			if want := strconv.Itoa(len(got)); resp.Header.Get("Content-Length") != want {
+				t.Errorf("Content-Length=%q, want %q", resp.Header.Get("Content-Length"), want)
+			}
+		})
 	}
 }
 
