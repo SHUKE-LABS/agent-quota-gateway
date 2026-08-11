@@ -50,34 +50,75 @@ func newGateway(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *http
 	return gwSrv, upstream
 }
 
-func TestProxy_responsesStreamsWithoutBuffering(t *testing.T) {
-	// Upstream writes three SSE events with a 100ms gap between them.
-	// If the proxy buffers the full response, the client will not see
-	// the first event until ~300ms after the request starts.
+// sseAttempt is the outcome of one streaming exchange through the proxy.
+// firstAt is zero when no event ever arrived.
+type sseAttempt struct {
+	firstAt time.Duration
+	events  int
+	writes  int32
+	scanErr error
+}
+
+// streamSSEOnce runs a single streaming exchange: a fake upstream writes three
+// SSE events with a 100ms gap between them, and the client reads the proxied
+// body to EOF, time-stamping the first event. Each call builds its own gateway
+// and its own write counter, so attempts never pool their counts.
+func streamSSEOnce(t *testing.T) sseAttempt {
+	t.Helper()
+
 	var writes atomic.Int32
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 
+		// Not t.Fatal: this runs on the httptest server's goroutine, and
+		// FailNow off the test goroutine is undefined. httptest's
+		// ResponseWriter always implements Flusher, so this only guards
+		// against a future change to the harness.
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			t.Fatal("upstream ResponseWriter is not an http.Flusher")
+			t.Error("upstream ResponseWriter is not an http.Flusher")
+			return
 		}
 
 		for i := 0; i < 3; i++ {
 			fmt.Fprintf(w, "event: response.output_text.delta\ndata: {\"chunk\":%d}\n\n", i)
 			flusher.Flush()
 			writes.Add(1)
+			// Sleeping after the final write as well keeps the script
+			// 300ms long, which is what makes the caller's 250ms budget
+			// discriminate: drop this and a fully buffered response
+			// would surface its first event at ~200ms and pass.
 			time.Sleep(100 * time.Millisecond)
 		}
 	})
 	gw, _ := newGateway(t, upstream)
 
-	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/responses", strings.NewReader("{\"input\":\"opaque\"}"))
+	// Deliberately bodyless. net/http defers the inbound connection's
+	// background read until the request body hits EOF, which for a
+	// request with a body lands in the middle of the streamed response
+	// and, under CPU contention, cancels the request context and kills
+	// the upstream connection mid-stream. A bodyless request starts that
+	// read up front instead (net/http/server.go, registerOnHitEOF vs the
+	// direct startBackgroundRead call). Measured with a stdlib-only
+	// reverse proxy, 200 runs each under saturating load: with a body
+	// 11-19 aborts, bodyless POST 0, bodyless GET 0.
+	//
+	// Nothing in the flush contract depends on the request body, and
+	// body passthrough is asserted by
+	// TestProxy_responsesJSONPassesThroughOpaque.
+	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/responses", nil)
 	if err != nil {
 		t.Fatalf("req: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	// Time from sending the request, not from the headers coming back. A
+	// proxy that buffers the whole upstream response before returning
+	// anything delays its headers too, so a clock started after Do would
+	// begin only once that delay had already elapsed and would measure
+	// ~0ms to the first event.
+	start := time.Now()
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -89,35 +130,80 @@ func TestProxy_responsesStreamsWithoutBuffering(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	// Read events line-by-line and time-stamp the first arrival. We
-	// give the request a generous 250ms budget; a buffered proxy would
-	// need 300ms+ to surface the first event.
-	start := time.Now()
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	var firstAt time.Duration
-	var events int
+	out := sseAttempt{}
 	for scanner.Scan() {
-		line := scanner.Text()
-		if firstAt == 0 && strings.HasPrefix(line, "event: response.output_text.delta") {
-			firstAt = time.Since(start)
+		if !strings.HasPrefix(scanner.Text(), "event: response.output_text.delta") {
+			continue
 		}
-		if strings.HasPrefix(line, "event: response.output_text.delta") {
-			events++
+		if out.firstAt == 0 {
+			out.firstAt = time.Since(start)
 		}
+		out.events++
 	}
-	if err := scanner.Err(); err != nil {
-		t.Fatalf("scan: %v", err)
+	out.scanErr = scanner.Err()
+	out.writes = writes.Load()
+	return out
+}
+
+// TestProxy_responsesStreamsWithoutBuffering proves the proxy surfaces SSE
+// frames as they arrive instead of holding them until the upstream finishes.
+// The upstream takes 300ms to write three events, so a buffering proxy cannot
+// deliver the first one inside the 250ms budget.
+//
+// The request is bodyless to dodge a net/http race that has nothing to do with
+// this gateway: see streamSSEOnce. Under CPU saturation the upstream connection
+// was closed mid-body, ReverseProxy logged a read error and panicked with
+// http.ErrAbortHandler, and the client's scanner saw `unexpected EOF` after a
+// single event. A pure-stdlib httputil.NewSingleHostReverseProxy with no
+// gateway code in the path reproduced it identically (issue #294).
+//
+// The bounded retry is a safety net for whatever residual environmental abort
+// remains. It is not the primary fix, and it cannot be: the aborts are
+// correlated inside a contention burst, so a run that hits one usually hits it
+// on every attempt.
+//
+// Both regression directions still fail deterministically: a buffering proxy
+// blows the 250ms budget on every attempt with no scan error, and a genuinely
+// truncating one aborts on every attempt.
+//
+// Note this test does not guard `rp.FlushInterval = -1`. The stdlib forces
+// immediate flushing for any text/event-stream response and for any response of
+// unknown length (httputil.ReverseProxy.flushInterval), and this upstream is
+// both, so the field is never consulted here.
+func TestProxy_responsesStreamsWithoutBuffering(t *testing.T) {
+	const attempts = 3
+
+	var got sseAttempt
+	for i := 0; i < attempts; i++ {
+		got = streamSSEOnce(t)
+		if got.scanErr == nil {
+			break
+		}
+		// Never retry silently: a retry that stops being rare is worth
+		// seeing before it becomes a failure. These lines print whenever
+		// the test fails, so the failure below needs only a summary.
+		t.Logf("attempt %d/%d cut short, retrying: %v (events=%d writes=%d firstAt=%v)",
+			i+1, attempts, got.scanErr, got.events, got.writes, got.firstAt)
 	}
-	if firstAt == 0 {
-		t.Fatal("never received first SSE event")
+
+	if got.scanErr != nil {
+		// Every attempt was cut short. That is the signature of a real
+		// truncation regression, so it stays loud and reports the
+		// counters — the original flake was undiagnosable without them.
+		t.Fatalf("all %d streaming attempts were cut short mid-body", attempts)
 	}
-	if firstAt > 250*time.Millisecond {
-		t.Errorf("first event arrived at %v; proxy appears to buffer (want < 250ms)", firstAt)
+
+	if got.firstAt == 0 {
+		t.Fatalf("never received first SSE event (events=%d writes=%d)", got.events, got.writes)
 	}
-	if events != 3 || writes.Load() != 3 {
-		t.Errorf("streamed events = %d, upstream writes = %d, want 3 each", events, writes.Load())
+	if got.firstAt > 250*time.Millisecond {
+		t.Errorf("first event arrived at %v; proxy appears to buffer (want < 250ms)", got.firstAt)
+	}
+	if got.events != 3 || got.writes != 3 {
+		t.Errorf("streamed events = %d, upstream writes = %d, want 3 each", got.events, got.writes)
 	}
 }
 
