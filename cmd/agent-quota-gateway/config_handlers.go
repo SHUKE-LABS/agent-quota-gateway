@@ -4,6 +4,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"time"
 
@@ -275,8 +277,19 @@ func addMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState
 			return
 		}
 
+		// This is the only mutation handler with no required body field: every
+		// field of addMemberRequest is optional, so re-adding a nick already
+		// known in another pool carries nothing at all (issue #292). An empty
+		// body is therefore "no fields supplied", not malformed JSON — Decode
+		// signals it with io.EOF, and reporting that as "invalid JSON body"
+		// sent operators hunting for a required field that does not exist.
+		// Only io.EOF is forgiven: a truncated body (`{"credential":`) yields
+		// io.ErrUnexpectedEOF, which is a genuine decode failure and stays on
+		// the 400 path along with every other syntax error. The zero-valued
+		// req then flows into AddMember unchanged, so an unresolvable nick
+		// still gets its own specific credential-required error.
 		var req addMemberRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
 			return
