@@ -3834,8 +3834,18 @@ func (c *Controller) resetFrom(resp *http.Response) (reset time.Time, storeUnrep
 }
 
 // rewriteTo503Response applies the shared synthetic-503 response shape. When
-// replaceBody is false, the upstream body, content type, and content length
-// remain untouched for policy responses that expose the original error.
+// replaceBody is false, the upstream body, content type, content length, and
+// content encoding remain untouched for policy responses that expose the
+// original error.
+//
+// Content-Encoding is deleted inside the replaceBody branch, not beside the
+// anthropic-ratelimit-* strip, because the two headers answer different
+// questions. The rate-limit strip is pool-boundary hygiene — a synthetic
+// response must never carry the rejected member's quota state out the pool
+// channel — and so is unconditional. Content-Encoding describes the *bytes of
+// the body*, so it is only stale once those bytes have been swapped for the
+// plain-JSON substitute; deleting it on the pass-through path mislabels a
+// still-compressed upstream body as uncompressed JSON (issue #291).
 func rewriteTo503Response(resp *http.Response, body []byte, replaceBody bool, retryAfter int) {
 	resp.StatusCode = http.StatusServiceUnavailable
 	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
@@ -3851,8 +3861,8 @@ func rewriteTo503Response(resp *http.Response, body []byte, replaceBody bool, re
 		resp.ContentLength = int64(len(body))
 		h.Set("Content-Type", "application/json")
 		h.Set("Content-Length", strconv.Itoa(len(body)))
+		h.Del("Content-Encoding")
 	}
-	h.Del("Content-Encoding")
 	setRetryAfter(h, retryAfter)
 }
 
@@ -3914,6 +3924,17 @@ func rewriteTo503DryPool(resp *http.Response, secs int) {
 // error message (e.g. a threatening client-identity warning from Anthropic).
 // The upstream rate-limit headers are stripped (they carry no useful quota
 // state for a policy 429), but Content-Type is preserved from the upstream.
+//
+// Content-Encoding is preserved for the same reason, and the reason is load
+// bearing: the forwarded bytes are the upstream's own and the gateway never
+// decodes them. internal/proxy forwards the client's Accept-Encoding verbatim
+// and sets DisableCompression, so http.Transport never adds its own
+// Accept-Encoding: gzip and therefore never transparently gunzips — a client
+// that asked for gzip gets a compressed body here. Dropping the header that
+// describes it handed that client gzip labelled application/json, corrupting
+// the one path whose entire purpose is to surface the real upstream error
+// (issue #291). Decompressing instead was rejected: it would break the
+// bodies-stay-opaque invariant and the FlushInterval = -1 streaming contract.
 func rewriteTo503WithBody(resp *http.Response) {
 	rewriteTo503Response(resp, nil, false, switchRetryAfterSeconds)
 }
