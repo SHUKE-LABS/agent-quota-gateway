@@ -177,27 +177,22 @@ func TestProxy_responsesStreamsWithoutBuffering(t *testing.T) {
 	const attempts = 3
 
 	var got sseAttempt
-	aborted := make([]sseAttempt, 0, attempts)
 	for i := 0; i < attempts; i++ {
 		got = streamSSEOnce(t)
 		if got.scanErr == nil {
 			break
 		}
 		// Never retry silently: a retry that stops being rare is worth
-		// seeing in the log before it becomes a failure.
+		// seeing before it becomes a failure. These lines print whenever
+		// the test fails, so the failure below needs only a summary.
 		t.Logf("attempt %d/%d cut short, retrying: %v (events=%d writes=%d firstAt=%v)",
 			i+1, attempts, got.scanErr, got.events, got.writes, got.firstAt)
-		aborted = append(aborted, got)
 	}
 
 	if got.scanErr != nil {
 		// Every attempt was cut short. That is the signature of a real
 		// truncation regression, so it stays loud and reports the
 		// counters — the original flake was undiagnosable without them.
-		for i, a := range aborted {
-			t.Errorf("attempt %d/%d: scan: %v (events=%d writes=%d firstAt=%v)",
-				i+1, attempts, a.scanErr, a.events, a.writes, a.firstAt)
-		}
 		t.Fatalf("all %d streaming attempts were cut short mid-body", attempts)
 	}
 
