@@ -94,7 +94,20 @@ func streamSSEOnce(t *testing.T) sseAttempt {
 	})
 	gw, _ := newGateway(t, upstream)
 
-	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/responses", strings.NewReader("{\"input\":\"opaque\"}"))
+	// Deliberately bodyless. net/http defers the inbound connection's
+	// background read until the request body hits EOF, which for a
+	// request with a body lands in the middle of the streamed response
+	// and, under CPU contention, cancels the request context and kills
+	// the upstream connection mid-stream. A bodyless request starts that
+	// read up front instead (net/http/server.go, registerOnHitEOF vs the
+	// direct startBackgroundRead call). Measured with a stdlib-only
+	// reverse proxy, 200 runs each under saturating load: with a body
+	// 11-19 aborts, bodyless POST 0, bodyless GET 0.
+	//
+	// Nothing in the flush contract depends on the request body, and
+	// body passthrough is asserted by
+	// TestProxy_responsesJSONPassesThroughOpaque.
+	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/responses", nil)
 	if err != nil {
 		t.Fatalf("req: %v", err)
 	}
@@ -140,13 +153,17 @@ func streamSSEOnce(t *testing.T) sseAttempt {
 // The upstream takes 300ms to write three events, so a buffering proxy cannot
 // deliver the first one inside the 250ms budget.
 //
-// The exchange is retried because the read can be cut short by an abort that
-// has nothing to do with this gateway. Under CPU saturation the upstream
-// connection is closed mid-body, `ReverseProxy` logs a read error and panics
-// with http.ErrAbortHandler, and the client's scanner sees `unexpected EOF`
-// after a single event. A pure-stdlib httputil.NewSingleHostReverseProxy with
-// no gateway code in the path reproduces it identically, so retrying is
-// tolerating the environment, not tolerating a defect (issue #294).
+// The request is bodyless to dodge a net/http race that has nothing to do with
+// this gateway: see streamSSEOnce. Under CPU saturation the upstream connection
+// was closed mid-body, ReverseProxy logged a read error and panicked with
+// http.ErrAbortHandler, and the client's scanner saw `unexpected EOF` after a
+// single event. A pure-stdlib httputil.NewSingleHostReverseProxy with no
+// gateway code in the path reproduced it identically (issue #294).
+//
+// The bounded retry is a safety net for whatever residual environmental abort
+// remains. It is not the primary fix, and it cannot be: the aborts are
+// correlated inside a contention burst, so a run that hits one usually hits it
+// on every attempt.
 //
 // Both regression directions still fail deterministically: a buffering proxy
 // blows the 250ms budget on every attempt with no scan error, and a genuinely
