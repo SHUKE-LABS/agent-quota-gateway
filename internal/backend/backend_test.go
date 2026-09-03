@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -9,6 +10,21 @@ import (
 )
 
 const testDefaultBaseURL = "https://api.anthropic.com"
+
+// scrubPoolEnv clears every AQG_POOL_* var for the duration of the test, so
+// a Load/LoadAllowEmpty test (which reads the real os.Environ()) isn't
+// polluted by an ambient AQG_POOL_* value already present in the process
+// environment (e.g. a developer's exported dev-server config).
+func scrubPoolEnv(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		k, _, ok := strings.Cut(kv, "=")
+		if ok && strings.HasPrefix(k, EnvPrefix) {
+			t.Setenv(k, "")
+			os.Unsetenv(k) //nolint:errcheck // only fails on empty key
+		}
+	}
+}
 
 func TestLoadFrom_collectsAndNormalizes(t *testing.T) {
 	reg, err := loadFrom([]string{
@@ -179,6 +195,55 @@ func TestLoadFrom_noBackendsRejected(t *testing.T) {
 		if _, err := loadFrom(env, testDefaultBaseURL); err == nil {
 			t.Errorf("loadFrom(%v): expected no-backends error", env)
 		}
+	}
+}
+
+// TestLoadAllowEmpty_zeroPoolsOK proves LoadAllowEmpty (issue #298) accepts
+// a fully empty environment where Load rejects it — the first-deploy
+// bootstrap path needs this to write an empty aqg.json instead of aborting
+// before the file ever exists. Exercises the real public entry points
+// (reading the real os.Environ()), not the internal parsing helper.
+func TestLoadAllowEmpty_zeroPoolsOK(t *testing.T) {
+	scrubPoolEnv(t)
+
+	reg, err := LoadAllowEmpty(testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("LoadAllowEmpty: %v, want nil", err)
+	}
+	if names := reg.PoolNames(); len(names) != 0 {
+		t.Errorf("empty registry has pools %v, want none", names)
+	}
+
+	if _, err := Load(testDefaultBaseURL); err == nil {
+		t.Error("Load: expected the strict no-backends error for the same empty environment")
+	}
+}
+
+// TestLoadAllowEmpty_stillValidatesSyntax proves relaxing the zero-pool
+// guard does not relax any other validation: an unrecognized key, an empty
+// credential, and an invalid balance mode must still fail fast through both
+// public entry points, Load and LoadAllowEmpty.
+func TestLoadAllowEmpty_stillValidatesSyntax(t *testing.T) {
+	cases := map[string][]string{
+		"unrecognized key":     {"AQG_POOL_AUTO_BACKED_A=cred"},
+		"empty credential":     {"AQG_POOL_AUTO_BACKEND_A="},
+		"invalid balance mode": {"AQG_POOL_AUTO_BACKEND_A=cred", "AQG_POOL_AUTO_BALANCE=bogus"},
+	}
+	for name, env := range cases {
+		t.Run(name, func(t *testing.T) {
+			scrubPoolEnv(t)
+			for _, kv := range env {
+				k, v, _ := strings.Cut(kv, "=")
+				t.Setenv(k, v)
+			}
+
+			if _, err := Load(testDefaultBaseURL); err == nil {
+				t.Errorf("Load, env=%v: expected error", env)
+			}
+			if _, err := LoadAllowEmpty(testDefaultBaseURL); err == nil {
+				t.Errorf("LoadAllowEmpty, env=%v: expected error", env)
+			}
+		})
 	}
 }
 
@@ -812,9 +877,10 @@ func TestBuildFromSpec_validatorTable(t *testing.T) {
 
 // TestBuildFromSpec_emptySpecAllowed proves the spec path accepts a zero-pool
 // registry (issue #232): deleting the last runtime pool persists an empty
-// aqg.json, and rebooting from it must not fail. The env cold-start path keeps
-// its "no backends configured" guard (a fully empty environment is still a
-// misconfiguration) — see TestLoad_* for that path.
+// aqg.json, and rebooting from it must not fail. Load keeps its
+// "no backends configured" guard for a fully empty environment; LoadAllowEmpty
+// opts out of it for the first-deploy bootstrap path (issue #298) — see
+// TestLoadFrom_noBackendsRejected and TestLoadAllowEmpty_zeroPoolsOK.
 func TestBuildFromSpec_emptySpecAllowed(t *testing.T) {
 	reg, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{}}, testDefaultBaseURL)
 	if err != nil {

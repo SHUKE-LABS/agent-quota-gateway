@@ -18,6 +18,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
 	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
+	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
 // configMux builds a ServeMux with the runtime-config routes wired exactly as
@@ -72,6 +73,19 @@ func loadPools(t *testing.T) *auto.Pools {
 	registry, err := backend.Load("https://api.anthropic.com")
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
+	}
+	return auto.NewPools(registry, nil, nil, io.Discard)
+}
+
+// emptyPools builds a zero-pool *auto.Pools the way the AQG_CONFIG
+// first-deploy bootstrap path now can (issue #298): via the spec path with no
+// pools declared, exactly as a freshly-written or pre-existing empty
+// aqg.json round-trips.
+func emptyPools(t *testing.T) *auto.Pools {
+	t.Helper()
+	registry, err := backend.BuildFromSpec(backend.Spec{Pools: map[string]backend.PoolSpec{}}, "https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("BuildFromSpec(empty): %v", err)
 	}
 	return auto.NewPools(registry, nil, nil, io.Discard)
 }
@@ -187,6 +201,47 @@ func TestCreatePoolWithMemberEndpoint(t *testing.T) {
 	assertPoolAbsent(t, srv.URL, "bad")
 	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"placement","nick":"p","credential":"cred-p","base_url":"https://p.example","placement":["p"]}`, http.StatusBadRequest)
 	assertPoolAbsent(t, srv.URL, "placement")
+}
+
+// TestPoolHandler_emptyRegistry proves issue #298's acceptance boundary:
+// GET /_gateway/pool on a truly zero-pool registry (the state an empty
+// AQG_CONFIG bootstrap or an existing empty aqg.json produces) returns 200
+// with an empty list, not an error.
+func TestPoolHandler_emptyRegistry(t *testing.T) {
+	srv := httptest.NewServer(poolHandler(quota.NewStore(), emptyPools(t), nil))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/_gateway/pool")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	var got []any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("pool list = %v, want empty", got)
+	}
+}
+
+// TestCreatePoolEndpoint_fromEmptyRegistry proves the other half of the
+// issue #298 acceptance boundary: the first pool can be added via
+// POST /_gateway/pool starting from a truly zero-pool registry, not just an
+// env-seeded baseline (the existing TestCreatePoolEndpoint always starts
+// with "auto" already present).
+func TestCreatePoolEndpoint_fromEmptyRegistry(t *testing.T) {
+	srv := configMux(t, emptyPools(t))
+
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"first","nick":"n","credential":"cred-n","base_url":"https://n.example"}`, http.StatusCreated)
+
+	v := fetchPool(t, srv.URL, "first")
+	if len(v.Members) != 1 || v.Members[0].Nick != "n" {
+		t.Fatalf("first pool members=%+v", v.Members)
+	}
 }
 
 func assertPoolAbsent(t *testing.T, baseURL, name string) {

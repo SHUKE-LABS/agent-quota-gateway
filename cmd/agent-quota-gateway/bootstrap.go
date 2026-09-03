@@ -25,10 +25,11 @@ import (
 //     env entirely. A pre-#198 state-file priority_override is consumed into
 //     aqg.json once before the server starts (issue #241).
 //   - A config path resolves but the file is absent (first deploy): generate it
-//     once by merging env (backend.Load) with the legacy state-file overlay
-//     using state-wins precedence, write it 0600, then read it back. Env is
-//     never consulted again on subsequent starts, except for the legacy state
-//     file location probe described by reconcileLegacyPriority.
+//     once by merging env (backend.LoadAllowEmpty — a zero-pool environment
+//     still boots, issue #298) with the legacy state-file overlay using
+//     state-wins precedence, write it 0600, then read it back. Env is never
+//     consulted again on subsequent starts, except for the legacy state file
+//     location probe described by reconcileLegacyPriority.
 //
 // It returns the effective config, the registry, and the config path the
 // writer should flush to ("" disables write-through).
@@ -64,6 +65,52 @@ func resolveConfig(configFlag string, logOut io.Writer) (config.Config, *backend
 	}
 	cfg, reg, err := configfile.LoadFile(path)
 	return cfg, reg, path, err
+}
+
+// resolveConfigAndWarn wraps resolveConfig with the startup warnings run()
+// needs to emit right after it (issue #246 persistence warning, issue #298
+// zero-pool warning) in the exact sequence run() executes them. Kept as one
+// function so run()'s real startup path is directly unit-testable without
+// standing up the HTTP listener.
+func resolveConfigAndWarn(configFlag string, logOut io.Writer) (config.Config, *backend.Registry, string, error) {
+	// A config path that does not exist yet, right before resolveConfig
+	// potentially bootstraps it, is the only moment AQG_POOL_* env vars are
+	// still usable to seed pools for this deployment (issue #298) — capture
+	// that here since resolveConfig itself doesn't report which branch it took.
+	path, useFile := configfile.Resolve(configFlag)
+	freshBootstrap := false
+	if useFile {
+		if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
+			freshBootstrap = true
+		}
+	}
+
+	cfg, reg, configPath, err := resolveConfig(configFlag, logOut)
+	if err != nil {
+		return cfg, reg, configPath, err
+	}
+	warnIfPersistenceDisabled(configPath, cfg.StateFile, logOut)
+	warnIfNoPools(reg, freshBootstrap, configPath, logOut)
+	return cfg, reg, configPath, nil
+}
+
+// warnIfNoPools tells operators when the gateway is booting with zero pools
+// configured (issue #298). Both the first-deploy bootstrap path and an
+// existing empty aqg.json boot instead of aborting; routing then fails
+// closed with 403 unknown selector until a pool exists. Recovery is always
+// via POST /_gateway/pool (or the UI). AQG_POOL_* env re-seeding is only
+// mentioned when freshBootstrap is true: the moment aqg.json exists, env is
+// never consulted again (issue #198), so suggesting env re-seeding against
+// an operator's already-customized empty file would be actively misleading.
+func warnIfNoPools(reg *backend.Registry, freshBootstrap bool, configPath string, logOut io.Writer) {
+	if reg == nil || len(reg.PoolNames()) != 0 {
+		return
+	}
+	msg := "agent-quota-gateway: WARNING: started with no pools configured — add one via POST /_gateway/pool (or the UI)"
+	if freshBootstrap {
+		msg += fmt.Sprintf("; to seed the first pool from AQG_POOL_* env vars instead, remove %q and restart before adding anything through the API", configPath)
+	}
+	fmt.Fprintln(logOut, msg)
 }
 
 // warnIfPersistenceDisabled tells config-file operators when an empty
@@ -486,7 +533,11 @@ func bootstrapConfigFile(path string, logOut io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	reg, err := backend.Load(cfg.AnthropicBaseURL)
+	// LoadAllowEmpty, not Load: an empty aqg.env must still bootstrap a
+	// (zero-pool) aqg.json rather than aborting before the file is ever
+	// written (issue #298) — the spec path already treats a zero-pool
+	// config file as a deliberate, restart-safe state (issue #232).
+	reg, err := backend.LoadAllowEmpty(cfg.AnthropicBaseURL)
 	if err != nil {
 		return fmt.Errorf("backend: %w", err)
 	}

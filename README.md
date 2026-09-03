@@ -379,7 +379,7 @@ classes and configure each pool's `BASE_URL` and members accordingly.
 | `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. When a config file declares an empty `state_file`, startup warns with the config path; set `state_file` in that file and restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles legacy `priority_override` and `disabled` (issues #241, #259) and **reports only** legacy `removed_members` / `added_members` (the credential-bearing keys are never silently applied), as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
 | `AQG_DEBUG_LOG_REQUESTS` | _(unset)_ | Set to `1` to dump every inbound request and outbound upstream request to stderr for debugging; any other value (or unset) leaves it off. Credentials are always redacted — the `Authorization` and `x-api-key` headers are never logged — but the inbound request body is dumped and may contain user message content, so enable only in dev/debug runs. |
 
-Startup fails closed on: no pools at all, an empty credential, a `BASE_URL`
+Startup fails closed on: an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
 `AQG_POOL_*` shape, two keys colliding on the same pool/member, a
 `PRIORITY` that is empty, repeats a nick, names a nick that is not a member
@@ -390,6 +390,17 @@ and `PRIORITY` both declared on the same pool, both `LISTEN_ADDR` and
 loopback, the wildcard address, or not an IP literal. A `|` in a
 credential is rejected because the tail must parse as a URL — tokens do
 not contain `|`.
+
+**No pools at all** is config-source-dependent (issue #298). In env-only
+mode (below) it still fails startup — a pure env-only deployment with
+nothing configured is a misconfiguration, not a deliberate empty state. With
+`AQG_CONFIG` set, an empty `aqg.env` (first deploy, no `aqg.json` yet) or an
+existing zero-pool `aqg.json` both boot instead: the service comes up,
+`GET /_gateway/pool` returns empty, and a WARNING is logged naming
+`POST /_gateway/pool` (or the UI) as the recovery path — a freshly-bootstrapped
+file's warning also names re-seeding `AQG_POOL_*` env vars and restarting
+before adding anything through the API, since env is read only once, the
+very first time `aqg.json` is written, and never again after (issue #198).
 
 In env-only mode (no config file resolved) pools live in the environment and
 the gateway reads no credential from disk (see [Security model](#security-model)).
@@ -1400,8 +1411,10 @@ remote installer) to the host, and under `sudo`:
   overwritten on upgrade,
 - `daemon-reload`, enables, and restarts the service.
 
-On a fresh install the env file is a template, so the service will not come
-up until you fill it in:
+On a fresh install the env file is a template. The service boots even if you
+leave it unfilled — it starts with zero pools and logs a WARNING, reachable
+via `POST /_gateway/pool` or the UI (issue #298) — but the normal path is to
+fill it in before the first start:
 
 ```bash
 sudo nano /etc/agent-quota-gateway/aqg.env   # set SHARED_LISTEN_ADDR + pools
