@@ -140,9 +140,10 @@ func Marshal(cfg config.Config, reg *backend.Registry) ([]byte, error) {
 		StateFile: cfg.StateFile,
 		Pools:     make(map[string]poolDTO),
 	}
-	// cfg.ListenAddr holds the Tailscale address when shared mode is active,
-	// otherwise the loopback bind. Route it to the matching field so the file
-	// round-trips through config.Build's mutual-exclusivity check.
+	// cfg.ListenAddr holds the non-loopback overlay/IP address when shared
+	// mode is active, otherwise the loopback bind. Route it to the matching
+	// field so the file round-trips through config.Build's mutual-exclusivity
+	// check.
 	if cfg.Shared {
 		dto.SharedListenAddr = cfg.ListenAddr
 	} else {
@@ -399,7 +400,7 @@ type fileDTO struct {
 	// ListenAddr is the loopback bind address. Empty string uses the default.
 	ListenAddr string `json:"listen_addr"`
 
-	// SharedListenAddr opts into shared mode (Tailscale binding).
+	// SharedListenAddr opts into shared mode (non-loopback overlay/IP binding).
 	SharedListenAddr string `json:"shared_listen_addr"`
 
 	// StateFile is the path for the persistent state file. Empty disables it.
