@@ -428,9 +428,9 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 // "KEY=VALUE" entries in the same shape as os.Environ().
 //
 // It performs syntactic parsing only (splitting credentials, parsing
-// float/duration strings, normalization, duplicate detection). All
-// semantic validation is delegated to buildRegistry, which requireNonEmpty
-// controls the zero-pool case of.
+// float/duration strings, normalization, duplicate detection). All semantic
+// validation is delegated to buildRegistry; requireNonEmpty controls only
+// its zero-pool case.
 func loadFromWithRequireNonEmpty(environ []string, defaultBaseURL string, requireNonEmpty bool) (*Registry, error) {
 	p := parsed{
 		poolBaseURL:            make(map[string]string),

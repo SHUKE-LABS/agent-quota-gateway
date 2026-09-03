@@ -25,10 +25,11 @@ import (
 //     env entirely. A pre-#198 state-file priority_override is consumed into
 //     aqg.json once before the server starts (issue #241).
 //   - A config path resolves but the file is absent (first deploy): generate it
-//     once by merging env (backend.Load) with the legacy state-file overlay
-//     using state-wins precedence, write it 0600, then read it back. Env is
-//     never consulted again on subsequent starts, except for the legacy state
-//     file location probe described by reconcileLegacyPriority.
+//     once by merging env (backend.LoadAllowEmpty — a zero-pool environment
+//     still boots, issue #298) with the legacy state-file overlay using
+//     state-wins precedence, write it 0600, then read it back. Env is never
+//     consulted again on subsequent starts, except for the legacy state file
+//     location probe described by reconcileLegacyPriority.
 //
 // It returns the effective config, the registry, and the config path the
 // writer should flush to ("" disables write-through).
