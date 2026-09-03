@@ -132,6 +132,121 @@ func TestResolveConfig_bootstrapsWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestResolveConfig_freshBootstrapEmptyEnv proves issue #298: an empty
+// AQG_CONFIG path with no AQG_POOL_* env vars set boots instead of erroring
+// out before aqg.json is ever written, and the resulting file itself then
+// boots cleanly on a second start (the existing-file branch), matching the
+// zero-pool contract BuildFromSpec already guarantees for runtime pool
+// deletion (issue #232).
+func TestResolveConfig_freshBootstrapEmptyEnv(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	t.Setenv("AQG_CONFIG", cfgPath)
+
+	var buf bytes.Buffer
+	_, reg, path, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig (fresh bootstrap, empty env): %v, want nil", err)
+	}
+	if path != cfgPath {
+		t.Errorf("path = %q, want %q", path, cfgPath)
+	}
+	if names := reg.PoolNames(); len(names) != 0 {
+		t.Errorf("bootstrapped registry has pools %v, want none", names)
+	}
+	if _, err := os.Stat(cfgPath); err != nil {
+		t.Fatalf("bootstrapped config file not written: %v", err)
+	}
+
+	// Second start: the file now exists (existing-file branch), env is still
+	// empty and stays ignored either way — must still boot with zero pools.
+	var buf2 bytes.Buffer
+	_, reg2, path2, err := resolveConfig("", &buf2)
+	if err != nil {
+		t.Fatalf("resolveConfig (existing empty aqg.json): %v, want nil", err)
+	}
+	if path2 != cfgPath {
+		t.Errorf("path = %q, want %q", path2, cfgPath)
+	}
+	if names := reg2.PoolNames(); len(names) != 0 {
+		t.Errorf("re-read registry has pools %v, want none", names)
+	}
+}
+
+// TestResolveConfigAndWarn_emitsWarningOnFreshBootstrap drives run()'s actual
+// startup call (resolveConfigAndWarn) end-to-end against a temp AQG_CONFIG
+// path with no file and no AQG_POOL_* env vars, and asserts the zero-pool
+// WARNING lands on the captured log output. This is the exact sequence run()
+// executes, so it demonstrates the journal-visible warning the issue #298
+// acceptance boundary requires without standing up the HTTP listener.
+func TestResolveConfigAndWarn_emitsWarningOnFreshBootstrap(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	t.Setenv("AQG_CONFIG", cfgPath)
+
+	var buf bytes.Buffer
+	_, reg, _, err := resolveConfigAndWarn("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfigAndWarn: %v, want nil", err)
+	}
+	if names := reg.PoolNames(); len(names) != 0 {
+		t.Fatalf("registry has pools %v, want none", names)
+	}
+	if !strings.Contains(buf.String(), "started with no pools configured") {
+		t.Errorf("startup log = %q, want a no-pools WARNING", buf.String())
+	}
+	if !strings.Contains(buf.String(), "POST /_gateway/pool") {
+		t.Errorf("startup log = %q, want it to mention POST /_gateway/pool", buf.String())
+	}
+}
+
+// TestWarnIfNoPools_freshBootstrapMentionsEnvRecovery, ..._existingFileOmitsEnvRecovery
+// and ..._populatedRegistryQuiet pin the exact source-aware contract: env
+// re-seeding is only ever a valid recovery path the moment aqg.json is
+// freshly written, since it is never consulted again afterward (issue #198).
+func TestWarnIfNoPools_freshBootstrapMentionsEnvRecovery(t *testing.T) {
+	reg := specReg(t, map[string]backend.PoolSpec{})
+	var buf bytes.Buffer
+	warnIfNoPools(reg, true, "/var/lib/agent-quota-gateway/aqg.json", &buf)
+	got := buf.String()
+	if !strings.Contains(got, "POST /_gateway/pool") {
+		t.Errorf("warning = %q, want it to mention POST /_gateway/pool", got)
+	}
+	if !strings.Contains(got, "AQG_POOL_") || !strings.Contains(got, "/var/lib/agent-quota-gateway/aqg.json") {
+		t.Errorf("warning = %q, want it to mention env re-seeding and the config path (fresh bootstrap)", got)
+	}
+}
+
+func TestWarnIfNoPools_existingFileOmitsEnvRecovery(t *testing.T) {
+	reg := specReg(t, map[string]backend.PoolSpec{})
+	var buf bytes.Buffer
+	warnIfNoPools(reg, false, "/var/lib/agent-quota-gateway/aqg.json", &buf)
+	got := buf.String()
+	if !strings.Contains(got, "POST /_gateway/pool") {
+		t.Errorf("warning = %q, want it to mention POST /_gateway/pool", got)
+	}
+	if strings.Contains(got, "AQG_POOL_") {
+		t.Errorf("warning = %q, must not suggest env re-seeding once aqg.json already existed", got)
+	}
+}
+
+func TestWarnIfNoPools_populatedRegistryQuiet(t *testing.T) {
+	reg := specReg(t, map[string]backend.PoolSpec{
+		"auto": {Members: map[string]backend.MemberSpec{"a": {Credential: "cred-a"}}},
+	})
+	for _, fresh := range []bool{true, false} {
+		var buf bytes.Buffer
+		warnIfNoPools(reg, fresh, "/var/lib/agent-quota-gateway/aqg.json", &buf)
+		if buf.String() != "" {
+			t.Errorf("freshBootstrap=%v: warning = %q, want silence for a populated registry", fresh, buf.String())
+		}
+	}
+}
+
 func TestWarnIfPersistenceDisabled_startupOutput(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -235,6 +235,15 @@ func Load(defaultBaseURL string) (*Registry, error) {
 	return loadFrom(os.Environ(), defaultBaseURL)
 }
 
+// LoadAllowEmpty is Load, except a zero-pool result is not an error (issue
+// #298): the first-deploy bootstrap path must be able to write an empty
+// aqg.json from an empty aqg.env instead of aborting before the file is ever
+// written. All other validation (empty credential, invalid balance mode,
+// malformed keys, ...) still fails fast exactly as it does for Load.
+func LoadAllowEmpty(defaultBaseURL string) (*Registry, error) {
+	return loadFromWithRequireNonEmpty(os.Environ(), defaultBaseURL, false)
+}
+
 // BuildFromSpec builds a Registry from a Spec (file-source configuration),
 // using defaultBaseURL for any pool that does not declare its own.
 // Pool and member names are normalized the same way env vars are.
@@ -388,7 +397,7 @@ type rawMember struct {
 // during the syntactic pass; buildRegistry consumes them to produce
 // a Registry.
 type parsed struct {
-	members                []rawMember
+	members []rawMember
 	// declaredPools lists every pool name the source declared, including a
 	// pool with zero members. The env path leaves it nil (an env pool always
 	// has at least one member); the file/spec path fills it from every pool
@@ -409,12 +418,20 @@ type parsed struct {
 }
 
 // loadFrom is Load's testable core: it takes "KEY=VALUE" entries in the
-// same shape as os.Environ().
+// same shape as os.Environ(). Always requires at least one pool/member (see
+// loadFromWithRequireNonEmpty for the LoadAllowEmpty variant).
+func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
+	return loadFromWithRequireNonEmpty(environ, defaultBaseURL, true)
+}
+
+// loadFromWithRequireNonEmpty is loadFrom's testable core: it takes
+// "KEY=VALUE" entries in the same shape as os.Environ().
 //
 // It performs syntactic parsing only (splitting credentials, parsing
 // float/duration strings, normalization, duplicate detection). All
-// semantic validation is delegated to buildRegistry.
-func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
+// semantic validation is delegated to buildRegistry, which requireNonEmpty
+// controls the zero-pool case of.
+func loadFromWithRequireNonEmpty(environ []string, defaultBaseURL string, requireNonEmpty bool) (*Registry, error) {
 	p := parsed{
 		poolBaseURL:            make(map[string]string),
 		poolURLOrigin:          make(map[string]string),
@@ -560,9 +577,11 @@ func loadFrom(environ []string, defaultBaseURL string) (*Registry, error) {
 		return nil, fmt.Errorf("backend: %s is not a recognised AQG_POOL_ key (expected suffixes: _BASE_URL, _BACKEND_<NICK>, _PRIORITY, _BALANCE, _BALANCE_GAP, _BALANCE_DWELL)", key)
 	}
 
-	// Env cold-start path: a fully empty environment is a misconfiguration, so
-	// the non-empty guard is on.
-	return buildRegistry(defaultBaseURL, p, true)
+	// Env cold-start path: a fully empty environment is ordinarily a
+	// misconfiguration (requireNonEmpty=true via loadFrom/Load). The
+	// first-deploy bootstrap path opts out via LoadAllowEmpty so it can still
+	// write a zero-pool aqg.json instead of aborting (issue #298).
+	return buildRegistry(defaultBaseURL, p, requireNonEmpty)
 }
 
 // buildRegistry is the single semantic validation core shared by both
@@ -604,7 +623,7 @@ func buildRegistry(defaultBaseURL string, p parsed, requireNonEmpty bool) (*Regi
 	// nick case is already caught by the syntactic originKey dedup in
 	// loadFrom / BuildFromSpec, so this loop only governs the cross-pool
 	// pairing. No credential value is emitted in either error.
-	nickCred := make(map[string]string, len(p.members))  // nick -> cred
+	nickCred := make(map[string]string, len(p.members))   // nick -> cred
 	nickOrigin := make(map[string]string, len(p.members)) // nick -> originKey (for error path)
 	credNick := make(map[string]string, len(p.members))   // cred -> nick
 	credOrigin := make(map[string]string, len(p.members)) // cred -> originKey

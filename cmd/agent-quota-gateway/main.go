@@ -77,11 +77,13 @@ func run(configFlag string) error {
 	// file), an existing aqg.json (env ignored), or first-deploy bootstrap
 	// (generate aqg.json from env + legacy state, then read it). configPath is
 	// "" in env-only mode, which disables config write-through.
-	cfg, registry, configPath, err := resolveConfig(configFlag, os.Stderr)
+	// resolveConfigAndWarn also runs the persistence (issue #246) and
+	// zero-pool (issue #298) startup warnings, in the exact sequence run()
+	// needs — kept in bootstrap.go so it's testable without an HTTP listener.
+	cfg, registry, configPath, err := resolveConfigAndWarn(configFlag, os.Stderr)
 	if err != nil {
 		return err
 	}
-	warnIfPersistenceDisabled(configPath, cfg.StateFile, os.Stderr)
 
 	store := quota.NewStore()
 

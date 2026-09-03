@@ -182,6 +182,42 @@ func TestLoadFrom_noBackendsRejected(t *testing.T) {
 	}
 }
 
+// TestLoadAllowEmpty_zeroPoolsOK proves LoadAllowEmpty (issue #298) accepts
+// a fully empty environment where Load/loadFrom would reject it — the
+// first-deploy bootstrap path needs this to write an empty aqg.json instead
+// of aborting before the file ever exists.
+func TestLoadAllowEmpty_zeroPoolsOK(t *testing.T) {
+	reg, err := loadFromWithRequireNonEmpty([]string{"PATH=/usr/bin", "HOME=/root"}, testDefaultBaseURL, false)
+	if err != nil {
+		t.Fatalf("loadFromWithRequireNonEmpty(requireNonEmpty=false): %v, want nil", err)
+	}
+	if names := reg.PoolNames(); len(names) != 0 {
+		t.Errorf("empty registry has pools %v, want none", names)
+	}
+}
+
+// TestLoadAllowEmpty_stillValidatesSyntax proves relaxing the zero-pool
+// guard does not relax any other validation: an unrecognized key, an empty
+// credential, and an invalid balance mode must still fail fast through both
+// Load (requireNonEmpty=true) and LoadAllowEmpty (requireNonEmpty=false).
+func TestLoadAllowEmpty_stillValidatesSyntax(t *testing.T) {
+	cases := map[string][]string{
+		"unrecognized key":     {"AQG_POOL_AUTO_BACKED_A=cred"},
+		"empty credential":     {"AQG_POOL_AUTO_BACKEND_A="},
+		"invalid balance mode": {"AQG_POOL_AUTO_BACKEND_A=cred", "AQG_POOL_AUTO_BALANCE=bogus"},
+	}
+	for name, env := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadFromWithRequireNonEmpty(env, testDefaultBaseURL, true); err == nil {
+				t.Errorf("requireNonEmpty=true, env=%v: expected error", env)
+			}
+			if _, err := loadFromWithRequireNonEmpty(env, testDefaultBaseURL, false); err == nil {
+				t.Errorf("requireNonEmpty=false, env=%v: expected error", env)
+			}
+		})
+	}
+}
+
 func TestLoadFrom_baseURLForMemberlessPoolRejected(t *testing.T) {
 	// A base URL for a pool that has no members of its own is a typo'd
 	// nick; fail closed even when other pools are well-formed.
@@ -812,9 +848,10 @@ func TestBuildFromSpec_validatorTable(t *testing.T) {
 
 // TestBuildFromSpec_emptySpecAllowed proves the spec path accepts a zero-pool
 // registry (issue #232): deleting the last runtime pool persists an empty
-// aqg.json, and rebooting from it must not fail. The env cold-start path keeps
-// its "no backends configured" guard (a fully empty environment is still a
-// misconfiguration) — see TestLoad_* for that path.
+// aqg.json, and rebooting from it must not fail. Load keeps its
+// "no backends configured" guard for a fully empty environment; LoadAllowEmpty
+// opts out of it for the first-deploy bootstrap path (issue #298) — see
+// TestLoadFrom_noBackendsRejected and TestLoadAllowEmpty_zeroPoolsOK.
 func TestBuildFromSpec_emptySpecAllowed(t *testing.T) {
 	reg, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{}}, testDefaultBaseURL)
 	if err != nil {
