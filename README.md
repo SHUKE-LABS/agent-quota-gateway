@@ -12,8 +12,9 @@ method and path to the selected upstream (Anthropic clients use
 payloads are opaque to the gateway: it performs no body inspection,
 translation, or provider detection. For multiple machines that
 share one set of pool credentials, an opt-in
-[shared mode](#shared-mode-over-tailscale) binds a Tailscale address so
-they ride one authoritative instance.
+[shared mode](#shared-mode-over-tailscale) binds a non-loopback overlay/IP
+address (Tailscale, an OpenVPN overlay, or any address a fleet's own
+network trusts) so they ride one authoritative instance.
 
 The gateway owns one or more named **pools**. A pool is a set of
 *interchangeable* backends — one client-facing application contract and the
@@ -92,9 +93,9 @@ Out of scope:
   backend is kept. Snapshots are merged field-by-field, so a window absent
   from one response/poll no longer clears a reset already learned.
 - Authentication on `/_gateway/*` — loopback is the trust boundary (in
-  [shared mode](#shared-mode-over-tailscale) the Tailscale ACL is, and the
-  `/_gateway/quota` view becomes readable by every permitted tailnet
-  member).
+  [shared mode](#shared-mode-over-tailscale) the deployment's own network
+  ACL/firewall is, and the `/_gateway/quota` view becomes readable by
+  every client that can reach the bound address).
 - Docker image or other packaging — `go build` is the deliverable.
 
 ## Quickstart
@@ -372,7 +373,7 @@ classes and configure each pool's `BASE_URL` and members accordingly.
 | `AQG_POOL_<POOL>_BALANCE_DWELL` | `5m` | Minimum time between balance switches. Accepts Go duration strings (e.g. `5m`, `2m30s`). Only valid when `BALANCE=lead` is set. |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
-| `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single **Tailscale** address (IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`) instead of loopback, so other tailnet machines share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, RFC1918, public addresses, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
+| `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single non-loopback overlay/IP address (e.g. a Tailscale address, `100.64.0.0/10` / `fd7a:115c:a1e0::/48`; or any other overlay/LAN address the deployment trusts, such as an OpenVPN `10.8.0.0/24`) instead of loopback, so other machines that can reach it share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
 | `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. When a config file declares an empty `state_file`, startup warns with the config path; set `state_file` in that file and restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles legacy `priority_override` and `disabled` (issues #241, #259) and **reports only** legacy `removed_members` / `added_members` (the credential-bearing keys are never silently applied), as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
@@ -385,9 +386,10 @@ on a pool with no members, a malformed upstream URL, an unrecognized
 of the pool, or targets a pool with no members, a `BALANCE` value other than
 `lead`, `BALANCE_GAP` or `BALANCE_DWELL` set without `BALANCE`, `BALANCE`
 and `PRIORITY` both declared on the same pool, both `LISTEN_ADDR` and
-`SHARED_LISTEN_ADDR` set at once, or a `SHARED_LISTEN_ADDR` outside the
-Tailscale ranges. A `|` in a credential is rejected because the tail must
-parse as a URL — tokens do not contain `|`.
+`SHARED_LISTEN_ADDR` set at once, or a `SHARED_LISTEN_ADDR` that is
+loopback, the wildcard address, or not an IP literal. A `|` in a
+credential is rejected because the tail must parse as a URL — tokens do
+not contain `|`.
 
 In env-only mode (no config file resolved) pools live in the environment and
 the gateway reads no credential from disk (see [Security model](#security-model)).
@@ -524,7 +526,7 @@ pool name.
 | `AQG_POOL_<P>_BALANCE_DWELL` | `pools.<P>.balance_dwell` | Omit for the default (`5m`). An explicit non-positive value is rejected. |
 | `ANTHROPIC_BASE_URL` | `base_url` | Gateway default upstream. |
 | `LISTEN_ADDR` | `listen_addr` | Loopback-only bind address. |
-| `SHARED_LISTEN_ADDR` | `shared_listen_addr` | Tailscale bind address for shared mode. |
+| `SHARED_LISTEN_ADDR` | `shared_listen_addr` | Overlay/IP bind address for shared mode (e.g. Tailscale). |
 | `AQG_STATE_FILE` | `state_file` | Path to persistent state file. |
 
 **Sample file:**
@@ -1075,11 +1077,11 @@ on an unknown source or target pool; `409` on an unresolved same-nick conflict.
 All error bodies are credential-free.
 
 > **Shared mode:** these are **write** endpoints. In shared mode (see below)
-> any tailnet member that can reach the port can reorder priority, disable,
+> any client that can reach the port can reorder priority, disable,
 > remove, or **move** members, or **add** a member — injecting a credential and a
 > new upstream of their choosing. This is a sharper exposure than the read-only
-> quota view. The Tailscale ACL restricting this port is the only gate; the
-> gateway adds no auth of its own.
+> quota view. The network ACL/firewall restricting this port is the only gate;
+> the gateway adds no auth of its own.
 
 **Clearing live-429 parks.** `POST /_gateway/clear` drops reactive `429` parks
 so an over-parked member becomes selectable again without waiting out the park
@@ -1142,8 +1144,8 @@ the status poll (issue #250), so a member added or removed in another tab or
 via the API shows up here within one tick without a manual refresh; any text
 already typed into the add-subscription form survives the re-render. The page
 contains no auth and no build step — it inherits the gateway's trust boundary. In shared mode this exposes
-write controls to any tailnet member that can reach the port; a Tailscale
-ACL restricting the port is the only gate.
+write controls to any client that can reach the port; the network
+ACL/firewall restricting the port is the only gate.
 
 A rolling-window utilization cell (5h or long) renders `-` once its reset has
 already elapsed, mirroring what the adjacent reset cell and status badge
@@ -1210,8 +1212,8 @@ In the default mode the trust boundary is the loopback interface.
 Everything that can reach `127.0.0.1:8080` is considered authorised, so the
 gateway is safe to run alongside a single user account without
 authentication. ([Shared mode](#shared-mode-over-tailscale) moves that
-boundary to a Tailscale ACL — see that section for the changed model.) The
-guarantees that follow:
+boundary to whatever network ACL/firewall gates the bound address — see
+that section for the changed model.) The guarantees that follow:
 
 - The gateway owns every credential. Clients never see one — they send a
   pool name (`ANTHROPIC_AUTH_TOKEN` → `Authorization: Bearer <pool>`), and
@@ -1248,10 +1250,12 @@ guarantees that follow:
   that member's own provider — never to Anthropic, and never carrying
   request/response bodies.
 - The listen address is loopback-only by default. `config.validate`
-  rejects `0.0.0.0`, public IPs, and unresolvable names so a misconfigured
-  deployment fails closed at startup. The one sanctioned way off loopback
-  is [shared mode](#shared-mode-over-tailscale), which accepts only
-  Tailscale addresses and nothing else.
+  rejects `0.0.0.0`, and unresolvable names so a misconfigured deployment
+  fails closed at startup. The one sanctioned way off loopback is
+  [shared mode](#shared-mode-over-tailscale), which accepts a single
+  non-loopback, non-wildcard IP literal — Tailscale is the reference
+  deployment, but any overlay/LAN address the operator's network trusts
+  works the same way.
 
 ## Shared mode over Tailscale
 
@@ -1259,8 +1263,13 @@ By default the gateway is single-machine: it binds loopback and only local
 clients reach it. If several machines **intentionally share the same pool
 credentials** and want one authoritative view — one sticky pointer, one
 failover decision, one quota snapshot across all of them — run a single
-gateway instance and let the others reach it over a [Tailscale](https://tailscale.com)
-overlay.
+gateway instance and let the others reach it over a shared overlay/LAN.
+
+`SHARED_LISTEN_ADDR` accepts any non-loopback, non-wildcard IP literal —
+this section uses [Tailscale](https://tailscale.com) as the reference
+deployment, but an OpenVPN overlay, a bare RFC1918 LAN, or any other
+address your network trusts works the same way; substitute your own
+overlay's address and ACL/firewall equivalent below.
 
 Set `SHARED_LISTEN_ADDR` to this device's Tailscale IP (leave `LISTEN_ADDR`
 unset — the two are mutually exclusive):
@@ -1317,11 +1326,15 @@ switch.
 ### The Tailscale ACL is required, not optional
 
 The gateway adds **no authentication of its own** — the identity layer is
-the Tailscale overlay. But Tailscale's default ACL is *allow-all*: without
-an explicit ACL, any tailnet member can reach the gateway port and drive
-your pools (and read `/_gateway/quota`). An ACL restricting the port to
-specific tags is a **required** part of running shared mode. Tag the
-gateway host and the clients, and allow only the client tag to the port:
+whatever overlay/network the operator chose (the deployment's own network
+ACL/firewall is the gate). For a Tailscale deployment specifically:
+Tailscale's default ACL is *allow-all*: without an explicit ACL, any
+tailnet member can reach the gateway port and drive your pools (and read
+`/_gateway/quota`). An ACL restricting the port to specific tags is a
+**required** part of running shared mode over Tailscale — the same
+requirement applies to any other overlay (e.g. an OpenVPN firewall rule
+scoped to the gateway port). Tag the gateway host and the clients, and
+allow only the client tag to the port:
 
 ```jsonc
 {
@@ -1357,10 +1370,13 @@ Anthropic), never the credential itself. That bounds the worst case:
   does not recover.
 
 The gateway does not distinguish pool credential types, which is exactly
-why the address boundary is uniform — the Tailscale overlay, not "trust the
-LAN for subscription pools." Bare-LAN (RFC1918) and public listen addresses
-are rejected for this reason: there is no "the LAN is trusted" middle
-ground.
+why the address boundary is uniform — whatever network the operator
+chooses to trust as the shared-mode boundary, not an implicit "the LAN is
+always safer than the internet" assumption. `SHARED_LISTEN_ADDR` accepts
+RFC1918 and public IP literals alike; the operator is responsible for
+gating reachability of the chosen address with their own network
+ACL/firewall (loopback and the wildcard address are the only ones the
+gateway itself refuses, since neither can express a meaningful boundary).
 
 ## Deploying as a systemd service
 
@@ -1393,8 +1409,9 @@ sudo systemctl restart agent-quota-gateway
 ```
 
 See [`deploy/aqg.env.example`](deploy/aqg.env.example) for the full
-template. `SHARED_LISTEN_ADDR` should be the host's Tailscale IP
-(`tailscale ip -4`); omit it to run loopback-only instead.
+template. `SHARED_LISTEN_ADDR` should be the host's overlay/LAN IP (e.g.
+its Tailscale IP, via `tailscale ip -4`); omit it to run loopback-only
+instead.
 
 > This file is a systemd `EnvironmentFile`, **not** a shell script. Use
 > bare `KEY=value` lines — **no `export` prefix** (systemd ignores

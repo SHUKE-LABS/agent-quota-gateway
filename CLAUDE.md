@@ -63,8 +63,9 @@ payloads.
 
 Listen/behavior vars: `ANTHROPIC_BASE_URL` (upstream, default
 api.anthropic.com), `LISTEN_ADDR` (loopback, default 127.0.0.1:8080),
-`SHARED_LISTEN_ADDR` (Tailscale address — opt into shared mode; mutually
-exclusive with `LISTEN_ADDR`), `AQG_STATE_FILE` / `$STATE_DIRECTORY`
+`SHARED_LISTEN_ADDR` (non-loopback overlay/IP address, e.g. Tailscale or
+OpenVPN — opt into shared mode; mutually exclusive with `LISTEN_ADDR`),
+`AQG_STATE_FILE` / `$STATE_DIRECTORY`
 (persistence). `AQG_DEBUG_LOG_REQUESTS=1` turns on the inbound/outbound
 request dump (`internal/reqlog`, credentials redacted).
 
@@ -176,9 +177,10 @@ request dump (`internal/reqlog`, credentials redacted).
   state overlay are merged once (state-wins) to bootstrap the file; env is
   never read again. `Registry` is immutable-after-build; the hot read path
   stays lock-free.
-- **Trust boundary = loopback** (or a Tailscale ACL in shared mode). No
-  auth on `/_gateway/*`; the bind address is validated at config load
-  (loopback or a literal Tailscale range only).
+- **Trust boundary = loopback** (or the deployment's network ACL/firewall
+  in shared mode, e.g. a Tailscale ACL or OpenVPN overlay). No auth on
+  `/_gateway/*`; the bind address is validated at config load (loopback,
+  or a literal non-loopback, non-wildcard IP for shared mode).
 
 ### Admin API
 

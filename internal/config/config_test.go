@@ -83,13 +83,19 @@ func TestLoad_rejectsMalformedAddr(t *testing.T) {
 	}
 }
 
-func TestLoad_sharedAcceptsTailscale(t *testing.T) {
+func TestLoad_sharedAcceptsAnyNonLoopbackIP(t *testing.T) {
 	cases := []string{
-		"100.64.0.0:8080",          // first address of the CGNAT /10
+		"100.64.0.0:8080",          // first address of the Tailscale CGNAT /10
 		"100.101.102.103:8080",     // a typical Tailscale IPv4
 		"100.127.255.255:8080",     // last address of the CGNAT /10
 		"[fd7a:115c:a1e0::1]:8080", // Tailscale IPv6 ULA
 		"[fd7a:115c:a1e0:ab12::5]:8080",
+		"10.8.0.1:9949",    // an OpenVPN overlay address (issue #297)
+		"10.0.0.1:8080",    // RFC1918
+		"172.16.0.1:8080",  // RFC1918
+		"192.168.1.1:8080", // RFC1918
+		"8.8.8.8:8080",     // a public address
+		"[fd00::1]:8080",   // a non-Tailscale ULA
 	}
 	for _, addr := range cases {
 		t.Run(addr, func(t *testing.T) {
@@ -110,21 +116,14 @@ func TestLoad_sharedAcceptsTailscale(t *testing.T) {
 	}
 }
 
-func TestLoad_sharedRejectsNonTailscale(t *testing.T) {
+func TestLoad_sharedRejectsInvalid(t *testing.T) {
 	cases := []string{
-		"100.63.255.255:8080",         // just below the CGNAT /10
-		"100.128.0.0:8080",            // just above the CGNAT /10 (the /10-vs-/16 trap)
-		"10.0.0.1:8080",               // RFC1918
-		"172.16.0.1:8080",             // RFC1918
-		"192.168.1.1:8080",            // RFC1918
-		"8.8.8.8:8080",                // public
 		"0.0.0.0:8080",                // wildcard
 		"[::]:8080",                   // wildcard
 		"127.0.0.1:8080",              // loopback belongs on LISTEN_ADDR
 		"[::1]:8080",                  // loopback
 		"localhost:8080",              // names are rejected in shared mode
 		"my-host.tailnet.ts.net:8080", // MagicDNS name
-		"[fd00::1]:8080",              // a non-Tailscale ULA
 	}
 	for _, addr := range cases {
 		t.Run(addr, func(t *testing.T) {
@@ -271,13 +270,26 @@ func TestBuild_rejectsNonLoopback(t *testing.T) {
 	}
 }
 
-func TestBuild_rejectsNonTailscaleShared(t *testing.T) {
+func TestBuild_rejectsInvalidShared(t *testing.T) {
 	inputs := Inputs{
-		SharedListenAddr: "192.168.1.1:8080",
+		SharedListenAddr: "127.0.0.1:8080",
 	}
 	_, err := Build(inputs)
 	if err == nil {
-		t.Error("Build() expected error for non-Tailscale shared_listen_addr")
+		t.Error("Build() expected error for loopback shared_listen_addr")
+	}
+}
+
+func TestBuild_acceptsNonTailscaleShared(t *testing.T) {
+	inputs := Inputs{
+		SharedListenAddr: "192.168.1.1:8080",
+	}
+	cfg, err := Build(inputs)
+	if err != nil {
+		t.Fatalf("Build() unexpected error: %v", err)
+	}
+	if !cfg.Shared {
+		t.Error("cfg.Shared = false, want true")
 	}
 }
 

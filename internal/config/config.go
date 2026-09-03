@@ -27,12 +27,14 @@ const (
 	EnvListenAddr = "LISTEN_ADDR"
 
 	// EnvSharedListenAddr opts into shared mode: the gateway binds to a
-	// single Tailscale address instead of loopback, so other machines on
-	// the tailnet can drive the same pools (sharing one authoritative
+	// single non-loopback overlay/IP address instead of loopback, so other
+	// machines that can reach it (a Tailscale tailnet, an OpenVPN overlay,
+	// a bare LAN, ...) can drive the same pools (sharing one authoritative
 	// sticky pointer, failover state, and quota view). It is mutually
 	// exclusive with EnvListenAddr — set exactly one. The trust boundary
-	// in shared mode is a Tailscale ACL, not the loopback interface; the
-	// gateway adds no auth of its own. See the README "Shared mode" section.
+	// in shared mode is whatever network ACL/firewall gates reachability
+	// of that address, not the loopback interface; the gateway adds no
+	// auth of its own. See the README "Shared mode" section.
 	EnvSharedListenAddr = "SHARED_LISTEN_ADDR"
 
 	// EnvStateFile sets the path for the persistent state file. When unset,
@@ -49,16 +51,6 @@ const (
 	DefaultListenAddr = "127.0.0.1:8080"
 )
 
-// tailscalePrefixes are the only address ranges shared mode accepts:
-// Tailscale's IPv4 CGNAT block and its IPv6 ULA block. They are the
-// overlay's own ranges — an address inside them is reachable only over
-// the tailnet, never from the public internet or a bare LAN. Pinned as
-// literals (not "the ULA range") so the boundary is exact and auditable.
-var tailscalePrefixes = []netip.Prefix{
-	netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("fd7a:115c:a1e0::/48"),
-}
-
 // Config is the resolved gateway configuration.
 type Config struct {
 	// AnthropicBaseURL is the upstream scheme + host the proxy forwards
@@ -66,12 +58,12 @@ type Config struct {
 	AnthropicBaseURL string
 
 	// ListenAddr is the address the gateway binds to. Loopback by
-	// default; a Tailscale address when Shared is true.
+	// default; a non-loopback overlay/IP address when Shared is true.
 	ListenAddr string
 
 	// Shared reports whether shared mode is active (ListenAddr is a
-	// Tailscale address). It selects the listen-address validator and
-	// drives the loud startup warning in main.
+	// non-loopback overlay/IP address). It selects the listen-address
+	// validator and drives the loud startup warning in main.
 	Shared bool
 
 	// StateFile is the path for the persistent state file. Empty string
@@ -88,7 +80,7 @@ type Inputs struct {
 	// ListenAddr is the loopback bind address. Empty string uses DefaultListenAddr.
 	ListenAddr string
 
-	// SharedListenAddr is the Tailscale bind address for shared mode.
+	// SharedListenAddr is the overlay/IP bind address for shared mode.
 	// Empty string means shared mode is off.
 	SharedListenAddr string
 
@@ -111,7 +103,7 @@ func Load() (Config, error) {
 	// precedence rule that silently ignores the other; fail closed
 	// instead so the operator's intent is never guessed.
 	if listenSet && sharedSet {
-		return Config{}, fmt.Errorf("%s and %s are mutually exclusive: set exactly one (loopback by default, or a Tailscale address for shared mode)", EnvListenAddr, EnvSharedListenAddr)
+		return Config{}, fmt.Errorf("%s and %s are mutually exclusive: set exactly one (loopback by default, or an overlay/IP address for shared mode)", EnvListenAddr, EnvSharedListenAddr)
 	}
 
 	inputs := Inputs{
@@ -136,7 +128,7 @@ func Build(in Inputs) (Config, error) {
 	listenSet := in.ListenAddr != ""
 	sharedSet := in.SharedListenAddr != ""
 	if listenSet && sharedSet {
-		return Config{}, fmt.Errorf("listen_addr and shared_listen_addr are mutually exclusive: set exactly one (loopback by default, or a Tailscale address for shared mode)")
+		return Config{}, fmt.Errorf("listen_addr and shared_listen_addr are mutually exclusive: set exactly one (loopback by default, or an overlay/IP address for shared mode)")
 	}
 
 	cfg := Config{
@@ -164,7 +156,7 @@ func Build(in Inputs) (Config, error) {
 
 // validate enforces the contract: an upstream URL with a scheme and
 // host, and a listen address that matches the active mode — loopback by
-// default, a Tailscale range in shared mode.
+// default, any non-loopback IP literal in shared mode.
 func (c Config) validate() error {
 	upstream, err := url.Parse(c.AnthropicBaseURL)
 	if err != nil {
@@ -199,14 +191,17 @@ func validateListenAddr(addr string) error {
 }
 
 // validateSharedListenAddr enforces the shared-mode constraint: the host
-// part of SHARED_LISTEN_ADDR must be an IP literal inside a Tailscale
-// range (IPv4 CGNAT 100.64.0.0/10 or IPv6 ULA fd7a:115c:a1e0::/48).
+// part of SHARED_LISTEN_ADDR must be a non-loopback, non-wildcard IP
+// literal — any overlay or LAN address that a fleet's own network trusts
+// as its shared-mode boundary (Tailscale's CGNAT/ULA ranges, an OpenVPN
+// overlay like 10.8.0.0/24, bare RFC1918, or a public address).
 //
-// Everything else is rejected at startup, fail-closed: loopback (use
-// LISTEN_ADDR for that), 0.0.0.0 / ::, RFC1918 bare-LAN ranges, public
-// addresses, and DNS / MagicDNS names. Names are rejected on purpose —
-// proving a name resolves to a tailnet address is fragile, so shared
-// mode requires the literal Tailscale IP of this device's interface.
+// Rejected at startup, fail-closed: loopback (use LISTEN_ADDR for that),
+// 0.0.0.0 / :: (the wildcard binds every interface, defeating the
+// single-address contract), and DNS / MagicDNS names. Names are rejected
+// on purpose — proving a name resolves to the intended address is
+// fragile, so shared mode requires the literal IP of this device's
+// interface.
 func validateSharedListenAddr(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -214,14 +209,15 @@ func validateSharedListenAddr(addr string) error {
 	}
 	ip, err := netip.ParseAddr(host)
 	if err != nil {
-		return fmt.Errorf("SHARED_LISTEN_ADDR must be a Tailscale IP literal (within 100.64.0.0/10 or fd7a:115c:a1e0::/48), not a name; got %q", host)
+		return fmt.Errorf("SHARED_LISTEN_ADDR must be an IP literal, not a name; got %q", host)
 	}
-	for _, p := range tailscalePrefixes {
-		if p.Contains(ip) {
-			return nil
-		}
+	if ip.IsLoopback() {
+		return fmt.Errorf("SHARED_LISTEN_ADDR must not be loopback (use LISTEN_ADDR for that); got %q", host)
 	}
-	return fmt.Errorf("SHARED_LISTEN_ADDR must be a Tailscale address (within 100.64.0.0/10 or fd7a:115c:a1e0::/48); got %q", host)
+	if ip.IsUnspecified() {
+		return fmt.Errorf("SHARED_LISTEN_ADDR must not be the wildcard address; got %q", host)
+	}
+	return nil
 }
 
 // lookupEnv reports a variable's value and whether it is set to a
