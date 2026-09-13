@@ -66,8 +66,10 @@ api.anthropic.com), `LISTEN_ADDR` (loopback, default 127.0.0.1:8080),
 `SHARED_LISTEN_ADDR` (non-loopback overlay/IP address, e.g. Tailscale or
 OpenVPN — opt into shared mode; mutually exclusive with `LISTEN_ADDR`),
 `AQG_STATE_FILE` / `$STATE_DIRECTORY`
-(persistence). `AQG_DEBUG_LOG_REQUESTS=1` turns on the inbound/outbound
-request dump (`internal/reqlog`, credentials redacted).
+(persistence). `AQG_DEBUG_LOG_REQUESTS=1` seeds the inbound/outbound request
+dump (`internal/reqlog`, credentials redacted) on first bootstrap only; the
+live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
+(issue #301).
 
 ## Architecture
 

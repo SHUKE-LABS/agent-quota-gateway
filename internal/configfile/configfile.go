@@ -89,6 +89,7 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 		ListenAddr:       dto.ListenAddr,
 		SharedListenAddr: dto.SharedListenAddr,
 		StateFile:        dto.StateFile,
+		DebugLogRequests: dto.Debug != nil && dto.Debug.LogRequests,
 	}
 	cfg, err := config.Build(cfgInputs)
 	if err != nil {
@@ -139,6 +140,13 @@ func Marshal(cfg config.Config, reg *backend.Registry) ([]byte, error) {
 		BaseURL:   cfg.AnthropicBaseURL,
 		StateFile: cfg.StateFile,
 		Pools:     make(map[string]poolDTO),
+	}
+	// The debug section is written only when logging is on (issue #301): an
+	// absent section and "log_requests": false mean the same thing, so off
+	// keeps the file byte-identical to what pre-#301 gateways wrote — an
+	// existing deployment that never touches the toggle sees no diff.
+	if cfg.DebugLogRequests {
+		dto.Debug = &debugDTO{LogRequests: true}
 	}
 	// cfg.ListenAddr holds the non-loopback overlay/IP address when shared
 	// mode is active, otherwise the loopback bind. Route it to the matching
@@ -406,8 +414,22 @@ type fileDTO struct {
 	// StateFile is the path for the persistent state file. Empty disables it.
 	StateFile string `json:"state_file"`
 
+	// Debug holds runtime debug settings (issue #301). A pointer so the
+	// zero value (section absent) means "off" and Marshal omits the key
+	// entirely when logging is off — existing files without it load
+	// unchanged. DisallowUnknownFields still rejects a typo'd inner key.
+	Debug *debugDTO `json:"debug,omitempty"`
+
 	// Pools maps pool names to their specs.
 	Pools map[string]poolDTO `json:"pools"`
+}
+
+// debugDTO is the "debug" section of a config file (issue #301).
+type debugDTO struct {
+	// LogRequests turns on the inbound/outbound request dump
+	// (internal/reqlog). Hot-toggleable at runtime via
+	// POST /_gateway/debug; persists across restarts through this field.
+	LogRequests bool `json:"log_requests"`
 }
 
 // poolDTO is one pool's configuration from the file.

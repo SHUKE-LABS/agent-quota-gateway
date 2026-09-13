@@ -374,10 +374,10 @@ classes and configure each pool's `BASE_URL` and members accordingly.
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single non-loopback overlay/IP address (e.g. a Tailscale address, `100.64.0.0/10` / `fd7a:115c:a1e0::/48`; or any other overlay/LAN address the deployment trusts, such as an OpenVPN `10.8.0.0/24`) instead of loopback, so other machines that can reach it share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
-| `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. |
-| `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. |
+| `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. Deliberately env-only (issue #301): account-level signing credentials are not pool-member intent, so they stay out of `aqg.json`; a missing pair surfaces as the member's `last_err` in pool status. |
+| `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. Env-only by design — see `VOLC_ACCESSKEY`. |
 | `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. When a config file declares an empty `state_file`, startup warns with the config path; set `state_file` in that file and restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles legacy `priority_override` and `disabled` (issues #241, #259) and **reports only** legacy `removed_members` / `added_members` (the credential-bearing keys are never silently applied), as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
-| `AQG_DEBUG_LOG_REQUESTS` | _(unset)_ | Set to `1` to dump every inbound request and outbound upstream request to stderr for debugging; any other value (or unset) leaves it off. Credentials are always redacted — the `Authorization` and `x-api-key` headers are never logged — but the inbound request body is dumped and may contain user message content, so enable only in dev/debug runs. |
+| `AQG_DEBUG_LOG_REQUESTS` | _(unset)_ | Set to `1` to dump every inbound request and outbound upstream request to stderr for debugging; any other value (or unset) leaves it off. Credentials are always redacted — the `Authorization` and `x-api-key` headers are never logged — but the inbound request body is dumped (truncated to 500 bytes) and may contain user message content, so enable only in dev/debug runs. This env var is a **first-start bootstrap seed** exactly like `AQG_POOL_*` (issue #301): read only in env-only mode and when generating a fresh `aqg.json`, whose `debug.log_requests` section then owns the setting. Once a config file exists it is never read again — flip logging on a running gateway via `POST /_gateway/debug` or the UI instead (no restart). |
 
 Startup fails closed on: an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
@@ -500,6 +500,7 @@ permissions causes startup to fail closed — no silent fallback to env.
   "listen_addr": "127.0.0.1:8080",
   "shared_listen_addr": "",
   "state_file": "",
+  "debug": { "log_requests": false },
   "pools": {
     "<POOL>": {
       "base_url": "<pool-default-upstream>",
@@ -539,6 +540,7 @@ pool name.
 | `LISTEN_ADDR` | `listen_addr` | Loopback-only bind address. |
 | `SHARED_LISTEN_ADDR` | `shared_listen_addr` | Overlay/IP bind address for shared mode (e.g. Tailscale). |
 | `AQG_STATE_FILE` | `state_file` | Path to persistent state file. |
+| `AQG_DEBUG_LOG_REQUESTS` | `debug.log_requests` | Request dump toggle (issue #301). Env seeds the first bootstrap only; afterwards the JSON key is the source of truth and `POST /_gateway/debug` flips it live. The section is written only when on — an absent `debug` key and `false` mean the same thing. |
 
 **Sample file:**
 
@@ -920,6 +922,8 @@ restarting is the wrong tool.
 | Method & path | Effect |
 |---------------|--------|
 | `GET /_gateway/config` | Effective configuration for every pool, **credentials redacted** |
+| `GET /_gateway/debug` | Current request-logging state: `{"log_requests": bool}` (issue #301). |
+| `POST /_gateway/debug` | Hot-toggle request logging on a running gateway; body `{"log_requests": true\|false}` (field required, missing → `400`). Takes effect on the **next request** — no restart, no dropped connections — and flushes to `aqg.json`'s `debug.log_requests` via the same debounced write every mutation uses, so it survives restart. In env-only mode the toggle is in-memory only and the response says so (`X-AQG-Persistence: env_only`). Non-GET/POST returns `405`. The dump itself is the stderr request dump described under `AQG_DEBUG_LOG_REQUESTS`: credentials redacted, bodies truncated. |
 | `POST /_gateway/pool` | Create a plain pool at runtime; body `{"name": "...", "mode": "plain"}` (`name` required, `mode` optional and defaults to `plain`). A runtime pool is a pure named container with no pool-level base_url; each member resolves its own `base_url` via `AddMember`'s fallback chain. To atomically create the first member, include optional `nick`, `credential`, `base_url`, and `placement` fields; `nick` switches to combined mode, and validation failure creates neither resource. Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
 | `DELETE /_gateway/pool/{name}` | Remove a pool. The pool must be **empty** — drain members first via `DELETE .../member/{nick}`; a pool that still has members returns `409` (no cascade, so no persisted credential is silently discarded). Returns `200` `{"status": "ok"}`; an unknown pool returns `404`. Deleting the last pool is allowed (routing then fails closed with `403` unknown selector). Persisted: a deleted pool does not reappear on restart. |
 | `POST /_gateway/pool/{name}/rename` | Rename a pool in place; body `{"name": "<new>"}` (required, normalized server-side). Carries the pool's members, disabled flags, declared priority, and balance parameters over to the new key. The controller's runtime observation (sticky pointer, exhausted marks, balance sequence, local-snapshot set) is keyed by member nick, so it follows the rename unchanged. Returns `200` `{"pool": "<new>"}`. Empty / identical-after-normalize new name → `400`; unknown old pool → `404`; new name collides with a different existing pool → `409`. Persisted: the next config-roundtrip restart restores the rename under the new key. **Caveat for env-only mode** (`AQG_CONFIG` unset, no `aqg.json`): the config writer is a no-op, so the rename is runtime-only and reverts to the env-declared name on restart — same constraint `AddPool`/`AddMember` already carry. |
@@ -949,6 +953,8 @@ curl -X DELETE http://127.0.0.1:8080/_gateway/pool/auto/member/d
 curl -X DELETE http://127.0.0.1:8080/_gateway/pool/spare
 # rename a pool in place — membership and runtime observation follow
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/rename -d '{"name":"primary"}'
+# hot-toggle the request dump on a running gateway — no restart (issue #301)
+curl -X POST http://127.0.0.1:8080/_gateway/debug -d '{"log_requests": true}'
 ```
 
 `GET /_gateway/config` returns one object per pool — balance settings, the

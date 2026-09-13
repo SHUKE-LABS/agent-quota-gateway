@@ -38,6 +38,40 @@ func TestLoad_overrides(t *testing.T) {
 	}
 }
 
+// TestLoad_debugLogRequestsSeed covers the env-path half of issue #301:
+// AQG_DEBUG_LOG_REQUESTS=1 seeds DebugLogRequests on Config; anything else
+// (unset or empty or other value) leaves it false. The env var is a
+// first-start bootstrap seed; file-mode loads map it from the "debug"
+// section instead.
+func TestLoad_debugLogRequestsSeed(t *testing.T) {
+	t.Setenv(EnvDebugLogRequests, "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.DebugLogRequests {
+		t.Errorf("unset env → DebugLogRequests = true, want false")
+	}
+
+	t.Setenv(EnvDebugLogRequests, "1")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if !cfg.DebugLogRequests {
+		t.Errorf("AQG_DEBUG_LOG_REQUESTS=1 → DebugLogRequests = false, want true")
+	}
+
+	t.Setenv(EnvDebugLogRequests, "true") // not "1", must not turn it on
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.DebugLogRequests {
+		t.Errorf("AQG_DEBUG_LOG_REQUESTS=true → DebugLogRequests = true, want false (only \"1\" is recognized)")
+	}
+}
+
 func TestLoad_loopbackVariants(t *testing.T) {
 	cases := []string{
 		"127.0.0.1:8080",

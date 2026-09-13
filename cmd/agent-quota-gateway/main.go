@@ -142,6 +142,13 @@ func run(configFlag string) error {
 		return err
 	}
 
+	// Seed the live request-logging gate from the resolved config (issue
+	// #301): file mode maps the "debug" section; env mode reads the
+	// AQG_DEBUG_LOG_REQUESTS seed. From here the flag is hot-toggled via
+	// POST /_gateway/debug — reqlog holds the live value and this startup
+	// stamp is the only other writer in normal operation.
+	reqlog.SetEnabled(cfg.DebugLogRequests)
+
 	store := quota.NewStore()
 
 	// Load persisted state from the state file (if configured). A missing
@@ -206,8 +213,15 @@ func run(configFlag string) error {
 	// Wire the config writer: every operator mutation re-serializes the whole
 	// config registry to aqg.json (debounced atomic 0600). In env-only mode
 	// configPath is "" and the writer is a no-op (no credentials on disk).
+	// The debug toggle stamps the live reqlog flag into the snapshot (issue
+	// #301): cfg was resolved once at startup, but the request-logging state
+	// is mutable operator intent whose single live owner is reqlog's atomic
+	// — the same "mutation already took effect, flush re-serializes current
+	// intent" contract every pools mutation follows.
 	configWriter := configfile.NewWriter(configPath, func() ([]byte, error) {
-		return configfile.Marshal(cfg, pools.CurrentRegistry())
+		c := cfg
+		c.DebugLogRequests = reqlog.Enabled()
+		return configfile.Marshal(c, pools.CurrentRegistry())
 	})
 	pools.SetOnConfigChange(configWriter.MarkDirty)
 
@@ -271,6 +285,7 @@ func run(configFlag string) error {
 	mux.HandleFunc("POST /_gateway/pool/{name}/rename", renamePoolHandler(pools, persistence))
 	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
 	mux.HandleFunc("/_gateway/config", configHandler(pools, persistence))
+	mux.HandleFunc("/_gateway/debug", debugHandler(persistence, configWriter.MarkDirty))
 	mux.HandleFunc("/_gateway/ui", uiHandler())
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools, persistence))
