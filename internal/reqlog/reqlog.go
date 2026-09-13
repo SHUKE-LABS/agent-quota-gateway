@@ -45,6 +45,29 @@ func SetEnabled(v bool) { enabled.Store(v) }
 // Enabled reports the current request-logging state.
 func Enabled() bool { return enabled.Load() }
 
+// debugOut is the test-injection point for the dump stream (issue #301's
+// AC1 integration test). nil means "use os.Stderr at call time" — which
+// matters because tests that redirect os.Stderr (captureStderr) must keep
+// working: capturing os.Stderr once at init time would freeze the var to
+// the original *os.File and silently bypass the pipe. sink() does the
+// dynamic lookup so both paths land in the test's buffer.
+var debugOut io.Writer
+
+// SetDebugOutput redirects the dump stream. Restoring nil (or os.Stderr
+// behaviour) is the caller's job; tests use a t.Cleanup. Production code
+// never calls this — the dump goes to stderr unconditionally.
+func SetDebugOutput(w io.Writer) { debugOut = w }
+
+// sink returns the current dump target: the test-injected writer if
+// non-nil, otherwise os.Stderr looked up at call time so a test's
+// captureStderr-style redirect is honoured.
+func sink() io.Writer {
+	if debugOut != nil {
+		return debugOut
+	}
+	return os.Stderr
+}
+
 // WrapTransport always wraps t; the wrapper consults the live flag before
 // each upstream round-trip and, when on, dumps the outbound request headers
 // (after the director stamped them) to stderr. Wrapping unconditionally is
@@ -74,7 +97,7 @@ func (d *debugTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		fmt.Fprintf(&sb, "  %s: %s\n", name, strings.Join(r.Header[name], ", "))
 	}
-	fmt.Fprint(os.Stderr, sb.String())
+	fmt.Fprint(sink(), sb.String())
 	return d.inner.RoundTrip(r)
 }
 
@@ -128,5 +151,5 @@ func dump(r *http.Request) {
 		}
 	}
 
-	fmt.Fprint(os.Stderr, sb.String())
+	fmt.Fprint(sink(), sb.String())
 }

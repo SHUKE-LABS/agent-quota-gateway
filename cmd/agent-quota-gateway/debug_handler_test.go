@@ -3,8 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
@@ -194,3 +198,117 @@ func TestDebugEndpoint_methodNotAllowed(t *testing.T) {
 // and TestWrapTransport_hotToggle. The handler test above only owns the
 // handler-shape contract (status codes, headers, persistence signals,
 // markDirty).
+
+// safeBuffer serializes writes/reads across the HTTP server goroutines and
+// the test goroutine. Writers are the request handlers running under the
+// httptest server; the reader is the test goroutine between assertions.
+// Plain bytes.Buffer is not safe for concurrent use, so this wrapper is.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func (s *safeBuffer) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf.Reset()
+}
+
+// TestDebugEndpoint_liveGatewayHotToggle is AC1 end-to-end (issue #301):
+// a real httptest server wired as run() wires it (reqlog.Middleware wrapping
+// a mux that owns /_gateway/debug) must obey SetEnabled on the very next
+// inbound request, in both directions, with no rewire. This catches a
+// routing or middleware wiring regression that the per-package unit tests
+// (reqlog's hot-toggle, the handler's status codes) cannot — they exercise
+// the components separately. A captured dump proves the middleware consulted
+// the live flag through the actual request path.
+func TestDebugEndpoint_liveGatewayHotToggle(t *testing.T) {
+	var captured safeBuffer
+	reqlog.SetDebugOutput(&captured)
+	t.Cleanup(func() { reqlog.SetDebugOutput(nil) })
+
+	setDebug(t, false)
+	markDirty := func() {}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_gateway/debug", debugHandler(persistedCleanState(), markDirty))
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		// Drain so the middleware's restore path stays honest.
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := httptest.NewServer(reqlog.Middleware(mux))
+	defer srv.Close()
+
+	postDebug := func(v bool) {
+		t.Helper()
+		body := fmt.Sprintf(`{"log_requests":%v}`, v)
+		resp, err := http.Post(srv.URL+"/_gateway/debug", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST debug(%v): %v", v, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("POST debug(%v) code = %d, want 200", v, resp.StatusCode)
+		}
+	}
+
+	hitUpstream := func(label string) {
+		t.Helper()
+		resp, err := http.Post(srv.URL+"/v1/messages", "application/json", strings.NewReader("hello-body"))
+		if err != nil {
+			t.Fatalf("POST upstream (%s): %v", label, err)
+		}
+		resp.Body.Close()
+	}
+
+	// 1. Pre-toggle: the request must not dump. The "outbound" arm is
+	// the WrapTransport path, not exercised here (no real upstream in
+	// this test); the "inbound" arm is Middleware. With logging off,
+	// Middleware short-circuits and the dump sink stays empty.
+	hitUpstream("pre-toggle")
+	if got := captured.String(); strings.Contains(got, "hello-body") {
+		t.Errorf("pre-toggle dump should be empty, got: %q", got)
+	}
+
+	// 2. Flip on through the live endpoint — this is the moment under test.
+	postDebug(true)
+	if !reqlog.Enabled() {
+		t.Fatal("POST /_gateway/debug true did not flip the live flag")
+	}
+
+	// 3. The very next request must dump. Captured via the injected sink,
+	// proving the handler chain (reqlog → mux → handler) consults the
+	// atomic on the request path the live toggle reached.
+	captured.Reset()
+	hitUpstream("post-enable")
+	if got := captured.String(); !strings.Contains(got, "hello-body") {
+		t.Errorf("post-enable dump missing body, got: %q", got)
+	}
+
+	// 4. Flip off through the same endpoint — same atomic, same chain.
+	postDebug(false)
+	if reqlog.Enabled() {
+		t.Fatal("POST /_gateway/debug false did not flip the live flag")
+	}
+
+	// 5. The next request must not dump.
+	captured.Reset()
+	hitUpstream("post-disable")
+	if got := captured.String(); strings.Contains(got, "hello-body") {
+		t.Errorf("post-disable dump should be empty, got: %q", got)
+	}
+}

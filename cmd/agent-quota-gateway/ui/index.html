@@ -1963,31 +1963,6 @@
       });
   }
 
-  function tick() {
-    Promise.all([
-      loadStatus().then(applyLiveStatus),
-      loadActivity()
-    ]).then(function () {
-      setTimeout(tick, POLL_MS);
-    }).catch(function (e) {
-      console.error('status poll failed', e);
-      setTimeout(tick, POLL_MS);
-    });
-  }
-
-  function boot() {
-    loadConfig()
-      .then(renderAll)
-      .then(loadStatus)
-      .then(applyLiveStatus)
-      .then(loadActivity)
-      .then(tick)
-      .catch(function (e) {
-        console.error('boot failed', e);
-        renderEmpty('Failed to reach the gateway. ' + (e && e.message ? e.message : ''));
-      });
-  }
-
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);
   } else {
