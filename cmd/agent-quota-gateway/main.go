@@ -52,6 +52,62 @@ func hasQuotaWindow(s quota.Snapshot) bool {
 		s.Unified7dStatus != "" || s.Unified7dUtilization != nil || s.Unified7dReset != nil ||
 		s.UnifiedFallbackPercentage != nil ||
 		s.UnifiedOverageStatus != "" || s.UnifiedOverageDisabledReason != ""
+	// The x-codex-* window-minutes fields (issue #304) are duration
+	// metadata, not window state: like OrgID they do not admit a snapshot
+	// here — admission still requires a utilization/reset field.
+}
+
+// quotaObserver builds the per-response snapshot extractor run() wires into
+// the proxy: it extracts the rate-limit headers and files the snapshot under
+// the backend the resolver middleware selected for the request. Header-only
+// inspection — no body access.
+//
+// A ChatGPT-Codex member (chatgpt.com, issue #304) emits no
+// anthropic-ratelimit-* headers; its metered 5h/weekly windows arrive as the
+// x-codex-* family on EVERY Codex response — including the 429 itself — so
+// they are overlaid onto the (empty) Anthropic extraction before admission.
+// This is what makes /_gateway/quota show live 5h/7d usage for a codex pool
+// and lets sibling pools sharing the nick read the same exhaustion record.
+// The host gate keeps a lookalike x-codex-* header set from any other vendor
+// out of the store (the same gate the 429 classifier applies).
+//
+// We only file snapshots that carry at least one quota-window field. An
+// upstream response with no rate-limit headers (e.g. a 5xx page, or a future
+// endpoint that doesn't return them) would otherwise overwrite the last
+// known-good snapshot with an empty one, which would look to consumers like
+// the quota state was reset. The same shape fires for org-id-only responses
+// (e.g. GET /v1/models carries anthropic-organization-id but no rate-limit
+// headers): a Put on such a snapshot wipes the previously-cached 5h/7d
+// resets to nil, and the UI flashes the reset cells to "-" until the next
+// quota-bearing response lands (issue #121).
+func quotaObserver(store *quota.Store, pools *auto.Pools) func(*http.Response) {
+	return func(resp *http.Response) {
+		snap := quota.Extract(resp)
+		key := defaultBackendKey
+		markPool, markNick := "", ""
+		if resp.Request != nil {
+			if b, ok := backend.FromContext(resp.Request.Context()); ok {
+				key = b.QuotaKey()
+				markPool, markNick = b.Pool, b.Nick
+				if auto.IsCodexBackend(b) {
+					snap.OverlayCodex(quota.ExtractCodex(resp.Header, time.Now().UTC()))
+				}
+			}
+		}
+		if !hasQuotaWindow(snap) {
+			return
+		}
+		if markPool != "" {
+			// Mark this controller as having observed a snapshot for
+			// the nick, so the pool status view does not flash another
+			// pool's data for a runtime-added member (issue #111).
+			pools.MarkLocalSnapshot(markPool, markNick)
+		}
+		// Merge, not Put: a response reports only the windows it touched, so
+		// a window absent from this response must not blank the reset it
+		// taught us last time (issue #163).
+		store.Merge(key, snap)
+	}
 }
 
 // version is stamped at build time via -ldflags "-X main.version=...".
@@ -173,26 +229,7 @@ func run(configFlag string) error {
 	// response lands (issue #121). hasQuotaWindow excludes OrgID — that
 	// field is metadata and does not invalidate the last known quota
 	// state.
-	observer := func(resp *http.Response) {
-		snap := quota.Extract(resp)
-		if !hasQuotaWindow(snap) {
-			return
-		}
-		key := defaultBackendKey
-		if resp.Request != nil {
-			if b, ok := backend.FromContext(resp.Request.Context()); ok {
-				key = b.QuotaKey()
-				// Mark this controller as having observed a snapshot for
-				// the nick, so the pool status view does not flash another
-				// pool's data for a runtime-added member (issue #111).
-				pools.MarkLocalSnapshot(b.Pool, b.Nick)
-			}
-		}
-		// Merge, not Put: a response reports only the windows it touched, so
-		// a window absent from this response must not blank the reset it
-		// taught us last time (issue #163).
-		store.Merge(key, snap)
-	}
+	observer := quotaObserver(store, pools)
 
 	// The pools' ModifyResponse hook runs after the observer: it dispatches
 	// to the controller of the pool the request resolved through and fails
