@@ -1,8 +1,10 @@
 package auto
 
 import (
+	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
@@ -336,5 +338,279 @@ func TestAdd_defaultBaseURLResolverCallTime(t *testing.T) {
 	}
 	if am, ok := addedMember(t, p, "pb", "b1"); !ok || am.BaseURL != "https://beta.example.com" {
 		t.Fatalf("b1 base_url=%+v ok=%v, want https://beta.example.com", am, ok)
+	}
+}
+
+// rebuildPoolsFromSpec simulates a restart under the config-single-source
+// model (issue #198): the current registry is round-tripped through Spec
+// and a fresh Pools is built from it. Mirrors cmd/agent-quota-gateway
+// `reloadPools` but lives in the package so add_test.go can simulate a
+// restart mid-test without depending on cmd_test-only helpers.
+func rebuildPoolsFromSpec(t *testing.T, p *Pools) *Pools {
+	t.Helper()
+	reg, err := backend.BuildFromSpec(p.CurrentRegistry().Spec(), testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("rebuild registry from config: %v", err)
+	}
+	return NewPools(reg, nil, p.now, io.Discard)
+}
+
+// TestAdd_resolvesAcrossRestartFromEnv pins issue #303 AC1 (source=env): a
+// nick declared via env on the initial load survives a restart-by-Spec and
+// remains resolvable for a bodyless add to a fresh pool. The reset of env
+// between the two loads is the actual env-only restart behavior (issue #198:
+// env is consulted exactly once, at the very first boot).
+func TestAdd_resolvesAcrossRestartFromEnv(t *testing.T) {
+	clock := newMoveClock()
+	env := map[string]string{
+		backend.EnvPrefix + "A_BACKEND_CCZ":   "cred-ccz",
+		backend.EnvPrefix + "A_BASE_URL":     "https://a.example",
+		backend.EnvPrefix + "B_BACKEND_OTHER": "cred-other",
+	}
+	p := loadMovePools(t, clock, env)
+
+	// Simulate restart: rebuild from the current spec. A second backend.Load
+	// would be a no-op in production (issue #198), but going through Spec
+	// exercises the same write-through path a real restart does.
+	p = rebuildPoolsFromSpec(t, p)
+
+	if status, err := p.AddMember("b", "ccz", "", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember b ccz (resolve): status=%d err=%v, want 200", status, err)
+	}
+	am, ok := addedMember(t, p, "b", "ccz")
+	if !ok {
+		t.Fatalf("ccz not added to b")
+	}
+	if am.Credential != "cred-ccz" {
+		t.Errorf("resolved credential=%q, want cred-ccz", am.Credential)
+	}
+	if am.BaseURL != "https://a.example" {
+		t.Errorf("resolved base_url=%q, want https://a.example", am.BaseURL)
+	}
+}
+
+// TestAdd_resolvesAcrossRestartFromRuntimeMutation pins issue #303 AC1
+// (source=runtime + aqg.json): a nick first added to pool B at runtime —
+// which writes through to the registry's Spec (issue #198) — is still
+// resolvable from a *third* pool after the registry is rebuilt from that
+// Spec. The simulation is the env-only restart loop with a config file
+// already on disk: the runtime mutation lands in aqg.json, and the next
+// boot reads it back as the source of truth.
+func TestAdd_resolvesAcrossRestartFromRuntimeMutation(t *testing.T) {
+	clock := newMoveClock()
+	env := map[string]string{
+		backend.EnvPrefix + "A_BACKEND_CCZ":   "cred-ccz",
+		backend.EnvPrefix + "A_BASE_URL":     "https://a.example",
+		backend.EnvPrefix + "B_BACKEND_OTHER": "cred-other",
+		backend.EnvPrefix + "C_BACKEND_D":     "cred-d",
+	}
+	p := loadMovePools(t, clock, env)
+
+	// Runtime add: ccz → b (resolves from a). The new registry carries ccz
+	// in both a and b.
+	if status, err := p.AddMember("b", "ccz", "", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("seed AddMember b ccz: status=%d err=%v, want 200", status, err)
+	}
+
+	// Restart via Spec — mirrors aqg.json round-trip.
+	p = rebuildPoolsFromSpec(t, p)
+
+	// Bodyless add of ccz to c: crossPoolResolve scans a and b, finds
+	// 1 distinct credential + 1 distinct URL → 200.
+	if status, err := p.AddMember("c", "ccz", "", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember c ccz (after restart): status=%d err=%v, want 200", status, err)
+	}
+	am, ok := addedMember(t, p, "c", "ccz")
+	if !ok {
+		t.Fatalf("ccz not added to c after restart")
+	}
+	if am.Credential != "cred-ccz" {
+		t.Errorf("resolved credential=%q, want cred-ccz", am.Credential)
+	}
+	if am.BaseURL != "https://a.example" {
+		t.Errorf("resolved base_url=%q, want https://a.example", am.BaseURL)
+	}
+}
+
+// TestAdd_envOnlyRuntimeMutationNotSurvivesRestart pins issue #303 AC1
+// (source=runtime-only, not persisted) and the improved error message
+// contract: in env-only mode (no aqg.json), a runtime-only nick does not
+// survive the next env-only restart, so a subsequent bodyless add of the
+// same nick to a fresh pool must surface the (0 creds, 0 URLs) result
+// with the registry-scope + recipe message. ccz is intentionally NOT in
+// env — it is a pure runtime declaration. The "rebuild" here is the
+// env-only restart loop: a fresh loadMovePools reads env again, and the
+// runtime intent is gone.
+func TestAdd_envOnlyRuntimeMutationNotSurvivesRestart(t *testing.T) {
+	clock := newMoveClock()
+	env := map[string]string{
+		backend.EnvPrefix + "A_BACKEND_X": "cred-x",
+		backend.EnvPrefix + "B_BACKEND_Y": "cred-y",
+	}
+	p := loadMovePools(t, clock, env)
+
+	// Runtime add: ccz with full credentials into b (no other pool carries
+	// it, so ccz is a runtime-only declaration in this test).
+	if status, err := p.AddMember("b", "ccz", "cred-ccz", "https://b.example", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("seed AddMember b ccz: status=%d err=%v, want 200", status, err)
+	}
+
+	// Env-only restart: fresh loadMovePools reads env again. ccz was never
+	// in env, so the new registry has no ccz anywhere — exactly the state
+	// an operator hits when their runtime-only nick vanishes on restart.
+	p = loadMovePools(t, clock, env)
+
+	status, err := p.AddMember("a", "ccz", "", "", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("AddMember a ccz after env-only restart: status=%d err=%v, want 400", status, err)
+	}
+	if err == nil {
+		t.Fatalf("expected credential-required error, got nil")
+	}
+	msg := err.Error()
+	// Registry scope: every pool the operator could have meant. The pool
+	// names here come from the original env, sorted: a, b.
+	if !strings.Contains(msg, "(pools: a, b)") {
+		t.Errorf("error text %q missing registry scope (pools: a, b)", msg)
+	}
+	// Recipe: tell the operator the two ways out of the 400.
+	if !strings.Contains(msg, "supply credential + base_url, or restore the missing pool from env / aqg.json") {
+		t.Errorf("error text %q missing the recipe phrase", msg)
+	}
+	// No credential leakage.
+	if strings.Contains(msg, "cred-") {
+		t.Errorf("error text leaked credential: %q", msg)
+	}
+}
+
+// TestAdd_sameCredentialAcrossPoolsNotAmbiguous pins issue #303 AC4: the
+// bijection requires the same credential for the same nick across pools,
+// but the *same* credential + the *same* URL across two pools is not an
+// ambiguity — crossPoolResolve produces one of each. The runtime add is
+// the only way to seed the same nick in two pools today (env would
+// collide), so the second declaration is via AddMember with explicit
+// values.
+func TestAdd_sameCredentialAcrossPoolsNotAmbiguous(t *testing.T) {
+	clock := newMoveClock()
+	env := map[string]string{
+		backend.EnvPrefix + "A_BACKEND_CCZ": "cred-ccz",
+		backend.EnvPrefix + "A_BASE_URL":   "https://z.example",
+		backend.EnvPrefix + "B_BACKEND_X":  "cred-x",
+		backend.EnvPrefix + "C_BACKEND_D":  "cred-d",
+	}
+	p := loadMovePools(t, clock, env)
+
+	// Seed ccz in b with the *same* credential and URL as a. The bijection
+	// is satisfied (one credential, one nick), and the explicit base_url
+	// pins the cross-pool URL to a single value.
+	if status, err := p.AddMember("b", "ccz", "cred-ccz", "https://z.example", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("seed AddMember b ccz: status=%d err=%v, want 200", status, err)
+	}
+
+	// Bodyless add to c must resolve cleanly — 1 cred, 1 URL.
+	if status, err := p.AddMember("c", "ccz", "", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember c ccz (same cred + url): status=%d err=%v, want 200", status, err)
+	}
+	am, ok := addedMember(t, p, "c", "ccz")
+	if !ok {
+		t.Fatalf("ccz not added to c")
+	}
+	if am.Credential != "cred-ccz" {
+		t.Errorf("resolved credential=%q, want cred-ccz", am.Credential)
+	}
+	if am.BaseURL != "https://z.example" {
+		t.Errorf("resolved base_url=%q, want https://z.example", am.BaseURL)
+	}
+}
+
+// TestAdd_differentBaseURLAcrossPoolsIsAmbiguous pins issue #303 AC5:
+// credential and base_url resolve independently, and a base_url that
+// differs across pools must stay a 400 with the existing ambiguity
+// message — the registry-scope improvement is exclusively for the
+// (0 creds, 0 URLs) result and must not swallow real conflicts.
+func TestAdd_differentBaseURLAcrossPoolsIsAmbiguous(t *testing.T) {
+	clock := newMoveClock()
+	env := map[string]string{
+		backend.EnvPrefix + "A_BACKEND_CCZ": "cred-ccz",
+		backend.EnvPrefix + "A_BASE_URL":   "https://z.example",
+		backend.EnvPrefix + "C_BACKEND_CCZ": "cred-ccz", // same nick, same cred, DIFFERENT url override
+		backend.EnvPrefix + "C_BASE_URL":   "https://c.example",
+		backend.EnvPrefix + "B_BACKEND_X":  "cred-x",
+	}
+	// Note: declaring ccz in both a and c with the same credential but
+	// different pool-level base_urls is exactly the bijection-allowed shape
+	// the registry accepts. The ambiguity fires when b's bodyless add tries
+	// to borrow.
+	p := loadMovePools(t, clock, env)
+
+	status, err := p.AddMember("b", "ccz", "", "", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("ambiguous base_url: status=%d err=%v, want 400", status, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "base_url for nick ccz is ambiguous across pools") {
+		t.Errorf("ambiguity error text=%v, want base_url-for-nick-ambiguous message", err)
+	}
+}
+
+// TestAdd_unknownNickErrorNamesRegistryScope pins issue #303's
+// message-contract sub-bullet directly: the (0 creds, 0 URLs) error names
+// the current registry's pools and ends with the recipe. Built as a
+// separate test (not folded into the env-only-restart one above) so the
+// assertion stays a one-purpose contract on the helper, independent of
+// the runtime-mutation lifecycle that test interleaves.
+func TestAdd_unknownNickErrorNamesRegistryScope(t *testing.T) {
+	clock := newMoveClock()
+	env := map[string]string{
+		backend.EnvPrefix + "A_BACKEND_X": "cred-x",
+		backend.EnvPrefix + "B_BACKEND_Y": "cred-y",
+	}
+	p := loadMovePools(t, clock, env)
+
+	status, err := p.AddMember("a", "ghost", "", "", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("AddMember a ghost: status=%d err=%v, want 400", status, err)
+	}
+	if err == nil {
+		t.Fatalf("expected credential-required error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "(pools: a, b)") {
+		t.Errorf("error text %q missing sorted registry scope (pools: a, b)", msg)
+	}
+	if !strings.Contains(msg, "supply credential + base_url, or restore the missing pool from env / aqg.json") {
+		t.Errorf("error text %q missing the recipe phrase", msg)
+	}
+	if strings.Contains(msg, "cred-") {
+		t.Errorf("error text leaked credential: %q", msg)
+	}
+}
+
+// TestCreatePool_unknownNickErrorNamesRegistryScope mirrors the above for
+// the CreatePoolWithMember path: a bodyless combined create (pool + first
+// member) where the nick is unknown produces the same registry-scope +
+// recipe message. The two call sites share nickNotResolvableError, so the
+// contract holds on both — but a regression on either side is invisible
+// from the other test, so each is pinned separately.
+func TestCreatePool_unknownNickErrorNamesRegistryScope(t *testing.T) {
+	clock := newMoveClock()
+	env := map[string]string{
+		backend.EnvPrefix + "A_BACKEND_X": "cred-x",
+		backend.EnvPrefix + "B_BACKEND_Y": "cred-y",
+	}
+	p := loadMovePools(t, clock, env)
+
+	status, err := p.CreatePoolWithMember("fresh", "", "ghost", "", "", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("CreatePoolWithMember fresh ghost: status=%d err=%v, want 400", status, err)
+	}
+	if err == nil {
+		t.Fatalf("expected credential-required error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "(pools: a, b)") {
+		t.Errorf("error text %q missing sorted registry scope (pools: a, b)", msg)
+	}
+	if !strings.Contains(msg, "supply credential + base_url, or restore the missing pool from env / aqg.json") {
+		t.Errorf("error text %q missing the recipe phrase", msg)
 	}
 }
