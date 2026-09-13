@@ -2,10 +2,11 @@ package auto
 
 import (
 	"net/http"
-	"strings"
+	"os"
 	"testing"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/config"
 )
 
 // addedMember reads a member's resolved entry directly from the controller's
@@ -218,35 +219,34 @@ func TestAdd_configNickReAddAfterRemove(t *testing.T) {
 }
 
 // TestAdd_memberBaseURLNotUnanimous proves that AddMember with an omitted
-// base_url is rejected when the target pool already holds members on
-// different effective upstreams (issue #248). The first member's URL is
-// alphabetical, not authoritative: in a mixed-provider pool a new member
-// cannot inherit it without being pointed at the wrong upstream, so the
-// only acceptable input is an explicit base_url. The pool here is set up
-// so the alphabetically first member's BaseURL is the value the legacy
-// fallback would have picked — the test must fail against pre-#248 code.
+// base_url in a pool whose members hold different effective upstreams
+// (issue #248) no longer 400s: the first member's URL is alphabetical, not
+// authoritative, so it is not borrowable — the member instead falls back to
+// the gateway default upstream (issue #302). The pool is set up so the
+// alphabetically first member's BaseURL is the z.ai pool default; the
+// assertion pins that the fallback is the registry default
+// (testDefaultBaseURL), not either member's URL.
 func TestAdd_memberBaseURLNotUnanimous(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
 		// Pool default is z.ai. "a" inherits it (BaseURL = z.ai);
-		// "b" carries a per-member Anthropic override. With
-		// "new" absent, the legacy fallback (c.members[0].BaseURL)
-		// would return the z.ai URL — the test asserts that path is
-		// now blocked.
+		// "b" carries a per-member Anthropic override. With "new"
+		// absent there is no unanimous URL to borrow.
 		backend.EnvPrefix + "MIX_BASE_URL":  "https://api.z.ai/anthropic",
 		backend.EnvPrefix + "MIX_BACKEND_A": "cred-a",
 		backend.EnvPrefix + "MIX_BACKEND_B": "cred-b|https://api.anthropic.com",
 	})
 
 	status, err := p.AddMember("mix", "new", "cred-new", "", nil)
-	if status != http.StatusBadRequest {
-		t.Fatalf("mixed pool AddMember without base_url: status=%d err=%v, want 400", status, err)
+	if status != http.StatusOK || err != nil {
+		t.Fatalf("mixed pool AddMember without base_url: status=%d err=%v, want 200", status, err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "ambiguous across this pool's members") {
-		t.Fatalf("error=%v, want mention of in-pool ambiguity", err)
+	am, ok := addedMember(t, p, "mix", "new")
+	if !ok {
+		t.Fatalf("new not added to mixed pool")
 	}
-	if _, ok := addedMember(t, p, "mix", "new"); ok {
-		t.Errorf("new was added to mixed pool despite ambiguity")
+	if am.BaseURL != testDefaultBaseURL {
+		t.Errorf("fallback base_url=%q, want gateway default %q", am.BaseURL, testDefaultBaseURL)
 	}
 }
 
@@ -272,5 +272,69 @@ func TestAdd_memberBaseURLUnanimous(t *testing.T) {
 	}
 	if am.BaseURL != "https://api.z.ai/anthropic" {
 		t.Errorf("inherited base_url=%q, want https://api.z.ai/anthropic", am.BaseURL)
+	}
+}
+
+// TestCreatePoolWithMember_fallsBackToGatewayDefault proves the create-pool
+// half of the issue #302 contract: the combined create (pool + first member)
+// with a new nick and no base_url no longer 400s — the first member lands on
+// the gateway default upstream, so bootstrapping a fresh pool is a one-call
+// operation.
+func TestCreatePoolWithMember_fallsBackToGatewayDefault(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
+	})
+	status, err := p.CreatePoolWithMember("fresh", "", "n", "cred-n", "", nil)
+	if status != http.StatusCreated || err != nil {
+		t.Fatalf("CreatePoolWithMember(no-baseurl): status=%d err=%v, want 201", status, err)
+	}
+	am, ok := addedMember(t, p, "fresh", "n")
+	if !ok {
+		t.Fatalf("n not added to fresh pool")
+	}
+	if am.BaseURL != testDefaultBaseURL {
+		t.Errorf("fallback base_url=%q, want gateway default %q", am.BaseURL, testDefaultBaseURL)
+	}
+}
+
+// TestAdd_defaultBaseURLResolverCallTime proves the resolver consulted by the
+// fallback is called per mutation, not captured at startup (issue #302): a
+// resolver reading ANTHROPIC_BASE_URL sees the value current at each call, so
+// two consecutive adds observe different defaults when the env changes between
+// them. The production wiring (env-only mode) is main.envDefaultBaseURL; this
+// pins the Pools-side mechanism it plugs into.
+func TestAdd_defaultBaseURLResolverCallTime(t *testing.T) {
+	clock := newMoveClock()
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
+	})
+	p.SetDefaultBaseURL(func() string {
+		if v := os.Getenv(config.EnvAnthropicBaseURL); v != "" {
+			return v
+		}
+		return testDefaultBaseURL
+	})
+
+	t.Setenv(config.EnvAnthropicBaseURL, "https://alpha.example.com")
+	if status, err := p.AddPool("pa", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool pa: status=%d err=%v, want 201", status, err)
+	}
+	if status, err := p.AddMember("pa", "a1", "cred-a1", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember pa a1: status=%d err=%v, want 200", status, err)
+	}
+	if am, ok := addedMember(t, p, "pa", "a1"); !ok || am.BaseURL != "https://alpha.example.com" {
+		t.Fatalf("a1 base_url=%+v ok=%v, want https://alpha.example.com", am, ok)
+	}
+
+	t.Setenv(config.EnvAnthropicBaseURL, "https://beta.example.com")
+	if status, err := p.AddPool("pb", ""); status != http.StatusCreated || err != nil {
+		t.Fatalf("AddPool pb: status=%d err=%v, want 201", status, err)
+	}
+	if status, err := p.AddMember("pb", "b1", "cred-b1", "", nil); status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember pb b1: status=%d err=%v, want 200", status, err)
+	}
+	if am, ok := addedMember(t, p, "pb", "b1"); !ok || am.BaseURL != "https://beta.example.com" {
+		t.Fatalf("b1 base_url=%+v ok=%v, want https://beta.example.com", am, ok)
 	}
 }

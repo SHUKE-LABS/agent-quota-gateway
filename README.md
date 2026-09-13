@@ -1000,16 +1000,16 @@ adds a runtime member. The JSON body is `{"credential": "...", "base_url": "..."
   everywhere, so cross-pool resolution is unambiguous; supplying a *different*
   credential for a nick that already exists elsewhere is rejected with `400`.
 - `base_url` — optional with the same fallback chain as before: omitting it falls
-  back to the other-pool resolution (same logic), then to the pool's first static
-  member's URL **only when every existing member already agrees on one effective
-  upstream**. In a mixed-provider pool (issue #248) the first member's URL is
-  alphabetical, not authoritative, so an omitted `base_url` is rejected with `400
-  base_url for nick <nick> is ambiguous across this pool's members; specify it
-  explicitly` — the new member would otherwise be silently pointed at whichever
-  provider happened to sort first. Returns `400` if the base_url is ambiguous
-  across other pools; falls back to the pool default when no other pool has a URL
-  for this nick (equivalent to omitting it in a static config). Required only when
-  the pool has no members and no other pool resolves a URL for this nick.
+  back to the other-pool resolution (same logic), then to the existing members'
+  URL **only when every existing member already agrees on one effective
+  upstream** — in a mixed-provider pool (issue #248) the first member's URL is
+  alphabetical, not authoritative, so it is not borrowable. When no URL is
+  resolvable (a pool with no members, or one whose members disagree), the member
+  falls back to the **gateway default upstream** (`ANTHROPIC_BASE_URL`, default
+  `api.anthropic.com`; issue #302) — adding a fresh credential to a Claude pool
+  needs no explicit `base_url`. The fallback is recorded as the member's resolved
+  URL, so `aqg.json` stays self-describing. Returns `400` if the base_url is
+  ambiguous across other pools.
 - `placement` — a JSON array of nicks, highest priority first; **must include**
   the added nick. Required when the target pool is in priority mode — there is no
   implicit insertion position. Rejected with `400` for plain/balanced-mode targets.
@@ -1019,9 +1019,7 @@ credential* (mode `0600`) and re-read at startup. Status codes: `200` on
 success; `400` on a missing or empty nick, invalid JSON body, missing credential
 (nick not in any other pool), a credential conflicting with the nick's existing
 credential (bijection), invalid `base_url`, ambiguous `base_url` across pools,
-ambiguous `base_url` across the target pool's existing members (issue #248),
-missing `base_url` for a pool with no members and no resolvable URL, missing
-`placement` for a priority target with no existing slot, unknown nick in
+missing `placement` for a priority target with no existing slot, unknown nick in
 `placement`, `placement` not containing the added nick, duplicate nick in
 `placement`, or `placement` supplied for a non-priority target; `404` on an
 unknown pool; `409` when the nick is already a member.

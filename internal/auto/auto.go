@@ -161,6 +161,13 @@ type Pools struct {
 	// the new config to disk. Distinct from onMutate, which persists runtime
 	// observation (sticky/exhausted) to the state file.
 	onConfigChange func()
+
+	// defaultBaseURL, when non-nil, resolves the gateway default upstream at
+	// call time for the add-member fallback (issue #302). main wires an
+	// env-reading resolver only in env-only mode; in file mode it stays nil so
+	// the registry's build-time default is used — env is never consulted again
+	// there (issue #198). Read under p.mu.
+	defaultBaseURL func() string
 }
 
 // NewPools builds one Controller per pool in reg. Each controller starts
@@ -637,9 +644,12 @@ func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) 
 // for a *known* subscription: when omitted, they are resolved by scanning the
 // other pools for the same nick (credential and base_url resolve independently).
 // A priority target requires an explicit placement (must include nick), reusing
-// the move path's validation; plain/balanced targets must carry none. The
-// resolved concrete base_url is persisted — never an empty string when one is
-// resolvable. Returns (httpStatus, error) with a credential-free message.
+// the move path's validation; plain/balanced targets must carry none. A base_url
+// that stays unresolved after the cross-pool scan and the unanimous in-pool
+// borrow (empty pool, or members disagreeing, issue #248) falls back to the
+// gateway default upstream (issue #302). The resolved concrete base_url is
+// persisted — never an empty string. Returns (httpStatus, error) with a
+// credential-free message.
 func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement []string) (int, error) {
 	name := backend.NormalizeName(poolName)
 	normalized := backend.NormalizeName(nick)
@@ -692,33 +702,33 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 		return http.StatusConflict, fmt.Errorf("nick %s already exists as a member", normalized)
 	}
 	// Resolve base_url to a concrete value so the config record is
-	// self-describing. An unresolved (new-nick) base_url falls back to the
-	// pool's members' URL only when every member already agrees on one
-	// effective upstream — a mixed-provider pool cannot lend its first
-	// member's URL because that member's upstream is alphabetical, not
-	// authoritative (issue #248). A pool with no members has no default to
-	// borrow, so a genuinely new nick must supply base_url explicitly.
-	// (WithMemberSet would otherwise inherit the pool default, but keeping
-	// the explicit fallback preserves the documented cross-pool-add
-	// ergonomics.)
+	// self-describing. An unresolved (new-nick) base_url borrows the pool's
+	// members' URL only when every member already agrees on one effective
+	// upstream — a mixed-provider pool cannot lend its first member's URL
+	// because that member's upstream is alphabetical, not authoritative
+	// (issue #248). An empty pool, or a pool whose members disagree, has no
+	// borrowable URL; both fall back to the gateway default upstream instead
+	// of erroring (issue #302): the operator's mental model is that a fresh
+	// credential in a Claude pool defaults to the configured gateway upstream
+	// (ANTHROPIC_BASE_URL), so demanding an explicit base_url was friction
+	// with no value. The fallback is persisted as the member's resolved URL,
+	// so aqg.json stays self-describing and the next mutation sees a stable
+	// value.
 	if resolvedURL == "" {
-		switch len(c.members) {
-		case 0:
-			// A genuinely new nick in an empty pool has no default to borrow;
-			// require an explicit base_url rather than silently inheriting the
-			// gateway default (which could point a vendor key at the wrong
-			// upstream).
-			c.mu.Unlock()
-			return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no members")
-		default:
-			base := c.members[0].BaseURL
+		borrowed := ""
+		if len(c.members) > 0 {
+			borrowed = c.members[0].BaseURL
 			for i := 1; i < len(c.members); i++ {
-				if c.members[i].BaseURL != base {
-					c.mu.Unlock()
-					return http.StatusBadRequest, fmt.Errorf("base_url for nick %s is ambiguous across this pool's members; specify it explicitly", normalized)
+				if c.members[i].BaseURL != borrowed {
+					borrowed = ""
+					break
 				}
 			}
-			resolvedURL = base
+		}
+		if borrowed != "" {
+			resolvedURL = borrowed
+		} else {
+			resolvedURL = p.gatewayDefaultBaseURLLocked()
 		}
 	}
 	// Placement: a priority target needs an explicit order including nick; a
@@ -1066,8 +1076,11 @@ func (p *Pools) CreatePoolWithMember(name, mode, nick, credential, baseURL strin
 				resolvedURL = baseURLs[0]
 			}
 		}
+		// A newly created pool has no members to borrow a URL from; the
+		// gateway default upstream is the fallback (issue #302), symmetric
+		// with AddMember's empty-pool path.
 		if resolvedURL == "" {
-			return http.StatusBadRequest, fmt.Errorf("base_url is required when pool has no members")
+			resolvedURL = p.gatewayDefaultBaseURLLocked()
 		}
 		next, err = next.WithMemberSet(normalized, member, resolvedCred, resolvedURL, false)
 		if err != nil {
@@ -1279,6 +1292,30 @@ func (p *Pools) SetOnConfigChange(fn func()) {
 	p.mu.Lock()
 	p.onConfigChange = fn
 	p.mu.Unlock()
+}
+
+// SetDefaultBaseURL installs a call-time resolver for the gateway default
+// upstream used by the add-member base_url fallback (issue #302). main wires
+// it only in env-only mode, where ANTHROPIC_BASE_URL is the live config
+// source; a nil (or empty-returning) resolver falls back to the registry's
+// build-time default, which in file mode is the authoritative value (env is
+// never consulted again there, issue #198).
+func (p *Pools) SetDefaultBaseURL(fn func() string) {
+	p.mu.Lock()
+	p.defaultBaseURL = fn
+	p.mu.Unlock()
+}
+
+// gatewayDefaultBaseURLLocked resolves the gateway default upstream for the
+// add-member fallback: the installed resolver's value when it yields one,
+// else the registry's build-time default. Caller holds p.mu.
+func (p *Pools) gatewayDefaultBaseURLLocked() string {
+	if p.defaultBaseURL != nil {
+		if v := p.defaultBaseURL(); v != "" {
+			return v
+		}
+	}
+	return p.reg.DefaultBaseURL()
 }
 
 // CurrentRegistry returns the current authoritative registry — the operator

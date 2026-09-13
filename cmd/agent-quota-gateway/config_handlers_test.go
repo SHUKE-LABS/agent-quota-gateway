@@ -1557,3 +1557,191 @@ func TestMutationHandler_envOnly_fullFamily(t *testing.T) {
 		t.Errorf("move auto/a -> target: %s=%q, want \"env_only\"", configfile.HeaderPersistence, got)
 	}
 }
+
+// TestAddMemberEndpoint_fileModeIgnoresPostBootstrapEnv pins the file-mode
+// half of the issue #302 contract: once aqg.json exists, env is never
+// consulted again (issue #198). The file-mode add-member fallback must
+// therefore use the aqg.json base_url, not a stale ANTHROPIC_BASE_URL.
+// Without this, an operator who changes the env after first boot would
+// silently point a new member at the wrong upstream.
+func TestAddMemberEndpoint_fileModeIgnoresPostBootstrapEnv(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_CONFIG")
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("ANTHROPIC_BASE_URL", "https://alpha.example.com")
+
+	// Bootstrap: resolveConfig writes aqg.json with base_url=alpha from env,
+	// then resolveConfig+configfile.LoadFile agree on cfg.AnthropicBaseURL=alpha.
+	var buf bytes.Buffer
+	resolvedCfg, _, path, err := resolveConfig("", &buf)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if path != cfgPath {
+		t.Fatalf("config path=%q, want %q", path, cfgPath)
+	}
+	var _ config.Config = resolvedCfg
+	_, reg, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+
+	pools := auto.NewPools(reg, nil, nil, io.Discard)
+	wireDefaultBaseURL(pools, cfgPath) // no-op in file mode — the negative contract
+
+	cw := configfile.NewWriter(cfgPath, func() ([]byte, error) {
+		return configfile.Marshal(resolvedCfg, pools.CurrentRegistry())
+	})
+	pools.SetOnConfigChange(cw.MarkDirty)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { cw.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	srv := configMux(t, pools)
+
+	// Move ANTHROPIC_BASE_URL to a *different* value *after* bootstrap, before
+	// any mutation. A call-time env reader would pick up beta here; the file
+	// contract pins alpha.
+	t.Setenv("ANTHROPIC_BASE_URL", "https://beta.example.com")
+
+	// Create an empty runtime pool (pool-level base_url inherits alpha).
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"file-mode-empty"}`, http.StatusCreated)
+
+	// Credential-only POST member → 200 with effective upstream = alpha.
+	addJSON(t, srv.URL+"/_gateway/pool/file-mode-empty/member/brand-new", `{"credential":"test-credential-new"}`, http.StatusOK)
+
+	// In-memory: the added member's BaseURL must be alpha, not beta.
+	gotView := fetchPool(t, srv.URL, "file-mode-empty")
+	var am auto.PoolMemberConfigView
+	for _, m := range gotView.Members {
+		if m.Nick == "brand-new" {
+			am = m
+			break
+		}
+	}
+	if am.Nick != "brand-new" {
+		t.Fatalf("brand-new not found in file-mode-empty members: %+v", gotView.Members)
+	}
+	if am.BaseURL != "https://alpha.example.com" {
+		t.Errorf("in-memory base_url=%q, want alpha (file mode must ignore env)", am.BaseURL)
+	}
+
+	// Disk: the configwriter's flush must also record alpha *for the new
+	// member*, not just the bootstrap base_url. Poll until both pieces
+	// appear together — a writer flush that ran before the API mutations
+	// would carry alpha (the gateway default) without the member.
+	waitForDiskContain(t, cfgPath, "brand-new")
+	if diskHasEnvBeta(t, cfgPath) {
+		t.Errorf("aqg.json recorded https://beta.example.com after the add; file mode must ignore env")
+	}
+
+	// Cold-restart simulation: load aqg.json again and confirm the resolved
+	// member's BaseURL is still alpha — the on-disk record is self-describing.
+	_, reg2, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("post-add LoadFile: %v", err)
+	}
+	b, ok := reg2.ResolveIn("file-mode-empty", "brand-new")
+	if !ok {
+		t.Fatalf("brand-new not resolvable after reload")
+	}
+	if b.BaseURL != "https://alpha.example.com" {
+		t.Errorf("reloaded base_url=%q, want alpha", b.BaseURL)
+	}
+}
+
+// waitForDiskContain polls cfgPath until its body contains needle, or fails
+// the test when the window elapses. Mirrors waitForDiskOmit but for the
+// positive case (the debounced writer landing a value).
+func waitForDiskContain(t *testing.T, cfgPath, needle string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		d, err := os.ReadFile(cfgPath)
+		if err == nil && bytes.Contains(d, []byte(needle)) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	raw, _ := os.ReadFile(cfgPath)
+	t.Fatalf("aqg.json still missing %s after 3s: %s", needle, string(raw))
+}
+
+// diskHasEnvBeta reports whether cfgPath records the post-bootstrap env URL.
+// Used by TestAddMemberEndpoint_fileModeIgnoresPostBootstrapEnv to catch the
+// regression directly without depending on URL-parsing heuristics.
+func diskHasEnvBeta(t *testing.T, cfgPath string) bool {
+	t.Helper()
+	d, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(d, []byte("https://beta.example.com"))
+}
+
+// TestWireDefaultBaseURL_envOnlyCallTime pins the env-only half of the
+// issue #302 contract: the resolver wired by run() (envDefaultBaseURL) is
+// invoked per mutation, so two consecutive adds observe different defaults
+// when ANTHROPIC_BASE_URL changes between them. Exercised through the same
+// wireDefaultBaseURL helper run() calls — no in-line closure duplication.
+func TestWireDefaultBaseURL_envOnlyCallTime(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_CONFIG")
+	unsetenv(t, "AQG_STATE_FILE")
+	pools := emptyPools(t)
+	wireDefaultBaseURL(pools, "") // run()'s wiring path
+
+	srv := configMux(t, pools)
+
+	t.Setenv("ANTHROPIC_BASE_URL", "https://alpha.example.com")
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"pa","nick":"n-a","credential":"test-credential-a"}`, http.StatusCreated)
+	if got := memberBaseURL(t, srv.URL, "pa", "n-a"); got != "https://alpha.example.com" {
+		t.Errorf("pa/n-a base_url=%q, want alpha (call 1)", got)
+	}
+
+	t.Setenv("ANTHROPIC_BASE_URL", "https://beta.example.com")
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"pb","nick":"n-b","credential":"test-credential-b"}`, http.StatusCreated)
+	if got := memberBaseURL(t, srv.URL, "pb", "n-b"); got != "https://beta.example.com" {
+		t.Errorf("pb/n-b base_url=%q, want beta (call 2, env changed)", got)
+	}
+}
+
+// memberBaseURL returns the resolved BaseURL of (pool, nick) as exposed by
+// GET /_gateway/config — the operator-intent view the configwriter marshals
+// to aqg.json. Used by the env-only call-time test.
+func memberBaseURL(t *testing.T, baseURL, pool, nick string) string {
+	t.Helper()
+	view := fetchPool(t, baseURL, pool)
+	for _, m := range view.Members {
+		if m.Nick == nick {
+			return m.BaseURL
+		}
+	}
+	t.Fatalf("%s/%s not found in config view", pool, nick)
+	return ""
+}
+
+// TestUI_addMemberBaseUrlStaticGuard pins the issue #302 UI contract: the
+// base_url input is optional, the placeholder names the gateway-default
+// fallback, and the pre-#302 "required: members disagree" /
+// "refreshBaseUrlRequirement" toggle is gone (both the listener and the
+// function). Catches a future copy that reverts either change in the
+// embedded page.
+func TestUI_addMemberBaseUrlStaticGuard(t *testing.T) {
+	if !strings.Contains(uiHTML, "base_url (optional; defaults to gateway default)") {
+		t.Errorf("UI HTML missing the new optional/default base_url placeholder")
+	}
+	if strings.Contains(uiHTML, "required: members disagree") {
+		t.Errorf("UI HTML still contains the pre-#302 'required: members disagree' placeholder")
+	}
+	if strings.Contains(uiHTML, "refreshBaseUrlRequirement") {
+		t.Errorf("UI HTML still references the deleted refreshBaseUrlRequirement helper")
+	}
+	if strings.Contains(uiHTML, "base_url is required for a genuinely new nick") {
+		t.Errorf("UI HTML still uses the pre-#302 add-subscription hint copy")
+	}
+}
