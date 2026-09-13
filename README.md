@@ -1000,8 +1000,8 @@ adds a runtime member. The JSON body is `{"credential": "...", "base_url": "..."
   everywhere, so cross-pool resolution is unambiguous; supplying a *different*
   credential for a nick that already exists elsewhere is rejected with `400`.
 - `base_url` — optional with the same fallback chain as before: omitting it falls
-  back to the other-pool resolution (same logic), then to the pool's first static
-  member's URL **only when every existing member already agrees on one effective
+  back to the other-pool resolution (same logic), then to the existing members'
+  URL **only when every existing member already agrees on one effective
   upstream** — in a mixed-provider pool (issue #248) the first member's URL is
   alphabetical, not authoritative, so it is not borrowable. When no URL is
   resolvable (a pool with no members, or one whose members disagree), the member

@@ -1612,7 +1612,7 @@ func TestAddMemberEndpoint_fileModeIgnoresPostBootstrapEnv(t *testing.T) {
 	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"file-mode-empty"}`, http.StatusCreated)
 
 	// Credential-only POST member → 200 with effective upstream = alpha.
-	addJSON(t, srv.URL+"/_gateway/pool/file-mode-empty/member/brand-new", `{"credential":"sk-ant-new"}`, http.StatusOK)
+	addJSON(t, srv.URL+"/_gateway/pool/file-mode-empty/member/brand-new", `{"credential":"test-credential-new"}`, http.StatusOK)
 
 	// In-memory: the added member's BaseURL must be alpha, not beta.
 	gotView := fetchPool(t, srv.URL, "file-mode-empty")
@@ -1698,13 +1698,13 @@ func TestWireDefaultBaseURL_envOnlyCallTime(t *testing.T) {
 	srv := configMux(t, pools)
 
 	t.Setenv("ANTHROPIC_BASE_URL", "https://alpha.example.com")
-	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"pa","nick":"n-a","credential":"sk-ant-a"}`, http.StatusCreated)
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"pa","nick":"n-a","credential":"test-credential-a"}`, http.StatusCreated)
 	if got := memberBaseURL(t, srv.URL, "pa", "n-a"); got != "https://alpha.example.com" {
 		t.Errorf("pa/n-a base_url=%q, want alpha (call 1)", got)
 	}
 
 	t.Setenv("ANTHROPIC_BASE_URL", "https://beta.example.com")
-	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"pb","nick":"n-b","credential":"sk-ant-b"}`, http.StatusCreated)
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"pb","nick":"n-b","credential":"test-credential-b"}`, http.StatusCreated)
 	if got := memberBaseURL(t, srv.URL, "pb", "n-b"); got != "https://beta.example.com" {
 		t.Errorf("pb/n-b base_url=%q, want beta (call 2, env changed)", got)
 	}
