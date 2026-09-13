@@ -20,6 +20,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/activity"
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/config"
 	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
 	"github.com/shukebeta/agent-quota-gateway/internal/persist"
@@ -121,6 +122,12 @@ func run(configFlag string) error {
 	// without a live 429 — the only exhaustion signal poller-tracked
 	// backends (z.ai / MiniMaxi) ever produce.
 	pools := auto.NewPools(registry, store, nil, nil)
+
+	// Gateway-default-upstream resolver for the add-member base_url fallback
+	// (issue #302). Kept as a named helper so tests exercise the exact wiring
+	// run() installs — both the env-only call-time read and the file-mode
+	// "registry default wins, env ignored" contract.
+	wireDefaultBaseURL(pools, configPath)
 
 	// Restore sticky pointers and exhausted maps from the persisted state.
 	// Every member — including former runtime-added ones — is already present
@@ -361,6 +368,32 @@ func gracefulShutdown(srv *http.Server, timeout time.Duration, cancelWriters con
 	cancelWriters()
 	writers.Wait()
 	return err
+}
+
+// envDefaultBaseURL resolves the gateway default upstream at call time in
+// env-only mode: ANTHROPIC_BASE_URL when set, else the production endpoint.
+// Called per add-member mutation (via auto.Pools.SetDefaultBaseURL) rather
+// than captured at startup so a config reload picks up an updated value
+// (issue #302).
+func envDefaultBaseURL() string {
+	if v := os.Getenv(config.EnvAnthropicBaseURL); v != "" {
+		return v
+	}
+	return config.DefaultBaseURL
+}
+
+// wireDefaultBaseURL installs the gateway-default-upstream resolver Pools
+// consults for the add-member base_url fallback (issue #302). Only env-only
+// mode (no config file) wires the call-time env read — there ANTHROPIC_BASE_URL
+// is the live config source. File mode deliberately leaves the resolver unset
+// so Pools falls back to the registry's build-time default (the aqg.json
+// base_url): env is never consulted again once a config file is in play
+// (issue #198), and a stale ANTHROPIC_BASE_URL lingering in the process
+// environment must not point a new member at the wrong upstream.
+func wireDefaultBaseURL(pools *auto.Pools, configPath string) {
+	if configPath == "" {
+		pools.SetDefaultBaseURL(envDefaultBaseURL)
+	}
 }
 
 // migrateSnapshotKeys rewrites persisted quota snapshots from the

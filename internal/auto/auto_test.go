@@ -2426,13 +2426,13 @@ func TestRuntimeConfig_mixedPoolStickyRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAddMember_newNickBrandNewPoolRequiresBaseURL proves the acceptance
-// criterion (issue #172): a brand-new pool with no static members and a
-// genuinely new nick added without an explicit base_url returns 400 with the
-// existing message text — the same error an AddMember on a static-member-less
-// pool returned pre-#172, just reached one step sooner (the pool-default
-// fallback is gone).
-func TestAddMember_newNickBrandNewPoolRequiresBaseURL(t *testing.T) {
+// TestAddMember_newNickBrandNewPoolFallsBackToGatewayDefault proves the
+// issue #302 contract: a brand-new pool with no static members and a
+// genuinely new nick added without an explicit base_url no longer 400s
+// (issue #172's requirement) — the member lands on the gateway default
+// upstream instead, so adding a fresh credential to an empty pool is a
+// one-call operation.
+func TestAddMember_newNickBrandNewPoolFallsBackToGatewayDefault(t *testing.T) {
 	clock := newMoveClock()
 	p := loadMovePools(t, clock, map[string]string{
 		backend.EnvPrefix + "SRC_BACKEND_X": "cred-x",
@@ -2441,11 +2441,15 @@ func TestAddMember_newNickBrandNewPoolRequiresBaseURL(t *testing.T) {
 		t.Fatalf("AddPool: status=%d err=%v, want 201", status, err)
 	}
 	status, err := p.AddMember("fresh", "brand-new-nick", "cred-bn", "", nil)
-	if status != http.StatusBadRequest || err == nil {
-		t.Fatalf("AddMember(new-nick, no-baseurl) on brand-new pool: status=%d err=%v, want 400", status, err)
+	if status != http.StatusOK || err != nil {
+		t.Fatalf("AddMember(new-nick, no-baseurl) on brand-new pool: status=%d err=%v, want 200", status, err)
 	}
-	if !strings.Contains(err.Error(), "base_url is required when pool has no members") {
-		t.Errorf("error text=%q, want it to contain %q", err.Error(), "base_url is required when pool has no members")
+	am, ok := addedMember(t, p, "fresh", "brand-new-nick")
+	if !ok {
+		t.Fatalf("brand-new-nick not added to fresh pool")
+	}
+	if am.BaseURL != testDefaultBaseURL {
+		t.Errorf("fallback base_url=%q, want gateway default %q", am.BaseURL, testDefaultBaseURL)
 	}
 }
 

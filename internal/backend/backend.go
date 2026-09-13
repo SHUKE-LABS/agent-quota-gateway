@@ -844,6 +844,16 @@ func ValidateBaseURL(raw string) (string, error) {
 	return raw, nil
 }
 
+// DefaultBaseURL returns the gateway default upstream this registry was built
+// with (the ANTHROPIC_BASE_URL / config base_url captured at build time). It
+// is the last-resort fallback auto.Pools uses when an add-member call carries
+// no resolvable base_url (issue #302); in file mode this captured value is the
+// authoritative default, since env is never consulted again after the config
+// file is loaded (issue #198).
+func (r *Registry) DefaultBaseURL() string {
+	return r.defaultBaseURL
+}
+
 // HasPool reports whether name (normalized) is a configured pool.
 func (r *Registry) HasPool(name string) bool {
 	_, ok := r.pools[normalizeName(name)]

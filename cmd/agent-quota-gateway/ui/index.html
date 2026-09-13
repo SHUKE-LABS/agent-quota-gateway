@@ -1148,8 +1148,8 @@
     hint.className = 'addsub-hint';
     hint.textContent = 'Choose a target pool, or pick "New pool…" to create a ' +
       'runtime plain pool (name required) — a nick is optional there and, ' +
-      'if given, is added as the pool’s first member (base_url is required ' +
-      'for a genuinely new nick).';
+      'if given, is added as the pool’s first member (base_url is optional; ' +
+      'it defaults to the gateway default upstream).';
     section.appendChild(hint);
 
     var form = document.createElement('form');
@@ -1157,7 +1157,7 @@
     form.setAttribute('data-role', 'add-member');
 
     var nick = mkInput('text', 'nick', 'nick');
-    var base = mkInput('text', 'base_url', 'base_url (optional)');
+    var base = mkInput('text', 'base_url', 'base_url (optional; defaults to gateway default)');
     var cred = mkInput('password', 'credential', 'credential (optional)');
 
     // New-pool field, revealed only when NEW_POOL is selected.
@@ -1182,38 +1182,11 @@
     form.appendChild(pool);
     form.appendChild(poolName);
 
-    // Mark base_url required when the chosen pool's existing members do
-    // not unanimously share one effective base URL (issue #248): a
-    // mixed-provider pool cannot lend its first member's URL to a new
-    // member, so the only acceptable input is an explicit value. The
-    // currentViews entry already carries each member's base_url; the check
-    // is local and runs on build + on every pool selector change.
-    function membersAgree(v) {
-      var ms = v && v.members;
-      if (!ms || !ms.length) return true;
-      var base = ms[0].base_url;
-      for (var i = 1; i < ms.length; i++) {
-        if (ms[i].base_url !== base) return false;
-      }
-      return true;
-    }
-    function refreshBaseUrlRequirement() {
-      var creating = pool.value === NEW_POOL;
-      if (creating) {
-        base.required = false;
-        base.placeholder = 'base_url (optional)';
-        return;
-      }
-      var target = null;
-      for (var i = 0; i < views.length; i++) {
-        if (views[i].pool === pool.value) { target = views[i]; break; }
-      }
-      var ambiguous = target && !membersAgree(target);
-      base.required = !!ambiguous;
-      base.placeholder = ambiguous ? 'base_url (required: members disagree)' : 'base_url (optional)';
-    }
-    pool.addEventListener('change', refreshBaseUrlRequirement);
-    refreshBaseUrlRequirement();
+    // base_url is never required: an omitted value falls back to the
+    // gateway default upstream server-side (issue #302), so the field's
+    // placeholder is static. The pre-#302 per-pool required/optional flip
+    // (issue #248) is gone with the server-side 400s it mirrored.
+    base.required = false;
 
     // toggleNewPool reveals/hides the new-pool field and adjusts the nick
     // placeholder (nick is optional when creating a pool). Called on build and
@@ -1347,13 +1320,12 @@
       el.value = captured.values[f];
     });
     // Programmatic .value = above does not fire 'change', so the pool
-    // select's dependent state (pool_name visibility, nick placeholder,
-    // base_url required flag — all set by toggleNewPool /
-    // refreshBaseUrlRequirement on build + on the 'change' event)
-    // still reflects the build-time default pool after a reconcile
-    // rebuild. Re-derive: a no-op for an existing pool, and reveals
-    // pool_name for NEW_POOL. Dispatched before focus so a refocused
-    // pool_name is visible when it lands.
+    // select's dependent state (pool_name visibility and nick placeholder,
+    // set by toggleNewPool on build + on the 'change' event) still
+    // reflects the build-time default pool after a reconcile rebuild.
+    // Re-derive: a no-op for an existing pool, and reveals pool_name for
+    // NEW_POOL. Dispatched before focus so a refocused pool_name is
+    // visible when it lands.
     var poolSel = document.querySelector('form.add-member [data-field="pool"]');
     if (poolSel) {
       try { poolSel.dispatchEvent(new Event('change')); } catch (e) { /* older browser */ }
