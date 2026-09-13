@@ -2508,7 +2508,12 @@ func (c *Controller) reanchorLocked() {
 //     policy/punishment 429 (no rate-limit headers). Policy 429s are not
 //     parked — the backend stays in rotation and the client receives a 503
 //     carrying the upstream error body. Only genuine exhaustion 429s park the
-//     backend and advance the sticky pointer.
+//     backend and advance the sticky pointer. A ChatGPT-Codex member
+//     (chatgpt.com) has its own exhaustion signature — the x-codex-* metered
+//     family: x-codex-rate-limit-reached-type: usage_limit_reached, or a
+//     window at the cap — and parks until the latest contributing reset with
+//     a conservative fallback for unusable ones (issue #304); see
+//     codexExhaustion429 for the bound and retirement rules.
 //   - 401 Unauthorized / 403 Forbidden: the backend's own credential was
 //     rejected — revoked, expired, or the account pulled. The gateway stamps
 //     the credential itself (the client never supplies one), so the rejection
@@ -2545,6 +2550,34 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 			rewriteTo503Throttle(resp, zaiThrottleRetryAfterSeconds)
 			return nil
 		}
+		// ChatGPT-Codex members (issue #304) meter via the x-codex-* family
+		// and signal depletion with usage_limit_reached / capped windows —
+		// no anthropic-ratelimit-* headers, no Retry-After, so the generic
+		// classifier below sees a policy 429 and never parks (a depleted
+		// seat then sticks as sticky forever; the reported bug). This branch
+		// owns classification END-TO-END from the response headers: it never
+		// falls through to isGenuineExhaustionSignal, whose store lookup
+		// would park a headerless policy 429 off a prior fresh capped
+		// snapshot (AC3; same ordering rationale as the z.ai branch above —
+		// keyed before the exhaustion classifier so store state cannot
+		// misclassify the response).
+		if isCodexBackend(b) {
+			if reset, windowFact, genuine := codexExhaustion429(resp, c.now()); genuine {
+				// Always store-unrepresentable: a codex snapshot has no
+				// status field, so windowBlocks' no-status branch reads it
+				// as blocking only while AsOf is fresh (≤ storeSnapshotFreshness)
+				// — the park bound is never durably store-derivable, and
+				// issue #254's credentialPark propagation is the correct
+				// sibling-pool channel. windowFact comes from the bound's
+				// composition (see codexExhaustion429): fully-precise bounds
+				// stay retirable on real later evidence, fallback-containing
+				// bounds are protected like a credential fact.
+				return c.parkAndFailoverWithSource(resp, b.Nick, reset, "hit 429", true, windowFact)
+			}
+			// No metered signature → today's transient/policy split, shared
+			// with the generic path below.
+			return c.absorbNonExhaustion429(resp, b)
+		}
 		respSnap := quota.Extract(resp)
 		// Resolve the member entry under c.mu so a concurrent
 		// reconcileLocked (AddMember/RemoveMember/SetMemberDisabled/SetPriority/
@@ -2564,23 +2597,7 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 		}
 		c.mu.Unlock()
 		if !c.isGenuineExhaustionSignal(entry, entryOK, respSnap) {
-			// Not genuine exhaustion. Split the two remaining cases by the
-			// rate-limit signature: a transient per-minute throttle
-			// (RPM/ITPM/OTPM) carries an upstream retry-after and/or the legacy
-			// anthropic-ratelimit-requests/tokens headers and clears in seconds
-			// — absorb it as a short 503 back-off on the SAME member, never
-			// parking or switching (issue #191). Everything else is a
-			// policy/punishment 429 (e.g. "unsupported third-party client",
-			// which carries no rate-limit headers): forward the body on a 503,
-			// also without parking.
-			if secs, ok := transientRateLimit429(resp); ok {
-				fmt.Fprintf(c.logOut, "auto[%s]: %s rate-limit 429 (transient throttle) — backing off %ds, not parking\n", c.name(), b.Nick, secs)
-				rewriteTo503Throttle(resp, secs)
-				return nil
-			}
-			fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.name(), b.Nick)
-			rewriteTo503WithBody(resp)
-			return nil
+			return c.absorbNonExhaustion429(resp, b)
 		}
 		// A genuine 429 carries a precise window reset; park until then.
 		// reset is store-unrepresentable when resetFrom fell back to
@@ -2613,6 +2630,30 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 // 429's recoverable quota exhaustion.
 func isCredentialRejected(code int) bool {
 	return code == http.StatusUnauthorized || code == http.StatusForbidden
+}
+
+// absorbNonExhaustion429 handles a 429 already classified as NOT genuine
+// quota exhaustion, splitting the two remaining cases by the rate-limit
+// signature. A transient per-minute throttle (RPM/ITPM/OTPM) carries an
+// upstream retry-after and/or the legacy anthropic-ratelimit-requests/tokens
+// headers and clears in seconds — absorb it as a short 503 back-off on the
+// SAME member, never parking or switching (issue #191). Everything else is a
+// policy/punishment 429 (e.g. "unsupported third-party client", or a
+// ChatGPT-Codex 429 with no x-codex-* exhaustion signature — issue #304):
+// forward the body on a 503, also without parking.
+//
+// Shared by the generic classifier fall-through and the codex branch, which
+// reaches it directly so a headerless codex 429 can never be parked by the
+// generic path's store lookup (AC3).
+func (c *Controller) absorbNonExhaustion429(resp *http.Response, b backend.Backend) error {
+	if secs, ok := transientRateLimit429(resp); ok {
+		fmt.Fprintf(c.logOut, "auto[%s]: %s rate-limit 429 (transient throttle) — backing off %ds, not parking\n", c.name(), b.Nick, secs)
+		rewriteTo503Throttle(resp, secs)
+		return nil
+	}
+	fmt.Fprintf(c.logOut, "auto[%s]: %s policy 429 (no exhaustion signal) — not parking\n", c.name(), b.Nick)
+	rewriteTo503WithBody(resp)
+	return nil
 }
 
 // isNativeAnthropicBackend reports whether b points at Anthropic's native
@@ -3674,14 +3715,28 @@ func (c *Controller) memberLeadsLocked(nick string) (overall, lead5h, lead7d flo
 	// would clamp the elapsed fraction to 0 and collapse the lead to raw
 	// utilization (issue #140). Resolve the length from the same provider
 	// mapping that supplies the column label.
-	lead5h, has5h = computeLead(snap.Unified5hUtilization, snap.Unified5hReset, window5h)
+	//
+	// Codex members (issue #304) additionally carry the window length the
+	// upstream itself reported (x-codex-*-window-minutes) — window lengths
+	// are not contractual there, so a reported length outranks both fixed
+	// defaults. The minutes fields are nil for Anthropic and poller-tracked
+	// providers, which keep the fixed/provider lengths.
+	windowLen5h := window5h
+	if snap.Unified5hWindowMinutes != nil && *snap.Unified5hWindowMinutes > 0 {
+		windowLen5h = time.Duration(*snap.Unified5hWindowMinutes) * time.Minute
+	}
+	windowLen7d := poller.LongWindowFor(b.BaseURL)
+	if snap.Unified7dWindowMinutes != nil && *snap.Unified7dWindowMinutes > 0 {
+		windowLen7d = time.Duration(*snap.Unified7dWindowMinutes) * time.Minute
+	}
+	lead5h, has5h = computeLead(snap.Unified5hUtilization, snap.Unified5hReset, windowLen5h)
 	// The long window feeds routing pressure only when it is a genuine
 	// chat-blocking signal. For Z.AI/Zhipu the monthly slot is a
 	// web-search/reader/zread tool quota (issue #192), so leave has7d false
 	// and drive balance-mode pressure from the 5h window alone — a filled
 	// tool quota must not skew chat routing.
 	if poller.LongWindowBlocksExhaustion(b.BaseURL) {
-		lead7d, has7d = computeLead(snap.Unified7dUtilization, snap.Unified7dReset, poller.LongWindowFor(b.BaseURL))
+		lead7d, has7d = computeLead(snap.Unified7dUtilization, snap.Unified7dReset, windowLen7d)
 	}
 
 	switch {
@@ -3935,7 +3990,12 @@ func rewriteTo503Response(resp *http.Response, body []byte, replaceBody bool, re
 
 	h := resp.Header
 	for k := range h {
-		if strings.HasPrefix(strings.ToLower(k), "anthropic-ratelimit-") {
+		lk := strings.ToLower(k)
+		// anthropic-ratelimit-* and x-codex-* are both the rejected member's
+		// metered quota state — pool-boundary hygiene says a synthetic
+		// response must never carry either out the pool channel (the codex
+		// family joined the strip with issue #304).
+		if strings.HasPrefix(lk, "anthropic-ratelimit-") || strings.HasPrefix(lk, "x-codex-") {
 			h.Del(k)
 		}
 	}

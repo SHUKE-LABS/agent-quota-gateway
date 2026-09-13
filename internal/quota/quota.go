@@ -69,10 +69,21 @@ type Snapshot struct {
 	Unified5hStatus      string     `json:"unified_5h_status,omitempty"`
 	Unified5hUtilization *float64   `json:"unified_5h_utilization,omitempty"`
 	Unified5hReset       *time.Time `json:"unified_5h_reset,omitempty"`
+	// Unified5hWindowMinutes is the window length the upstream itself
+	// reported (x-codex-primary-window-minutes), in minutes. Carried for
+	// consumers that need the true length — balance-lead elapsed-fraction
+	// math — because Codex window lengths are not contractual (issue #304).
+	// Deliberately NOT part of HasData / hasQuotaWindow admission: it is
+	// duration metadata, not window state, so it neither admits a snapshot
+	// nor alone refreshes one.
+	Unified5hWindowMinutes *int `json:"unified_5h_window_minutes,omitempty"`
 
 	Unified7dStatus      string     `json:"unified_7d_status,omitempty"`
 	Unified7dUtilization *float64   `json:"unified_7d_utilization,omitempty"`
 	Unified7dReset       *time.Time `json:"unified_7d_reset,omitempty"`
+	// Unified7dWindowMinutes is the long-window analogue of
+	// Unified5hWindowMinutes (x-codex-secondary-window-minutes).
+	Unified7dWindowMinutes *int `json:"unified_7d_window_minutes,omitempty"`
 
 	UnifiedFallbackPercentage    *float64 `json:"unified_fallback_percentage,omitempty"`
 	UnifiedOverageStatus         string   `json:"unified_overage_status,omitempty"`
@@ -235,6 +246,9 @@ func mergeSnapshot(prev, next Snapshot) Snapshot {
 	if out.Unified5hReset == nil {
 		out.Unified5hReset = prev.Unified5hReset
 	}
+	if out.Unified5hWindowMinutes == nil {
+		out.Unified5hWindowMinutes = prev.Unified5hWindowMinutes
+	}
 	if out.Unified7dStatus == "" {
 		out.Unified7dStatus = prev.Unified7dStatus
 	}
@@ -243,6 +257,9 @@ func mergeSnapshot(prev, next Snapshot) Snapshot {
 	}
 	if out.Unified7dReset == nil {
 		out.Unified7dReset = prev.Unified7dReset
+	}
+	if out.Unified7dWindowMinutes == nil {
+		out.Unified7dWindowMinutes = prev.Unified7dWindowMinutes
 	}
 	if out.UnifiedFallbackPercentage == nil {
 		out.UnifiedFallbackPercentage = prev.UnifiedFallbackPercentage
