@@ -1538,3 +1538,85 @@ func TestResolveConfig_existingFile_disabledInLowerCandidateNotMerged(t *testing
 		t.Errorf("lower candidate was modified; merge contract violated (before=%s, after=%s)", beforeLow, got)
 	}
 }
+
+// TestResolveConfig_bootstrapSeedsDebugFromEnv covers AC2: a fresh deploy
+// with AQG_DEBUG_LOG_REQUESTS=1 and no aqg.json writes a file whose
+// debug section is on, and the resolved Config carries it through. The
+// env var is the first-start bootstrap seed (issue #301) — once a
+// config file exists it owns the setting and env is never consulted again
+// (issue #198).
+func TestResolveConfig_bootstrapSeedsDebugFromEnv(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_STATE_FILE")
+	t.Setenv("AQG_DEBUG_LOG_REQUESTS", "1")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	t.Setenv("AQG_CONFIG", cfgPath)
+
+	cfg, _, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if !cfg.DebugLogRequests {
+		t.Errorf("Config.DebugLogRequests = false, want true (env seed)")
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read aqg.json: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("parse aqg.json: %v", err)
+	}
+	if _, ok := raw["debug"]; !ok {
+		t.Errorf("fresh aqg.json has no debug section:\n%s", data)
+	}
+	var debug map[string]bool
+	if err := json.Unmarshal(raw["debug"], &debug); err != nil {
+		t.Fatalf("parse debug section: %v", err)
+	}
+	if !debug["log_requests"] {
+		t.Errorf("debug.log_requests = false, want true")
+	}
+
+	// Reload the freshly-written file through the existing-file branch —
+	// debug state must survive the round-trip without env (env is not
+	// consulted in this branch, matching issue #198).
+	unsetenv(t, "AQG_DEBUG_LOG_REQUESTS")
+	cfg2, _, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig (existing file, env unset): %v", err)
+	}
+	if !cfg2.DebugLogRequests {
+		t.Errorf("after reload with env unset, DebugLogRequests = false, want true (persisted)")
+	}
+}
+
+// TestResolveConfig_existingFile_ignoresEnvDebug is the other half of the
+// issue #301/#198 contract: an existing aqg.json with debug absent plus
+// AQG_DEBUG_LOG_REQUESTS=1 leaves the effective state off. The env var is
+// a first-start seed only — once the file exists it owns operator intent.
+func TestResolveConfig_existingFile_ignoresEnvDebug(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	if err := os.WriteFile(cfgPath, []byte(`{
+		"pools": {
+			"auto": { "members": { "a": {"credential": "sk-ant-oat-a"} } }
+		}
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("AQG_DEBUG_LOG_REQUESTS", "1")
+
+	cfg, _, _, err := resolveConfig("", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if cfg.DebugLogRequests {
+		t.Errorf("existing aqg.json without debug section + env=1 → DebugLogRequests = true; env must not seed an existing file (issue #198)")
+	}
+}

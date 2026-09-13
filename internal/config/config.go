@@ -43,6 +43,16 @@ const (
 	// present. An empty result disables persistence.
 	EnvStateFile = "AQG_STATE_FILE"
 
+	// EnvDebugLogRequests enables the inbound/outbound request dump
+	// (internal/reqlog). "1" turns it on; anything else leaves it off.
+	// This is a first-start bootstrap seed exactly like AQG_POOL_* (issue
+	// #301): it is read here (the env path) only — which covers env-only
+	// local dev and the one-time generation of a fresh aqg.json, whose
+	// "debug" section then owns the setting. Once a config file exists,
+	// env is never consulted again (issue #198), so toggling request
+	// logging on a deployed gateway goes through POST /_gateway/debug.
+	EnvDebugLogRequests = "AQG_DEBUG_LOG_REQUESTS"
+
 	// DefaultBaseURL is the Anthropic production endpoint.
 	DefaultBaseURL = "https://api.anthropic.com"
 
@@ -69,6 +79,13 @@ type Config struct {
 	// StateFile is the path for the persistent state file. Empty string
 	// disables persistence (the gateway runs as before, all state in memory).
 	StateFile string
+
+	// DebugLogRequests is the effective request-logging state (issue #301).
+	// Off by default. In env mode it is seeded from EnvDebugLogRequests; in
+	// file mode it maps the "debug" JSON section. The live runtime flag
+	// lives in internal/reqlog — this field is the persisted/configured
+	// value that flows through Build/Load/Marshal.
+	DebugLogRequests bool
 }
 
 // Inputs bundles all gateway configuration inputs for the Build function.
@@ -88,6 +105,10 @@ type Inputs struct {
 	// means disabled; no $STATE_DIRECTORY consultation (that fallback
 	// is env-only).
 	StateFile string
+
+	// DebugLogRequests is the request-logging seed (issue #301). False
+	// leaves it off; the file path maps it from the "debug" JSON section.
+	DebugLogRequests bool
 }
 
 // Load reads the gateway configuration from the process environment.
@@ -111,6 +132,7 @@ func Load() (Config, error) {
 		ListenAddr:       getEnv(EnvListenAddr, DefaultListenAddr),
 		SharedListenAddr: shared,
 		StateFile:        resolveStateFile(),
+		DebugLogRequests: os.Getenv(EnvDebugLogRequests) == "1",
 	}
 	// Build's mutual-exclusion check uses non-emptiness, so we must
 	// pass empty for the unset listen knob to avoid a false positive.
@@ -134,6 +156,7 @@ func Build(in Inputs) (Config, error) {
 	cfg := Config{
 		AnthropicBaseURL: in.AnthropicBaseURL,
 		StateFile:        in.StateFile,
+		DebugLogRequests: in.DebugLogRequests,
 	}
 	if in.AnthropicBaseURL == "" {
 		cfg.AnthropicBaseURL = DefaultBaseURL

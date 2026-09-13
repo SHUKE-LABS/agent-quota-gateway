@@ -3,6 +3,7 @@
   "listen_addr": "127.0.0.1:8080",
   "shared_listen_addr": "",
   "state_file": "",
+  "debug": { "log_requests": false },
   "pools": {
     "auto": {
       "base_url": "",

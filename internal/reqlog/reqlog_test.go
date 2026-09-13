@@ -6,19 +6,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 )
 
-// setDebug overrides the package-level enable gate for the duration of a test,
-// restoring it afterwards. The gate is normally read once from the environment
-// at init, so tests flip it directly rather than via env.
-func setDebug(t *testing.T, v bool) {
+// setEnabled overrides the live gate for the duration of a test, restoring it
+// afterwards. SetEnabled/Enabled are the public surface the /_gateway/debug
+// handler uses (issue #301); tests go through them too so the toggle path
+// itself stays covered.
+func setEnabled(t *testing.T, v bool) {
 	t.Helper()
-	old := debugEnabled
-	debugEnabled = v
-	t.Cleanup(func() { debugEnabled = old })
+	old := Enabled()
+	SetEnabled(v)
+	t.Cleanup(func() { SetEnabled(old) })
 }
 
 // captureStderr redirects os.Stderr through a pipe while fn runs and returns
@@ -53,21 +53,32 @@ func (rt *recordingTransport) RoundTrip(r *http.Request) (*http.Response, error)
 	return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 }
 
-func TestWrapTransport_disabledReturnsInner(t *testing.T) {
-	setDebug(t, false)
+// TestWrapTransport_disabledPassesThrough verifies the off path: the wrapper
+// is still installed (it must be, for the runtime toggle to reach it) but
+// consults the flag per round-trip and stays silent when off.
+func TestWrapTransport_disabledPassesThrough(t *testing.T) {
+	setEnabled(t, false)
 	inner := &recordingTransport{}
-	if got := WrapTransport(inner); got != http.RoundTripper(inner) {
-		t.Errorf("disabled WrapTransport should return inner unchanged, got %T", got)
+	rt := WrapTransport(inner)
+
+	req, _ := http.NewRequest(http.MethodGet, "https://upstream.example/v1", nil)
+	out := captureStderr(t, func() {
+		if _, err := rt.RoundTrip(req); err != nil {
+			t.Fatalf("RoundTrip: %v", err)
+		}
+	})
+	if !inner.called {
+		t.Error("inner RoundTripper was not called")
+	}
+	if out != "" {
+		t.Errorf("disabled transport should dump nothing, got:\n%s", out)
 	}
 }
 
 func TestWrapTransport_enabledRedactsAndDelegates(t *testing.T) {
-	setDebug(t, true)
+	setEnabled(t, true)
 	inner := &recordingTransport{}
 	rt := WrapTransport(inner)
-	if rt == http.RoundTripper(inner) {
-		t.Fatal("enabled WrapTransport should wrap, not return inner")
-	}
 
 	req, _ := http.NewRequest(http.MethodGet, "https://upstream.example/v1", nil)
 	req.Header.Set("Authorization", "Bearer secret-token")
@@ -93,17 +104,93 @@ func TestWrapTransport_enabledRedactsAndDelegates(t *testing.T) {
 	}
 }
 
-func TestMiddleware_disabledReturnsNext(t *testing.T) {
-	setDebug(t, false)
+// TestWrapTransport_hotToggle is the issue #301 core behavior for the
+// outbound path: a transport wired while logging is off starts dumping the
+// moment SetEnabled(true) lands, without any rewire, and stops again on
+// SetEnabled(false).
+func TestWrapTransport_hotToggle(t *testing.T) {
+	setEnabled(t, false)
+	inner := &recordingTransport{}
+	rt := WrapTransport(inner)
+	req, _ := http.NewRequest(http.MethodGet, "https://upstream.example/v1", nil)
+
+	out := captureStderr(t, func() {
+		_, _ = rt.RoundTrip(req)
+	})
+	if out != "" {
+		t.Fatalf("pre-toggle round-trip should dump nothing, got:\n%s", out)
+	}
+
+	out = captureStderr(t, func() {
+		SetEnabled(true)
+		_, _ = rt.RoundTrip(req)
+	})
+	if !strings.Contains(out, ">>> outbound GET") {
+		t.Errorf("post-enable round-trip should dump, got:\n%s", out)
+	}
+
+	out = captureStderr(t, func() {
+		SetEnabled(false)
+		_, _ = rt.RoundTrip(req)
+	})
+	if out != "" {
+		t.Errorf("post-disable round-trip should dump nothing, got:\n%s", out)
+	}
+}
+
+// TestMiddleware_disabledPassesThrough verifies the off path: middleware is
+// always installed (the chain cannot be rewired once the server listens) and
+// dumps nothing while the flag is off.
+func TestMiddleware_disabledPassesThrough(t *testing.T) {
+	setEnabled(t, false)
 	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
-	got := Middleware(next)
-	if reflect.ValueOf(got).Pointer() != reflect.ValueOf(next).Pointer() {
-		t.Error("disabled Middleware should return next unchanged")
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte("hello-body")))
+	out := captureStderr(t, func() {
+		Middleware(next).ServeHTTP(httptest.NewRecorder(), req)
+	})
+	if out != "" {
+		t.Errorf("disabled middleware should dump nothing, got:\n%s", out)
+	}
+}
+
+// TestMiddleware_hotToggle is the issue #301 core behavior for the inbound
+// path: a handler chain wired while logging is off obeys SetEnabled on the
+// very next request, in both directions.
+func TestMiddleware_hotToggle(t *testing.T) {
+	setEnabled(t, false)
+	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	h := Middleware(next)
+
+	newReq := func() *http.Request {
+		return httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte("hello-body")))
+	}
+
+	out := captureStderr(t, func() {
+		h.ServeHTTP(httptest.NewRecorder(), newReq())
+	})
+	if out != "" {
+		t.Fatalf("pre-toggle request should dump nothing, got:\n%s", out)
+	}
+
+	out = captureStderr(t, func() {
+		SetEnabled(true)
+		h.ServeHTTP(httptest.NewRecorder(), newReq())
+	})
+	if !strings.Contains(out, "hello-body") {
+		t.Errorf("post-enable request should dump, got:\n%s", out)
+	}
+
+	out = captureStderr(t, func() {
+		SetEnabled(false)
+		h.ServeHTTP(httptest.NewRecorder(), newReq())
+	})
+	if out != "" {
+		t.Errorf("post-disable request should dump nothing, got:\n%s", out)
 	}
 }
 
 func TestMiddleware_enabledRedactsAndRestoresBody(t *testing.T) {
-	setDebug(t, true)
+	setEnabled(t, true)
 
 	var gotBody string
 	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -137,7 +224,7 @@ func TestMiddleware_enabledRedactsAndRestoresBody(t *testing.T) {
 }
 
 func TestMiddleware_enabledTruncatesLargeBody(t *testing.T) {
-	setDebug(t, true)
+	setEnabled(t, true)
 
 	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
 	large := strings.Repeat("x", 600)

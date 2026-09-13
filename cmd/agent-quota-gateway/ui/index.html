@@ -528,6 +528,21 @@
   table.activity tr:last-child td { border-bottom: none; }
   table.activity td.err { color: var(--danger); }
   section.activity .note { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+
+  /* Request-logging panel (issue #301): one row — label, the same switch the
+     member table uses, and a note. Reuses .toggle* styles verbatim; the
+     data-state semantics match the member toggle (enabled = logging on). */
+  section.debug {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    margin: 16px 0;
+    padding: 12px 16px;
+  }
+  section.debug .row { display: flex; align-items: center; gap: 12px; }
+  section.debug h2 { font-size: 15px; margin: 0; }
+  section.debug .note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
 </style>
 </head>
 <body>
@@ -542,6 +557,7 @@
   <div id="addsub"></div>
   <div id="pools"></div>
   <div id="activity"></div>
+  <div id="debug"></div>
 </main>
 <footer class="bottom">
   <p>Inherits the gateway&rsquo;s trust boundary. Default mode: loopback only.</p>
@@ -1832,10 +1848,99 @@
   }
   // ------------------------------------------------------------------------
 
+  // ---- Request-logging panel (issue #301) --------------------------------
+  // GET/POST /_gateway/debug hot-toggles the reqlog dump on a running
+  // gateway. The panel renders from the GET each poll (a full rebuild, same
+  // approach as the activity panel), so an out-of-band toggle — another tab,
+  // a curl — surfaces here within one poll without extra diffing.
+  var debugRoot = document.getElementById('debug');
+
+  function loadDebug() {
+    return fetchJSON('/_gateway/debug').then(function (r) {
+      if (!r.ok || !r.body || typeof r.body !== 'object') {
+        renderDebug(null);
+        return;
+      }
+      renderDebug(!!r.body.log_requests);
+    }).catch(function () { renderDebug(null); });
+  }
+
+  function renderDebug(on) {
+    debugRoot.innerHTML = '';
+    var section = document.createElement('section');
+    section.className = 'debug';
+
+    var row = document.createElement('div');
+    row.className = 'row';
+
+    var h2 = document.createElement('h2');
+    h2.textContent = 'Request logging';
+    row.appendChild(h2);
+
+    // Same switch control the member table uses; data-state encodes the
+    // current state (enabled = logging on), not the click's action.
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'toggle';
+    btn.setAttribute('data-state', on ? 'enabled' : 'disabled');
+    btn.setAttribute('role', 'switch');
+    btn.setAttribute('aria-checked', on ? 'true' : 'false');
+    btn.setAttribute('aria-label', on ? 'Disable request logging' : 'Enable request logging');
+    var track = document.createElement('span');
+    track.className = 'toggle-track';
+    track.setAttribute('aria-hidden', 'true');
+    var thumb = document.createElement('span');
+    thumb.className = 'toggle-thumb';
+    thumb.setAttribute('aria-hidden', 'true');
+    track.appendChild(thumb);
+    btn.appendChild(track);
+    var labelEl = document.createElement('span');
+    labelEl.className = 'toggle-label';
+    labelEl.textContent = on ? 'On' : 'Off';
+    btn.appendChild(labelEl);
+    btn.addEventListener('click', function () {
+      var enabling = btn.getAttribute('data-state') !== 'enabled';
+      // Enabling dumps request bodies (truncated to 500 bytes) to the
+      // gateway's stderr — they may contain user message content, so
+      // confirm first. Disabling is one click.
+      if (enabling) {
+        var ok = window.confirm(
+          'Turn on request logging?\n\n' +
+          'Every inbound and outbound request is dumped to the gateway\'s stderr ' +
+          '(auth headers are never written, bodies truncated to 500 bytes). ' +
+          'Bodies may contain user message content.');
+        if (!ok) { return; }
+      }
+      postJSON('/_gateway/debug', { log_requests: enabling })
+        .then(function (r) {
+          if (r && r.ok) {
+            renderDebug(!!(r.body && r.body.log_requests));
+            return;
+          }
+          var err = (r && r.body && r.body.error) || ('status ' + r.status);
+          showBanner('Failed to toggle request logging: ' + err);
+        });
+    });
+    row.appendChild(btn);
+
+    section.appendChild(row);
+
+    var note = document.createElement('p');
+    note.className = 'note';
+    note.textContent = 'Dumps every inbound and outbound request to the gateway\'s stderr for debugging. ' +
+      'Takes effect on the next request — no restart. Auth headers are never written; ' +
+      'in env-only mode the toggle does not survive a restart.';
+    section.appendChild(note);
+
+    debugRoot.appendChild(section);
+  }
+  // ------------------------------------------------------------------------
+
   function tick() {
     Promise.all([
       loadStatus().then(applyLiveStatus),
-      loadActivity()
+      loadActivity(),
+      loadDebug()
     ]).then(function () {
       setTimeout(tick, POLL_MS);
     }).catch(function (e) {
@@ -1850,6 +1955,7 @@
       .then(loadStatus)
       .then(applyLiveStatus)
       .then(loadActivity)
+      .then(loadDebug)
       .then(tick)
       .catch(function (e) {
         console.error('boot failed', e);

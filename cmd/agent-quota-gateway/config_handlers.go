@@ -13,6 +13,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
+	"github.com/shukebeta/agent-quota-gateway/internal/reqlog"
 )
 
 // activityHandler serves GET /_gateway/activity — the rolling per-endpoint
@@ -52,6 +53,60 @@ func configHandler(pools *auto.Pools, persistence configfile.PersistenceState) h
 		configfile.ApplyPersistenceHeader(w, persistence)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(pools.EffectiveConfig())
+	}
+}
+
+// debugSetRequest is the JSON body for POST /_gateway/debug. log_requests
+// is a *bool so "absent" is distinguishable from an explicit false: the
+// field is required, and a bare {} would otherwise silently read as "turn
+// logging off".
+type debugSetRequest struct {
+	LogRequests *bool `json:"log_requests"`
+}
+
+// debugHandler serves GET/POST /_gateway/debug — the runtime request-logging
+// toggle (issue #301). GET reports the current state; POST with a required
+// {"log_requests": bool} flips it. The flip lands in reqlog's atomic before
+// the response is written, so the very next inbound request already obeys
+// it — no restart, no dropped connections — and markDirty schedules the
+// config-file flush that makes it survive restart (env-only mode toggles
+// in-memory only and says so via the persistence header/body like every
+// other mutation).
+func debugHandler(persistence configfile.PersistenceState, markDirty func()) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			configfile.ApplyPersistenceHeader(w, persistence)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]bool{"log_requests": reqlog.Enabled()})
+			return
+		case http.MethodPost:
+			var req debugSetRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
+				return
+			}
+			if req.LogRequests == nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "log_requests is required"})
+				return
+			}
+			reqlog.SetEnabled(*req.LogRequests)
+			markDirty()
+			configfile.ApplyPersistenceHeader(w, persistence)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			body := map[string]any{"log_requests": reqlog.Enabled()}
+			configfile.ApplyEnvOnlyBodyField(body, persistence)
+			_ = json.NewEncoder(w).Encode(body)
+			return
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
 	}
 }
 
