@@ -681,6 +681,16 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 			case 1:
 				resolvedCred = creds[0]
 			case 0:
+				// (0 credentials, 0 URLs): the registry holds no declaration
+				// for nick at all. Distinct from the ambiguity errors below,
+				// which are real conflicts that need an explicit operator
+				// choice. Build validation rejects empty credentials today, so
+				// len(creds)==0 implies len(baseURLs)==0 — the AND-ed gate
+				// documents that contract and protects the no-declaration
+				// helper from a future (0 creds, 1+ URLs) shape.
+				if len(baseURLs) == 0 {
+					return http.StatusBadRequest, nickNotResolvableError(normalized, p.reg)
+				}
 				return http.StatusBadRequest, fmt.Errorf("credential is required: nick %s is not a known subscription in any other pool", normalized)
 			default:
 				return http.StatusBadRequest, fmt.Errorf("credential for nick %s is ambiguous across pools; specify it explicitly", normalized)
@@ -1064,6 +1074,9 @@ func (p *Pools) CreatePoolWithMember(name, mode, nick, credential, baseURL strin
 				case 1:
 					resolvedCred = creds[0]
 				case 0:
+					if len(baseURLs) == 0 {
+						return http.StatusBadRequest, nickNotResolvableError(member, p.reg)
+					}
 					return http.StatusBadRequest, fmt.Errorf("credential is required: nick %s is not a known subscription in any other pool", member)
 				default:
 					return http.StatusBadRequest, fmt.Errorf("credential for nick %s is ambiguous across pools; specify it explicitly", member)
@@ -1356,6 +1369,17 @@ func (p *Pools) applyRegistryLocked(next *backend.Registry, pools ...string) {
 // with the given (normalized) nick, collecting the distinct credentials and
 // distinct resolved base URLs. Used to fill an omitted credential / base_url
 // when re-adding a known subscription by name. Lock-free: reg is immutable.
+//
+// Reachability: every nick that is actually in reg surfaces here — except
+// one carrying the same name as skipPool, which the destination pool already
+// owns (so adding it there is a 409, not a re-declaration). The registry is
+// the single source of operator intent (issue #198): env declarations flow
+// in via backend.Load, runtime mutations land via WithMemberSet/With* under
+// p.mu, and aqg.json reloads via BuildFromSpec. Build-time validation
+// rejects empty credentials (internal/backend/backend.go) and the
+// nick↔credential bijection means every registered member of nick has
+// exactly one credential — there is no registry path where an in-registry
+// nick is invisible to this scan.
 func crossPoolResolve(reg *backend.Registry, skipPool, nick string) (creds, baseURLs []string) {
 	credSeen := make(map[string]bool)
 	urlSeen := make(map[string]bool)
@@ -1377,6 +1401,28 @@ func crossPoolResolve(reg *backend.Registry, skipPool, nick string) (creds, base
 		}
 	}
 	return creds, baseURLs
+}
+
+// nickNotResolvableError builds the credential-required 400 body for the
+// (0 credentials, 0 URLs) result of crossPoolResolve. The message names the
+// pools the current registry actually holds (so the operator can see whether
+// the missing declaration is one they expected to be there, or simply not
+// configured) and closes with the one-line recipe. Only registry *names* are
+// echoed — credentials and base URLs are intentionally omitted.
+//
+// Exclusivity: callers must only invoke this when both returned slices are
+// empty. A result like (0 credentials, ≥1 URL) — impossible today because
+// build validation rejects empty credentials, but a future schema could
+// permit it — must keep its own credential-required failure rather than emit
+// this "no declaration anywhere" message, since the nick *is* visible to the
+// registry, just without a credential to copy.
+func nickNotResolvableError(nick string, reg *backend.Registry) error {
+	names := reg.PoolNames() // already sorted
+	return fmt.Errorf(
+		"credential is required: nick %s is not a known subscription in any pool of the current registry (pools: %s); supply credential + base_url, or restore the missing pool from env / aqg.json",
+		nick,
+		strings.Join(names, ", "),
+	)
 }
 
 // propagateCredentialPark mirrors a store-unrepresentable park (401/403, or
