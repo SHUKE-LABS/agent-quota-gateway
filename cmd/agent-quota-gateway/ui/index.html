@@ -549,6 +549,7 @@
 <header class="top">
   <h1>Agent Quota Gateway</h1>
   <span class="meta">Pool Management</span>
+  <span class="meta" id="version"></span>
 </header>
 <main>
   <div id="banner" role="alert"></div>
@@ -1949,7 +1950,30 @@
     });
   }
 
+  // loadVersion renders the build version stamped at boot into the
+  // header chip next to "Pool Management". The build version is
+  // stamped once at process start and only changes on restart, so a
+  // single fetch per page load is enough — no polling. Any failure
+  // (network, non-2xx, missing/non-string body.version, parse error)
+  // degrades gracefully to the literal "unknown" so the header
+  // never shows empty; this matters on a cold cache where the
+  // boot chain can race the health endpoint.
+  function loadVersion() {
+    var el = document.getElementById('version');
+    if (!el) return;
+    fetchJSON('/_gateway/health').then(function (r) {
+      var v = (r && r.ok && r.body && typeof r.body.version === 'string') ? r.body.version : '';
+      el.textContent = v || 'unknown';
+    }).catch(function () {
+      el.textContent = 'unknown';
+    });
+  }
+
   function boot() {
+    // Fire-and-forget: loadVersion runs in parallel with the main
+    // boot chain so the header chip fills in even if the rest of
+    // boot later fails through renderEmpty("Failed to reach...").
+    loadVersion();
     loadConfig()
       .then(renderAll)
       .then(loadStatus)

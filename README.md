@@ -1220,15 +1220,23 @@ curl http://127.0.0.1:8080/_gateway/ui
 
 A loopback-only liveness probe is exposed at `GET /_gateway/health`. It
 returns `200` with a `Content-Type` of `application/json`. The response
-carries no version, uptime, or upstream reachability check — because the
-trust model treats any local process as legitimate. The body is one of
-three shapes (issue #246):
+carries no upstream reachability check — because the trust model
+treats any local process as legitimate — but it does include an
+unconditional build-`version` field (issue #309) so operators can
+identify the deployed build from the UI without SSH. The body is one of
+three shapes (issue #246), each with `version` appended:
 
 | Mode | Body | Meaning |
 | --- | --- | --- |
-| persisted, clean | `{"status":"ok"}` | everything saved |
-| persisted, lagging | `{"status":"ok","unsaved_config_changes":true}` | the on-disk `aqg.json` lags the in-memory config (a pending or failed debounced flush — issue #198 decision 3) |
-| env-only | `{"status":"ok","persistence":"env_only"}` | no config file is configured; every runtime mutation is in-memory only and is lost on restart |
+| persisted, clean | `{"status":"ok","version":"<v>"}` | everything saved |
+| persisted, lagging | `{"status":"ok","unsaved_config_changes":true,"version":"<v>"}` | the on-disk `aqg.json` lags the in-memory config (a pending or failed debounced flush — issue #198 decision 3) |
+| env-only | `{"status":"ok","persistence":"env_only","version":"<v>"}` | no config file is configured; every runtime mutation is in-memory only and is lost on restart |
+
+`<v>` is the same string `./agent-quota-gateway -version` prints:
+the build-time stamp wired through `-ldflags "-X main.version=..."`
+from `git describe --tags --always --dirty`. The UI header reads it
+once on page load; on any fetch failure it renders the literal
+`unknown` so the chip never shows empty.
 
 The `unsaved_config_changes` field is the operator's signal that runtime
 mutations — including credentials — may not yet be persisted; watch for it

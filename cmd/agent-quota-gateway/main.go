@@ -512,20 +512,22 @@ func migrateSnapshotKeys(state persist.GatewayState, registry *backend.Registry)
 	return migrated, dropped
 }
 
-// healthHandler returns a fixed {"status":"ok"} body. It is a loopback-
+// healthHandler returns a {"status":"ok",...} body. It is a loopback-
 // only liveness probe — the loopback trust model means it carries no
-// sensitive state, so the response shape is deliberately minimal and
-// does not expose the version, uptime, or upstream reachability. Any
-// additional readiness signal would belong on a separate endpoint so
-// callers can tell "process is alive" from "upstream is reachable".
-// Method is GET only; non-GET requests receive 405 — matching
-// quotaHandler's policy so the two /_gateway/* endpoints agree.
+// sensitive state. The response shape is additive and informational:
+// readiness signals go on this endpoint so callers can tell
+// "process is alive" from "upstream is reachable" without a second
+// round-trip. Method is GET only; non-GET requests receive 405 —
+// matching quotaHandler's policy so the two /_gateway/* endpoints
+// agree.
 //
 // persistence (issue #246) carries the three-state config-durability
-// signal on a single additive body field:
-//   - clean persisted:      {"status":"ok"}
-//   - persisted, unsaved:   {"status":"ok","unsaved_config_changes":true}
-//   - env-only:             {"status":"ok","persistence":"env_only"}
+// signal on a single additive body field (version, and optionally
+// poller_health, are appended after these in the wire order the
+// handler builds):
+//   - clean persisted:      {"status":"ok","version":"<v>"}
+//   - persisted, unsaved:   {"status":"ok","unsaved_config_changes":true,"version":"<v>"}
+//   - env-only:             {"status":"ok","persistence":"env_only","version":"<v>"}
 //
 // poller_health (issue #247) is emitted conditionally as the additive
 // "poller_health":"stale" field when the poller reports at least one
@@ -534,6 +536,12 @@ func migrateSnapshotKeys(state persist.GatewayState, registry *backend.Registry)
 // source of truth for the staleness math (owning the StaleAfterIntervals
 // constant); the handler just reads the aggregate. pl may be nil in
 // tests, in which case the field is never emitted.
+//
+// version (issue #309) is unconditional and additive — always the
+// same string `-version` prints, stamped at build time via
+// `-ldflags "-X main.version=..."` (see deploy.sh, main.go version
+// var). Operators surface it in the UI header to identify the
+// deployed build without SSH.
 //
 // Status code stays 200 in every case; a readiness probe asserts on
 // "status", not on a byte-for-byte body match (README §Health).
@@ -556,6 +564,11 @@ func healthHandler(persistence configfile.PersistenceState, pl *poller.Poller) h
 		default:
 			body = `{"status":"ok"`
 		}
+		// version (issue #309) is unconditional and additive — same
+		// string `-version` prints. json.Marshal never fails on a plain
+		// Go string; the err is kept only for future-proofing.
+		ver, _ := json.Marshal(version)
+		body += `,"version":` + string(ver)
 		// poller_health is additive and conditional. Emit only when stale,
 		// matching unsaved_config_changes / persistence — absence means
 		// "ok". The polled-pool count and stale count are kept internal

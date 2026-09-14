@@ -78,7 +78,7 @@ func mkObserver(store *quota.Store) proxy.ResponseObserver {
 //   - streaming passthrough works (first SSE event arrives within 150ms)
 //   - the gateway swaps in the backend's real credential and drops the selector
 //   - the quota snapshot is readable via GET /_gateway/quota?backend=auto
-//   - GET /_gateway/health returns 200 with {"status":"ok"}
+//   - GET /_gateway/health returns 200 with {"status":"ok","version":"dev"}
 //   - no credential headers or request body bytes appear in the stderr log
 func TestIntegration_fullStack(t *testing.T) {
 	// Capture stderr so the logging middleware does not contaminate the
@@ -260,8 +260,8 @@ func TestIntegration_fullStack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("health read: %v", err)
 	}
-	if got := strings.TrimSpace(string(body)); got != `{"status":"ok"}` {
-		t.Errorf("health body = %q, want {\"status\":\"ok\"}", got)
+	if got := strings.TrimSpace(string(body)); got != `{"status":"ok","version":"dev"}` {
+		t.Errorf("health body = %q, want {\"status\":\"ok\",\"version\":\"dev\"}", got)
 	}
 
 	// 4. Stop capturing stderr and assert nothing leaked.
