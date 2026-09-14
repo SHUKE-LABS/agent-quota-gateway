@@ -1223,20 +1223,20 @@ func TestHealthHandler_threeStates(t *testing.T) {
 		{
 			name:     "persisted clean",
 			pers:     persistedCleanState(),
-			wantBody: `{"status":"ok"}`,
+			wantBody: `{"status":"ok","version":"dev"}`,
 			wantHead: "persisted",
 		},
 		{
 			name:      "persisted unsaved",
 			pers:      persistedUnsavedState(),
-			wantBody:  `{"status":"ok","unsaved_config_changes":true}`,
+			wantBody:  `{"status":"ok","unsaved_config_changes":true,"version":"dev"}`,
 			wantHead:  "persisted",
 			noHeaders: nil, // legacy unsaved header is set on the dedicated endpoint, not here
 		},
 		{
 			name:     "env-only",
 			pers:     envOnlyState(),
-			wantBody: `{"status":"ok","persistence":"env_only"}`,
+			wantBody: `{"status":"ok","persistence":"env_only","version":"dev"}`,
 			wantHead: "env_only",
 		},
 	}
