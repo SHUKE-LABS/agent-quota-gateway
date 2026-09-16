@@ -89,6 +89,19 @@ type Snapshot struct {
 	UnifiedOverageStatus         string   `json:"unified_overage_status,omitempty"`
 	UnifiedOverageDisabledReason string   `json:"unified_overage_disabled_reason,omitempty"`
 
+	// unified5hResetIsFallback / unified7dResetIsFallback record whether the
+	// corresponding reset was resolved from x-codex-*-reset-after-seconds
+	// (true — a drift-prone now+secs computed at observe time) rather than an
+	// absolute x-codex-*-reset-at (false — precise). Codex-only (issue #311):
+	// Anthropic extraction and the poller never set them. Unexported on
+	// purpose so they can never surface in the JSON wire shape or HasData;
+	// OverlayCodex and mergeSnapshot consult them to keep a fresh fallback
+	// from overwriting a reset that is already known. The json:"-" tag is
+	// inert on an unexported field (encoding/json skips it regardless) and
+	// documents non-serialization.
+	unified5hResetIsFallback bool `json:"-"`
+	unified7dResetIsFallback bool `json:"-"`
+
 	// OrgID is the Anthropic organization that owns the backend's account,
 	// copied from the anthropic-organization-id response header. Present
 	// only when that header was on the snapshot-driving response.
@@ -226,6 +239,17 @@ func (s *Store) Merge(key string, snap Snapshot) {
 // mergeSnapshot returns next with every absent field (nil pointer or empty
 // string) filled from prev. Backend and AsOf are always next's — the merge
 // preserves learned window data, not the "when we last heard" timestamp.
+//
+// Codex fallback-precision gate (issue #311): a reset flagged as a
+// reset-after-seconds fallback is resolved as now+secs at observe time, so it
+// drifts on every response. A fallback reset on next therefore never
+// overwrites a reset prev already knows, whatever prev's precision — this
+// runs under Store.Merge's write lock, which is what makes the gate hold when
+// two responses to the same nick interleave the observer's
+// read-prev→overlay→merge sequence (a stale-prev overlay merged after a
+// precise merge must not regress it). Precise (unflagged) and nil resets keep
+// the plain fill-forward rules; the flag only ever originates in ExtractCodex,
+// so Anthropic-extraction and poller snapshots merge bit-identically to before.
 func mergeSnapshot(prev, next Snapshot) Snapshot {
 	out := next
 	if out.UnifiedStatus == "" {
@@ -245,6 +269,15 @@ func mergeSnapshot(prev, next Snapshot) Snapshot {
 	}
 	if out.Unified5hReset == nil {
 		out.Unified5hReset = prev.Unified5hReset
+		out.unified5hResetIsFallback = prev.unified5hResetIsFallback
+	} else if out.unified5hResetIsFallback && prev.Unified5hReset != nil {
+		// next carries a drift-prone fallback and prev already knows a reset
+		// (precise or not): keep prev's. The reset-non-nil condition is
+		// structural here — the else branch only runs with a non-nil next
+		// reset — so a flag-only malformed snapshot can never trigger the
+		// gate (plan-review round 1 note).
+		out.Unified5hReset = prev.Unified5hReset
+		out.unified5hResetIsFallback = prev.unified5hResetIsFallback
 	}
 	if out.Unified5hWindowMinutes == nil {
 		out.Unified5hWindowMinutes = prev.Unified5hWindowMinutes
@@ -257,6 +290,10 @@ func mergeSnapshot(prev, next Snapshot) Snapshot {
 	}
 	if out.Unified7dReset == nil {
 		out.Unified7dReset = prev.Unified7dReset
+		out.unified7dResetIsFallback = prev.unified7dResetIsFallback
+	} else if out.unified7dResetIsFallback && prev.Unified7dReset != nil {
+		out.Unified7dReset = prev.Unified7dReset
+		out.unified7dResetIsFallback = prev.unified7dResetIsFallback
 	}
 	if out.Unified7dWindowMinutes == nil {
 		out.Unified7dWindowMinutes = prev.Unified7dWindowMinutes
