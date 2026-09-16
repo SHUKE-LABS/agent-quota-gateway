@@ -71,6 +71,15 @@ func hasQuotaWindow(s quota.Snapshot) bool {
 // The host gate keeps a lookalike x-codex-* header set from any other vendor
 // out of the store (the same gate the 429 classifier applies).
 //
+// The overlay is prev-aware (issue #311): the store's last snapshot for the
+// key is passed in so a window missing from this response carries forward
+// and a drift-prone reset-after-seconds fallback does not overwrite a known
+// reset. That prev read is intentionally cheap (single map lookup) and may
+// be stale under concurrent responses to the same nick — tolerated, because
+// the utilization/minutes carry is idempotent under mergeSnapshot's
+// nil-fill and reset precision is enforced inside Merge under its write
+// lock, the serialization point.
+//
 // We only file snapshots that carry at least one quota-window field. An
 // upstream response with no rate-limit headers (e.g. a 5xx page, or a future
 // endpoint that doesn't return them) would otherwise overwrite the last
@@ -90,7 +99,8 @@ func quotaObserver(store *quota.Store, pools *auto.Pools) func(*http.Response) {
 				key = b.QuotaKey()
 				markPool, markNick = b.Pool, b.Nick
 				if auto.IsCodexBackend(b) {
-					snap.OverlayCodex(quota.ExtractCodex(resp.Header, time.Now().UTC()))
+					prev := store.Get(key)
+					snap.OverlayCodex(prev, quota.ExtractCodex(resp.Header, time.Now().UTC()))
 				}
 			}
 		}

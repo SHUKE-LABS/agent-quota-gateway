@@ -67,46 +67,100 @@ func CodexReachedType(resp *http.Response) string {
 // at the cap with a future reset" as the blocking signal, exactly like a
 // z.ai / MiniMaxi / Ark dashboard snapshot.
 //
-// reset-at (absolute unix seconds) is preferred; reset-after-seconds is
-// resolved relative to now when reset-at is absent or unparseable. Absent or
-// unparseable headers leave nil fields — never invented values.
+// reset-at (absolute unix seconds) is precise; reset-after-seconds is a
+// fallback — now+secs resolved against the observe-time now — flagged as such
+// so a fresh fallback never overwrites a reset that is already known (issue
+// #311). Absent or unparseable headers leave nil fields — never invented
+// values.
 //
 // The Backend field is left empty (same contract as Extract): the caller
 // files the snapshot under the key it chooses.
 func ExtractCodex(h http.Header, now time.Time) Snapshot {
 	s := Snapshot{}
 	s.Unified5hUtilization = parseCodexPercent(h.Get(HeaderCodexPrimaryUsedPercent))
-	s.Unified5hReset = parseCodexReset(h.Get(HeaderCodexPrimaryResetAt), h.Get(HeaderCodexPrimaryResetAfterSeconds), now)
+	s.Unified5hReset, s.unified5hResetIsFallback = parseCodexReset(h.Get(HeaderCodexPrimaryResetAt), h.Get(HeaderCodexPrimaryResetAfterSeconds), now)
 	s.Unified5hWindowMinutes = parseCodexWindowMinutes(h.Get(HeaderCodexPrimaryWindowMinutes))
 	s.Unified7dUtilization = parseCodexPercent(h.Get(HeaderCodexSecondaryUsedPercent))
-	s.Unified7dReset = parseCodexReset(h.Get(HeaderCodexSecondaryResetAt), h.Get(HeaderCodexSecondaryResetAfterSeconds), now)
+	s.Unified7dReset, s.unified7dResetIsFallback = parseCodexReset(h.Get(HeaderCodexSecondaryResetAt), h.Get(HeaderCodexSecondaryResetAfterSeconds), now)
 	s.Unified7dWindowMinutes = parseCodexWindowMinutes(h.Get(HeaderCodexSecondaryWindowMinutes))
 	return s
 }
 
-// OverlayCodex copies every codex-derived field c actually carries onto s,
-// leaving fields c does not carry untouched. The response observer uses this
-// to combine the codex windows with (the, for a chatgpt.com member, always
-// empty) Anthropic header extraction before filing one snapshot — a merge at
-// the source rather than two Store writes.
-func (s *Snapshot) OverlayCodex(c Snapshot) {
+// OverlayCodex merges a codex-derived snapshot c onto s with prev-aware
+// precedence; the response observer uses this to combine the codex windows
+// with (the, for a chatgpt.com member, always empty) Anthropic header
+// extraction before filing one snapshot — a merge at the source rather than
+// two Store writes. prev is the store's last-known snapshot for the key
+// (quotaObserver passes store.Get(key)); on a fresh key it is the zero
+// Snapshot and every rule below degenerates to today's behavior.
+//
+// Two field classes with different rules (issue #311 — the 5h window went
+// missing and the 5h reset drifted because the pre-#311 overlay was
+// prev-blind):
+//
+//   - utilization and window-minutes: c is authoritative when present; a
+//     field absent from both s and c carries forward from prev, mirroring
+//     mergeSnapshot's #163 fill semantics at the overlay step.
+//
+//   - resets: precise values (absolute reset-at, fallback flag false) always
+//     win; a drift-prone reset-after-seconds fallback is adopted only when no
+//     prior reset is known, and never overwrites one that is — each fallback
+//     is now+secs resolved at observe time, so letting it overwrite would
+//     drift the stored reset on every response.
+//
+// The prev read is best-effort and may be stale under concurrent responses
+// to the same nick; these reset rules are therefore advisory at this layer.
+// The authoritative fallback gate is mergeSnapshot's, which runs under
+// Store.Merge's write lock — the serialization point (plan-review round 1).
+func (s *Snapshot) OverlayCodex(prev, c Snapshot) {
 	if c.Unified5hUtilization != nil {
 		s.Unified5hUtilization = c.Unified5hUtilization
+	} else if s.Unified5hUtilization == nil && prev.Unified5hUtilization != nil {
+		s.Unified5hUtilization = prev.Unified5hUtilization
 	}
-	if c.Unified5hReset != nil {
-		s.Unified5hReset = c.Unified5hReset
-	}
+	s.Unified5hReset, s.unified5hResetIsFallback = overlayCodexReset(
+		s.Unified5hReset, s.unified5hResetIsFallback,
+		prev.Unified5hReset, prev.unified5hResetIsFallback,
+		c.Unified5hReset, c.unified5hResetIsFallback)
 	if c.Unified5hWindowMinutes != nil {
 		s.Unified5hWindowMinutes = c.Unified5hWindowMinutes
+	} else if s.Unified5hWindowMinutes == nil && prev.Unified5hWindowMinutes != nil {
+		s.Unified5hWindowMinutes = prev.Unified5hWindowMinutes
 	}
 	if c.Unified7dUtilization != nil {
 		s.Unified7dUtilization = c.Unified7dUtilization
+	} else if s.Unified7dUtilization == nil && prev.Unified7dUtilization != nil {
+		s.Unified7dUtilization = prev.Unified7dUtilization
 	}
-	if c.Unified7dReset != nil {
-		s.Unified7dReset = c.Unified7dReset
-	}
+	s.Unified7dReset, s.unified7dResetIsFallback = overlayCodexReset(
+		s.Unified7dReset, s.unified7dResetIsFallback,
+		prev.Unified7dReset, prev.unified7dResetIsFallback,
+		c.Unified7dReset, c.unified7dResetIsFallback)
 	if c.Unified7dWindowMinutes != nil {
 		s.Unified7dWindowMinutes = c.Unified7dWindowMinutes
+	} else if s.Unified7dWindowMinutes == nil && prev.Unified7dWindowMinutes != nil {
+		s.Unified7dWindowMinutes = prev.Unified7dWindowMinutes
+	}
+}
+
+// overlayCodexReset applies OverlayCodex's reset-class precedence for one
+// window and returns the resulting value and fallback flag. See OverlayCodex
+// for the rationale; the cases in order are: precise wins, first-time
+// fallback adoption, fallback never overwrites a known reset, carry absent
+// forward from prev, and leave s untouched when neither c nor prev
+// contributes.
+func overlayCodexReset(sVal *time.Time, sFB bool, pVal *time.Time, pFB bool, cVal *time.Time, cFB bool) (*time.Time, bool) {
+	switch {
+	case cVal != nil && !cFB:
+		return cVal, false
+	case cVal != nil && pVal == nil:
+		return cVal, cFB
+	case cVal != nil:
+		return pVal, pFB
+	case sVal == nil && pVal != nil:
+		return pVal, pFB
+	default:
+		return sVal, sFB
 	}
 }
 
@@ -124,21 +178,23 @@ func parseCodexPercent(v string) *float64 {
 	return &util
 }
 
-// parseCodexReset resolves a window's reset: absolute unix seconds from
-// resetAt when usable, else now+seconds from resetAfter, else nil.
-func parseCodexReset(resetAt, resetAfter string, now time.Time) *time.Time {
+// parseCodexReset resolves a window's reset and reports whether the value is
+// a fallback: absolute unix seconds from resetAt when usable (precise, false);
+// else now+seconds from resetAfter (fallback, true — drift-prone, only
+// adopted when no prior reset is known); else (nil, false).
+func parseCodexReset(resetAt, resetAfter string, now time.Time) (*time.Time, bool) {
 	if t := parseUnixTime(resetAt); t != nil {
-		return t
+		return t, false
 	}
 	if resetAfter == "" {
-		return nil
+		return nil, false
 	}
 	secs, err := strconv.ParseInt(strings.TrimSpace(resetAfter), 10, 64)
 	if err != nil || secs < 0 {
-		return nil
+		return nil, false
 	}
 	t := now.Add(time.Duration(secs) * time.Second).UTC()
-	return &t
+	return &t, true
 }
 
 // parseCodexWindowMinutes parses a window length in minutes; nil for
