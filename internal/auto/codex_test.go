@@ -252,83 +252,105 @@ func TestModifyResponse_codexMixedCapsFallbackDominates(t *testing.T) {
 	}
 }
 
-// TestModifyResponse_codexReachedTypeOnlyFallsBackTo5h: usage_limit_reached
-// with no capped window — the percents lag the verdict — parks for the
-// conservative default window (issue #304).
-func TestModifyResponse_codexReachedTypeOnlyFallsBackTo5h(t *testing.T) {
+// TestModifyResponse_codexReachedTypeSubCapThrottlesSameMember: a
+// usage_limit_reached 429 whose windows are sub-cap does NOT park (the #304
+// reached-type-only 5h fallback parked the last enabled seat of a
+// one-member pool until a manual /_gateway/clear — issue #314): the member
+// stays in rotation and the client gets the transient same-member 503 with
+// the short back-off band. Also pins the Retry-After clamp (upstream value
+// clamped into the band, band top when absent/malformed) and the sub-cap
+// shape WITHOUT the marker staying on the policy path.
+func TestModifyResponse_codexReachedTypeSubCapThrottlesSameMember(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	c := codexController(t, clock, io.Discard, nil, "a", "b")
+	var logBuf bytes.Buffer
+	c := codexController(t, clock, &logBuf, nil, "a", "b")
 
 	resp := resp429Codex(c.resolve(t, "a"), clock,
-		codexWin{percent: "50", resetIn: time.Hour},
-		codexWin{},
+		codexWin{percent: "9", minutes: "300", resetIn: 2 * time.Hour},
+		codexWin{percent: "60", minutes: "10080", resetIn: 79 * time.Hour},
 		quota.CodexReachedTypeUsageLimit)
 
 	if err := c.ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
-	reset, exhausted, cpReset, cpOK, cpWindowFact := codexParkState(t, c, "a")
-	if !exhausted {
-		t.Fatalf("a not parked")
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503 (same-member throttle)", resp.StatusCode)
 	}
-	if want := clock.now().Add(defaultExhaustionWindow); !reset.Equal(want) || !cpReset.Equal(want) {
-		t.Errorf("park reset=%v credentialPark=%v, want both %v", reset, cpReset, want)
+	body, _ := io.ReadAll(resp.Body)
+	if got := string(body); got != `{"error":"backend throttled; same member"}` {
+		t.Errorf("503 body=%q, want the throttle shape", got)
 	}
-	if !cpOK || cpWindowFact {
-		t.Errorf("credentialPark ok=%v windowFact=%v, want ok+false (fallback bound protected)", cpOK, cpWindowFact)
+	if got := resp.Header.Get("x-codex-primary-used-percent"); got != "" {
+		t.Errorf("x-codex-* header not stripped from synthetic 503: %q", got)
 	}
-}
-
-// TestModifyResponse_codexReachedTypeParkSurvivesFreshSubCapSnapshot is the
-// round-3 route-level regression: a reached-type 429 whose windows read
-// sub-cap must stay parked for the fallback window even though the same
-// response's (or any earlier) windows sit FRESH in the quota store — the
-// state storeReconcilesParkLocked would otherwise read as healthy. The
-// windowFact=false lifecycle: unavailable before the bound, selectable again
-// only after it elapses (or an explicit /_gateway/clear).
-func TestModifyResponse_codexReachedTypeParkSurvivesFreshSubCapSnapshot(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := codexController(t, clock, io.Discard, store, "a", "b")
-
-	resp := resp429Codex(c.resolve(t, "a"), clock,
-		codexWin{percent: "50", minutes: "300", resetIn: 4 * time.Hour},
-		codexWin{percent: "20", minutes: "10080", resetIn: 79 * time.Hour},
-		quota.CodexReachedTypeUsageLimit)
-
-	// Observer-equivalent: the 429's own windows land in the store (fresh,
-	// sub-cap — the shape reconciliation would treat as healthy).
-	snap := quota.ExtractCodex(resp.Header, clock.now())
-	snap.AsOf = clock.now()
-	store.Merge("a", snap)
-
-	if err := c.ModifyResponse(resp); err != nil {
-		t.Fatalf("ModifyResponse: %v", err)
+	secs, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || secs < rateLimitBackoffMinSeconds || secs > rateLimitBackoffMaxSeconds {
+		t.Errorf("Retry-After=%q (parsed %d, err %v), want within [%d,%d]", resp.Header.Get("Retry-After"), secs, err, rateLimitBackoffMinSeconds, rateLimitBackoffMaxSeconds)
+	}
+	if got := resp.Header.Get("Retry-After"); got != strconv.Itoa(rateLimitBackoffMaxSeconds) {
+		t.Errorf("Retry-After=%q with no upstream header, want the band top %d", got, rateLimitBackoffMaxSeconds)
+	}
+	reset, exhausted, _, cpOK, _ := codexParkState(t, c, "a")
+	if exhausted || cpOK || !reset.IsZero() {
+		t.Errorf("reached-type sub-cap 429 parked the member: exhausted=%v credentialPark=%v reset=%v", exhausted, cpOK, reset)
+	}
+	if got := c.Current(); got != "a" {
+		t.Errorf("Current()=%q, want a (no failover on the throttle)", got)
+	}
+	if log := logBuf.String(); !strings.Contains(log, "throttling same member, not parking") {
+		t.Errorf("throttle branch not logged; got %q", log)
 	}
 
-	blockedAt := func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		_, blocked := c.exhaustedUntilLocked("a")
-		return blocked
+	// Retry-After clamp: an upstream value is honoured only inside the band.
+	for _, tc := range []struct {
+		name     string
+		upstream string
+		want     int
+	}{
+		{"in band honoured", "2", 2},
+		{"above band clamped", "120", rateLimitBackoffMaxSeconds},
+		{"below band clamped", "0", rateLimitBackoffMinSeconds},
+		{"malformed defaults to band top", "soon-ish", rateLimitBackoffMaxSeconds},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+			c := codexController(t, clock, io.Discard, nil, "a", "b")
+			resp := resp429Codex(c.resolve(t, "a"), clock,
+				codexWin{percent: "9", resetIn: 2 * time.Hour},
+				codexWin{percent: "60", resetIn: 79 * time.Hour},
+				quota.CodexReachedTypeUsageLimit)
+			resp.Header.Set("Retry-After", tc.upstream)
+			if err := c.ModifyResponse(resp); err != nil {
+				t.Fatalf("ModifyResponse: %v", err)
+			}
+			if got := resp.Header.Get("Retry-After"); got != strconv.Itoa(tc.want) {
+				t.Errorf("Retry-After=%q for upstream %q, want %d", got, tc.upstream, tc.want)
+			}
+		})
 	}
 
-	clock.t = clock.now().Add(1 * time.Minute) // snapshot still fresh (≤5m)
-	if !blockedAt() {
-		t.Fatalf("park reconciled away by a fresh sub-cap snapshot at +1m; the reached-type marker must outrank its own lagging percents")
+	// Sub-cap windows WITHOUT the reached-type marker: policy shape — the
+	// upstream body is forwarded on the 503, still no park, no failover.
+	resp2 := resp429Codex(c.resolve(t, "a"), clock,
+		codexWin{percent: "9", resetIn: 2 * time.Hour},
+		codexWin{percent: "60", resetIn: 79 * time.Hour},
+		"")
+	if err := c.ModifyResponse(resp2); err != nil {
+		t.Fatalf("ModifyResponse (no marker): %v", err)
 	}
-	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "b" {
-		t.Errorf("ResolveAuto at +1m routed to %q exhausted=%v, want healthy b (a must stay parked)", b.Nick, exhausted)
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503 (policy shape)", resp2.StatusCode)
 	}
-
-	clock.t = clock.now().Add(4*time.Hour + 58*time.Minute) // +4h59m total
-	if !blockedAt() {
-		t.Fatalf("park lapsed before the 5h fallback bound at +4h59m")
+	body2, _ := io.ReadAll(resp2.Body)
+	if !strings.Contains(string(body2), "usage_limit_reached") {
+		t.Errorf("503 body dropped the upstream policy message: %q", body2)
 	}
-
-	clock.t = clock.now().Add(2 * time.Minute) // +5h01m total: bound elapsed
-	if blockedAt() {
-		t.Errorf("member still blocked after the fallback bound elapsed at +5h01m")
+	reset2, exhausted2, _, cpOK2, _ := codexParkState(t, c, "a")
+	if exhausted2 || cpOK2 || !reset2.IsZero() {
+		t.Errorf("sub-cap no-marker 429 parked the member: exhausted=%v credentialPark=%v", exhausted2, cpOK2)
+	}
+	if got := c.Current(); got != "a" {
+		t.Errorf("Current()=%q, want a (policy path never fails over)", got)
 	}
 }
 

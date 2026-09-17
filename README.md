@@ -604,9 +604,9 @@ zero-probe**, per pool:
   `1.0` cap is the signal — without it such a member, which emits no clean
   pre-stream `429`, would never fail off. For a ChatGPT-Codex member
   (`chatgpt.com` backend), whose `429` carries the `x-codex-*` metered family
-  instead of Anthropic headers, the signal is the exhaustion signature:
-  `x-codex-rate-limit-reached-type: usage_limit_reached` or a window at the
-  cap with a future reset (issue #304).
+  instead of Anthropic headers, the signal is a window at the cap with a
+  future reset (issues #304, #314 — the `usage_limit_reached` marker alone
+  throttles the same member instead of parking it).
 - **Dead-credential switch.** A member that returns `401`/`403` (its
   credential was revoked, expired, or the account pulled) is parked for the
   conservative default window and the pool fails over — a dead account never
@@ -730,26 +730,31 @@ fixed 1 s hint). The per-minute headers are read only to classify the
 response; they are never stored (they are a throughput rate, not the
 subscription budget).
 
-The **ChatGPT-Codex exhaustion** flavour (issue #304): a `chatgpt.com` member
-(ChatGPT-subscription seats hitting the Codex backend) meters its plan
-windows on every response via the `x-codex-*` family instead of
-`anthropic-ratelimit-*` headers, and signals depletion as a `429` carrying
-`x-codex-rate-limit-reached-type: usage_limit_reached` and/or a
-`x-codex-{primary,secondary}-used-percent` at the cap. That signature parks
-the member — a precise park until the latest contributing window reset, with
-a conservative 5-hour bound for any capped window whose reset is missing or
-unreadable — and fails over; the `429` becomes the standard switch/pool-dry
-`503` described above, so Claude Code retries rather than ending the turn.
-Two guardrails keep the classification honest: it applies **only** to
-`chatgpt.com` members (any other vendor's lookalike headers are ignored),
-and a Codex `429` carrying **no** metered signature keeps the policy-`429`
+The **ChatGPT-Codex exhaustion** flavour (issues #304, #314): a
+`chatgpt.com` member (ChatGPT-subscription seats hitting the Codex backend)
+meters its plan windows on every response via the `x-codex-*` family instead
+of `anthropic-ratelimit-*` headers, and signals depletion as a `429`
+carrying a `x-codex-{primary,secondary}-used-percent` at the cap. That
+signature parks the member — a precise park until the latest contributing
+window reset, with a conservative 5-hour bound for any capped window whose
+reset is missing or unreadable — and fails over; the `429` becomes the
+standard switch/pool-dry `503` described above, so Claude Code retries
+rather than ending the turn. A `429` carrying only
+`x-codex-rate-limit-reached-type: usage_limit_reached` with sub-cap windows
+is not depletion: it is absorbed as a same-member transient `503` throttle
+(`Retry-After` in the 1–3 s band, honouring an upstream `Retry-After`
+clamped into it) so the seat stays in rotation — the earlier
+park-on-marker-alone behavior stranded the last enabled seat of a
+one-member pool until a manual `POST /_gateway/clear` (issue #314). Three
+guardrails keep the classification honest: it applies **only** to
+`chatgpt.com` members (any other vendor's lookalike headers are ignored), a
+Codex `429` carrying **no** metered signature keeps the policy-`429`
 behavior (forwarded body on a `503`, no park, no failover) even when the
-quota store already holds a capped snapshot for the seat. A park whose bound
-contains any fallback contribution is protected from store reconciliation —
-the reached-type marker outranks its own lagging percents — so the seat
-stays parked for its full bound (or until `POST /_gateway/clear`). The
-`x-codex-*` windows also feed the quota store (see
-[Reading a pool's quota](#reading-a-pools-quota)), and the headers are
+quota store already holds a capped snapshot for the seat, and a park whose
+bound contains any fallback contribution is protected from store
+reconciliation so the seat stays parked for its full bound (or until
+`POST /_gateway/clear`). The `x-codex-*` windows also feed the quota store
+(see [Reading a pool's quota](#reading-a-pools-quota)), and the headers are
 stripped from every synthetic `503` alongside the Anthropic rate-limit
 family.
 

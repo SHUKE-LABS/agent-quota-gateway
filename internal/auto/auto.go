@@ -2510,10 +2510,12 @@ func (c *Controller) reanchorLocked() {
 //     carrying the upstream error body. Only genuine exhaustion 429s park the
 //     backend and advance the sticky pointer. A ChatGPT-Codex member
 //     (chatgpt.com) has its own exhaustion signature — the x-codex-* metered
-//     family: x-codex-rate-limit-reached-type: usage_limit_reached, or a
-//     window at the cap — and parks until the latest contributing reset with
-//     a conservative fallback for unusable ones (issue #304); see
-//     codexExhaustion429 for the bound and retirement rules.
+//     family — and parks only on a window at the cap, until the latest
+//     contributing reset with a conservative fallback for unusable ones;
+//     a usage_limit_reached 429 with sub-cap windows is a same-member
+//     transient throttle, and one with no metered signature at all stays on
+//     the policy path (issues #304, #314); see codexExhaustion429 for the
+//     bound and retirement rules.
 //   - 401 Unauthorized / 403 Forbidden: the backend's own credential was
 //     rejected — revoked, expired, or the account pulled. The gateway stamps
 //     the credential itself (the client never supplies one), so the rejection
@@ -2551,16 +2553,16 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 			return nil
 		}
 		// ChatGPT-Codex members (issue #304) meter via the x-codex-* family
-		// and signal depletion with usage_limit_reached / capped windows —
-		// no anthropic-ratelimit-* headers, no Retry-After, so the generic
-		// classifier below sees a policy 429 and never parks (a depleted
-		// seat then sticks as sticky forever; the reported bug). This branch
-		// owns classification END-TO-END from the response headers: it never
-		// falls through to isGenuineExhaustionSignal, whose store lookup
-		// would park a headerless policy 429 off a prior fresh capped
-		// snapshot (AC3; same ordering rationale as the z.ai branch above —
-		// keyed before the exhaustion classifier so store state cannot
-		// misclassify the response).
+		// and signal depletion with a capped window — no
+		// anthropic-ratelimit-* headers, so the generic classifier below
+		// sees a policy 429 and never parks (a depleted seat then sticks as
+		// sticky forever; the reported bug). This branch owns classification
+		// END-TO-END from the response headers: it never falls through to
+		// isGenuineExhaustionSignal, whose store lookup would park a
+		// headerless policy 429 off a prior fresh capped snapshot (AC3; same
+		// ordering rationale as the z.ai branch above — keyed before the
+		// exhaustion classifier so store state cannot misclassify the
+		// response).
 		if isCodexBackend(b) {
 			if reset, windowFact, genuine := codexExhaustion429(resp, c.now()); genuine {
 				// Always store-unrepresentable: a codex snapshot has no
@@ -2573,6 +2575,19 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 				// stay retirable on real later evidence, fallback-containing
 				// bounds are protected like a credential fact.
 				return c.parkAndFailoverWithSource(resp, b.Nick, reset, "hit 429", true, windowFact)
+			}
+			// usage_limit_reached with no capped window: the marker alone is
+			// not depletion evidence (issue #314 — parking here stranded the
+			// last enabled seat until a manual /_gateway/clear), but it does
+			// say the plan is being throttled, so absorb as a same-member
+			// transient 503 with the short back-off band. Deliberately NOT
+			// absorbNonExhaustion429: its policy-body leg would forward
+			// "You've hit your usage limit" on the 503 and end the Codex
+			// turn instead of letting it retry.
+			if strings.EqualFold(quota.CodexReachedType(resp), quota.CodexReachedTypeUsageLimit) {
+				fmt.Fprintf(c.logOut, "auto[%s]: %s codex reached-type 429 (sub-cap windows) — throttling same member, not parking\n", c.name(), b.Nick)
+				rewriteTo503Throttle(resp, codexThrottleRetryAfter(resp))
+				return nil
 			}
 			// No metered signature → today's transient/policy split, shared
 			// with the generic path below.
