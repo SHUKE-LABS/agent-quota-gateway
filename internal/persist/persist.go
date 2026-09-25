@@ -1,16 +1,15 @@
 // Package persist handles atomic read/write of gateway state across restarts.
 //
-// GatewayState is the on-disk JSON record: per-pool routing state (sticky
-// nick + exhausted map), per-backend quota snapshots, and runtime configuration
-// (priority overrides, disabled members, and runtime-added members with their
-// credentials). A single Persister goroutine debounces writes so the proxy hot
-// path is never blocked on I/O — callers just call MarkDirty() (non-blocking
-// channel send) and the persister coalesces flushes at most once per 200ms.
+// GatewayState is the on-disk JSON record for per-pool routing observations
+// (sticky nick, exhausted map, worker affinities and allocation cursor) and
+// per-backend quota snapshots. Operator intent lives in aqg.json. A single
+// Persister goroutine debounces writes so the proxy hot path is never blocked
+// on I/O — callers just call MarkDirty() (non-blocking channel send) and the
+// persister coalesces flushes at most once per 200ms.
 //
 // Atomic write is temp-file + rename at mode 0600 so a crash mid-write never
-// leaves a torn JSON. The state file may contain credentials for runtime-added
-// members, so it is protected at 0600. A missing or unparseable state file logs
-// and starts fresh rather than failing startup.
+// leaves a torn JSON. The state file contains no credentials. A missing or
+// unparseable state file logs and starts fresh rather than failing startup.
 package persist
 
 import (
@@ -26,8 +25,9 @@ import (
 )
 
 // GatewayState is the complete on-disk JSON record. It holds pure runtime
-// observation only (issue #198): per-pool sticky/exhausted routing state and
-// per-backend quota snapshots. Operator intent (members, credentials,
+// observation only (issue #198): per-pool sticky/exhausted routing state,
+// worker affinities and allocation cursors, and per-backend quota snapshots.
+// Operator intent (members, credentials,
 // priority, disabled, runtime-created pools) lives in the config file now, not
 // here. A pre-#198 state file's `config` / `added_pools` keys are ignored on
 // load (the bootstrap migration reads them separately, once).

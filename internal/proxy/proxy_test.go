@@ -575,6 +575,48 @@ func TestProxy_responsesJSONPassesThroughOpaque(t *testing.T) {
 	}
 }
 
+func TestProxy_preservesEscapedAPISuffixAndRawQuery(t *testing.T) {
+	const credential = "worker-upstream-secret"
+	var gotRequestURI, gotAuth, gotAPIKey string
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequestURI = r.RequestURI
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("x-api-key")
+		w.WriteHeader(http.StatusOK)
+	})
+	upSrv := httptest.NewServer(upstream)
+	t.Cleanup(upSrv.Close)
+	gw, err := proxy.New(nil, nil)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	b := backend.Backend{Pool: "codex", Nick: "seat1", Credential: credential, BaseURL: upSrv.URL}
+	gwSrv := httptest.NewServer(injectBackend(b, gw))
+	t.Cleanup(gwSrv.Close)
+
+	req, err := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/responses/a%2Fb?q=one%2ftwo&empty", nil)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer codex")
+	req.Header.Set("x-api-key", "client-placeholder")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotRequestURI != "/v1/responses/a%2Fb?q=one%2ftwo&empty" {
+		t.Errorf("upstream RequestURI=%q, want escaped API suffix and raw query preserved", gotRequestURI)
+	}
+	if gotAuth != "Bearer "+credential {
+		t.Errorf("Authorization=%q, want stamped upstream credential", gotAuth)
+	}
+	if gotAPIKey != "" {
+		t.Errorf("x-api-key=%q, want removed client placeholder", gotAPIKey)
+	}
+}
+
 // TestProxy_nonPOSTMethodReachesUpstream confirms the proxy forwards
 // non-POST methods (the POST-only gate was lifted in #141): a GET with a
 // valid selector reaches the upstream, carrying the backend's stamped

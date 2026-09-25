@@ -3,9 +3,12 @@ package backend
 import (
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // PoolRouter picks the backend an inbound request resolves to. The
@@ -24,6 +27,111 @@ type PoolRouter interface {
 	// Retry-After (the wait until the soonest member resets); b is then
 	// the soonest-resetting member the client's post-wait retry lands on.
 	Route(pool string) (b Backend, retryAfter time.Duration, ok, exhausted bool)
+}
+
+// WorkerPoolRouter is implemented by routers that support per-worker
+// affinity. It is separate from PoolRouter so existing routers and callers
+// retain the no-namespace global-sticky contract.
+type WorkerPoolRouter interface {
+	RouteWorker(pool, workerNickname string) (b Backend, retryAfter time.Duration, ok, exhausted bool)
+}
+
+const (
+	workerNamespaceRoot   = "/_aqg/w"
+	workerNamespacePrefix = workerNamespaceRoot + "/"
+	maxWorkerNicknameSize = 128
+)
+
+// WorkerNamespaceMiddleware parses and strips /_aqg/w/<worker>/ before the
+// ServeMux and request loggers see the path. It preserves the escaped API path
+// suffix and RawQuery exactly; the worker name remains routing context only.
+func WorkerNamespaceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		reserved := path == workerNamespaceRoot || strings.HasPrefix(path, workerNamespacePrefix)
+		if !reserved {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		escapedPath := r.URL.EscapedPath()
+		if !strings.HasPrefix(escapedPath, workerNamespacePrefix) {
+			writeInvalidWorkerNamespace(w)
+			return
+		}
+		rawWorker, rawSuffix, found := strings.Cut(escapedPath[len(workerNamespacePrefix):], "/")
+		if !found {
+			writeInvalidWorkerNamespace(w)
+			return
+		}
+		worker, err := url.PathUnescape(rawWorker)
+		if err != nil || !IsValidWorkerNickname(worker) {
+			writeInvalidWorkerNamespace(w)
+			return
+		}
+		rawAPIPath := "/" + rawSuffix
+		apiPath, err := url.PathUnescape(rawAPIPath)
+		if err != nil {
+			writeInvalidWorkerNamespace(w)
+			return
+		}
+		// EscapedPath uses RawPath only when it is a valid encoding of Path.
+		// Check that representation before preserving its suffix through the
+		// path rewrite.
+		decodedPath, err := url.PathUnescape(escapedPath)
+		if err != nil || decodedPath != path {
+			writeInvalidWorkerNamespace(w)
+			return
+		}
+
+		r.URL.Path = apiPath
+		r.URL.RawPath = rawAPIPath
+		next.ServeHTTP(w, r.WithContext(WithWorkerNickname(r.Context(), worker)))
+	})
+}
+
+// IsValidWorkerNickname validates the opaque worker identity carried in the
+// URL segment and persisted as routing observation. Encoded separators,
+// traversal segments, control characters, nested escapes that form path
+// separators or traversal segments, and oversized names are rejected.
+func IsValidWorkerNickname(worker string) bool {
+	if worker == "" || len(worker) > maxWorkerNicknameSize || !utf8.ValidString(worker) {
+		return false
+	}
+	if worker == "." || worker == ".." || strings.ContainsAny(worker, "/\\") {
+		return false
+	}
+	for _, r := range worker {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	// Inspect repeated URL decoding only for traversal or separators. A
+	// literal percent remains a valid opaque nickname, while double-encoded
+	// forms such as %252F and %252e%252e cannot hide path syntax.
+	nested := worker
+	for i := 0; i < maxWorkerNicknameSize && strings.Contains(nested, "%"); i++ {
+		decoded, err := url.PathUnescape(nested)
+		if err != nil || decoded == nested {
+			break
+		}
+		if !utf8.ValidString(decoded) || decoded == "." || decoded == ".." || strings.ContainsAny(decoded, "/\\") {
+			return false
+		}
+		for _, r := range decoded {
+			if unicode.IsControl(r) {
+				return false
+			}
+		}
+		nested = decoded
+	}
+	return true
+}
+
+func writeInvalidWorkerNamespace(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_, _ = w.Write([]byte(`{"error":"invalid worker namespace"}`))
 }
 
 // Middleware resolves the inbound selector to a backend and stores it on
@@ -46,7 +154,19 @@ func Middleware(router PoolRouter, next http.Handler) http.Handler {
 		// any case, and ANTHROPIC_AUTH_TOKEN=AUTO must match pool "auto".
 		selector := normalizeName(bearerToken(r.Header.Get("Authorization")))
 
-		b, retryAfter, ok, exhausted := router.Route(selector)
+		worker, hasWorker := WorkerNicknameFromContext(r.Context())
+		route := func(pool string) (Backend, time.Duration, bool, bool) {
+			if !hasWorker {
+				return router.Route(pool)
+			}
+			workerRouter, ok := router.(WorkerPoolRouter)
+			if !ok {
+				return Backend{}, 0, false, false
+			}
+			return workerRouter.RouteWorker(pool, worker)
+		}
+
+		b, retryAfter, ok, exhausted := route(selector)
 		if !ok {
 			// Fallback: some clients (e.g. pi.dev with api:"anthropic-messages")
 			// send the pool name via X-Api-Key rather than as a Bearer token.
@@ -55,7 +175,7 @@ func Middleware(router PoolRouter, next http.Handler) http.Handler {
 			// pool still fails closed — this is a named-pool check, not a
 			// passthrough.
 			if xKey := normalizeName(r.Header.Get("X-Api-Key")); xKey != "" {
-				b, retryAfter, ok, exhausted = router.Route(xKey)
+				b, retryAfter, ok, exhausted = route(xKey)
 			}
 		}
 		if !ok {

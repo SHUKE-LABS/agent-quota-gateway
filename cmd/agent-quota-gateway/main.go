@@ -203,15 +203,16 @@ func run(configFlag string) error {
 	// "registry default wins, env ignored" contract.
 	wireDefaultBaseURL(pools, configPath)
 
-	// Restore sticky pointers and exhausted maps from the persisted state.
+	// Restore sticky pointers, exhausted maps, and worker affinities from the
+	// persisted state.
 	// Every member — including former runtime-added ones — is already present
 	// from the config registry (issue #198), so a persisted sticky/snapshot
 	// nick resolves immediately. Expired exhausted entries are dropped.
 	pools.LoadPersistState(persisted.Pools)
 
-	// Wire up the state persister (runtime observation only: sticky/exhausted/
-	// snapshots). Operator intent is no longer persisted here — it lives in the
-	// config file (issue #198). The persister goroutine is started below.
+	// Wire up the state persister (runtime observation only: sticky, exhausted,
+	// worker affinity, and snapshots). Operator intent stays in the config file
+	// (issue #198). The persister goroutine is started below.
 	statePersister := persist.NewPersister(cfg.StateFile, func() persist.GatewayState {
 		return persist.GatewayState{
 			Pools:     pools.PersistState(),
@@ -332,7 +333,10 @@ func run(configFlag string) error {
 	// the same status the handler emits; it excludes /_gateway/* itself. Its
 	// statusRecorder implements Unwrap, so logging's outer recorder and the
 	// proxy's flusher still reach the real writer and SSE keeps streaming.
-	handler := reqlog.Middleware(logging.Middleware(activity.Middleware(activityStore, mux)))
+	// Strip the reserved worker namespace before ServeMux path cleaning and
+	// before request logs capture the API path. The worker name is carried only
+	// in request context into the selector middleware.
+	handler := backend.WorkerNamespaceMiddleware(reqlog.Middleware(logging.Middleware(activity.Middleware(activityStore, mux))))
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
