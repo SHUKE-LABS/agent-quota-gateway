@@ -61,13 +61,13 @@ contract from nick, token prefix, hostname, or request body.
 - Pool-based routing. The inbound `ANTHROPIC_AUTH_TOKEN` is a local pool
   name, never forwarded upstream. Unknown or missing selectors fail
   closed with `403` — there is no silent fallback.
-- Quota snapshots are captured passively from upstream rate-limit headers
-  and exposed at `GET /_gateway/quota`, keyed per pool. No synthetic probe
-  requests against the Messages API — header-derived freshness depends on
-  real client traffic. The exception is providers that never return
-  rate-limit headers (Z.ai / ZhipuAI, MiniMaxi, Volcengine Ark): a
-  background poller reads their proprietary quota endpoint for the active
-  member of each pool (see
+- Quota snapshots are captured from upstream rate-limit headers and
+  exposed at `GET /_gateway/quota`, keyed per account. Header-derived
+  freshness usually follows real client traffic. After a stored weekly
+  reset, a `chatgpt.com` Codex member gets one fixed background hello to
+  start its next session; it does not inspect client bodies or affect
+  routing. Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark use the background
+  poller for their proprietary quota endpoints (see
   [Proprietary quota polling](#proprietary-quota-polling)).
 
 Out of scope:
@@ -331,8 +331,8 @@ AQG_POOL_SUB_BALANCE=lead
 - Between switches the pool is fully sticky: cache locality is preserved.
 - The switch fires on the request path (no background goroutine); the gap
   and dwell keep it rare.
-- The lead check never synthesises probes — it reads only snapshots learned
-  from real traffic or the existing poller.
+- The lead check never synthesises probes — it reads snapshots learned from
+  real traffic, the existing poller, or a Codex weekly hello.
 - Exhausted members (recorded after a failed response or blocked by a
   status-bearing rejected window) are never chosen
   as the balance target.
@@ -587,8 +587,8 @@ forwards the opaque JSON or SSE exchange to that pool's configured upstream.
 A client sends a pool name and the gateway auto-rotates within it. The
 consumer never needs to know pool membership — it sends `auto` (or any
 pool name) and the gateway routes to one member, switching accounts on its
-behalf when one runs out. The model is **sticky, reactive, and
-zero-probe**, per pool:
+behalf when one runs out. Routing is **sticky and reactive**; the background
+Codex weekly hello below is independent of member selection:
 
 - **Sticky.** Every request to a pool reuses the same member so Anthropic's
   per-account prompt cache keeps paying off. The gateway does not compare
@@ -618,17 +618,17 @@ zero-probe**, per pool:
   that fact until its own next `401`. The park is cleared, everywhere it was
   copied to, by `POST /_gateway/clear` once the account is restored, or
   retried automatically when the window elapses.
-- **Zero probe.** The starting member is chosen at random on startup (or by
-  declared priority — see below) and its quota fills in from the first real
-  response. No member is ever contacted just to measure it. This is also why
-  resets stay naturally staggered: each account's rolling 5-hour window is
-  anchored to its own real first use, so the windows drift apart and there
-  is almost always one member freeing up before the others.
+- **No routing probe.** The starting member is chosen at random on startup
+  (or by declared priority — see below) and the gateway never contacts a
+  member just to measure quota. The Codex hello starts the upstream weekly
+  session after its stored reset; its quota headers update the shared
+  snapshot, but it never moves the sticky pointer or changes exhaustion
+  state. Rolling 5-hour windows remain anchored to real use.
 
 A pool may opt out of the random start and round-robin failover by
 declaring a preference order with `AQG_POOL_<POOL>_PRIORITY` — see
 [Priority within a pool](#priority-within-a-pool). This changes only
-*which* healthy member is picked; the sticky, reactive, zero-probe model is
+*which* healthy member is picked; the request-driven routing model is
 otherwise unchanged.
 
 ### What the client sees on an upstream 429 or native Anthropic 529
@@ -1203,6 +1203,7 @@ curl http://127.0.0.1:8080/_gateway/ui
 - `cmd/agent-quota-gateway/` — service entrypoint and integration tests
 - `internal/auto/` — per-pool sticky controllers and the `Pools` router
 - `internal/backend/` — pool registry, selector resolution middleware
+- `internal/codexhello/` — background Codex weekly-reset hello
 - `internal/config/` — env loading and validation
 - `internal/proxy/` — reverse-proxy handler and tests
 - `internal/quota/` — rate-limit header extraction and snapshot store
@@ -1290,13 +1291,14 @@ that section for the changed model.) The guarantees that follow:
   survives a restart. The file contains only quota utilization data and
   timing — no credentials — and is `0600` so only the service account can
   read it. There is no telemetry egress.
-- The proxy does not issue probe traffic against the Messages API: every
-  header-derived snapshot is the side effect of a real client request. The
-  only gateway-originated requests are the background poller's reads of
-  Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark quota endpoints, sent with
-  the active member's own credential (or IAM key pair for Volcengine) to
-  that member's own provider — never to Anthropic, and never carrying
-  request/response bodies.
+- The proxy does not issue probe traffic against the Messages API: each
+  header-derived snapshot there comes from a real client request. Background
+  upstream requests are the poller's reads of Z.ai / ZhipuAI, MiniMaxi, and
+  Volcengine Ark quota endpoints, plus the Codex weekly hello to an eligible
+  member's own `chatgpt.com` upstream. Each uses that member's credential
+  (or Volcengine's IAM key pair). The hello carries only its fixed
+  gateway-created JSON body; client request and response bodies remain
+  opaque.
 - The listen address is loopback-only by default. `config.validate`
   rejects `0.0.0.0`, and unresolvable names so a misconfigured deployment
   fails closed at startup. The one sanctioned way off loopback is
@@ -1588,11 +1590,33 @@ local read-only view, gated by the loopback boundary like
 For Anthropic and other header-reporting backends, snapshots only update
 when real traffic flows. The gateway issues no synthetic probe requests
 against the Messages API — if no client has hit the pool recently, the
-snapshot is stale by exactly that gap.
+snapshot is stale by exactly that gap. Codex weekly resets use the separate
+hello described below; it does not probe Anthropic or affect routing.
 
 Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark backends are kept fresh
 independently of traffic by the background poller (see
 [Proprietary quota polling](#proprietary-quota-polling)).
+
+### Codex weekly-reset hello
+
+For each enabled, present member whose base URL resolves to `chatgpt.com`,
+the background loop sends a hello when its stored weekly (`Unified7dReset`)
+reset has passed and the snapshot's `AsOf` predates that reset. It checks at
+known reset times and on a 10-minute idle fallback cadence. Pool names do not
+control eligibility; the backend host does. Five-hour resets never trigger a
+hello.
+
+The request is one `POST <member upstream>/responses` with the fixed body
+`{"model":"gpt-5.2-codex","input":"hi"}`, the member's credential, and a
+30-second deadline. A `(QuotaKey(), reset)` pair is attempted once per
+process, including after a failed request; two pools sharing an account
+coalesce to one request. A restart may make one additional attempt for the
+current reset. On success, returned `x-codex-*` quota headers merge into the
+shared account snapshot. Only the pool that supplied the hello is marked
+locally; the quota itself remains shared across pools by account key. An
+empty 2xx does not advance snapshot freshness. The hello never changes
+sticky routing or exhaustion state, and client request and response bodies
+remain opaque.
 
 ### Consumer contract
 
@@ -1662,8 +1686,8 @@ How it behaves:
   without any client request. It shares the process shutdown signal and
   stops when the gateway does.
 
-The poller's reads are the only gateway-originated upstream traffic; see
-[Security model](#security-model).
+The background upstream requests are the poller's reads and the Codex weekly
+hello; see [Security model](#security-model).
 
 ### Recovery probing for parked members
 
@@ -1755,9 +1779,11 @@ probe-eligible member (issue #242):
 
 The proxy is the trust boundary — it owns the credentials and resolves a
 pool name to a member per request, and its logs are safe to share with any
-local tool. Quota observation piggy-backs on the same boundary: rate-limit
-headers come down on every response, so we capture them per backend with
-zero extra upstream load.
+local tool. For most backends, quota observation piggy-backs on client
+responses, so rate-limit headers are captured with no extra upstream load.
+The exception is the separate Codex weekly-reset hello: after a stored
+weekly reset expires, its background path sends the fixed `/responses`
+prompt described in [Freshness model](#codex-weekly-reset-hello).
 
 ## License
 
