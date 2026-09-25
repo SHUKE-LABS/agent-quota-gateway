@@ -2051,8 +2051,9 @@ func (c *Controller) nextWorkerReassignmentLocked() (nick, nextCursor string, ok
 
 // reconcileWorkerAffinityLocked clears all assignments at concurrency 1.
 // Above 1, it leaves stale member references for ResolveWorker to reassign on
-// that worker's next request, and repairs the round-robin cursor. Caller holds
-// c.mu.
+// that worker's next request, and repairs the round-robin cursor. A worker that
+// never returns can therefore leave a stale runtime entry in the state file.
+// Caller holds c.mu.
 func (c *Controller) reconcileWorkerAffinityLocked() bool {
 	changed := false
 	if c.workerConcurrency <= 1 {

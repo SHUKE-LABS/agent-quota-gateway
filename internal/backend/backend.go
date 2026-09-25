@@ -412,10 +412,11 @@ type rawMember struct {
 // a Registry.
 type parsed struct {
 	members []rawMember
-	// declaredPools lists pool names declared without members. The env path
-	// records pools named by a concurrency setting; the file/spec path records
-	// every pool key so an operator-created-but-empty pool (issue #198, folding
-	// in the old AddedPools) materializes in the Registry instead of vanishing.
+	// declaredPools lists pool names declared without members. The file/spec
+	// path records every pool key so an operator-created-but-empty pool (issue
+	// #198, folding in the old AddedPools) materializes instead of vanishing.
+	// Env pools are materialized from their members; auxiliary settings cannot
+	// create a pool by themselves.
 	declaredPools          map[string]bool
 	originKey              map[string]string // pool/nick -> origin key for errors
 	poolBaseURL            map[string]string // pool -> declared default upstream
@@ -552,7 +553,6 @@ func loadFromWithRequireNonEmpty(environ []string, defaultBaseURL string, requir
 			}
 			p.poolConcurrencyOrigin[poolName] = key
 			p.poolConcurrency[poolName] = n
-			p.declaredPools[poolName] = true
 			continue
 		}
 
@@ -645,6 +645,19 @@ func buildRegistry(defaultBaseURL string, p parsed, requireNonEmpty bool) (*Regi
 	for poolName, concurrency := range p.poolConcurrency {
 		if concurrency < 1 {
 			return nil, fmt.Errorf("backend: %s for pool %q must be an integer >= 1", p.poolConcurrencyOrigin[poolName], poolName)
+		}
+		if p.declaredPools[poolName] {
+			continue // Explicit file/spec pool; zero members are valid there.
+		}
+		hasMembers := false
+		for _, member := range p.members {
+			if member.pool == poolName {
+				hasMembers = true
+				break
+			}
+		}
+		if !hasMembers {
+			return nil, fmt.Errorf("backend: %s sets concurrency for pool %q, which has no backends", p.poolConcurrencyOrigin[poolName], poolName)
 		}
 	}
 

@@ -404,6 +404,16 @@ func TestLoadFrom_concurrency(t *testing.T) {
 	}
 }
 
+func TestLoadFrom_concurrencyDoesNotCreateUnknownPool(t *testing.T) {
+	_, err := loadFrom([]string{
+		"AQG_POOL_AUTO_BACKEND_A=cred-a",
+		"AQG_POOL_TYPO_CONCURRENCY=2",
+	}, testDefaultBaseURL)
+	if err == nil || !strings.Contains(err.Error(), "AQG_POOL_TYPO_CONCURRENCY") || !strings.Contains(err.Error(), `pool "typo"`) || !strings.Contains(err.Error(), "which has no backends") {
+		t.Fatalf("unknown concurrency pool error = %v, want pool-specific no-backends error", err)
+	}
+}
+
 func TestLoadFrom_concurrencyRejectsInvalidValuesAndBalance(t *testing.T) {
 	for _, value := range []string{"not-an-int", "0", "-1"} {
 		t.Run(value, func(t *testing.T) {
@@ -722,6 +732,19 @@ func TestBuildFromSpec_concurrencyAndCopyOnWrite(t *testing.T) {
 	}
 	if got := reg.Spec().Pools["auto"].Concurrency; got == nil || *got != 3 {
 		t.Errorf("Spec concurrency = %v, want 3", got)
+	}
+}
+
+func TestBuildFromSpec_emptyPoolMayDeclareConcurrency(t *testing.T) {
+	value := 2
+	reg, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{
+		"waiting": {Concurrency: &value},
+	}}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec explicit empty pool: %v", err)
+	}
+	if got := reg.PoolConcurrency("waiting"); got != 2 {
+		t.Errorf("empty pool concurrency = %d, want 2", got)
 	}
 }
 
