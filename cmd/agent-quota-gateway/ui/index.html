@@ -259,6 +259,15 @@
   table.members th:nth-child(5) { width: 13%; }
   table.members th:nth-child(6) { width: 12%; }
   table.members th:nth-child(7) { width: 21%; }
+  table.members.with-workers { min-width: 850px; }
+  table.members.with-workers th:nth-child(1) { width: 17%; }
+  table.members.with-workers th:nth-child(2) { width: 9%; }
+  table.members.with-workers th:nth-child(3) { width: 10%; }
+  table.members.with-workers th:nth-child(4) { width: 11%; }
+  table.members.with-workers th:nth-child(5) { width: 11%; }
+  table.members.with-workers th:nth-child(6) { width: 12%; }
+  table.members.with-workers th:nth-child(7) { width: 10%; }
+  table.members.with-workers th:nth-child(8) { width: 20%; }
   table.members th, table.members td {
     text-align: left;
     padding: 6px 8px;
@@ -269,6 +278,9 @@
   table.members td.nick { font-family: var(--mono); }
   table.members td.quota { min-width: 72px; }
   table.members td.reset { color: var(--muted); white-space: nowrap; }
+  table.members td.workers { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  table.members td.workers.pending { opacity: 0.5; }
+  .serving { color: var(--ok); font-size: 10px; font-weight: 600; text-transform: uppercase; }
 
   /* Compact quota bar: a track with a fill, plus a NN% label. Falls back
      to a plain "-" text node when the window has no utilization yet.
@@ -435,6 +447,16 @@
   }
   button.rename-pool + button.delete-pool { margin-left: 8px; }
   button.rename-pool:hover { border-color: var(--accent); background: rgba(0, 0, 0, 0.04); }
+  button.concurrency-control {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  button.concurrency-control:hover { border-color: var(--accent); }
 
   .addsub-card {
     background: var(--panel);
@@ -682,6 +704,7 @@
     // the field.
     return {
       pool: String(view.pool || ''),
+      concurrency: Number.isInteger(view.concurrency) && view.concurrency > 0 ? view.concurrency : 1,
       priority: Array.isArray(view.priority) ? view.priority.slice() : [],
       members: members,
     };
@@ -718,6 +741,7 @@
     var section = document.createElement('section');
     section.className = 'pool';
     section.setAttribute('data-pool', view.pool);
+    section.setAttribute('data-concurrency', String(view.concurrency));
 
     var head = document.createElement('header');
     var h2 = document.createElement('h2');
@@ -753,6 +777,20 @@
     updated.setAttribute('data-role', 'updated');
     updated.textContent = '';
     head.appendChild(updated);
+
+    if (showConcurrencyControl((view.members || []).length)) {
+      var concurrency = document.createElement('button');
+      concurrency.type = 'button';
+      concurrency.className = 'concurrency-control';
+      concurrency.setAttribute('data-role', 'concurrency-control');
+      concurrency.setAttribute('data-concurrency', String(view.concurrency));
+      concurrency.setAttribute('aria-label', 'Edit pool concurrency');
+      concurrency.textContent = 'Concurrency: ' + view.concurrency;
+      concurrency.addEventListener('click', function () {
+        editConcurrency(view.pool, Number(concurrency.getAttribute('data-concurrency')), view.members.length);
+      });
+      head.appendChild(concurrency);
+    }
 
     // Delete-pool control, offered only for an empty pool (issue #233). The
     // DELETE API is empty-only — it returns 409 for a pool that still has
@@ -818,7 +856,8 @@
 
   function renderMembers(view) {
     var table = document.createElement('table');
-    table.className = 'members';
+    var showWorkers = showsWorkerColumn(view.concurrency);
+    table.className = showWorkers ? 'members with-workers' : 'members';
 
     // Provider-agnostic column headers (issue #154): the long-window
     // header used to be inferred from the active member's base URL via
@@ -832,7 +871,10 @@
     // text-transform:uppercase renders these.
     var thead = document.createElement('thead');
     var trh = document.createElement('tr');
-    ['Nick', 'Status', '5H', '5H reset', '7/30D', '7/30D reset', ''].forEach(function (h) {
+    var headers = ['Nick'];
+    if (showWorkers) headers.push('Workers');
+    headers.push('Status', '5H', '5H reset', '7/30D', '7/30D reset', '');
+    headers.forEach(function (h) {
       var th = document.createElement('th');
       th.textContent = h;
       trh.appendChild(th);
@@ -861,6 +903,15 @@
         rank.className = 'rank';
         rank.textContent = String(idx + 1);
         wrap.appendChild(rank);
+
+        if (showWorkers) {
+          var serving = document.createElement('span');
+          serving.className = 'serving';
+          serving.setAttribute('data-role', 'serving');
+          serving.textContent = 'serving';
+          serving.style.display = 'none';
+          wrap.appendChild(serving);
+        }
 
         var name = document.createElement('span');
         name.className = 'nick-name';
@@ -892,8 +943,24 @@
         tdN.appendChild(wrap);
       } else {
         tdN.textContent = m.nick;
+        if (showWorkers) {
+          var soloServing = document.createElement('span');
+          soloServing.className = 'serving';
+          soloServing.setAttribute('data-role', 'serving');
+          soloServing.textContent = ' serving';
+          soloServing.style.display = 'none';
+          tdN.appendChild(soloServing);
+        }
       }
       tr.appendChild(tdN);
+
+      if (showWorkers) {
+        var workerCell = document.createElement('td');
+        workerCell.className = 'workers';
+        workerCell.setAttribute('data-role', 'workers');
+        applyWorkerPresentation(workerCell, m, view.concurrency);
+        tr.appendChild(workerCell);
+      }
 
       var tdS = document.createElement('td');
       var status = document.createElement('span');
@@ -1015,6 +1082,47 @@
     scroll.className = 'members-scroll';
     scroll.appendChild(table);
     return scroll;
+  }
+
+  function concurrencyInputAction(raw, current, memberCount) {
+    if (raw == null) return { kind: 'ignore' };
+    if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return { kind: 'invalid' };
+    var value = Number(raw.trim());
+    if (!Number.isSafeInteger(value) || value < 1 || value > memberCount) return { kind: 'invalid' };
+    if (value === current) return { kind: 'ignore' };
+    return { kind: 'post', value: value };
+  }
+
+  function showConcurrencyControl(memberCount) {
+    return memberCount >= 2;
+  }
+
+  function showsWorkerColumn(concurrency) {
+    return Number(concurrency) > 1;
+  }
+
+  function workerPresentation(concurrency, member) {
+    var enabled = showsWorkerColumn(concurrency);
+    var workers = enabled && Array.isArray(member.workers) ? member.workers.slice().sort() : [];
+    var serving = enabled && member.in_window === true;
+    var pending = workers.length > 0 && !serving;
+    var names = workers.join(', ');
+    return {
+      enabled: enabled,
+      serving: serving,
+      count: workers.length,
+      pending: pending,
+      names: names,
+      title: names ? names + (pending ? ' (moves on next request)' : '') : '',
+    };
+  }
+
+  function applyWorkerPresentation(cell, member, concurrency) {
+    var state = workerPresentation(concurrency, member);
+    cell.textContent = String(state.count);
+    cell.title = state.title;
+    if (state.pending) cell.classList.add('pending');
+    else cell.classList.remove('pending');
   }
 
   // renderQuota paints one rolling-window cell. utilization is a 0..1
@@ -1382,6 +1490,11 @@
       var upd = section.querySelector('[data-role="updated"]');
       if (upd) upd.textContent = stamp;
       if (!s) return;
+      var concurrencyControl = section.querySelector('[data-role="concurrency-control"]');
+      if (concurrencyControl) {
+        concurrencyControl.setAttribute('data-concurrency', String(s.concurrency));
+        concurrencyControl.textContent = 'Concurrency: ' + s.concurrency;
+      }
       var rows = section.querySelectorAll('table.members tbody tr');
       rows.forEach(function (tr) {
         var nick = tr.getAttribute('data-nick');
@@ -1392,6 +1505,12 @@
         if (badge) {
           badge.setAttribute('data-status', match.status || 'idle');
           badge.textContent = match.status || 'idle';
+        }
+        var workerCell = tr.querySelector('[data-role="workers"]');
+        if (workerCell) applyWorkerPresentation(workerCell, match, s.concurrency);
+        var serving = tr.querySelector('[data-role="serving"]');
+        if (serving) {
+          serving.style.display = workerPresentation(s.concurrency, match).serving ? '' : 'none';
         }
         // Sync the toggle from the live disabled flag so it can't freeze "On"
         // while the badge reads "disabled" after an out-of-band disable (issue
@@ -1452,7 +1571,11 @@
     // DOM walk in the steady state. Schedules a single re-render; the
     // in-flight guard above coalesces any further divergence the
     // re-render would otherwise miss.
-    if (!rosterEqual(liveRoster(statuses), renderedRoster())) {
+    var concurrencyChanged = (statuses || []).some(function (s) {
+      var section = root.querySelector('section.pool[data-pool="' + cssEscape(s.pool) + '"]');
+      return section && section.getAttribute('data-concurrency') !== String(s.concurrency);
+    });
+    if (concurrencyChanged || !rosterEqual(liveRoster(statuses), renderedRoster())) {
       scheduleReconcile();
     }
   }
@@ -1481,6 +1604,20 @@
     order.splice(to, 0, nick);
     postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/priority', order)
       .then(function (r) { return refreshAfter(r, 'Failed to reorder priority'); });
+  }
+
+  function editConcurrency(pool, current, memberCount) {
+    var raw = window.prompt(
+      'Enter concurrency from 1 to ' + memberCount + ':', String(current));
+    var action = concurrencyInputAction(raw, current, memberCount);
+    if (action.kind === 'ignore') return;
+    if (action.kind === 'invalid') {
+      showBanner('Concurrency must be an integer from 1 to ' + memberCount);
+      return;
+    }
+    postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/concurrency',
+      { concurrency: action.value })
+      .then(function (r) { return refreshAfter(r, 'Failed to set concurrency'); });
   }
 
   function toggleMember(pool, nick, disabled) {

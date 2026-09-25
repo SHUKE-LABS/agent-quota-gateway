@@ -317,6 +317,7 @@ func run(configFlag string) error {
 	mux.HandleFunc("POST /_gateway/pool", createPoolHandler(pools, persistence))
 	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/rename", renamePoolHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/concurrency", concurrencyHandler(pools, persistence))
 	mux.HandleFunc("/_gateway/clear", clearHandler(pools))
 	mux.HandleFunc("/_gateway/config", configHandler(pools, persistence))
 	mux.HandleFunc("/_gateway/debug", debugHandler(persistence, configWriter.MarkDirty))

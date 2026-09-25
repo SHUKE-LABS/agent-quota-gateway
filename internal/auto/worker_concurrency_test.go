@@ -1,6 +1,7 @@
 package auto
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
 func workerPriorityRegistry(t *testing.T, concurrency int, priority string, nicks ...string) *backend.Registry {
@@ -109,6 +111,116 @@ func TestWorkerAffinity_concurrencyWindowAndReclaim(t *testing.T) {
 	}
 	if got, _, exhausted := c.ResolveWorker("worker-b"); exhausted || got.Nick != "b" {
 		t.Fatalf("worker-b moved after a recovered = %q exhausted=%v, want b", got.Nick, exhausted)
+	}
+}
+
+func TestWorkerStatus_reportsWindowAndDeferredAffinity(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	p := NewPools(workerRegistryWithConcurrency(t, 2, "a", "b", "c"), nil, clock.now, io.Discard)
+	for _, tc := range []struct{ worker, want string }{{"worker-z", "a"}, {"worker-y", "b"}, {"worker-a", "a"}} {
+		if got, _, _, exhausted := p.RouteWorker("auto", tc.worker); exhausted || got.Nick != tc.want {
+			t.Fatalf("initial %s = %q exhausted=%v, want %s", tc.worker, got.Nick, exhausted, tc.want)
+		}
+	}
+
+	status, ok := p.PoolStatus("auto", quota.NewStore(), nil)
+	if !ok {
+		t.Fatal("PoolStatus(auto) missing")
+	}
+	byNick := make(map[string]MemberStatus, len(status.Members))
+	for _, member := range status.Members {
+		byNick[member.Nick] = member
+	}
+	for nick, want := range map[string]bool{"a": true, "b": true, "c": false} {
+		if byNick[nick].InWindow != want {
+			t.Errorf("%s in_window=%v, want %v", nick, byNick[nick].InWindow, want)
+		}
+	}
+	if got := strings.Join(byNick["a"].Workers, ","); got != "worker-a,worker-z" {
+		t.Errorf("a workers=%v, want sorted [worker-a worker-z]", byNick["a"].Workers)
+	}
+	if got := strings.Join(byNick["b"].Workers, ","); got != "worker-y" {
+		t.Errorf("b workers=%v, want [worker-y]", byNick["b"].Workers)
+	}
+	if len(byNick["c"].Workers) != 0 {
+		t.Errorf("c workers=%v, want none", byNick["c"].Workers)
+	}
+
+	p.byPool["auto"].park("b", clock.now().Add(time.Hour))
+	status, _ = p.PoolStatus("auto", quota.NewStore(), nil)
+	byNick = make(map[string]MemberStatus, len(status.Members))
+	for _, member := range status.Members {
+		byNick[member.Nick] = member
+	}
+	if byNick["b"].InWindow {
+		t.Error("exhausted b remains in the worker window")
+	}
+	if !byNick["c"].InWindow {
+		t.Error("available c did not enter the worker window after b was exhausted")
+	}
+	if got := strings.Join(byNick["b"].Workers, ","); got != "worker-y" {
+		t.Errorf("b workers before next request=%v, want [worker-y]", byNick["b"].Workers)
+	}
+	if got, _, _, exhausted := p.RouteWorker("auto", "worker-a"); exhausted || got.Nick != "a" {
+		t.Errorf("worker-a in window moved to %q exhausted=%v, want a", got.Nick, exhausted)
+	}
+	if got, _, _, exhausted := p.RouteWorker("auto", "worker-y"); exhausted || got.Nick != "c" {
+		t.Errorf("worker-y deferred reassignment=%q exhausted=%v, want c", got.Nick, exhausted)
+	}
+
+	if code, err := p.SetConcurrency("auto", 1); code != http.StatusOK || err != nil {
+		t.Fatalf("SetConcurrency(1): status=%d err=%v", code, err)
+	}
+	status, _ = p.PoolStatus("auto", quota.NewStore(), nil)
+	for _, member := range status.Members {
+		if member.InWindow {
+			t.Errorf("N=1 %s reports in_window=true", member.Nick)
+		}
+		if len(member.Workers) != 0 {
+			t.Errorf("N=1 %s reports workers=%v", member.Nick, member.Workers)
+		}
+	}
+	wire, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("marshal N=1 status: %v", err)
+	}
+	if strings.Contains(string(wire), `"workers"`) {
+		t.Errorf("N=1 status contains a workers field: %s", wire)
+	}
+}
+
+func TestSetConcurrency_reassignsOnlyWorkersOutsideLoweredWindow(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	p := NewPools(workerRegistryWithConcurrency(t, 3, "a", "b", "c"), nil, clock.now, io.Discard)
+	for _, tc := range []struct{ worker, want string }{{"worker-a", "a"}, {"worker-b", "b"}, {"worker-c", "c"}} {
+		if got, _, _, exhausted := p.RouteWorker("auto", tc.worker); exhausted || got.Nick != tc.want {
+			t.Fatalf("initial %s = %q exhausted=%v, want %s", tc.worker, got.Nick, exhausted, tc.want)
+		}
+	}
+	if code, err := p.SetConcurrency("auto", 2); code != http.StatusOK || err != nil {
+		t.Fatalf("SetConcurrency(2): status=%d err=%v", code, err)
+	}
+	status, _ := p.PoolStatus("auto", quota.NewStore(), nil)
+	byNick := make(map[string]MemberStatus, len(status.Members))
+	for _, member := range status.Members {
+		byNick[member.Nick] = member
+	}
+	for _, nick := range []string{"a", "b"} {
+		if !byNick[nick].InWindow {
+			t.Errorf("%s is outside the lowered worker window", nick)
+		}
+	}
+	if byNick["c"].InWindow || strings.Join(byNick["c"].Workers, ",") != "worker-c" {
+		t.Errorf("c before worker request: %+v, want outside window with worker-c pending", byNick["c"])
+	}
+	if got, _, _, exhausted := p.RouteWorker("auto", "worker-c"); exhausted || got.Nick == "c" {
+		t.Errorf("worker-c reassigned to %q exhausted=%v, want an in-window member", got.Nick, exhausted)
+	}
+	if got, _, _, exhausted := p.RouteWorker("auto", "worker-a"); exhausted || got.Nick != "a" {
+		t.Errorf("worker-a moved from retained window member to %q exhausted=%v, want a", got.Nick, exhausted)
+	}
+	if got, _, _, exhausted := p.RouteWorker("auto", "worker-b"); exhausted || got.Nick != "b" {
+		t.Errorf("worker-b moved from retained window member to %q exhausted=%v, want b", got.Nick, exhausted)
 	}
 }
 
