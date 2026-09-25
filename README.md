@@ -135,6 +135,45 @@ normalized: `AQG_POOL_AUTO_BACKEND_A` declares pool `auto`, member `a`
 (lowercase, `_`→`-`), and the client selects it by sending `auto` in any
 case.
 
+### Per-worker affinity
+
+Clients that need independent routing within one pool can put their existing
+stable worker nickname in the reserved URL namespace:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080/_aqg/w/agent-a \
+ANTHROPIC_AUTH_TOKEN=auto \
+claude
+```
+
+The selector still names the AQG pool through `Authorization` (or the
+existing `X-Api-Key` fallback). The worker nickname is taken from the URL and
+used only as routing identity; it is not an AQG member nick, a credential, or
+an authentication mechanism. The namespace is removed before proxying, so the
+upstream receives the same API path and query it would receive without the
+namespace. No worker field is added to `backends.json`.
+
+On first use, each `(pool, worker nickname)` receives the next healthy AQG
+member in a per-pool round-robin cycle. A configured `PRIORITY` order defines
+that cycle; otherwise member nick order is stable and sorted. Once assigned,
+the worker stays on that member while it is healthy. `BALANCE=lead` and
+priority preemption continue to affect only the legacy global sticky pointer;
+they do not move an existing worker assignment. When a member becomes
+unavailable, only workers assigned to it are reallocated. A real upstream
+quota rejection or credential failure clears assignments to that member in
+every pool that shares the nick. Transient same-member overload handling keeps
+the assignment.
+
+Worker assignments and the next first-use cursor are runtime routing
+observations in the configured state file. On restart and member changes,
+assignments to removed, disabled, or currently unavailable members are
+dropped. Without `/_aqg/w/<worker-nickname>`, requests keep the existing
+global-sticky behavior. The quota poller still tracks the global sticky
+member; a worker assigned to another poller-tracked member may not get a
+proactive quota refresh, so that worker's failover may wait for an upstream
+rejection. In shared mode, the existing listener and network ACL remain the
+trust boundary: callers must not treat the worker nickname as authentication.
+
 A **member name (nick) is the global identity for a physical account.** The
 gateway keys quota state by `QuotaKey()` (see `internal/backend`), and
 `QuotaKey()` is the nick alone — not `pool/nick`. This is deliberate: a
@@ -377,7 +416,7 @@ classes and configure each pool's `BASE_URL` and members accordingly.
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single non-loopback overlay/IP address (e.g. a Tailscale address, `100.64.0.0/10` / `fd7a:115c:a1e0::/48`; or any other overlay/LAN address the deployment trusts, such as an OpenVPN `10.8.0.0/24`) instead of loopback, so other machines that can reach it share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. Deliberately env-only (issue #301): account-level signing credentials are not pool-member intent, so they stay out of `aqg.json`; a missing pair surfaces as the member's `last_err` in pool status. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. Env-only by design — see `VOLC_ACCESSKEY`. |
-| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. When a config file declares an empty `state_file`, startup warns with the config path; set `state_file` in that file and restart. The file stores **runtime observation only** — sticky pointers, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles legacy `priority_override` and `disabled` (issues #241, #259) and **reports only** legacy `removed_members` / `added_members` (the credential-bearing keys are never silently applied), as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
+| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. When a config file declares an empty `state_file`, startup warns with the config path; set `state_file` in that file and restart. The file stores **runtime observation only** — sticky pointers, per-worker affinities and their first-use cursor, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles legacy `priority_override` and `disabled` (issues #241, #259) and **reports only** legacy `removed_members` / `added_members` (the credential-bearing keys are never silently applied), as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
 | `AQG_DEBUG_LOG_REQUESTS` | _(unset)_ | Set to `1` to dump every inbound request and outbound upstream request to stderr for debugging; any other value (or unset) leaves it off. Credentials are always redacted — the `Authorization` and `x-api-key` headers are never logged — but the inbound request body is dumped (truncated to 500 bytes) and may contain user message content, so enable only in dev/debug runs. This env var is a **first-start bootstrap seed** exactly like `AQG_POOL_*` (issue #301): read only in env-only mode and when generating a fresh `aqg.json`, whose `debug.log_requests` section then owns the setting. Once a config file exists it is never read again — flip logging on a running gateway via `POST /_gateway/debug` or the UI instead (no restart). |
 
 Startup fails closed on: an empty credential, a `BASE_URL`
@@ -918,7 +957,7 @@ restarting is the wrong tool.
 | `POST /_gateway/debug` | Hot-toggle request logging on a running gateway; body `{"log_requests": true\|false}` (field required, missing → `400`). Takes effect on the **next request** — no restart, no dropped connections — and flushes to `aqg.json`'s `debug.log_requests` via the same debounced write every mutation uses, so it survives restart. In env-only mode the toggle is in-memory only and the response says so (`X-AQG-Persistence: env_only`). Non-GET/POST returns `405`. The dump itself is the stderr request dump described under `AQG_DEBUG_LOG_REQUESTS`: credentials redacted, bodies truncated. |
 | `POST /_gateway/pool` | Create a plain pool at runtime; body `{"name": "...", "mode": "plain"}` (`name` required, `mode` optional and defaults to `plain`). A runtime pool is a pure named container with no pool-level base_url; each member resolves its own `base_url` via `AddMember`'s fallback chain. To atomically create the first member, include optional `nick`, `credential`, `base_url`, and `placement` fields; `nick` switches to combined mode, and validation failure creates neither resource. Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
 | `DELETE /_gateway/pool/{name}` | Remove a pool. The pool must be **empty** — drain members first via `DELETE .../member/{nick}`; a pool that still has members returns `409` (no cascade, so no persisted credential is silently discarded). Returns `200` `{"status": "ok"}`; an unknown pool returns `404`. Deleting the last pool is allowed (routing then fails closed with `403` unknown selector). Persisted: a deleted pool does not reappear on restart. |
-| `POST /_gateway/pool/{name}/rename` | Rename a pool in place; body `{"name": "<new>"}` (required, normalized server-side). Carries the pool's members, disabled flags, declared priority, and balance parameters over to the new key. The controller's runtime observation (sticky pointer, exhausted marks, balance sequence, local-snapshot set) is keyed by member nick, so it follows the rename unchanged. Returns `200` `{"pool": "<new>"}`. Empty / identical-after-normalize new name → `400`; unknown old pool → `404`; new name collides with a different existing pool → `409`. Persisted: the next config-roundtrip restart restores the rename under the new key. **Caveat for env-only mode** (`AQG_CONFIG` unset, no `aqg.json`): the config writer is a no-op, so the rename is runtime-only and reverts to the env-declared name on restart — same constraint `AddPool`/`AddMember` already carry. |
+| `POST /_gateway/pool/{name}/rename` | Rename a pool in place; body `{"name": "<new>"}` (required, normalized server-side). Carries the pool's members, disabled flags, declared priority, and balance parameters over to the new key. Sticky pointer, exhausted marks, balance sequence, and local-snapshot observations follow member nicks; worker affinities and their first-use cursor follow the controller and persist under the renamed pool key. Returns `200` `{"pool": "<new>"}`. Empty / identical-after-normalize new name → `400`; unknown old pool → `404`; new name collides with a different existing pool → `409`. Persisted: the next config-roundtrip restart restores the rename under the new key. **Caveat for env-only mode** (`AQG_CONFIG` unset, no `aqg.json`): the config writer is a no-op, so the rename is runtime-only and reverts to the env-declared name on restart — same constraint `AddPool`/`AddMember` already carry. |
 | `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
@@ -1286,10 +1325,10 @@ that section for the changed model.) The guarantees that follow:
   only by that service account. In env-only mode (no config file) the gateway
   keeps **zero credentials on disk**. Config views (`/_gateway/config`) always
   redact credentials regardless.
-- Quota snapshots, sticky pointers, and exhausted maps can optionally be
-  persisted to a local state file (see `AQG_STATE_FILE` below) so state
-  survives a restart. The file contains only quota utilization data and
-  timing — no credentials — and is `0600` so only the service account can
+- Quota snapshots, sticky pointers, worker affinities, and exhausted maps can
+  optionally be persisted to a local state file (see `AQG_STATE_FILE` below)
+  so state survives a restart. The file contains quota snapshots, routing
+  identities, and timing — no credentials — and is `0600` so only the service account can
   read it. There is no telemetry egress.
 - The proxy does not issue probe traffic against the Messages API: each
   header-derived snapshot there comes from a real client request. Background
@@ -1347,16 +1386,16 @@ address.
 
 ### What "shared" means
 
-This is not a new coordination protocol. The sticky pointer, exhausted
-marks, and quota snapshots have always lived **per process**; shared mode
-simply makes that one process reachable from other machines. So by
-definition:
+This is not a new coordination protocol. The global sticky pointer, worker
+affinities, exhausted marks, and quota snapshots live **per process**; shared
+mode makes that one process reachable from other machines. Requests without a
+worker namespace still use the global sticky pointer. So by definition:
 
-- every client drives the **same** sticky member, so the prompt cache on
-  the active account keeps paying off across all of them;
-- a `429` one machine triggers fails the pool over for **everyone** at
-  once — no machine has to independently hit the wall to learn a backend
-  is drained;
+- unnamespaced clients drive the **same** sticky member; namespaced clients
+  keep their own healthy worker assignment, while all clients still share
+  account quota and member availability;
+- a quota failure invalidates that member's assignments for every worker, so
+  its mapped workers are reassigned without moving workers on healthy members;
 - `GET /_gateway/quota` returns the one shared view, not a per-machine
   guess.
 

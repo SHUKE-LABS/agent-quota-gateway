@@ -75,16 +75,22 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
 
 ### Request flow
 
-1. Client sends `Authorization: Bearer <pool>` (Claude Code puts
+1. `backend.WorkerNamespaceMiddleware` strips an optional
+   `/_aqg/w/<worker-nickname>` prefix before ServeMux and request logging,
+   preserving the escaped API path suffix and query. It carries the worker
+   nickname only in request context.
+2. Client sends `Authorization: Bearer <pool>` (Claude Code puts
    `ANTHROPIC_AUTH_TOKEN` there). `backend.Middleware` extracts the
    selector (falls back to `X-Api-Key`), normalizes it, and calls
-   `auto.Pools.Route`.
-2. `Route` returns **403 unknown selector** (fail closed, no upstream
+   `auto.Pools.RouteWorker` for namespaced requests or `Route` otherwise.
+3. The router returns **403 unknown selector** (fail closed, no upstream
    round-trip), **503 + Retry-After** (whole pool exhausted — wait until
    the soonest member resets; 503 not 429 so Claude Code retries and
-   auto-resumes rather than ending the turn, issue #203), or the pool's
-   current **sticky backend**, stored on the request context.
-3. `proxy.New`'s director reads the resolved backend, picks the auth
+   auto-resumes rather than ending the turn, issue #203), or the global
+   sticky backend / healthy member assigned to that worker, stored on the
+   request context. Worker affinity ignores balance and preemption and is
+   reassigned only when its member becomes unavailable.
+4. `proxy.New`'s director reads the resolved backend, picks the auth
    scheme by credential prefix (`sk-ant-oat*`→`Bearer`+`oauth-2025-04-20`
    beta; `sk-ant-api*`→`x-api-key`; else `Bearer` no beta), and forwards
    with response buffering disabled so SSE streams as it arrives. It joins
@@ -93,7 +99,7 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
    selector/auth boundary gates, not a route table; `/` is the catch-all,
    `/_gateway/*` mounts directly with no selector. Request and response
    bodies remain opaque: no schema inspection or translation.
-4. Response observer calls `quota.Extract` (headers only) and **merges**
+5. Response observer calls `quota.Extract` (headers only) and **merges**
    the snapshot under the backend's `QuotaKey()` — but only if it carries
    a quota window. `mergeSnapshot` (`internal/quota/quota.go:218-247`)
    carries absent fields forward, so a response reporting only the windows
@@ -103,7 +109,7 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
    admission guard). `HasData()` is the **read** gate, used on `Store.Get`
    for a missing key — that returns a stamped-but-empty snapshot, never an
    admitted one.
-5. `pools.ModifyResponse` dispatches per-pool response handling: upstream
+6. `pools.ModifyResponse` dispatches per-pool response handling: upstream
    **429** → synthetic **503** for a member switch, a precise pool-dry wait,
    or a same-member transient throttle depending on the classifier; native
    Anthropic **529** overload → synthetic same-member **503** with
@@ -138,8 +144,9 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
 - `internal/config/`, `internal/configfile/` — env loading/validation and
   JSON file loading + precedence.
 - `internal/persist/` — single debounced atomic state file (0600,
-  temp+rename) for **runtime observation only**: sticky pointers, exhausted
-  maps, snapshots, balance sequence, local-snapshot nicks. Operator intent
+  temp+rename) for **runtime observation only**: sticky pointers, worker
+  affinities and allocation cursors, exhausted maps, snapshots, balance
+  sequence, local-snapshot nicks. Operator intent
   lives in the config file (issue #198), not here. `internal/configfile/`
   owns the config write path (`Marshal` + debounced `Writer`).
 - `internal/logging/` — one JSON line/request to stderr; bodies and
@@ -173,11 +180,12 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
   move) builds a fresh validated `*backend.Registry` via copy-on-write
   (`Registry.With*` → `BuildFromSpec`, so the nick↔credential bijection is
   enforced on every mutation), swaps it in under `Pools.mu`, reconciles the
-  affected controllers (`reconcileLocked` preserves sticky/exhausted/balance/
-  local-snapshot observation), and flushes to `aqg.json`. There is no
-  state-file overlay. On first deploy with no `aqg.json`, env + the legacy
-  state overlay are merged once (state-wins) to bootstrap the file; env is
-  never read again. `Registry` is immutable-after-build; the hot read path
+  affected controllers (`reconcileLocked` preserves healthy worker affinities
+  with sticky/exhausted/balance/local-snapshot observation), and flushes to
+  `aqg.json`. No state-file overlay is used. On first deploy with no
+  `aqg.json`, env + the legacy state overlay are merged once (state-wins) to
+  bootstrap the file; env is never read again. `Registry` is
+  immutable-after-build; the hot read path
   stays lock-free.
 - **Trust boundary = loopback** (or the deployment's network ACL/firewall
   in shared mode, e.g. a Tailscale ACL or OpenVPN overlay). No auth on

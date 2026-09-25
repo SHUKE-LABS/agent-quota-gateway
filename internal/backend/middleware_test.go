@@ -20,6 +20,20 @@ type stubRouter struct {
 	gotPool string
 }
 
+type workerStubRouter struct {
+	stubRouter
+	gotWorker string
+}
+
+func (s *workerStubRouter) RouteWorker(pool, worker string) (Backend, time.Duration, bool, bool) {
+	if pool != s.b.Pool {
+		return Backend{}, 0, false, false
+	}
+	s.gotPool = pool
+	s.gotWorker = worker
+	return s.b, s.retryAfter, s.ok, s.exhausted
+}
+
 func (s *stubRouter) Route(pool string) (Backend, time.Duration, bool, bool) {
 	s.gotPool = pool
 	return s.b, s.retryAfter, s.ok, s.exhausted
@@ -53,6 +67,115 @@ func TestMiddleware_resolvesAndInjects(t *testing.T) {
 	}
 	if router.gotPool != "auto" {
 		t.Errorf("router saw pool %q, want normalized %q", router.gotPool, "auto")
+	}
+}
+
+func TestWorkerNamespaceMiddleware_stripsPathAndRoutesByWorker(t *testing.T) {
+	want := Backend{Pool: "auto", Nick: "seat1", Credential: "cred-a", BaseURL: testDefaultBaseURL}
+	router := &workerStubRouter{stubRouter: stubRouter{b: want, ok: true}}
+	var gotPath, gotEscapedPath, gotQuery string
+	var gotBackend Backend
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotEscapedPath = r.URL.EscapedPath()
+		gotQuery = r.URL.RawQuery
+		gotBackend, _ = FromContext(r.Context())
+	})
+	h := WorkerNamespaceMiddleware(Middleware(router, next))
+	req := httptest.NewRequest(http.MethodPost, "/_aqg/w/agent-a/v1/responses", nil)
+	req.URL.Path = "/_aqg/w/agent-a/v1/responses/a/b"
+	req.URL.RawPath = "/_aqg/w/agent-a/v1/responses/a%2Fb"
+	req.URL.RawQuery = "q=one%2ftwo&empty"
+	req.Header.Set("Authorization", "Bearer AUTO")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if router.gotPool != "auto" || router.gotWorker != "agent-a" {
+		t.Errorf("route identity=(%q,%q), want (auto,agent-a)", router.gotPool, router.gotWorker)
+	}
+	if gotBackend != want {
+		t.Errorf("backend=%+v, want %+v", gotBackend, want)
+	}
+	if gotPath != "/v1/responses/a/b" {
+		t.Errorf("path=%q, want stripped decoded API path", gotPath)
+	}
+	if gotEscapedPath != "/v1/responses/a%2Fb" {
+		t.Errorf("escaped path=%q, want original escaped API suffix", gotEscapedPath)
+	}
+	if gotQuery != "q=one%2ftwo&empty" {
+		t.Errorf("query=%q, want original raw query", gotQuery)
+	}
+}
+
+func TestWorkerNamespaceMiddleware_rejectsMalformedIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		{name: "empty", path: "/_aqg/w//v1/responses"},
+		{name: "missing API suffix", path: "/_aqg/w/agent-a"},
+		{name: "encoded slash", path: "/_aqg/w/agent%2Fa/v1/responses"},
+		{name: "literal traversal", path: "/_aqg/w/../v1/responses"},
+		{name: "encoded traversal", path: "/_aqg/w/%2e%2e/v1/responses"},
+		{name: "nested escape", path: "/_aqg/w/%252e%252e/v1/responses"},
+		{name: "nested encoded slash", path: "/_aqg/w/%252F/v1/responses"},
+		{name: "invalid UTF-8", path: "/_aqg/w/%FF/v1/responses"},
+		{name: "overlong", path: "/_aqg/w/" + strings.Repeat("a", maxWorkerNicknameSize+1) + "/v1/responses"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Fatal("malformed worker path reached downstream")
+			})
+			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer auto")
+			rec := httptest.NewRecorder()
+			WorkerNamespaceMiddleware(Middleware(&stubRouter{ok: true}, next)).ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status=%d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+func TestWorkerNamespaceMiddleware_acceptsOpaquePercentNickname(t *testing.T) {
+	var gotWorker string
+	h := WorkerNamespaceMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		gotWorker, _ = WorkerNicknameFromContext(r.Context())
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/_aqg/w/a%25b/v1/messages", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	if gotWorker != "a%b" {
+		t.Errorf("worker=%q, want decoded opaque nickname a%%b", gotWorker)
+	}
+}
+
+func TestWorkerNamespaceMiddleware_keepsXApiKeyPoolFallback(t *testing.T) {
+	want := Backend{Pool: "auto", Nick: "seat1", Credential: "cred-a", BaseURL: testDefaultBaseURL}
+	router := &workerStubRouter{stubRouter: stubRouter{b: want, ok: true}}
+	var called bool
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		called = true
+		if _, ok := FromContext(r.Context()); !ok {
+			t.Error("resolved backend missing from request context")
+		}
+	})
+	h := WorkerNamespaceMiddleware(Middleware(router, next))
+	req := httptest.NewRequest(http.MethodPost, "/_aqg/w/agent-a/v1/messages", nil)
+	req.Header.Set("X-Api-Key", "AUTO")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !called {
+		t.Fatalf("status=%d called=%v, want forwarded fallback request", rec.Code, called)
+	}
+	if router.gotPool != "auto" || router.gotWorker != "agent-a" {
+		t.Errorf("route identity=(%q,%q), want (auto,agent-a)", router.gotPool, router.gotWorker)
 	}
 }
 
@@ -186,7 +309,7 @@ func TestMiddleware_xApiKeyFallback(t *testing.T) {
 		wantOK  bool
 	}{
 		{"x-api-key only", "", "claude", true},
-		{"x-api-key uppercase", "", "CLAUDE", true},        // normalized
+		{"x-api-key uppercase", "", "CLAUDE", true}, // normalized
 		{"bearer wins, no x-api-key", "Bearer claude", "", true},
 		{"bearer unknown, x-api-key fallback", "Bearer unknown", "claude", true},
 		{"both unknown", "Bearer unknown", "unknown", false},

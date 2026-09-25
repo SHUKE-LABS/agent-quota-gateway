@@ -99,11 +99,22 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 		r.Host = upstream.Host
 		basePath := strings.TrimRight(upstream.Path, "/")
 		reqPath := r.URL.Path
+		escapedReqPath := r.URL.EscapedPath()
 		// Normalize the version segment independently of the payload.
 		// Root-mounted upstreams receive exactly one leading /v1; a base
 		// URL ending in /v1 consumes inbound /v1.
 		reqPath = normalizeRequestPath(basePath, reqPath)
 		r.URL.Path = joinPath(basePath, reqPath)
+		escapedReqPath = normalizeEscapedRequestPath(basePath, escapedReqPath)
+		escapedJoinedPath := joinPath(basePath, escapedReqPath)
+		if decoded, err := url.PathUnescape(escapedJoinedPath); err == nil && decoded == r.URL.Path {
+			r.URL.RawPath = escapedJoinedPath
+		} else {
+			// RawPath is only a valid hint when it unescapes to Path. Fall back
+			// to net/url's canonical escaping when normalization changed an
+			// encoded separator's segment structure.
+			r.URL.RawPath = ""
+		}
 
 		StampAuth(r.Header, b.Credential)
 	}
@@ -249,6 +260,53 @@ func normalizeRequestPath(basePath, path string) string {
 		return path
 	}
 	return trimLeadingV1(path)
+}
+
+// normalizeEscapedRequestPath mirrors normalizeRequestPath while retaining
+// the original escaped suffix. This preserves valid RawPath distinctions
+// when a gateway worker namespace has been removed from the inbound URL.
+func normalizeEscapedRequestPath(basePath, escapedPath string) string {
+	if basePath != "" && !strings.HasSuffix(strings.TrimRight(basePath, "/"), "/v1") {
+		return escapedPath
+	}
+	rest, ok := stripLeadingV1Escaped(escapedPath)
+	if !ok {
+		return escapedPath
+	}
+	if basePath == "" {
+		return "/v1" + rest
+	}
+	if rest == "" {
+		return "/"
+	}
+	return rest
+}
+
+// stripLeadingV1Escaped removes decoded leading /v1 segments while preserving
+// the exact spelling of every byte after those segments.
+func stripLeadingV1Escaped(path string) (string, bool) {
+	rest := path
+	for {
+		if !strings.HasPrefix(rest, "/") {
+			return rest, true
+		}
+		segmentEnd := strings.IndexByte(rest[1:], '/')
+		segment := rest[1:]
+		if segmentEnd >= 0 {
+			segment = rest[1 : 1+segmentEnd]
+		}
+		decoded, err := url.PathUnescape(segment)
+		if err != nil {
+			return "", false
+		}
+		if decoded != "v1" {
+			return rest, true
+		}
+		rest = rest[1+len(segment):]
+		if rest == "" {
+			return "", true
+		}
+	}
 }
 
 func trimLeadingV1(path string) string {

@@ -19,6 +19,22 @@ func FromContext(ctx context.Context) (Backend, bool) {
 	return b, ok
 }
 
+// workerKey carries the routing-only worker identity extracted from the
+// reserved inbound URL namespace. It is never copied into a request header.
+type workerKey struct{}
+
+// WithWorkerNickname returns a copy of ctx carrying workerNickname.
+func WithWorkerNickname(ctx context.Context, workerNickname string) context.Context {
+	return context.WithValue(ctx, workerKey{}, workerNickname)
+}
+
+// WorkerNicknameFromContext returns the worker identity attached by
+// WorkerNamespaceMiddleware. ok is false for legacy requests.
+func WorkerNicknameFromContext(ctx context.Context) (string, bool) {
+	worker, ok := ctx.Value(workerKey{}).(string)
+	return worker, ok
+}
+
 // reachedPoolKey is the context slot for the "did this request name a valid
 // pool?" marker. It is separate from ctxKey so the two never collide.
 type reachedPoolKey struct{}

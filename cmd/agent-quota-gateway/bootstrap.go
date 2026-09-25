@@ -120,7 +120,7 @@ func warnIfPersistenceDisabled(configPath, statePath string, logOut io.Writer) {
 	if configPath == "" || statePath != "" {
 		return
 	}
-	fmt.Fprintf(logOut, "agent-quota-gateway: WARNING: config file %q has an empty state_file; runtime persistence is disabled, so sticky pointers, exhausted maps, balance sequence and quota snapshots do not survive a restart. Set state_file in %q and restart.\n", configPath, configPath)
+	fmt.Fprintf(logOut, "agent-quota-gateway: WARNING: config file %q has an empty state_file; runtime persistence is disabled, so sticky pointers, worker affinities, exhausted maps, balance sequence and quota snapshots do not survive a restart. Set state_file in %q and restart.\n", configPath, configPath)
 }
 
 type legacyPriorityVerdict struct {
@@ -309,8 +309,8 @@ func filteredLegacyPriority(reg *backend.Registry, pool string, rawOrder []strin
 }
 
 type legacyDisabledVerdict struct {
-	pool   string
-	nick   string
+	pool    string
+	nick    string
 	already bool // true if the member was already disabled in aqg.json; no rewrite
 }
 
