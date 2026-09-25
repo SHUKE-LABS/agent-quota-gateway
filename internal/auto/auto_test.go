@@ -1430,13 +1430,9 @@ func TestController_ClearExhaustedNick(t *testing.T) {
 	}
 }
 
-// TestController_ClearExhaustedNick_storeUntouched verifies the "live-park only,
-// never store" contract: clearing a member that is BOTH live-parked and
-// store-exhausted drops the live park but leaves store-sourced exhaustion in
-// place, so the member stays exhausted. It also checks the Parked field gate:
-// true while the live park holds, false once cleared even though the member is
-// still store-exhausted (issue #147).
-func TestController_ClearExhaustedNick_storeUntouched(t *testing.T) {
+// A full statusless snapshot does not recreate exhaustion after clearing a
+// recorded park.
+func TestController_ClearExhaustedNick_statuslessSnapshotDoesNotRepark(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
 	c := newController(t, 0, clock, io.Discard, "a", "b")
@@ -1458,20 +1454,19 @@ func TestController_ClearExhaustedNick_storeUntouched(t *testing.T) {
 		t.Fatalf("ClearExhaustedNick(a) = false, want true (live park was present)")
 	}
 
-	// Store exhaustion survives: a is still exhausted, and no longer Parked
-	// (the live park is gone; what remains is store-sourced).
+	// The full snapshot alone does not hold the member out after clear.
 	c.mu.Lock()
 	aExhausted := c.isExhaustedLocked("a")
 	c.mu.Unlock()
-	if !aExhausted {
-		t.Fatalf("after ClearExhaustedNick(a), a healthy, want still store-exhausted")
+	if aExhausted {
+		t.Fatalf("after ClearExhaustedNick(a), a exhausted, want healthy")
 	}
 	got := c.poolStatus(store, nil, nil)
 	if memberParked(got, "a") {
-		t.Fatalf("after clear: a Parked=true, want false (only store exhaustion remains)")
+		t.Fatalf("after clear: a Parked=true, want false")
 	}
-	if st := memberStatus(got, "a"); st != "exhausted" {
-		t.Fatalf("after clear: a status=%q, want exhausted (store-sourced)", st)
+	if st := memberStatus(got, "a"); st == "exhausted" {
+		t.Fatalf("after clear: a status=%q, want eligible", st)
 	}
 }
 

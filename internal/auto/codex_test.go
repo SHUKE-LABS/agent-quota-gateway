@@ -385,17 +385,8 @@ func TestModifyResponse_codexNoSignatureStaysPolicy(t *testing.T) {
 	}
 }
 
-// TestModifyResponse_codexHeaderless429WithSeededStoreAddsNothing is the AC3
-// boundary regression: the response handling for a headerless codex 429 adds
-// no live park, no credential park, and no sticky rotation — even when the
-// store already holds a FRESH CAPPED snapshot for the nick. The backend is
-// resolved while healthy (before seeding) so the assertion is about what
-// ModifyResponse does, not about pre-existing routing behavior. A fresh
-// capped snapshot is itself a store-driven block on the routing side
-// (ResolveAuto promotes store-exhausted members before forwarding;
-// isUnavailableLocked unions the store bound) — that is pre-existing generic
-// behavior for any no-status member, identical to z.ai, unchanged by this
-// diff and out of this test's scope (review round 2).
+// A headerless Codex 429 plus a fresh capped snapshot now parks the seat:
+// the failed original response supplies the missing exhaustion evidence.
 func TestModifyResponse_codexHeaderless429WithSeededStoreAddsNothing(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
@@ -419,15 +410,15 @@ func TestModifyResponse_codexHeaderless429WithSeededStoreAddsNothing(t *testing.
 		t.Errorf("status=%d, want 503 (policy shape)", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "usage_limit_reached") {
-		t.Errorf("503 body dropped the upstream policy message: %q", body)
+	if !strings.Contains(string(body), "backend switching") {
+		t.Errorf("503 body=%q, want switch response", body)
 	}
 	resetA, exhausted, _, cpOK, _ := codexParkState(t, c, "a")
-	if exhausted || cpOK || !resetA.IsZero() {
-		t.Errorf("response handling added a park: exhausted=%v credentialPark=%v reset=%v", exhausted, cpOK, resetA)
+	if !exhausted || !cpOK || !resetA.Equal(reset) {
+		t.Errorf("response handling park: exhausted=%v credentialPark=%v reset=%v, want capped-window reset", exhausted, cpOK, resetA)
 	}
-	if got := c.Current(); got != "a" {
-		t.Errorf("Current()=%q, want a (no rotation from response handling)", got)
+	if got := c.Current(); got != "b" {
+		t.Errorf("Current()=%q, want b (failed full window rotates)", got)
 	}
 }
 

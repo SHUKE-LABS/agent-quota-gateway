@@ -154,7 +154,7 @@ expired account stops being selected everywhere at once rather than being
 discovered separately, pool by pool, on each one's own next `401`. Clearing it
 — via `POST /_gateway/clear` or the per-nick clear — is symmetric: releasing
 it from any one pool releases it everywhere it was propagated (see
-[Clearing live-429 parks](#clearing-live-429-parks)).
+[Clearing recorded parks](#clearing-recorded-parks)).
 
 Two corollaries keep that sharing honest:
 
@@ -333,7 +333,8 @@ AQG_POOL_SUB_BALANCE=lead
   and dwell keep it rare.
 - The lead check never synthesises probes — it reads only snapshots learned
   from real traffic or the existing poller.
-- Exhausted members (live-429 parked or store-exhausted) are never chosen
+- Exhausted members (recorded after a failed response or blocked by a
+  status-bearing rejected window) are never chosen
   as the balance target.
 - When no snapshot data is available for a member its lead is treated as 0
   (neutral); the pool stays sticky until real traffic trains the store.
@@ -592,20 +593,20 @@ zero-probe**, per pool:
 - **Sticky.** Every request to a pool reuses the same member so Anthropic's
   per-account prompt cache keeps paying off. The gateway does not compare
   or balance across members.
-- **Reactive switch, no watermark below full.** A member is ridden until it
-  returns a `429` or its quota store window reads **blocking**. What counts as
-  blocking depends on the snapshot: for an Anthropic backend, whose headers
+- **Reactive switch, no watermark below full.** A member remains active while
+  requests succeed. What blocks it depends on the snapshot: for an Anthropic backend, whose headers
   carry a per-window status, only a `rejected` status blocks — a window at
   utilization `1.0` with status `allowed_warning` is in the soft-cap / overage
   zone and **still served**, so the gateway keeps using it rather than wrongly
   parking it (and, with every member at `1.0`-but-allowed, reporting the whole
   pool exhausted). For a poller-tracked backend (Z.ai / MiniMaxi / Ark), whose
-  dashboard API reports only a utilization fraction and no status, the
-  `1.0` cap is the signal — without it such a member, which emits no clean
-  pre-stream `429`, would never fail off. For a ChatGPT-Codex member
+  dashboard API reports only a utilization fraction and no status, a fresh
+  `1.0` cap must be paired with a failed upstream response; the snapshot alone
+  keeps the member eligible. For a ChatGPT-Codex member
   (`chatgpt.com` backend), whose `429` carries the `x-codex-*` metered family
-  instead of Anthropic headers, the signal is a window at the cap with a
-  future reset (issues #304, #314 — the `usage_limit_reached` marker alone
+  instead of Anthropic headers, a failed 429 with a window at the cap parks
+  it, using a future reset or the bounded fallback when needed (issues #304,
+  #314 — the `usage_limit_reached` marker alone
   throttles the same member instead of parking it).
 - **Dead-credential switch.** A member that returns `401`/`403` (its
   credential was revoked, expired, or the account pulled) is parked for the
@@ -644,7 +645,7 @@ distinct where the response paths take different actions (issue #245).
 |---|---|---|---|
 | **Switch** — a member is still available, the sticky pointer has already advanced | `{"error":"backend switching; retry"}` | `1` (fixed) | another member |
 | **Pool dry** — every member is exhausted; the sticky pointer is pre-pointed at the soonest-resetting member | `{"error":"all backends rate-limited"}` | precise wait until the soonest member resets (or a conservative 5-hour window) | the soonest-resetting member |
-| **Z.ai/Zhipu throttle absorbed** (issue #153) — proxy `429` is the `1302` concurrency throttle, never quota exhaustion | `{"error":"backend throttled; same member"}` | `3` (fixed; longer than the switch hint so a single-member z.ai pool's retry lets the concurrency window free up) | the same member |
+| **Z.ai/Zhipu throttle absorbed** (issue #153 / #316) — proxy `429` is a transient `1302` concurrency throttle when no fresh full eligible window is present | `{"error":"backend throttled; same member"}` | `3` (fixed; longer than the switch hint so a single-member z.ai pool's retry lets the concurrency window free up) | the same member |
 | **Anthropic per-minute rate-limit back-off** (issue #191) — transient RPM/ITPM/OTPM throttle, clears in seconds | `{"error":"backend throttled; same member"}` | upstream `retry-after` clamped to `[1, 3]` s, defaulting to `3` | the same member |
 | **Native Anthropic overload** (issue #258) — upstream `529` capacity wobble, not quota exhaustion | `{"error":"backend throttled; same member"}` | `60` (fixed) | the same member |
 
@@ -679,42 +680,28 @@ reconciliation is backend-agnostic and self-correcting — if a forwarded
 request still genuinely `429`s, its blocking headers refresh the store and
 the member re-parks.
 
-**Store-derived park from a polled snapshot at the cap** (issue #251). The
-quota store tracks each member's `as_of` timestamp; when the poller's
-most recent measurement lands a member at utilization 1.0 (or `rejected`
-status), the gateway asserts the member into an exhausted mark once on
-the next routing decision. If the snapshot carries a usable future
-reset, the park ends at that reset — and once a `rejected` window's 5h
-reset has elapsed the store-derived signal stops blocking, so the member
-leaves `exhausted` and becomes selectable again without a re-poll (issue
-#286), the same way an elapsed non-status window already recovers. If the
-snapshot carries no reset (the upstream `429` omitted it, or the poller's
-prior 5h field is the only data), the park runs for
-`defaultExhaustionWindow` (5 h) from `snap.AsOf` — a deliberate over-park
-rather than a probe — but that fallback stays bounded and expires: once
-`snap.AsOf + 5 h` is in the past the member is available and the elapsed
-bound is never recreated on a later read. The
-as-of-anchored bound is deterministic across reads (it does not re-arm
-on each query), and the assert-once prevents a flap on the poll cycle
-where the parked member's snapshot ages out minutes later. The
-operator escape hatch is `POST /_gateway/clear` (and the per-nick
-clear); clearing a store-derived park while a fresh at-cap snapshot is
-on file does not move the member — the next routing decision
-re-asserts the park from the store. See the comment at
-`auto.go:windowBlocks` for the freshness threshold and the
-poll-interval coupling the rule depends on.
+**Statusless quota windows** (issue #316). A full utilization snapshot from a
+provider without per-window status (Z.ai, MiniMaxi / Ark, or Codex) is not by
+itself proof that the provider has stopped serving. The member stays eligible,
+and `POST /_gateway/clear` does not re-create a park from that snapshot alone.
+A fresh full window becomes exhaustion evidence when the original upstream
+response is non-successful, regardless of whether it is 429, 503, or 500; the
+gateway checks this before rewriting the response. The park ends at that
+window's future reset, or at `as_of + 5 h` when the reset is missing or unusable.
+Only eligible chat windows count: Z.ai's monthly `TIME_LIMIT` window remains
+excluded. A later successful response or a failed response with a sub-cap or
+stale snapshot does not create a quota park. Status-bearing Anthropic windows
+keep their existing rule: `rejected` blocks, while `allowed` and
+`allowed_warning` remain eligible even at 100%.
 
-The **z.ai throttle absorbed** flavour: a z.ai proxy `429` is always the
-`1302` "Rate limit reached for requests" concurrency throttle (emitted when
-the GLM Coding Plan concurrency cap — often as low as 1 — is hit), never
-quota exhaustion — z.ai exhaustion is tracked out-of-band by the poller
-(5h / monthly windows), never signalled by a proxy `429`. The gateway
-absorbs it, leaves the member in rotation, and never lets the upstream
-`1302` message reach the client. Claude Code retries the `503`
-transparently instead of stopping on the passed-through `429`. The body
-text is what prevents the operator misdiagnosis in issue #245: a sustained
-stream of these is not a failover loop, because no failover is being
-attempted.
+The **z.ai throttle absorbed** flavour: a z.ai proxy `429` below a fresh full
+eligible quota window is the `1302` "Rate limit reached for requests"
+concurrency throttle (emitted when the GLM Coding Plan concurrency cap — often
+as low as 1 — is hit). The gateway absorbs it, leaves the member in rotation,
+and never lets the upstream `1302` message reach the client. With a fresh full
+5h window, the same failed response confirms exhaustion and triggers failover.
+Claude Code retries the transient `503` transparently instead of stopping on
+the passed-through `429`.
 
 The **Anthropic rate-limit back-off** flavour: a transient per-minute
 throttle (`rate_limit_error` for the RPM/ITPM/OTPM throughput limit,
@@ -830,7 +817,7 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
 | Value | Meaning |
 |-------|---------|
 | `active` | Currently selected by the sticky pointer **and** available — `exhausted` outranks `active`, so a sticky member that is also parked reports `exhausted`, not `active` |
-| `exhausted` | Parked — either a live-429 park or store-driven exhaustion; `exhausted_until` is the reset time |
+| `exhausted` | Unavailable — either a recorded failed-response park or a status-bearing rejected store window; `exhausted_until` is the bound |
 | `idle` | Healthy and not currently active |
 | `disabled` | Taken out of selection and failover by the runtime disable toggle — `disabled` outranks every other state, so a disabled member always reports `disabled` regardless of its quota |
 
@@ -839,11 +826,11 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
 `/_gateway/quota` returns, or `null` when no snapshot has been recorded
 for that member yet.
 
-**`parked`** is `true` only when a **live-429 park** is currently holding the
-member out of rotation (present, reset not yet elapsed, and not reconciled away
-by a fresh healthy store snapshot). It is the precise gate for the per-nick
+**`parked`** is `true` only when a recorded failed-response or credential park
+is currently holding the member out of rotation (present, reset not yet elapsed,
+and not reconciled away by a fresh healthy store snapshot). It is the precise gate for the per-nick
 "clear park" escape hatch — distinct from `status: "exhausted"`, which also
-covers store-driven exhaustion that clearing the live park cannot move. The UI
+covers a status-bearing rejected store window that clearing a recorded park cannot move. The UI
 shows the "Clear park" button only on a member with `parked: true`.
 
 **`disabled`** is `true` when the member has been taken out of selection and
@@ -1135,15 +1122,15 @@ All error bodies are credential-free.
 > quota view. The network ACL/firewall restricting this port is the only gate;
 > the gateway adds no auth of its own.
 
-**Clearing live-429 parks.** `POST /_gateway/clear` drops reactive `429` parks
-so an over-parked member becomes selectable again without waiting out the park
-or restarting:
+**Clearing recorded parks.** `POST /_gateway/clear` drops recorded parks so
+an over-parked member becomes selectable again without waiting out the park or
+restarting:
 
 | Query | Effect |
 |-------|--------|
-| _(none)_ | Clear every pool's live-429 parks |
-| `?pool=<name>` | Clear that one pool's live-429 parks |
-| `?pool=<name>&nick=<nick>` | Clear only `<nick>`'s live-429 park — the per-nick escape hatch for a single over-parked member, leaving the rest of the pool parked |
+| _(none)_ | Clear every pool's recorded parks |
+| `?pool=<name>` | Clear that one pool's recorded parks |
+| `?pool=<name>&nick=<nick>` | Clear only `<nick>`'s recorded park — the per-nick escape hatch for a single over-parked member, leaving the rest of the pool parked |
 
 ```bash
 curl -X POST 'http://127.0.0.1:8080/_gateway/clear'                    # all pools
@@ -1151,11 +1138,10 @@ curl -X POST 'http://127.0.0.1:8080/_gateway/clear?pool=auto'          # one poo
 curl -X POST 'http://127.0.0.1:8080/_gateway/clear?pool=auto&nick=a'   # one member
 ```
 
-It clears **only the reactive 429 park** — store-sourced exhaustion (a window
-still at cap with a future reset) reflects polled reality and is left untouched.
-Clearing a member that is genuinely out of quota is harmless: it simply re-parks
-via the next upstream `429`. The per-nick form responds `{"pool","nick",
-"cleared":<bool>}` where `cleared` reports whether a live park was actually
+It clears the recorded park. A full statusless snapshot alone does not recreate
+it; a later non-success upstream response can park the member again when a
+fresh eligible window is still at the cap. The per-nick form responds
+`{"pool","nick","cleared":<bool>}` where `cleared` reports whether a park was actually
 present; an unknown pool returns `404 {"error":"pool not found"}`, and a `nick`
 with no `pool` returns `400` rather than clearing every pool. This is the
 operator override complementary to the automatic recovery in
@@ -1205,6 +1191,8 @@ already show. Recovery from `exhausted` to `idle` happens by wall-clock; the
 quota store keeps the frozen at-cap snapshot until the next real response
 rewrites it, so a stale `100%` would otherwise read as live load. The next
 request that carries a fresh utilization header repopulates the cell.
+Utilization labels use floor precision: `0.995` displays as `99%`, while
+exactly `1.0` displays as `100%`.
 
 ```bash
 curl http://127.0.0.1:8080/_gateway/ui
