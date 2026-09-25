@@ -643,10 +643,12 @@ Codex weekly hello below is independent of member selection:
   `1.0` cap must be paired with a failed upstream response; the snapshot alone
   keeps the member eligible. For a ChatGPT-Codex member
   (`chatgpt.com` backend), whose `429` carries the `x-codex-*` metered family
-  instead of Anthropic headers, a failed 429 with a window at the cap parks
-  it, using a future reset or the bounded fallback when needed (issues #304,
-  #314 — the `usage_limit_reached` marker alone
-  throttles the same member instead of parking it).
+  instead of Anthropic headers, a failed metered 429 with a window at the cap
+  parks it, using a future reset or the bounded fallback when needed (issues
+  #304, #314 — the `usage_limit_reached` marker alone throttles the same
+  member instead of parking it). Separately, any original upstream non-2xx
+  response can park it when a fresh eligible statusless window is full; the
+  snapshot alone keeps the member eligible.
 - **Dead-credential switch.** A member that returns `401`/`403` (its
   credential was revoked, expired, or the account pulled) is parked for the
   conservative default window and the pool fails over — a dead account never
@@ -756,11 +758,11 @@ fixed 1 s hint). The per-minute headers are read only to classify the
 response; they are never stored (they are a throughput rate, not the
 subscription budget).
 
-The **ChatGPT-Codex exhaustion** flavour (issues #304, #314): a
+The **ChatGPT-Codex metered-429 exhaustion** flavour (issues #304, #314): a
 `chatgpt.com` member (ChatGPT-subscription seats hitting the Codex backend)
 meters its plan windows on every response via the `x-codex-*` family instead
-of `anthropic-ratelimit-*` headers, and signals depletion as a `429`
-carrying a `x-codex-{primary,secondary}-used-percent` at the cap. That
+of `anthropic-ratelimit-*` headers, and signals this direct depletion path as
+a `429` carrying a `x-codex-{primary,secondary}-used-percent` at the cap. That
 signature parks the member — a precise park until the latest contributing
 window reset, with a conservative 5-hour bound for any capped window whose
 reset is missing or unreadable — and fails over; the `429` becomes the
@@ -782,7 +784,9 @@ reconciliation so the seat stays parked for its full bound (or until
 `POST /_gateway/clear`). The `x-codex-*` windows also feed the quota store
 (see [Reading a pool's quota](#reading-a-pools-quota)), and the headers are
 stripped from every synthetic `503` alongside the Anthropic rate-limit
-family.
+family. Separately, Codex follows the statusless-window rule described above;
+that path can park on any original upstream non-2xx response and does not
+require a `429`.
 
 Each switch is logged server-side as one line — `auto[auto]: a -> b (a hit
 429)`, prefixed with the pool name — naming members only, never
