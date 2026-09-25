@@ -52,8 +52,7 @@ Env grammar (`internal/backend`):
 - `AQG_POOL_<POOL>_BASE_URL=<upstream>` — pool default upstream
 - `AQG_POOL_<POOL>_BACKEND_<NICK>=<cred>[|<url>]` — a member; `|<url>` overrides the pool's upstream
 - `AQG_POOL_<POOL>_PRIORITY=<nick>,<nick>` — ordered preference (vs. default random start + round-robin failover)
-- `AQG_POOL_<POOL>_BALANCE=lead` + `BALANCE_GAP` + `BALANCE_DWELL` — opt-in utilization-balanced routing
-- `AQG_POOL_<POOL>_CONCURRENCY=<int>` — namespaced worker concurrency; defaults to 1 and cannot exceed 1 with `BALANCE=lead`
+- `AQG_POOL_<POOL>_CONCURRENCY=<int>` — namespaced worker concurrency; defaults to 1
 
 Pool/nick names are normalized (lowercased, `_`→`-`): `AQG_POOL_Z_AI_BACKEND_KEY_A`
 is pool `z-ai`, member `key-a`, selected by sending `z-ai` as the bearer token.
@@ -89,7 +88,7 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
    the soonest member resets; 503 not 429 so Claude Code retries and
    auto-resumes rather than ending the turn, issue #203), or the selected
    backend stored on the request context. With concurrency 1, worker routes
-   use the same global sticky, failover, balance, and preempt behavior as
+  use the same global sticky, failover, and preempt behavior as
    ordinary requests and store no assignment. Above 1, workers are assigned
    round-robin within the first N available members in effective priority
    order (or sorted nick order); a worker is reassigned on its next request
@@ -132,7 +131,7 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
   here so `backend` does not import `auto` (which depends on it).
 - `internal/auto/` — the routing brain. One in-memory `Controller` per
   pool (`auto.go`); `Pools` bundles them and implements `PoolRouter`.
-  Sticky-reactive-zero-probe rotation, priority/balance modes, runtime
+  Sticky-reactive-zero-probe rotation, priority routing, runtime
   mutations that write through to the config file (add/remove/move/disable
   members, priority, create pool — via a copy-on-write registry swap +
   `Controller.reconcileLocked`, issue #198), pool status views, and the
@@ -149,8 +148,8 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
   JSON file loading + precedence.
 - `internal/persist/` — single debounced atomic state file (0600,
   temp+rename) for **runtime observation only**: sticky pointers, worker
-  affinities and allocation cursors, exhausted maps, snapshots, balance
-  sequence, local-snapshot nicks. Operator intent
+  affinities and allocation cursors, exhausted maps, snapshots, and
+  local-snapshot nicks. Operator intent
   lives in the config file (issue #198), not here. `internal/configfile/`
   owns the config write path (`Marshal` + debounced `Writer`).
 - `internal/logging/` — one JSON line/request to stderr; bodies and
@@ -185,7 +184,7 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
   (`Registry.With*` → `BuildFromSpec`, so the nick↔credential bijection is
   enforced on every mutation), swaps it in under `Pools.mu`, reconciles the
   affected controllers (`reconcileLocked` preserves healthy worker affinities
-  with sticky/exhausted/balance/local-snapshot observation), and flushes to
+  with sticky/exhausted/local-snapshot observation), and flushes to
   `aqg.json`. No state-file overlay is used. On first deploy with no
   `aqg.json`, env + the legacy state overlay are merged once (state-wins) to
   bootstrap the file; env is never read again. `Registry` is

@@ -289,7 +289,6 @@ func TestWarnIfPersistenceDisabled_startupOutput(t *testing.T) {
 				"runtime persistence is disabled",
 				"sticky pointers",
 				"exhausted maps",
-				"balance sequence",
 				"quota snapshots",
 				"do not survive a restart",
 				"state_file",
@@ -861,37 +860,6 @@ func TestResolveConfig_existingFile_noPriorityOverrideDoesNotConsumePriority(t *
 		// presence; this assertion is only meaningful as "no priority key
 		// written by the orchestrator". Empty state file is what we want.
 		t.Errorf("spurious priority_override key created at %s", statePath)
-	}
-}
-
-func TestResolveConfig_existingFile_balancedPoolConsumesPriority(t *testing.T) {
-	scrubPoolEnv(t)
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "aqg.json")
-	statePath := filepath.Join(dir, "state.json")
-	fileJSON := `{"base_url":"https://api.anthropic.com","state_file":"` + statePath + `","pools":{"auto":{"members":{"a":{"credential":"ca"},"b":{"credential":"cb"}},"balance":"lead"}}}`
-	if err := os.WriteFile(cfgPath, []byte(fileJSON), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	writeStateFile(t, dir, `{"config":{"auto":{"priority_override":["b","a"]}}}`)
-	beforeConfig := sha256File(t, cfgPath)
-	t.Setenv("AQG_CONFIG", cfgPath)
-	var log bytes.Buffer
-	_, reg, _, err := resolveConfig("", &log)
-	if err != nil {
-		t.Fatalf("resolveConfig: %v", err)
-	}
-	if reg.PoolPriority("auto") != nil || reg.PoolBalanceGap("auto") == 0 {
-		t.Errorf("balanced config changed: priority=%v balanceGap=%v", reg.PoolPriority("auto"), reg.PoolBalanceGap("auto"))
-	}
-	if got := sha256File(t, cfgPath); got != beforeConfig {
-		t.Error("balanced aqg.json was rewritten")
-	}
-	if legacyPriorityPresent(t, statePath, "auto") {
-		t.Error("priority superseded by balance was not consumed")
-	}
-	if !strings.Contains(log.String(), "balance mode") || !strings.Contains(log.String(), "priority mode") {
-		t.Errorf("log does not name both modes: %q", log.String())
 	}
 }
 

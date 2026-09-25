@@ -11,7 +11,7 @@ After=network-online.target tailscaled.service
 Type=simple
 ExecStart=/usr/local/bin/agent-quota-gateway
 # Config file (issue #198): the mutable single source of truth for pools,
-# members, credentials, priority, balance, and disabled. It lives under the
+# members, credentials, priority, and disabled. It lives under the
 # StateDirectory so the DynamicUser can rewrite it when operators change pools
 # through the UI/API. %S expands to /var/lib. The file is created 0600 by the
 # service on first start and never overwritten by a redeploy.

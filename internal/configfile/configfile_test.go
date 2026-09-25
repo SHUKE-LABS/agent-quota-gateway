@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
@@ -86,14 +85,6 @@ func TestLoadFile_success(t *testing.T) {
 				"balance": "",
 				"balance_gap": 0,
 				"balance_dwell": ""
-			},
-			"balanced": {
-				"members": {
-					"x": {"credential": "sk-ant-oat-xxx"}
-				},
-				"balance": "lead",
-				"balance_gap": 0.2,
-				"balance_dwell": "10m"
 			}
 		}
 	}`
@@ -116,23 +107,14 @@ func TestLoadFile_success(t *testing.T) {
 	}
 
 	// Check registry
-	if got := registry.PoolNames(); got[0] != "auto" && got[1] != "balanced" {
-		t.Errorf("PoolNames = %v, want [auto balanced]", got)
+	if got := registry.PoolNames(); len(got) != 1 || got[0] != "auto" {
+		t.Errorf("PoolNames = %v, want [auto]", got)
 	}
 	if got := registry.PoolPriority("auto"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
 		t.Errorf("PoolPriority(auto) = %v, want [a b]", got)
 	}
 	if got := registry.PoolConcurrency("auto"); got != 3 {
 		t.Errorf("PoolConcurrency(auto) = %d, want 3", got)
-	}
-	if got := registry.PoolConcurrency("balanced"); got != 1 {
-		t.Errorf("PoolConcurrency(balanced) = %d, want default 1", got)
-	}
-	if got := registry.PoolBalanceGap("balanced"); got != 0.2 {
-		t.Errorf("PoolBalanceGap(balanced) = %v, want 0.2", got)
-	}
-	if got := registry.PoolBalanceDwell("balanced"); got != 10*time.Minute {
-		t.Errorf("PoolBalanceDwell(balanced) = %v, want 10m", got)
 	}
 }
 
@@ -208,60 +190,52 @@ func TestLoadFile_rejectsUnknownFields(t *testing.T) {
 		t.Error("LoadFile with unknown field should fail")
 	}
 }
-
-func TestLoadFile_rejectsInvalidBalanceMode(t *testing.T) {
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.json")
-
-	content := `{
-		"base_url": "https://api.anthropic.com",
-		"pools": {
-			"sub": {
-				"members": {
-					"a": {"credential": "sk-ant-oat-aaa"}
-				},
-				"balance": "round-robin"
-			}
-		}
-	}`
-
-	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
-		t.Fatal(err)
+func TestLoadFile_rejectsEnabledLegacyBalanceSettings(t *testing.T) {
+	cases := []struct {
+		name, field, value string
+	}{
+		{name: "balance mode", field: "balance", value: `"lead"`},
+		{name: "other balance mode", field: "balance", value: `"round-robin"`},
+		{name: "balance gap", field: "balance_gap", value: `0.15`},
+		{name: "balance dwell", field: "balance_dwell", value: `"0s"`},
 	}
-
-	_, _, err := LoadFile(configPath)
-	if err == nil {
-		t.Error("LoadFile with invalid balance mode should fail")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "aqg.json")
+			content := `{"pools":{"auto":{"members":{"a":{"credential":"cred-a"}},"` + tc.field + `":` + tc.value + `}}}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err := LoadFile(path)
+			if err == nil || !strings.Contains(err.Error(), `pool "auto"`) || !strings.Contains(err.Error(), "concurrency replaces it") {
+				t.Errorf("LoadFile error = %v, want pool-specific concurrency migration error", err)
+			}
+		})
 	}
 }
 
-func TestLoadFile_rejectsOutOfRangeBalanceGap(t *testing.T) {
-	// A gap >= 1.0 is unreachable and silently disables balancing; the
-	// config-file path shares buildRegistry's check, so it must fail load
-	// (issue #215). 15 is the classic percent/fraction mix-up (meant 0.15).
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.json")
-
-	content := `{
-		"base_url": "https://api.anthropic.com",
-		"pools": {
-			"sub": {
-				"members": {
-					"a": {"credential": "sk-ant-oat-aaa"}
-				},
-				"balance": "lead",
-				"balance_gap": 15
-			}
-		}
-	}`
-
-	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+func TestLoadFile_legacyZeroBalanceKeysAreOmittedOnWriteBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aqg.json")
+	content := `{"pools":{"auto":{"members":{"a":{"credential":"cred-a"},"b":{"credential":"cred-b"}},"balance":"","balance_gap":0,"balance_dwell":""}}}`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	_, _, err := LoadFile(configPath)
-	if err == nil {
-		t.Error("LoadFile with balance_gap >= 1.0 should fail")
+	cfg, registry, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile legacy zero values: %v", err)
+	}
+	registry, err = registry.WithPriority("auto", []string{"b", "a"})
+	if err != nil {
+		t.Fatalf("runtime priority mutation: %v", err)
+	}
+	data, err := Marshal(cfg, registry)
+	if err != nil {
+		t.Fatalf("Marshal after mutation: %v", err)
+	}
+	for _, key := range []string{`"balance"`, `"balance_gap"`, `"balance_dwell"`} {
+		if strings.Contains(string(data), key) {
+			t.Errorf("write-back still contains legacy key %s: %s", key, data)
+		}
 	}
 }
 
@@ -447,7 +421,7 @@ func TestLoadFile_noCredentialInError(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid balance mode", func(t *testing.T) {
+	t.Run("removed balance setting", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		configPath := filepath.Join(tmpDir, "config.json")
 
@@ -467,8 +441,8 @@ func TestLoadFile_noCredentialInError(t *testing.T) {
 		}
 
 		_, _, err := LoadFile(configPath)
-		if err == nil {
-			t.Fatal("LoadFile with invalid balance mode should fail")
+		if err == nil || !strings.Contains(err.Error(), "concurrency replaces it") {
+			t.Fatalf("LoadFile error = %v, want concurrency migration guidance", err)
 		}
 		if strings.Contains(err.Error(), sentinelCred) {
 			t.Errorf("error message contains credential value: %v", err)

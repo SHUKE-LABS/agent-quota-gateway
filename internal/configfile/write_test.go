@@ -37,9 +37,6 @@ func testRegistry(t *testing.T) *backend.Registry {
 			Members: map[string]backend.MemberSpec{
 				"x": {Credential: "vendor-x", BaseURL: "https://mirror.example/anthropic"},
 			},
-			Balance:      "lead",
-			BalanceGap:   0.2,
-			BalanceDwell: backend.Duration{D: 10 * time.Minute},
 		},
 	}}, "https://api.anthropic.com")
 	if err != nil {
@@ -86,10 +83,6 @@ func TestMarshal_roundTripsThroughLoadFile(t *testing.T) {
 	// Disabled flag survives.
 	if b, _ := reg2.ResolveIn("auto", "b"); !b.Disabled {
 		t.Error("disabled flag lost through Marshal→LoadFile")
-	}
-	// Balance config survives.
-	if reg2.PoolBalanceGap("z-ai") != 0.2 || reg2.PoolBalanceDwell("z-ai") != 10*time.Minute {
-		t.Errorf("balance config lost: gap=%v dwell=%v", reg2.PoolBalanceGap("z-ai"), reg2.PoolBalanceDwell("z-ai"))
 	}
 }
 

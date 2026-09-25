@@ -71,8 +71,7 @@ type Snapshot struct {
 	Unified5hReset       *time.Time `json:"unified_5h_reset,omitempty"`
 	// Unified5hWindowMinutes is the window length the upstream itself
 	// reported (x-codex-primary-window-minutes), in minutes. Carried for
-	// consumers that need the true length — balance-lead elapsed-fraction
-	// math — because Codex window lengths are not contractual (issue #304).
+	// metadata because Codex window lengths are not contractual (issue #304).
 	// Deliberately NOT part of HasData / hasQuotaWindow admission: it is
 	// duration metadata, not window state, so it neither admits a snapshot
 	// nor alone refreshes one.
@@ -220,8 +219,8 @@ func (s *Store) Put(key string, snap Snapshot) {
 // org-id-only guard is unaffected).
 //
 // A stale-but-preserved reset is safe for the routing logic: windowBlocks
-// and the lead computation both gate on the reset still being in the
-// future, so a past reset reads as not-blocking exactly as a nil one did.
+// gates on the reset still being in the future, so a past reset reads as
+// not-blocking exactly as a nil one did.
 func (s *Store) Merge(key string, snap Snapshot) {
 	snap.Backend = key
 	s.mu.Lock()

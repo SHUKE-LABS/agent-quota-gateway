@@ -15,12 +15,9 @@
           "credential": "sk-ant-oat-PLACEHOLDER-B"
         }
       },
-      "priority": ["a", "b"],
-      "balance": "",
-      "balance_gap": 0,
-      "balance_dwell": ""
+      "priority": ["a", "b"]
     },
-    "balanced": {
+    "custom": {
       "base_url": "",
       "members": {
         "x": {
@@ -32,10 +29,7 @@
           "disabled": true
         }
       },
-      "priority": [],
-      "balance": "lead",
-      "balance_gap": 0.2,
-      "balance_dwell": "10m"
+      "priority": []
     },
     "api": {
       "base_url": "https://api.anthropic.com",
@@ -44,10 +38,7 @@
           "credential": "sk-ant-api-PLACEHOLDER-K1"
         }
       },
-      "priority": [],
-      "balance": "",
-      "balance_gap": 0,
-      "balance_dwell": ""
+      "priority": []
     },
     "responses": {
       "base_url": "https://openai-compatible.example/api/v1",
@@ -56,10 +47,7 @@
           "credential": "openai-compatible-PLACEHOLDER-RESPONSES"
         }
       },
-      "priority": [],
-      "balance": "",
-      "balance_gap": 0,
-      "balance_dwell": ""
+      "priority": []
     }
   }
 }

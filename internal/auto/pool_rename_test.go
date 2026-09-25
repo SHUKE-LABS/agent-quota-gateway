@@ -13,7 +13,7 @@ import (
 )
 
 // TestRenamePool_preservesObservation proves a renamed pool keeps its
-// sticky pointer, exhausted mark, balance sequence, and local-snapshot set
+// sticky pointer, exhausted mark, and local-snapshot set
 // attached to the controller under the new name (issue #238 AC: runtime
 // observation survives the rename).
 func TestRenamePool_preservesObservation(t *testing.T) {
@@ -40,8 +40,6 @@ func TestRenamePool_preservesObservation(t *testing.T) {
 	c.curNick = "a"
 	c.exhausted["b"] = clock.now().Add(time.Hour)
 	c.poolLocalSnapshots["a"] = struct{}{}
-	c.lastSelectedSeq["a"] = 7
-	c.balanceSeq = 11
 	c.mu.Unlock()
 
 	// Rename.
@@ -72,12 +70,6 @@ func TestRenamePool_preservesObservation(t *testing.T) {
 	}
 	if _, ok := c2.poolLocalSnapshots["a"]; !ok {
 		t.Errorf("poolLocalSnapshots[a] lost across rename")
-	}
-	if c2.lastSelectedSeq["a"] != 7 {
-		t.Errorf("lastSelectedSeq[a]=%d after rename, want 7", c2.lastSelectedSeq["a"])
-	}
-	if c2.balanceSeq != 11 {
-		t.Errorf("balanceSeq=%d after rename, want 11", c2.balanceSeq)
 	}
 	c2.mu.Unlock()
 

@@ -284,7 +284,7 @@ func TestWithPoolRemoved(t *testing.T) {
 
 // TestWithPoolRenamed_movesEverything proves the rename carries every
 // attribute the pool declared (membership, per-member base URL override,
-// disabled flag, priority order, balance mode/params) over to the new key
+// disabled flag, and priority order) over to the new key
 // while leaving every other pool untouched.
 func TestWithPoolRenamed_movesEverything(t *testing.T) {
 	reg := specFixture(t)
