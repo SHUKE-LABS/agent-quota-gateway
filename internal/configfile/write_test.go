@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,6 +90,70 @@ func TestMarshal_roundTripsThroughLoadFile(t *testing.T) {
 	// Balance config survives.
 	if reg2.PoolBalanceGap("z-ai") != 0.2 || reg2.PoolBalanceDwell("z-ai") != 10*time.Minute {
 		t.Errorf("balance config lost: gap=%v dwell=%v", reg2.PoolBalanceGap("z-ai"), reg2.PoolBalanceDwell("z-ai"))
+	}
+}
+
+func TestMarshal_preservesNonDefaultConcurrencyAndOmitsDefault(t *testing.T) {
+	cfg := testConfig(t)
+	concurrency := 2
+	reg, err := backend.BuildFromSpec(backend.Spec{Pools: map[string]backend.PoolSpec{
+		"auto": {
+			Concurrency: &concurrency,
+			Members: map[string]backend.MemberSpec{
+				"a": {Credential: "cred-a"},
+				"b": {Credential: "cred-b"},
+			},
+		},
+	}}, cfg.AnthropicBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	reg, err = reg.WithMemberSet("auto", "c", "cred-c", "", false)
+	if err != nil {
+		t.Fatalf("WithMemberSet: %v", err)
+	}
+	data, err := Marshal(cfg, reg)
+	if err != nil {
+		t.Fatalf("Marshal non-default: %v", err)
+	}
+	if !strings.Contains(string(data), `"concurrency": 2`) {
+		t.Fatalf("Marshal omitted non-default concurrency: %s", data)
+	}
+	path := filepath.Join(t.TempDir(), "aqg.json")
+	if err := WriteAtomic(path, data); err != nil {
+		t.Fatalf("WriteAtomic: %v", err)
+	}
+	_, restored, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile after copy-on-write: %v", err)
+	}
+	if got := restored.PoolConcurrency("auto"); got != 2 {
+		t.Errorf("restored concurrency = %d, want 2", got)
+	}
+
+	defaultData, err := Marshal(cfg, testRegistry(t))
+	if err != nil {
+		t.Fatalf("Marshal default: %v", err)
+	}
+	if strings.Contains(string(defaultData), `"concurrency"`) {
+		t.Errorf("Marshal should omit default concurrency: %s", defaultData)
+	}
+	one := 1
+	oneRegistry, err := backend.BuildFromSpec(backend.Spec{Pools: map[string]backend.PoolSpec{
+		"auto": {
+			Concurrency: &one,
+			Members:     map[string]backend.MemberSpec{"a": {Credential: "cred-a"}},
+		},
+	}}, cfg.AnthropicBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec explicit default: %v", err)
+	}
+	oneData, err := Marshal(cfg, oneRegistry)
+	if err != nil {
+		t.Fatalf("Marshal explicit default: %v", err)
+	}
+	if strings.Contains(string(oneData), `"concurrency"`) {
+		t.Errorf("Marshal should omit explicit concurrency 1: %s", oneData)
 	}
 }
 

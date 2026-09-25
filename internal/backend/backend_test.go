@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -382,6 +383,49 @@ func TestLoadFrom_balanceParsed(t *testing.T) {
 	}
 }
 
+func TestLoadFrom_concurrency(t *testing.T) {
+	reg, err := loadFrom([]string{
+		"AQG_POOL_AUTO_BACKEND_A=cred-a",
+		"AQG_POOL_AUTO_BACKEND_B=cred-b",
+		"AQG_POOL_AUTO_CONCURRENCY=2",
+	}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("loadFrom: %v", err)
+	}
+	if got := reg.PoolConcurrency("auto"); got != 2 {
+		t.Errorf("PoolConcurrency(auto) = %d, want 2", got)
+	}
+	defaultReg, err := loadFrom([]string{"AQG_POOL_AUTO_BACKEND_A=cred-a"}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("loadFrom default: %v", err)
+	}
+	if got := defaultReg.PoolConcurrency("auto"); got != 1 {
+		t.Errorf("default PoolConcurrency(auto) = %d, want 1", got)
+	}
+}
+
+func TestLoadFrom_concurrencyRejectsInvalidValuesAndBalance(t *testing.T) {
+	for _, value := range []string{"not-an-int", "0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			_, err := loadFrom([]string{
+				"AQG_POOL_AUTO_BACKEND_A=cred-a",
+				"AQG_POOL_AUTO_CONCURRENCY=" + value,
+			}, testDefaultBaseURL)
+			if err == nil || !strings.Contains(err.Error(), "auto") {
+				t.Errorf("error = %v, want a pool-specific concurrency error", err)
+			}
+		})
+	}
+	_, err := loadFrom([]string{
+		"AQG_POOL_AUTO_BACKEND_A=cred-a",
+		"AQG_POOL_AUTO_BALANCE=lead",
+		"AQG_POOL_AUTO_CONCURRENCY=2",
+	}, testDefaultBaseURL)
+	if err == nil || !strings.Contains(err.Error(), "auto") || !strings.Contains(err.Error(), "BALANCE=lead") {
+		t.Errorf("balance conflict error = %v, want pool-specific BALANCE=lead conflict", err)
+	}
+}
+
 func TestLoadFrom_balanceWithCustomTuning(t *testing.T) {
 	reg, err := loadFrom([]string{
 		"AQG_POOL_SUB_BALANCE=lead",
@@ -642,6 +686,69 @@ func TestBuildFromSpec_balanceParsed(t *testing.T) {
 	}
 	if got := reg.PoolBalanceDwell("sub"); got != defaultBalanceDwell {
 		t.Errorf("PoolBalanceDwell(sub) = %v, want default %v", got, defaultBalanceDwell)
+	}
+}
+
+func TestBuildFromSpec_concurrencyAndCopyOnWrite(t *testing.T) {
+	value := 3
+	reg, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{
+		"auto": {
+			Concurrency: &value,
+			Members: map[string]MemberSpec{
+				"a": {Credential: "cred-a"},
+				"b": {Credential: "cred-b"},
+			},
+		},
+	}}, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec: %v", err)
+	}
+	if got := reg.PoolConcurrency("auto"); got != 3 {
+		t.Fatalf("PoolConcurrency(auto) = %d, want 3", got)
+	}
+	copyOnWrite, err := reg.WithMemberDisabled("auto", "b", true)
+	if err != nil {
+		t.Fatalf("WithMemberDisabled: %v", err)
+	}
+	if got := copyOnWrite.PoolConcurrency("auto"); got != 3 {
+		t.Errorf("copy-on-write PoolConcurrency(auto) = %d, want 3", got)
+	}
+	withAddedMember, err := copyOnWrite.WithMemberSet("auto", "c", "cred-c", "", false)
+	if err != nil {
+		t.Fatalf("WithMemberSet: %v", err)
+	}
+	if got := withAddedMember.PoolConcurrency("auto"); got != 3 {
+		t.Errorf("copy-on-write after member add PoolConcurrency(auto) = %d, want 3", got)
+	}
+	if got := reg.Spec().Pools["auto"].Concurrency; got == nil || *got != 3 {
+		t.Errorf("Spec concurrency = %v, want 3", got)
+	}
+}
+
+func TestBuildFromSpec_concurrencyRejectsInvalidValues(t *testing.T) {
+	for _, value := range []int{0, -1} {
+		t.Run(strconv.Itoa(value), func(t *testing.T) {
+			_, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{
+				"auto": {
+					Concurrency: &value,
+					Members:     map[string]MemberSpec{"a": {Credential: "cred-a"}},
+				},
+			}}, testDefaultBaseURL)
+			if err == nil || !strings.Contains(err.Error(), "pools.auto.concurrency") {
+				t.Errorf("error = %v, want pools.auto.concurrency validation", err)
+			}
+		})
+	}
+	value := 2
+	_, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{
+		"auto": {
+			Balance:     "lead",
+			Concurrency: &value,
+			Members:     map[string]MemberSpec{"a": {Credential: "cred-a"}},
+		},
+	}}, testDefaultBaseURL)
+	if err == nil || !strings.Contains(err.Error(), "auto") || !strings.Contains(err.Error(), "BALANCE=lead") {
+		t.Errorf("balance conflict error = %v, want pool-specific conflict", err)
 	}
 }
 

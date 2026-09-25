@@ -153,23 +153,31 @@ an authentication mechanism. The namespace is removed before proxying, so the
 upstream receives the same API path and query it would receive without the
 namespace. No worker field is added to `backends.json`.
 
-On first use, each `(pool, worker nickname)` receives the next healthy AQG
-member in a per-pool round-robin cycle. A configured `PRIORITY` order defines
-that cycle; otherwise member nick order is stable and sorted. Once assigned,
-the worker stays on that member while it is healthy. `BALANCE=lead` and
-priority preemption continue to affect only the legacy global sticky pointer;
-they do not move an existing worker assignment. When a member becomes
-unavailable, only workers assigned to it are reallocated. A real upstream
-quota rejection or credential failure clears assignments to that member in
-every pool that shares the nick. Transient same-member overload handling keeps
-the assignment.
+Each pool's `concurrency` setting controls worker routing (default `1`). At
+`1`, a namespaced request uses the same global sticky, failover, balance, and
+preempt behavior as an ordinary request, and no worker assignment is stored.
+At values above `1`, the first N available members in effective order form the
+worker window: declared `PRIORITY` order when present, otherwise sorted member
+nick order. New workers are assigned round-robin within that window. An
+assignment stays put while its member remains available and inside the window.
+If it becomes unavailable or falls outside the window, the worker is assigned
+again on its next request. This brings workers back from fallback members when
+a higher member becomes available. `BALANCE=lead` cannot be combined with
+`concurrency` above `1`. A transient same-member throttle or 529 keeps the
+member available and does not move its workers.
+
+A real upstream quota rejection or credential failure makes the member
+unavailable in every pool that shares the nick; each mapped worker is
+reassigned within its pool window on its next request.
 
 Worker assignments and the next first-use cursor are runtime routing
-observations in the configured state file. On restart and member changes,
-assignments to removed, disabled, or currently unavailable members are
-dropped. Without `/_aqg/w/<worker-nickname>`, requests keep the existing
-global-sticky behavior. The quota poller still tracks the global sticky
-member; a worker assigned to another poller-tracked member may not get a
+observations in the configured state file. At concurrency above `1`, a stale
+assignment is checked against the current window and reassigned on that
+worker's next request. At concurrency `1`, any saved worker assignments and
+cursor are discarded on load and reconcile. Without
+`/_aqg/w/<worker-nickname>`, requests keep the existing global-sticky
+behavior. The quota poller still tracks the global sticky member; a worker
+assigned to another poller-tracked member may not get a
 proactive quota refresh, so that worker's failover may wait for an upstream
 rejection. In shared mode, the existing listener and network ACL remain the
 trust boundary: callers must not treat the worker nickname as authentication.
@@ -411,6 +419,7 @@ classes and configure each pool's `BASE_URL` and members accordingly.
 | `AQG_POOL_<POOL>_BALANCE` | _(optional)_ | Set to `lead` to enable lead-based balanced routing. The gateway switches the active member when its lead (utilization minus elapsed window fraction) exceeds the best candidate's lead by at least `BALANCE_GAP`, subject to `BALANCE_DWELL`. Mutually exclusive with `PRIORITY`. See [Balanced routing within a pool](#balanced-routing-within-a-pool). |
 | `AQG_POOL_<POOL>_BALANCE_GAP` | `0.15` | Minimum lead difference that triggers a balance switch. Only valid when `BALANCE=lead` is set. |
 | `AQG_POOL_<POOL>_BALANCE_DWELL` | `5m` | Minimum time between balance switches. Accepts Go duration strings (e.g. `5m`, `2m30s`). Only valid when `BALANCE=lead` is set. |
+| `AQG_POOL_<POOL>_CONCURRENCY` | `1` | Number of available members that may serve namespaced workers. Values above 1 use the first N available members in effective priority order (or sorted nick order), reassigning workers when their member leaves the window. Mutually exclusive with `BALANCE=lead`. |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single non-loopback overlay/IP address (e.g. a Tailscale address, `100.64.0.0/10` / `fd7a:115c:a1e0::/48`; or any other overlay/LAN address the deployment trusts, such as an OpenVPN `10.8.0.0/24`) instead of loopback, so other machines that can reach it share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
@@ -576,6 +585,7 @@ pool name.
 | `AQG_POOL_<P>_BALANCE` | `pools.<P>.balance` | Set to `"lead"` for balanced routing. |
 | `AQG_POOL_<P>_BALANCE_GAP` | `pools.<P>.balance_gap` | Omit for the default (0.15). A fraction in `(0, 1)`; a value `<= 0` or `>= 1.0` is rejected (a gap `>= 1.0` is unreachable — don't pass a percent like `15`). |
 | `AQG_POOL_<P>_BALANCE_DWELL` | `pools.<P>.balance_dwell` | Omit for the default (`5m`). An explicit non-positive value is rejected. |
+| `AQG_POOL_<P>_CONCURRENCY` | `pools.<P>.concurrency` | Omit for the default (`1`). Must be an integer >= 1; values above 1 use a moving window of available members and are incompatible with `BALANCE=lead`. |
 | `ANTHROPIC_BASE_URL` | `base_url` | Gateway default upstream. |
 | `LISTEN_ADDR` | `listen_addr` | Loopback-only bind address. |
 | `SHARED_LISTEN_ADDR` | `shared_listen_addr` | Overlay/IP bind address for shared mode (e.g. Tailscale). |
@@ -1398,8 +1408,9 @@ worker namespace still use the global sticky pointer. So by definition:
 - unnamespaced clients drive the **same** sticky member; namespaced clients
   keep their own healthy worker assignment, while all clients still share
   account quota and member availability;
-- a quota failure invalidates that member's assignments for every worker, so
-  its mapped workers are reassigned without moving workers on healthy members;
+- a quota failure takes that member out of each pool's availability window,
+  so mapped workers are reassigned on their next request without moving
+  workers on healthy members;
 - `GET /_gateway/quota` returns the one shared view, not a per-machine
   guess.
 
