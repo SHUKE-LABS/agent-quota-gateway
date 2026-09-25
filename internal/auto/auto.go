@@ -104,24 +104,6 @@ const (
 	rateLimitBackoffMaxSeconds = 3
 )
 
-// window5h is the length of the Anthropic unified short window, used by
-// the lead calculation:
-//
-//	elapsed_fraction = 1 - (time_until_reset / window_length)
-//	lead = utilization - elapsed_fraction
-//
-// A positive lead means the member is consuming faster than its window
-// is depleting and should be cooled down; near-zero is on pace; negative
-// is under pace.
-//
-// The long-window length is provider-aware and resolved per member via
-// poller.LongWindowFor (7-day default, ~30-day monthly for Z.AI/Zhipu;
-// issue #140), so there is no fixed long-window constant here. Whether the
-// long window feeds the lead at all is also provider-aware: for Z.AI/Zhipu
-// it is dropped, because its monthly slot is a web-search/reader/zread tool
-// quota, not chat throughput (poller.LongWindowBlocksExhaustion; issue #192).
-const window5h = 5 * time.Hour
-
 // Pools fronts each configured pool with its own Controller and routes a
 // request to the right one. It implements backend.PoolRouter.
 //
@@ -403,14 +385,6 @@ type MemberStatus struct {
 	// a status-bearing rejected store window can report "exhausted" without
 	// being Parked, since clearing the recorded park cannot move it.
 	Parked bool `json:"parked"`
-
-	// Lead fields are populated only for pools in balanced mode.
-	// Lead is max(Lead5h, Lead7d) over known windows; null when no data.
-	// Lead5h and Lead7d are null when the corresponding window has no data.
-	// A positive lead means the member is consuming ahead of schedule.
-	Lead   *float64 `json:"lead,omitempty"`
-	Lead5h *float64 `json:"lead_5h,omitempty"`
-	Lead7d *float64 `json:"lead_7d,omitempty"`
 }
 
 // PoolStatus is the /_gateway/pool response for one pool.
@@ -437,13 +411,10 @@ type PoolStatus struct {
 // It carries the effective configuration (static + runtime overlay) with
 // all credentials redacted.
 type PoolConfigView struct {
-	Pool         string                 `json:"pool"`
-	Concurrency  int                    `json:"concurrency"`
-	BalanceMode  string                 `json:"balance_mode,omitempty"`
-	BalanceGap   float64                `json:"balance_gap,omitempty"`
-	BalanceDwell string                 `json:"balance_dwell,omitempty"`
-	Priority     []string               `json:"priority,omitempty"`
-	Members      []PoolMemberConfigView `json:"members"`
+	Pool        string                 `json:"pool"`
+	Concurrency int                    `json:"concurrency"`
+	Priority    []string               `json:"priority,omitempty"`
+	Members     []PoolMemberConfigView `json:"members"`
 }
 
 // PoolMemberConfigView describes one pool member in the config view.
@@ -515,16 +486,10 @@ type PoolPersistState struct {
 	// Absent/empty in older state files; a missing key loads as no
 	// propagated park, which is safe (the parking pool's own restart
 	// re-asserts and re-propagates on its next failure).
-	CredentialPark    map[string]CredentialParkPersist `json:"credential_park,omitempty"`
-	LastBalanceSwitch time.Time                        `json:"last_balance_switch,omitempty"`
-	// BalanceSeq and LastSelectedSeq persist the selection-recency tiebreaker
-	// state for balanced pools. Absent in older state files; treated as zero /
-	// never-selected on load (backward-compatible).
-	BalanceSeq      uint64            `json:"balance_seq,omitempty"`
-	LastSelectedSeq map[string]uint64 `json:"last_selected_seq,omitempty"`
+	CredentialPark map[string]CredentialParkPersist `json:"credential_park,omitempty"`
 	// LocalSnapshotNicks lists members for which this controller has
 	// observed a snapshot since the last restart. Persisted unconditionally
-	// (not gated on balanceGap) so a non-balanced pool does not lose the
+	// so a pool does not lose the
 	// "this pool has seen traffic" signal across a restart. Empty/absent
 	// in older state files; treated as "no observed snapshots" on load,
 	// which is the same as the pre-fix behaviour for the first observation.
@@ -544,7 +509,7 @@ type memberEntry struct {
 func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 	for name, s := range states {
 		if c, ok := p.controller(name); ok {
-			c.loadState(s.Sticky, s.Exhausted, s.LastBalanceSwitch, s.BalanceSeq, s.LastSelectedSeq, s.LocalSnapshotNicks)
+			c.loadState(s.Sticky, s.Exhausted, s.LocalSnapshotNicks)
 			c.loadCredentialPark(s.CredentialPark)
 			c.loadWorkerAffinity(s.WorkerAffinity, s.WorkerCursor)
 		}
@@ -566,11 +531,6 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 	}
 
 	c.mu.Lock()
-	// Reject priority on a balanced pool (mutually exclusive modes).
-	if c.balanceGap > 0 {
-		c.mu.Unlock()
-		return http.StatusConflict, fmt.Errorf("balanced pools do not support priority override")
-	}
 	// Normalize and validate the input order against the current membership.
 	seen := make(map[string]bool)
 	validOrder := make([]string, 0, len(order))
@@ -653,7 +613,7 @@ func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) 
 // for a *known* subscription: when omitted, they are resolved by scanning the
 // other pools for the same nick (credential and base_url resolve independently).
 // A priority target requires an explicit placement (must include nick), reusing
-// the move path's validation; plain/balanced targets must carry none. A base_url
+// the move path's validation; other targets must carry none. A base_url
 // that stays unresolved after the cross-pool scan and the unanimous in-pool
 // borrow (empty pool, or members disagreeing, issue #248) falls back to the
 // gateway default upstream (issue #302). The resolved concrete base_url is
@@ -751,8 +711,8 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 		}
 	}
 	// Placement: a priority target needs an explicit order including nick; a
-	// plain/balanced target must not carry one.
-	isPriorityTarget := c.balanceGap == 0 && len(c.effectivePriorityLocked()) > 0
+	// target without a priority order must not carry one.
+	isPriorityTarget := len(c.effectivePriorityLocked()) > 0
 	var normPlacement []string
 	if isPriorityTarget {
 		var status int
@@ -829,7 +789,7 @@ func (p *Pools) RemoveMember(poolName, nick string) (int, error) {
 //
 // Placement: moving into a priority pool that has no existing slot for nick
 // requires an explicit placement order (which must include nick) — there is no
-// implicit insertion. Moving into a plain/balanced pool, or onto an existing
+// implicit insertion. Moving into a target without a priority order, or onto an existing
 // same-nick slot, needs no placement.
 //
 // Conflict: an existing same-nick member in the target whose credential and
@@ -880,7 +840,7 @@ func (p *Pools) MoveMember(fromPool, nick, toPool string, placement []string, fo
 		}
 		// Existing slot: no placement needed (identical → effective no-op on dst).
 	} else {
-		isPriorityTarget := dst.balanceGap == 0 && len(dst.effectivePriorityLocked()) > 0
+		isPriorityTarget := len(dst.effectivePriorityLocked()) > 0
 		if isPriorityTarget {
 			var status int
 			var err error
@@ -960,8 +920,8 @@ func (c *Controller) validatePlacementLocked(nick string, placement []string) ([
 }
 
 // EffectiveConfig returns the effective configuration for all pools,
-// with credentials fully redacted. Each pool's view includes its balance
-// settings, effective priority (runtime override when set, else env priority),
+// with credentials fully redacted. Each pool's view includes its effective
+// priority (runtime override when set, else env priority),
 // and per-member status including the disabled flag.
 func (p *Pools) EffectiveConfig() []PoolConfigView {
 	snapshot := p.controllersSnapshot()
@@ -976,13 +936,6 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 		c := snapshot[name]
 		c.mu.Lock()
 		view := PoolConfigView{Pool: name, Concurrency: c.workerConcurrency}
-
-		// Balance settings.
-		if c.balanceGap > 0 {
-			view.BalanceMode = "lead"
-			view.BalanceGap = c.balanceGap
-			view.BalanceDwell = c.balanceDwell.String()
-		}
 
 		// Effective priority.
 		pri := c.effectivePriorityLocked()
@@ -1203,7 +1156,7 @@ func (p *Pools) RemovePool(name string) (int, error) {
 
 // RenamePool renames a pool in place from oldName to newName (issue #238),
 // preserving the controller's runtime observation — sticky pointer, exhausted
-// marks, balance sequence, and local-snapshot set are all keyed by member
+// marks and local-snapshot set are all keyed by member
 // nick (not pool name) and so move with the rename for free. The credential-
 // free status mapping mirrors AddPool's conflict pattern: unknown old → 404,
 // empty / identical-after-normalize new → 400, new name collides with a
@@ -1263,7 +1216,7 @@ func (p *Pools) RenamePool(oldName, newName string) (int, error) {
 	}
 
 	// Rewire the controller to the new name. The membership, disabled set,
-	// priority, and balance params are unchanged by the rename — only the
+	// priority are unchanged by the rename — only the
 	// byPool key and the atomic poolName field need to move. reconcileLocked
 	// is intentionally NOT called here: it would re-read from reg.PoolNicks
 	// with the now-stale c.poolName if the swap ordering slipped, and
@@ -1360,7 +1313,7 @@ func (p *Pools) markConfigDirtyLocked() {
 
 // applyRegistryLocked installs next as the authoritative registry and
 // reconciles the named pools' controllers from it, preserving each
-// controller's runtime observation (sticky/exhausted/balance/local-snapshot).
+// controller's runtime observation (sticky/exhausted/local-snapshot).
 // Caller holds p.mu. Only the named pools are reconciled — every other pool's
 // membership is byte-identical in next, so re-deriving it would be a no-op.
 func (p *Pools) applyRegistryLocked(next *backend.Registry, pools ...string) {
@@ -1637,28 +1590,6 @@ type Controller struct {
 	// cur or exhausted. Set by Pools.SetOnMutate to notify the persister.
 	onMutate func()
 
-	// balanceGap is the minimum lead difference (active minus candidate)
-	// that triggers a balance switch. 0 means balance mode is off for this
-	// pool; populated from AQG_POOL_<POOL>_BALANCE_GAP (default 0.15).
-	balanceGap float64
-	// balanceDwell is the minimum time between balance switches. Populated
-	// from AQG_POOL_<POOL>_BALANCE_DWELL (default 5m).
-	balanceDwell time.Duration
-	// lastBalanceSwitch records the most recent balance switch time for
-	// dwell enforcement. Zero when no balance switch has occurred.
-	lastBalanceSwitch time.Time
-
-	// balanceSeq is a pool-level monotonic counter incremented each time the
-	// sticky pointer moves to a different member in a balanced pool. Together
-	// with lastSelectedSeq it implements the equal-lead tiebreaker: among
-	// eligible candidates with the same best lead, the one with the smallest
-	// lastSelectedSeq (least recently selected) wins.
-	balanceSeq uint64
-	// lastSelectedSeq maps a nick to the sequence number at which it last
-	// became the active member in a balanced pool. 0 (absent) means the
-	// member has never been selected.
-	lastSelectedSeq map[string]uint64
-
 	// poolLocalSnapshots records the nicks for which this controller has
 	// itself observed a quota snapshot (header observer or poller tick) since
 	// the controller was created. A member is only attached a snapshot in
@@ -1702,8 +1633,8 @@ type Controller struct {
 	credentialPark map[string]credentialParkEntry
 
 	// workerAffinity stores the last member assigned to each worker. Above
-	// concurrency 1, a mapped worker bypasses global sticky, balance, and
-	// preempt while its member remains in the current availability window.
+	// concurrency 1, a mapped worker bypasses global sticky and preempt while
+	// its member remains in the current availability window.
 	// Stale targets are rechecked on that worker's next request. Accessed only
 	// under c.mu.
 	workerAffinity map[string]string
@@ -1791,9 +1722,6 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		probeHTTPClient:    http.DefaultClient,
 		now:                now,
 		logOut:             logOut,
-		balanceGap:         reg.PoolBalanceGap(poolName),
-		balanceDwell:       reg.PoolBalanceDwell(poolName),
-		lastSelectedSeq:    make(map[string]uint64),
 		disabled:           make(map[string]bool),
 		poolLocalSnapshots: local,
 		topStatusLogged:    make(map[string]struct{}),
@@ -1832,14 +1760,11 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 	}
 	start = ((start % n) + n) % n
 	c.curNick = c.members[start].Nick
-	// Stamp the initial pick so it is distinguishable from members that have
-	// never been active. loadState may overwrite this with persisted values.
-	c.stampSelectionLocked(c.curNick)
 	return c
 }
 
 // reconcileLocked re-derives this controller's membership, disabled set,
-// effective priority, balance parameters, and worker concurrency from reg
+// effective priority and worker concurrency from reg
 // (the new authoritative registry after a copy-on-write mutation, issue #198).
 // It preserves runtime observations; stale worker targets, including removed
 // members, are rechecked on the worker's next request. Other per-member
@@ -1868,8 +1793,6 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	c.disabled = disabled
 	c.priority = effectiveOrder(reg.PoolPriority(c.name()), nicks)
 	c.workerConcurrency = reg.PoolConcurrency(c.name())
-	c.balanceGap = reg.PoolBalanceGap(c.name())
-	c.balanceDwell = reg.PoolBalanceDwell(c.name())
 
 	// Prune runtime observation for members that left the pool.
 	for nick := range c.exhausted {
@@ -1880,11 +1803,6 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	for nick := range c.credentialPark {
 		if !present[nick] {
 			delete(c.credentialPark, nick)
-		}
-	}
-	for nick := range c.lastSelectedSeq {
-		if !present[nick] {
-			delete(c.lastSelectedSeq, nick)
 		}
 	}
 	for nick := range c.poolLocalSnapshots {
@@ -2140,19 +2058,6 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	// has an empty curNick; skip the healthy-current branch and fall through
 	// to the exhausted return so the caller receives an honest 429.
 	if c.curNick != "" && !c.isUnavailableLocked(c.curNick) {
-		// Balance mode: check for a switch to a lower-utilization member.
-		// Applies to all members in the unified collection (issue #185).
-		if c.balanceGap > 0 {
-			if next, ok := c.balanceSwitchLocked(); ok {
-				from := c.curNick
-				c.lastBalanceSwitch = c.now()
-				c.setActiveMemberLocked(next)
-				fmt.Fprintf(c.logOut, "auto[%s]: balance %s -> %s (lead gap)\n", c.name(), from, next)
-				if b, ok := c.backendByNickLocked(next); ok {
-					return b, 0, false
-				}
-			}
-		}
 		if b, ok := c.backendByNickLocked(c.curNick); ok {
 			return b, 0, false
 		}
@@ -2442,23 +2347,11 @@ func (c *Controller) seedLocalSnapshotLocked(nick string) {
 	c.poolLocalSnapshots[nick] = struct{}{}
 }
 
-// stampSelectionLocked records that nick just became the active member in a
-// balanced pool. It increments the pool-level sequence counter and stores the
-// new value for nick. No-op for non-balanced pools. Caller holds c.mu.
-func (c *Controller) stampSelectionLocked(nick string) {
-	if c.balanceGap == 0 {
-		return
-	}
-	c.balanceSeq++
-	c.lastSelectedSeq[nick] = c.balanceSeq
-}
-
 // setActiveMemberLocked moves the sticky pointer to nick and notifies the
 // persister. Replaces the old cur/curAddedNick dual-pointer update.
 // Caller holds c.mu.
 func (c *Controller) setActiveMemberLocked(nick string) {
 	c.curNick = nick
-	c.stampSelectionLocked(nick)
 	c.notifyMutate()
 }
 
@@ -2515,21 +2408,6 @@ func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller, pollerMap
 				}
 			}
 		}
-		if c.balanceGap > 0 {
-			overall, l5h, l7d, has5h, has7d := c.memberLeadsLocked(nick)
-			if has5h || has7d {
-				ov := overall
-				ms.Lead = &ov
-			}
-			if has5h {
-				v := l5h
-				ms.Lead5h = &v
-			}
-			if has7d {
-				v := l7d
-				ms.Lead7d = &v
-			}
-		}
 		members = append(members, ms)
 	}
 	out := PoolStatus{Pool: c.name(), Active: c.curNick, Concurrency: c.workerConcurrency, Members: members}
@@ -2573,7 +2451,7 @@ func (c *Controller) activeBaseURLLocked() (string, bool) {
 // the single source of truth (issue #198), every member — including
 // previously runtime-added ones — is already present from NewController, so
 // sticky and local-snapshot references resolve immediately (no deferral).
-func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, lastBalanceSwitch time.Time, balanceSeq uint64, lastSelectedSeq map[string]uint64, localSnapshots []string) {
+func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, localSnapshots []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.indexOf(sticky) >= 0 {
@@ -2598,30 +2476,8 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, la
 		}
 		c.exhausted[nick] = reset
 	}
-	if c.balanceDwell > 0 && !lastBalanceSwitch.IsZero() {
-		c.lastBalanceSwitch = lastBalanceSwitch
-	}
-	if c.balanceGap > 0 {
-		// Load persisted selection-recency state, skipping nicks no longer in the pool.
-		if balanceSeq > c.balanceSeq {
-			c.balanceSeq = balanceSeq
-		}
-		for nick, seq := range lastSelectedSeq {
-			if c.indexOf(nick) >= 0 {
-				c.lastSelectedSeq[nick] = seq
-			}
-		}
-		// Seed the sticky member if no persisted seq exists (fresh install or
-		// upgrade from a state file that predates this feature). This ensures
-		// the currently active member is never treated as "never selected",
-		// which would let it win all future equal-lead tiebreaks indefinitely.
-		if _, stamped := c.lastSelectedSeq[c.curNick]; !stamped {
-			c.stampSelectionLocked(c.curNick)
-		}
-	}
 	// Restore the per-pool "we have seen traffic for this nick" set, dropping
-	// entries that no longer name a current member. Unconditional — applies to
-	// balanced and non-balanced pools alike.
+	// entries that no longer name a current member.
 	for _, nick := range localSnapshots {
 		if nick == "" {
 			continue
@@ -2690,9 +2546,8 @@ func (c *Controller) persistState() PoolPersistState {
 	// Persist the active member nick so it can be restored on next start.
 	sticky := c.curNick
 	ps := PoolPersistState{
-		Sticky:            sticky,
-		Exhausted:         ex,
-		LastBalanceSwitch: c.lastBalanceSwitch,
+		Sticky:    sticky,
+		Exhausted: ex,
 	}
 	if len(c.workerAffinity) > 0 {
 		affinity := make(map[string]string, len(c.workerAffinity))
@@ -2714,14 +2569,6 @@ func (c *Controller) persistState() PoolPersistState {
 			cp[k] = CredentialParkPersist{Reset: v.reset, WindowFact: v.windowFact}
 		}
 		ps.CredentialPark = cp
-	}
-	if c.balanceGap > 0 && c.balanceSeq > 0 {
-		ps.BalanceSeq = c.balanceSeq
-		seqs := make(map[string]uint64, len(c.lastSelectedSeq))
-		for k, v := range c.lastSelectedSeq {
-			seqs[k] = v
-		}
-		ps.LastSelectedSeq = seqs
 	}
 	if len(c.poolLocalSnapshots) > 0 {
 		nicks := make([]string, 0, len(c.poolLocalSnapshots))
@@ -3825,124 +3672,6 @@ func windowBlocks(util *float64, status string, reset *time.Time, asOf time.Time
 		return false
 	}
 	return now.Sub(asOf) <= storeSnapshotFreshness
-}
-
-// memberLeadsLocked computes the routing pressure for nick from the quota
-// store. It returns per-window leads (utilization minus elapsed window
-// fraction, clamped elapsed to [0,1]) and the overall max lead. has5h and
-// has7d are true when the corresponding window had enough data (non-nil
-// utilization, non-nil reset, reset still in the future). When neither
-// window has data all returned floats are 0 and both has flags are false.
-// Caller holds c.mu; the store has its own lock.
-func (c *Controller) memberLeadsLocked(nick string) (overall, lead5h, lead7d float64, has5h, has7d bool) {
-	if c.store == nil {
-		return 0, 0, 0, false, false
-	}
-	idx := c.indexOf(nick)
-	if idx < 0 {
-		return 0, 0, 0, false, false
-	}
-	b := c.backendAt(idx)
-	snap := c.store.Get(b.QuotaKey())
-	now := c.now()
-
-	computeLead := func(util *float64, reset *time.Time, windowLen time.Duration) (float64, bool) {
-		if util == nil || reset == nil || !reset.After(now) {
-			return 0, false
-		}
-		elapsed := 1.0 - float64(reset.Sub(now))/float64(windowLen)
-		if elapsed < 0 {
-			elapsed = 0
-		} else if elapsed > 1 {
-			elapsed = 1
-		}
-		return *util - elapsed, true
-	}
-
-	// The long window's length is provider-aware: Z.AI/Zhipu's long slot
-	// carries a monthly TIME_LIMIT window, so dividing its reset by 7 days
-	// would clamp the elapsed fraction to 0 and collapse the lead to raw
-	// utilization (issue #140). Resolve the length from the same provider
-	// mapping that supplies the column label.
-	//
-	// Codex members (issue #304) additionally carry the window length the
-	// upstream itself reported (x-codex-*-window-minutes) — window lengths
-	// are not contractual there, so a reported length outranks both fixed
-	// defaults. The minutes fields are nil for Anthropic and poller-tracked
-	// providers, which keep the fixed/provider lengths.
-	windowLen5h := window5h
-	if snap.Unified5hWindowMinutes != nil && *snap.Unified5hWindowMinutes > 0 {
-		windowLen5h = time.Duration(*snap.Unified5hWindowMinutes) * time.Minute
-	}
-	windowLen7d := poller.LongWindowFor(b.BaseURL)
-	if snap.Unified7dWindowMinutes != nil && *snap.Unified7dWindowMinutes > 0 {
-		windowLen7d = time.Duration(*snap.Unified7dWindowMinutes) * time.Minute
-	}
-	lead5h, has5h = computeLead(snap.Unified5hUtilization, snap.Unified5hReset, windowLen5h)
-	// The long window feeds routing pressure only when it is a genuine
-	// chat-blocking signal. For Z.AI/Zhipu the monthly slot is a
-	// web-search/reader/zread tool quota (issue #192), so leave has7d false
-	// and drive balance-mode pressure from the 5h window alone — a filled
-	// tool quota must not skew chat routing.
-	if poller.LongWindowBlocksExhaustion(b.BaseURL) {
-		lead7d, has7d = computeLead(snap.Unified7dUtilization, snap.Unified7dReset, windowLen7d)
-	}
-
-	switch {
-	case has5h && has7d:
-		if lead5h >= lead7d {
-			overall = lead5h
-		} else {
-			overall = lead7d
-		}
-	case has5h:
-		overall = lead5h
-	case has7d:
-		overall = lead7d
-	}
-	return overall, lead5h, lead7d, has5h, has7d
-}
-
-// balanceSwitchLocked returns the nick of the member to switch to when the
-// active member's overall lead exceeds the best candidate's lead by at least
-// balanceGap and the dwell timer has elapsed. Returns ("", false) when no
-// switch is warranted. Covers all members in the unified collection —
-// runtime-added members participate in balance consideration (issue #185).
-// Caller holds c.mu.
-//
-// Among eligible candidates with the same best lead (including the common
-// all-zero / no-snapshot case), the one with the smallest lastSelectedSeq
-// wins: the member that was least recently active is preferred, spreading
-// 5-hour cycles across pool members rather than repeatedly re-selecting
-// the lexically-first nick.
-func (c *Controller) balanceSwitchLocked() (string, bool) {
-	if !c.lastBalanceSwitch.IsZero() && c.now().Sub(c.lastBalanceSwitch) < c.balanceDwell {
-		return "", false
-	}
-	curOverall, _, _, _, _ := c.memberLeadsLocked(c.curNick)
-
-	bestNick := ""
-	bestLead := curOverall
-	var bestSeq uint64
-	for _, m := range c.members {
-		if m.Nick == c.curNick || c.isUnavailableLocked(m.Nick) {
-			continue
-		}
-		candOverall, _, _, _, _ := c.memberLeadsLocked(m.Nick)
-		if curOverall-candOverall < c.balanceGap {
-			continue
-		}
-		seq := c.lastSelectedSeq[m.Nick]
-		if bestNick == "" || candOverall < bestLead || (candOverall == bestLead && seq < bestSeq) {
-			bestLead = candOverall
-			bestNick = m.Nick
-			bestSeq = seq
-		}
-	}
-	if bestNick == "" {
-		return "", false
-	}
-	return bestNick, true
 }
 
 // soonestNickLocked returns the nick and reset time of the member that

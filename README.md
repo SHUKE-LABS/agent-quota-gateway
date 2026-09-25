@@ -154,7 +154,7 @@ upstream receives the same API path and query it would receive without the
 namespace. No worker field is added to `backends.json`.
 
 Each pool's `concurrency` setting controls worker routing (default `1`). At
-`1`, a namespaced request uses the same global sticky, failover, balance, and
+`1`, a namespaced request uses the same global sticky, failover, and
 preempt behavior as an ordinary request, and no worker assignment is stored.
 At values above `1`, the first N available members in effective order form the
 worker window: declared `PRIORITY` order when present, otherwise sorted member
@@ -162,9 +162,8 @@ nick order. New workers are assigned round-robin within that window. An
 assignment stays put while its member remains available and inside the window.
 If it becomes unavailable or falls outside the window, the worker is assigned
 again on its next request. This brings workers back from fallback members when
-a higher member becomes available. `BALANCE=lead` cannot be combined with
-`concurrency` above `1`. A transient same-member throttle or 529 keeps the
-member available and does not move its workers.
+a higher member becomes available. A transient same-member throttle or 529
+keeps the member available and does not move its workers.
 
 A real upstream quota rejection or credential failure makes the member
 unavailable in every pool that shares the nick; each mapped worker is
@@ -327,84 +326,6 @@ static `PRIORITY` declaration never preempt unless priority is set at runtime
 via `POST /_gateway/pool/{name}/priority`, so their prompt cache is never
 interrupted.
 
-### Balanced routing within a pool
-
-By default the gateway is intentionally sticky: it rides one member until
-that member returns `429` or its quota store reports a fully consumed window.
-This maximises prompt-cache locality. The downside is that a pool of
-*interchangeable* subscription accounts can repeatedly over-drain one member
-across rolling 5-hour windows, burning its 7-day allowance much faster than
-the others.
-
-**Lead-based balanced routing** is an opt-in per-pool mode that adds a
-proactive switch when the active member's quota consumption is materially
-*ahead of schedule* relative to a healthier alternative. The metric is:
-
-```
-elapsed_fraction = 1 − (time_until_reset / window_length)   # clamped to [0, 1]
-lead = utilization − elapsed_fraction
-```
-
-A positive lead means the member is consuming faster than time is passing.
-The gateway computes `max(lead_5h, lead_7d)` over any windows whose
-utilization and reset are known, and switches when the active member's lead
-exceeds the best non-exhausted candidate's lead by at least the configured
-gap. A dwell timer prevents churn immediately after a switch.
-
-`window_length` for the long window is **provider-aware**: it is ~30 days
-for Z.AI / Zhipu (whose long slot carries the monthly `TIME_LIMIT` quota)
-and 7 days for everyone else, resolved from the same provider mapping that
-labels the column (see the provider-aware window note below). Using the
-fixed 7-day length for a monthly reset weeks out would push
-`time_until_reset / window_length` above 1, clamp `elapsed_fraction` to 0,
-and collapse the long lead to raw utilization (issue #140).
-
-Enable it with `AQG_POOL_<POOL>_BALANCE=lead`:
-
-```
-# A pool of interchangeable subscription accounts, balanced by lead.
-AQG_POOL_SUB_BACKEND_A=sk-ant-...
-AQG_POOL_SUB_BACKEND_B=sk-ant-...
-AQG_POOL_SUB_BACKEND_C=sk-ant-...
-AQG_POOL_SUB_BALANCE=lead
-
-# Optional tuning (shown with their defaults):
-# AQG_POOL_SUB_BALANCE_GAP=0.15    # switch when active lead − best lead ≥ 0.15
-# AQG_POOL_SUB_BALANCE_DWELL=5m    # minimum time between switches
-```
-
-**How it interacts with the default sticky design:**
-
-- Between switches the pool is fully sticky: cache locality is preserved.
-- The switch fires on the request path (no background goroutine); the gap
-  and dwell keep it rare.
-- The lead check never synthesises probes — it reads snapshots learned from
-  real traffic, the existing poller, or a Codex weekly hello.
-- Exhausted members (recorded after a failed response or blocked by a
-  status-bearing rejected window) are never chosen
-  as the balance target.
-- When no snapshot data is available for a member its lead is treated as 0
-  (neutral); the pool stays sticky until real traffic trains the store.
-- **Equal-lead tiebreaker:** when multiple candidates share the same best
-  lead (the common case when none have snapshot data yet, all reading as 0),
-  the gateway prefers the member that was least recently active — tracked by
-  a per-member selection-sequence counter that increments each time a member
-  becomes the sticky backend. This prevents the lexically-first nick from
-  winning every equal-lead comparison and accumulating disproportionate
-  5-hour cycles. The selection-sequence state is persisted in the state file
-  and survives restarts.
-
-**Cache-locality tradeoff:** a balance switch breaks prompt-cache continuity
-for the in-flight session, just like any other mid-session switch. Unlike a
-`429` switch (which is forced), a balance switch is *elective* — the session
-cache is sacrificed to avoid a worse outcome (7-day window tragedy). The gap
-(default 0.15) and dwell (default 5m) tune how eagerly the gateway makes
-that trade.
-
-**Mutual exclusion with `PRIORITY`:** a pool cannot declare both
-`BALANCE=lead` and `PRIORITY` — the two modes have conflicting goals.
-Declaring both is a startup error.
-
 ## Environment variables
 
 There is deliberately no pool protocol field or `AQG_POOL_<POOL>_PROTOCOL`
@@ -415,26 +336,21 @@ classes and configure each pool's `BASE_URL` and members accordingly.
 |----------|---------|-------|
 | `AQG_POOL_<POOL>_BACKEND_<NICK>` | _(at least one required)_ | A pool member's credential, optionally `=<cred>\|<base-url>` to override the pool default upstream for that member. `<POOL>` and `<NICK>` are normalized (`AQG_POOL_Z_AI_BACKEND_KEY_A` → pool `z-ai`, member `key-a`). |
 | `AQG_POOL_<POOL>_BASE_URL` | `ANTHROPIC_BASE_URL` | The pool's default upstream; scheme and host are required. Omit it for pools that hit `api.anthropic.com`. |
-| `AQG_POOL_<POOL>_PRIORITY` | _(optional)_ | Comma-separated member nicks, highest priority first (e.g. `zai,m3`). When set, the pool starts on and fails over toward the highest-priority healthy member instead of random/round-robin. Unlisted members rank last (sorted). Carries no credential. See [Priority within a pool](#priority-within-a-pool). Mutually exclusive with `BALANCE`. |
-| `AQG_POOL_<POOL>_BALANCE` | _(optional)_ | Set to `lead` to enable lead-based balanced routing. The gateway switches the active member when its lead (utilization minus elapsed window fraction) exceeds the best candidate's lead by at least `BALANCE_GAP`, subject to `BALANCE_DWELL`. Mutually exclusive with `PRIORITY`. See [Balanced routing within a pool](#balanced-routing-within-a-pool). |
-| `AQG_POOL_<POOL>_BALANCE_GAP` | `0.15` | Minimum lead difference that triggers a balance switch. Only valid when `BALANCE=lead` is set. |
-| `AQG_POOL_<POOL>_BALANCE_DWELL` | `5m` | Minimum time between balance switches. Accepts Go duration strings (e.g. `5m`, `2m30s`). Only valid when `BALANCE=lead` is set. |
-| `AQG_POOL_<POOL>_CONCURRENCY` | `1` | Number of available members that may serve namespaced workers. Values above 1 use the first N available members in effective priority order (or sorted nick order), reassigning workers when their member leaves the window. Mutually exclusive with `BALANCE=lead`. |
+| `AQG_POOL_<POOL>_PRIORITY` | _(optional)_ | Comma-separated member nicks, highest priority first (e.g. `zai,m3`). When set, the pool starts on and fails over toward the highest-priority healthy member instead of random/round-robin. Unlisted members rank last (sorted). Carries no credential. See [Priority within a pool](#priority-within-a-pool).. |
+| `AQG_POOL_<POOL>_CONCURRENCY` | `1` | Number of available members that may serve namespaced workers. Values above 1 use the first N available members in effective priority order (or sorted nick order), reassigning workers when their member leaves the window.. |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single non-loopback overlay/IP address (e.g. a Tailscale address, `100.64.0.0/10` / `fd7a:115c:a1e0::/48`; or any other overlay/LAN address the deployment trusts, such as an OpenVPN `10.8.0.0/24`) instead of loopback, so other machines that can reach it share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. Deliberately env-only (issue #301): account-level signing credentials are not pool-member intent, so they stay out of `aqg.json`; a missing pair surfaces as the member's `last_err` in pool status. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. Env-only by design — see `VOLC_ACCESSKEY`. |
-| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. When a config file declares an empty `state_file`, startup warns with the config path; set `state_file` in that file and restart. The file stores **runtime observation only** — sticky pointers, per-worker affinities and their first-use cursor, exhausted maps, quota snapshots, balance selection-sequence, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, balance, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles legacy `priority_override` and `disabled` (issues #241, #259) and **reports only** legacy `removed_members` / `added_members` (the credential-bearing keys are never silently applied), as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
+| `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. When a config file declares an empty `state_file`, startup warns with the config path; set `state_file` in that file and restart. The file stores **runtime observation only** — sticky pointers, per-worker affinities and their first-use cursor, exhausted maps, quota snapshots, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles legacy `priority_override` and `disabled` (issues #241, #259) and **reports only** legacy `removed_members` / `added_members` (the credential-bearing keys are never silently applied), as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
 | `AQG_DEBUG_LOG_REQUESTS` | _(unset)_ | Set to `1` to dump every inbound request and outbound upstream request to stderr for debugging; any other value (or unset) leaves it off. Credentials are always redacted — the `Authorization` and `x-api-key` headers are never logged — but the inbound request body is dumped (truncated to 500 bytes) and may contain user message content, so enable only in dev/debug runs. This env var is a **first-start bootstrap seed** exactly like `AQG_POOL_*` (issue #301): read only in env-only mode and when generating a fresh `aqg.json`, whose `debug.log_requests` section then owns the setting. Once a config file exists it is never read again — flip logging on a running gateway via `POST /_gateway/debug` or the UI instead (no restart). |
 
 Startup fails closed on: an empty credential, a `BASE_URL`
 on a pool with no members, a malformed upstream URL, an unrecognized
 `AQG_POOL_*` shape, two keys colliding on the same pool/member, a
 `PRIORITY` that is empty, repeats a nick, names a nick that is not a member
-of the pool, or targets a pool with no members, a `BALANCE` value other than
-`lead`, `BALANCE_GAP` or `BALANCE_DWELL` set without `BALANCE`, `BALANCE`
-and `PRIORITY` both declared on the same pool, both `LISTEN_ADDR` and
+of the pool, both `LISTEN_ADDR` and
 `SHARED_LISTEN_ADDR` set at once, or a `SHARED_LISTEN_ADDR` that is
 loopback, the wildcard address, or not an IP literal. A `|` in a
 credential is rejected because the tail must parse as a URL — tokens do
@@ -461,7 +377,7 @@ and the environment is only a first-start bootstrap seed.
 ## Config file
 
 `aqg.json` is the **single source of truth for operator intent** (issue #198):
-pools, members (credential + `base_url`), priority, balance, and the `disabled`
+pools, members (credential + `base_url`), priority, and the `disabled`
 flag. Every runtime mutation made through the UI/API — add/remove/update a
 member, disable/enable, set priority, create a pool, move a member — is
 **written through to `aqg.json`** (debounced atomic write at 0600). There is no
@@ -518,8 +434,7 @@ the gateway never probes past it to a possibly stale file.
 Legacy priority nicks are normalized, filtered to current pool members, and
 deduplicated before migration. A priority with no surviving member fails
 startup and names the state/config paths that need repair. A missing pool is
-logged and skipped. A pool that now uses balance mode keeps that newer mode and
-has the superseded legacy priority key consumed. Legacy `disabled` entries are
+logged and skipped. Legacy `disabled` entries are
 migrated the same way (issue #259): listed nicks that are configured and
 currently enabled are disabled in `aqg.json`; non-member nicks are logged and
 skipped; the key is consumed at the pool level once every listed nick has been
@@ -560,10 +475,7 @@ permissions causes startup to fail closed — no silent fallback to env.
           "disabled": false
         }
       },
-      "priority": ["nick-a", "nick-b"],
-      "balance": "lead",
-      "balance_gap": 0.15,
-      "balance_dwell": "5m"
+      "priority": ["nick-a", "nick-b"]
     }
   }
 }
@@ -582,10 +494,7 @@ pool name.
 | _(runtime disable via UI/API)_ | `pools.<P>.members.<N>.disabled` | `true` takes the member out of selection until re-enabled. Persisted to config (issue #198). |
 | `AQG_POOL_<P>_BASE_URL` | `pools.<P>.base_url` | Pool-level default. |
 | `AQG_POOL_<P>_PRIORITY` | `pools.<P>.priority` | Array of nicks, highest first. |
-| `AQG_POOL_<P>_BALANCE` | `pools.<P>.balance` | Set to `"lead"` for balanced routing. |
-| `AQG_POOL_<P>_BALANCE_GAP` | `pools.<P>.balance_gap` | Omit for the default (0.15). A fraction in `(0, 1)`; a value `<= 0` or `>= 1.0` is rejected (a gap `>= 1.0` is unreachable — don't pass a percent like `15`). |
-| `AQG_POOL_<P>_BALANCE_DWELL` | `pools.<P>.balance_dwell` | Omit for the default (`5m`). An explicit non-positive value is rejected. |
-| `AQG_POOL_<P>_CONCURRENCY` | `pools.<P>.concurrency` | Omit for the default (`1`). Must be an integer >= 1; values above 1 use a moving window of available members and are incompatible with `BALANCE=lead`. |
+| `AQG_POOL_<P>_CONCURRENCY` | `pools.<P>.concurrency` | Omit for the default (`1`). Must be an integer >= 1; values above 1 use a moving window of available members. |
 | `ANTHROPIC_BASE_URL` | `base_url` | Gateway default upstream. |
 | `LISTEN_ADDR` | `listen_addr` | Loopback-only bind address. |
 | `SHARED_LISTEN_ADDR` | `shared_listen_addr` | Overlay/IP bind address for shared mode (e.g. Tailscale). |
@@ -641,7 +550,7 @@ Codex weekly hello below is independent of member selection:
 
 - **Sticky.** Every request to a pool reuses the same member so Anthropic's
   per-account prompt cache keeps paying off. The gateway does not compare
-  or balance across members.
+  using quota consumption.
 - **Reactive switch, no watermark below full.** A member remains active while
   requests succeed. What blocks it depends on the snapshot: for an Anthropic backend, whose headers
   carry a per-window status, only a `rejected` status blocks — a window at
@@ -971,11 +880,11 @@ restarting is the wrong tool.
 | `POST /_gateway/debug` | Hot-toggle request logging on a running gateway; body `{"log_requests": true\|false}` (field required, missing → `400`). Takes effect on the **next request** — no restart, no dropped connections — and flushes to `aqg.json`'s `debug.log_requests` via the same debounced write every mutation uses, so it survives restart. In env-only mode the toggle is in-memory only and the response says so (`X-AQG-Persistence: env_only`). Non-GET/POST returns `405`. The dump itself is the stderr request dump described under `AQG_DEBUG_LOG_REQUESTS`: credentials redacted, bodies truncated. |
 | `POST /_gateway/pool` | Create a plain pool at runtime; body `{"name": "...", "mode": "plain"}` (`name` required, `mode` optional and defaults to `plain`). A runtime pool is a pure named container with no pool-level base_url; each member resolves its own `base_url` via `AddMember`'s fallback chain. To atomically create the first member, include optional `nick`, `credential`, `base_url`, and `placement` fields; `nick` switches to combined mode, and validation failure creates neither resource. Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
 | `DELETE /_gateway/pool/{name}` | Remove a pool. The pool must be **empty** — drain members first via `DELETE .../member/{nick}`; a pool that still has members returns `409` (no cascade, so no persisted credential is silently discarded). Returns `200` `{"status": "ok"}`; an unknown pool returns `404`. Deleting the last pool is allowed (routing then fails closed with `403` unknown selector). Persisted: a deleted pool does not reappear on restart. |
-| `POST /_gateway/pool/{name}/rename` | Rename a pool in place; body `{"name": "<new>"}` (required, normalized server-side). Carries the pool's members, disabled flags, declared priority, and balance parameters over to the new key. Sticky pointer, exhausted marks, balance sequence, and local-snapshot observations follow member nicks; worker affinities and their first-use cursor follow the controller and persist under the renamed pool key. Returns `200` `{"pool": "<new>"}`. Empty / identical-after-normalize new name → `400`; unknown old pool → `404`; new name collides with a different existing pool → `409`. Persisted: the next config-roundtrip restart restores the rename under the new key. **Caveat for env-only mode** (`AQG_CONFIG` unset, no `aqg.json`): the config writer is a no-op, so the rename is runtime-only and reverts to the env-declared name on restart — same constraint `AddPool`/`AddMember` already carry. |
+| `POST /_gateway/pool/{name}/rename` | Rename a pool in place; body `{"name": "<new>"}` (required, normalized server-side). Carries the pool's members, disabled flags, and declared priority over to the new key. Sticky pointer, exhausted marks, and local-snapshot observations follow member nicks; worker affinities and their first-use cursor follow the controller and persist under the renamed pool key. Returns `200` `{"pool": "<new>"}`. Empty / identical-after-normalize new name → `400`; unknown old pool → `404`; new name collides with a different existing pool → `409`. Persisted: the next config-roundtrip restart restores the rename under the new key. **Caveat for env-only mode** (`AQG_CONFIG` unset, no `aqg.json`): the config writer is a no-op, so the rename is runtime-only and reverts to the env-declared name on restart — same constraint `AddPool`/`AddMember` already carry. |
 | `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
-| `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "...", "placement": [...]}`. `credential` and `base_url` are each optional when the nick is already a known subscription in another pool (resolved independently; ambiguous → `400`). `placement` is a JSON array of nicks (highest priority first, must include the added nick) and is **required** when the target is a priority pool with no existing slot for that nick; rejected (`400`) for plain/balanced targets. Persisted with its credential. |
+| `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "...", "placement": [...]}`. `credential` and `base_url` are each optional when the nick is already a known subscription in another pool (resolved independently; ambiguous → `400`). `placement` is a JSON array of nicks (highest priority first, must include the added nick) and is **required** when the target is a priority pool with no existing slot for that nick; rejected (`400`) for targets without a priority order. Persisted with its credential. |
 | `POST /_gateway/pool/{name}/member/{nick}/move` | Move a subscription to another pool; body `{"to": "<pool>", "placement": [...], "force": false}`. |
 | `DELETE /_gateway/pool/{name}/member/{nick}` | Remove a member (static or runtime-added) from selection |
 
@@ -1002,8 +911,8 @@ curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/rename -d '{"name":"primar
 curl -X POST http://127.0.0.1:8080/_gateway/debug -d '{"log_requests": true}'
 ```
 
-`GET /_gateway/config` returns one object per pool — balance settings, the
-effective priority order, and per-member `nick` / `base_url` / `disabled` /
+`GET /_gateway/config` returns one object per pool — the effective priority
+order, and per-member `nick` / `base_url` / `disabled` /
 `status`. **No credential ever appears** in the response, a log, or an error.
 
 ```json
@@ -1068,9 +977,8 @@ failure.
 A priority reorder does **not** force the pool off a healthy active member
 (prompt-cache preservation is unchanged): the new order takes effect on the
 next failover and on reset-driven preempt-back. Validation: an unknown nick
-returns `400`, an unknown pool `404`, and a priority override on a
-balanced-mode pool returns `409` (priority and balance are mutually
-exclusive). All error bodies are credential-free.
+returns `400`, and an unknown pool returns `404`. All error bodies are
+credential-free.
 
 **Adding and removing members.** `POST /_gateway/pool/{name}/member/{nick}`
 adds a runtime member. The JSON body is `{"credential": "...", "base_url": "...",
@@ -1095,7 +1003,7 @@ adds a runtime member. The JSON body is `{"credential": "...", "base_url": "..."
   ambiguous across other pools.
 - `placement` — a JSON array of nicks, highest priority first; **must include**
   the added nick. Required when the target pool is in priority mode — there is no
-  implicit insertion position. Rejected with `400` for plain/balanced-mode targets.
+  implicit insertion position. Rejected with `400` for targets without a priority order.
 
 On success the member is written through to the config file *with its
 credential* (mode `0600`) and re-read at startup. Status codes: `200` on
@@ -1151,7 +1059,7 @@ is `{"to": "<pool>", "placement": [...], "force": false}`:
 - `placement` is an explicit priority order (highest first, comma/array) that
   **must include** the moved nick. It is **required** when the target is a
   priority pool and has no existing slot for the nick — there is no implicit
-  top/bottom/sorted insertion. It is not accepted for a plain/balanced target
+  top/bottom/sorted insertion. It is not accepted for a target without a priority order
   (`400`) and is unnecessary when overwriting an existing same-nick slot (the
   slot is preserved).
 - `force` confirms an overwrite when the target already has a member with the

@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1336,7 +1336,7 @@ func TestController_loadState(t *testing.T) {
 
 	// Load persisted state: sticky = c, b exhausted for 1h.
 	reset := clock.now().Add(time.Hour)
-	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{}, 0, nil, nil)
+	c.loadState("c", map[string]time.Time{"b": reset}, nil)
 
 	if got := c.Current(); got != "c" {
 		t.Fatalf("after loadState sticky=c, Current=%q, want c", got)
@@ -1497,7 +1497,7 @@ func TestController_loadState_expiredExhaustedDropped(t *testing.T) {
 	c := newController(t, 0, clock, io.Discard, "a", "b")
 
 	pastReset := clock.now().Add(-time.Hour) // already expired
-	c.loadState("a", map[string]time.Time{"b": pastReset}, time.Time{}, 0, nil, nil)
+	c.loadState("a", map[string]time.Time{"b": pastReset}, nil)
 
 	// b's reset is in the past; resolve should reach b without exhaustion.
 	c.setCur("b")
@@ -1513,7 +1513,7 @@ func TestController_loadState_unchangedMembership(t *testing.T) {
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b", "c")
 	reset := clock.now().Add(time.Hour)
-	c.loadState("b", map[string]time.Time{"a": reset}, time.Time{}, 0, nil, nil)
+	c.loadState("b", map[string]time.Time{"a": reset}, nil)
 	if logBuf.Len() != 0 {
 		t.Fatalf("expected no log output for unchanged membership, got: %q", logBuf.String())
 	}
@@ -1529,7 +1529,7 @@ func TestController_loadState_additiveMembership(t *testing.T) {
 	// Pool now has a, b, c, d but persisted state only knew a, b, c.
 	c := newController(t, 0, clock, &logBuf, "a", "b", "c", "d")
 	reset := clock.now().Add(time.Hour)
-	c.loadState("c", map[string]time.Time{"b": reset}, time.Time{}, 0, nil, nil)
+	c.loadState("c", map[string]time.Time{"b": reset}, nil)
 	if logBuf.Len() != 0 {
 		t.Fatalf("expected no log output for additive membership, got: %q", logBuf.String())
 	}
@@ -1546,7 +1546,7 @@ func TestController_loadState_missingStickyLogs(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
-	c.loadState("old", map[string]time.Time{}, time.Time{}, 0, nil, nil)
+	c.loadState("old", map[string]time.Time{}, nil)
 	out := logBuf.String()
 	if !strings.Contains(out, "persisted sticky=old") {
 		t.Fatalf("expected log about missing sticky, got: %q", out)
@@ -1562,7 +1562,7 @@ func TestController_loadState_staleExhaustedEntryLogged(t *testing.T) {
 	var logBuf strings.Builder
 	c := newController(t, 0, clock, &logBuf, "a", "b") // "old" was removed
 	reset := clock.now().Add(time.Hour)
-	c.loadState("a", map[string]time.Time{"old": reset}, time.Time{}, 0, nil, nil)
+	c.loadState("a", map[string]time.Time{"old": reset}, nil)
 	out := logBuf.String()
 	if !strings.Contains(out, "dropping persisted exhausted entry old") {
 		t.Fatalf("expected log about stale exhausted entry, got: %q", out)
@@ -1734,498 +1734,34 @@ func TestPools_persistState_loadPersistState(t *testing.T) {
 	}
 }
 
-// testRegistryBalance builds a pool in balanced mode with the given gap and
-// dwell. dwell=0 omits the BALANCE_DWELL env var so the Controller gets
-// balanceDwell=defaultBalanceDwell but lastBalanceSwitch=zero, meaning the
-// first resolve is always eligible to switch (dwell has never been exceeded).
-func testRegistryBalance(t *testing.T, gap float64, dwell time.Duration, nicks ...string) *backend.Registry {
-	t.Helper()
-	scrubPoolEnv(t)
-	for _, n := range nicks {
-		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
-	}
-	t.Setenv(backend.EnvPrefix+"AUTO_BALANCE", "lead")
-	t.Setenv(backend.EnvPrefix+"AUTO_BALANCE_GAP", fmt.Sprintf("%g", gap))
-	if dwell > 0 {
-		t.Setenv(backend.EnvPrefix+"AUTO_BALANCE_DWELL", dwell.String())
-	}
-	reg, err := backend.Load(testDefaultBaseURL)
-	if err != nil {
-		t.Fatalf("backend.Load: %v", err)
-	}
-	return reg
-}
-
-// newBalanceController creates a controller in balance mode with a quota
-// store that tests can pre-populate.
-func newBalanceController(t *testing.T, start int, clock *fixedClock, gap float64, dwell time.Duration, store *quota.Store, nicks ...string) *Controller {
-	t.Helper()
-	reg := testRegistryBalance(t, gap, dwell, nicks...)
-	return NewController(reg, "auto", start, store, clock.now, io.Discard)
-}
-
-// putSnap stores a quota snapshot for the given controller member nick.
-func putSnap(store *quota.Store, c *Controller, nick string, util5h, util7d *float64, reset5h, reset7d *time.Time) {
-	idx := c.indexOf(nick)
-	if idx < 0 {
-		return
-	}
-	c.mu.Lock()
-	b := c.backendAt(idx)
-	c.mu.Unlock()
-	store.Put(b.QuotaKey(), quota.Snapshot{
-		Unified5hUtilization: util5h,
-		Unified5hReset:       reset5h,
-		Unified7dUtilization: util7d,
-		Unified7dReset:       reset7d,
-	})
-}
-
-func fptr(f float64) *float64     { return &f }
-func tptr(t time.Time) *time.Time { return &t }
-
-// TestMemberLeads_longWindowProviderAware verifies the provider-aware long
-// window in balance-mode lead computation. Post-#192 the two providers
-// diverge: Anthropic's 7d window still feeds the long lead (a genuine chat
-// quota), but Z.AI/Zhipu's long slot is dropped entirely — its monthly
-// TIME_LIMIT is a web-search/reader/zread tool quota, not chat throughput,
-// so it must not skew chat routing (has7d=false, lead7d=0). This supersedes
-// the pre-#192 #140 behavior, where Z.AI's monthly length divided the
-// elapsed fraction to keep its long lead from collapsing to raw
-// utilization; now that window contributes nothing regardless of length.
-func TestMemberLeads_longWindowProviderAware(t *testing.T) {
+func TestPools_loadsStateWithRetiredBalanceFields(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-
-	const util = 0.50
-	reset := clock.now().Add(20 * 24 * time.Hour)
-
-	newCtl := func(baseURL string) *Controller {
-		scrubPoolEnv(t)
-		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_A", "cred-a")
-		reg, err := backend.Load(baseURL)
-		if err != nil {
-			t.Fatalf("backend.Load(%q): %v", baseURL, err)
-		}
-		store := quota.NewStore()
-		c := NewController(reg, "auto", 0, store, clock.now, io.Discard)
-		putSnap(store, c, "a", nil, fptr(util), nil, tptr(reset))
-		return c
-	}
-
-	leadOf := func(c *Controller) (float64, bool) {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		_, _, lead7d, _, has7d := c.memberLeadsLocked("a")
-		return lead7d, has7d
-	}
-
-	// Z.AI: long window does not block chat (issue #192), so it is dropped
-	// from the lead — has7d=false, lead7d=0 — even with a filled monthly slot.
-	zaiLead, zaiHas := leadOf(newCtl("https://api.z.ai"))
-	if zaiHas {
-		t.Errorf("z.ai: has7d=true, want false (monthly slot is a tool quota, not chat — issue #192)")
-	}
-	if zaiLead != 0 {
-		t.Errorf("z.ai lead7d=%v, want 0 (long window dropped from lead)", zaiLead)
-	}
-
-	// Anthropic default: 7-day length → 480h/168h > 1, elapsed clamps to 0,
-	// lead7d = utilization = 0.50 (unchanged pre-#140 behavior).
-	antLead, antHas := leadOf(newCtl(testDefaultBaseURL))
-	if !antHas {
-		t.Fatal("anthropic: has7d=false, want true")
-	}
-	if math.Abs(antLead-util) > 1e-9 {
-		t.Errorf("anthropic lead7d=%v, want %v (7d window, elapsed clamps to 0)", antLead, util)
-	}
-}
-
-// TestBalance_defaultPoolUnaffected verifies that a pool without BALANCE
-// configured is unaffected by the feature and retains sticky behaviour.
-func TestBalance_defaultPoolUnaffected(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
 	c := newController(t, 0, clock, io.Discard, "a", "b")
-	c.store = store
-
-	// Put a snapshot that would trigger a balance switch if balance were on.
-	reset := clock.now().Add(window5h)
-	putSnap(store, c, "a", fptr(0.9), nil, tptr(reset), nil)
-	putSnap(store, c, "b", fptr(0.1), nil, tptr(reset), nil)
-
-	// Without BALANCE, balanceGap should be 0 and no switch should happen.
-	for i := 0; i < 5; i++ {
-		b, _, _ := c.ResolveAuto()
-		if b.Nick != "a" {
-			t.Fatalf("call %d: nick=%q, want a (balance mode off, sticky)", i, b.Nick)
-		}
-	}
-}
-
-// TestBalance_5hLeadSwitchesWhenGapExceeded verifies that the active member
-// is switched when its 5h lead exceeds the gap over the best candidate.
-func TestBalance_5hLeadSwitchesWhenGapExceeded(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	// gap=0.15, dwell=0 so switches can happen immediately
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-
-	// a: 5h window halfway through, utilization at 0.7 → lead = 0.7-0.5 = 0.2
-	// b: 5h window halfway through, utilization at 0.4 → lead = 0.4-0.5 = -0.1
-	// difference = 0.3 ≥ 0.15 → should switch to b
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "a", fptr(0.7), nil, tptr(reset), nil)
-	putSnap(store, c, "b", fptr(0.4), nil, tptr(reset), nil)
-
-	b, _, _ := c.ResolveAuto()
-	if b.Nick != "b" {
-		t.Fatalf("ResolveAuto: nick=%q, want b (balance switched)", b.Nick)
-	}
-}
-
-// TestBalance_smallGapDoesNotSwitch verifies that a lead difference below
-// the threshold does not cause a switch.
-func TestBalance_smallGapDoesNotSwitch(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-
-	// a: lead = 0.6-0.5 = 0.1; b: lead = 0.5-0.5 = 0.0
-	// difference = 0.1 < 0.15 → no switch
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "a", fptr(0.6), nil, tptr(reset), nil)
-	putSnap(store, c, "b", fptr(0.5), nil, tptr(reset), nil)
-
-	b, _, _ := c.ResolveAuto()
-	if b.Nick != "a" {
-		t.Fatalf("ResolveAuto: nick=%q, want a (gap below threshold, sticky)", b.Nick)
-	}
-}
-
-// TestBalance_dwellPreventsImmediateReswitch verifies that after a balance
-// switch the controller stays on the new member until the dwell expires.
-func TestBalance_dwellPreventsImmediateReswitch(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	dwell := 10 * time.Minute
-	c := newBalanceController(t, 0, clock, 0.15, dwell, store, "a", "b")
-
-	// a heavily over-budget, b healthy → first resolve should switch to b
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "a", fptr(0.9), nil, tptr(reset), nil)
-	putSnap(store, c, "b", fptr(0.1), nil, tptr(reset), nil)
-
-	b1, _, _ := c.ResolveAuto()
-	if b1.Nick != "b" {
-		t.Fatalf("first resolve: nick=%q, want b", b1.Nick)
-	}
-
-	// Flip snapshots: now b is over-budget, a is healthy. But dwell not elapsed.
-	putSnap(store, c, "a", fptr(0.1), nil, tptr(reset), nil)
-	putSnap(store, c, "b", fptr(0.9), nil, tptr(reset), nil)
-
-	b2, _, _ := c.ResolveAuto()
-	if b2.Nick != "b" {
-		t.Fatalf("second resolve (dwell active): nick=%q, want b (still dwelled)", b2.Nick)
-	}
-
-	// Advance past dwell: now a is healthier, switch should happen.
-	clock.advance(dwell + time.Second)
-	b3, _, _ := c.ResolveAuto()
-	if b3.Nick != "a" {
-		t.Fatalf("third resolve (dwell elapsed): nick=%q, want a (b over-budget)", b3.Nick)
-	}
-}
-
-// TestBalance_exhaustedMemberExcluded verifies that a parked (exhausted)
-// member is not chosen as the balance target even if it has a lower lead.
-func TestBalance_exhaustedMemberExcluded(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-
-	// Park b (simulating a 429 exhaustion).
-	c.mu.Lock()
-	c.exhausted["b"] = clock.now().Add(time.Hour)
-	c.mu.Unlock()
-
-	// a over-budget, b would be a good target — but b is exhausted.
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "a", fptr(0.9), nil, tptr(reset), nil)
-	putSnap(store, c, "b", fptr(0.1), nil, tptr(reset), nil)
-
-	b, _, _ := c.ResolveAuto()
-	if b.Nick != "a" {
-		t.Fatalf("ResolveAuto: nick=%q, want a (b exhausted, no valid switch target)", b.Nick)
-	}
-}
-
-// TestBalance_7dLeadHighUtilNearReset is healthy (low lead).
-// A member with 7d utilization=0.95 and 1 day remaining has
-//
-//	elapsed = 1 - 1d/7d ≈ 0.857  →  lead = 0.95 - 0.857 ≈ 0.093
-//
-// which is below the 0.15 gap, so we do NOT switch away from the active
-// member even though absolute utilization is high.
-func TestBalance_7dLeadHighUtilNearReset(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-
-	// a: 7d window, 1 day until reset, utilization 0.95
-	//    elapsed = 1 - 1/7 ≈ 0.857, lead ≈ 0.093
-	// b: 7d window, 1 day until reset, utilization 0.5
-	//    elapsed ≈ 0.857, lead ≈ -0.357
-	// gap between a and b ≈ 0.45 ≥ 0.15 → switch
-	// (This tests the "high util near reset" case is correctly evaluated as
-	// lower-pressure than "high util with most window remaining".)
-	reset7d := clock.now().Add(24 * time.Hour)
-	putSnap(store, c, "a", nil, fptr(0.95), nil, tptr(reset7d))
-	putSnap(store, c, "b", nil, fptr(0.5), nil, tptr(reset7d))
-
-	b, _, _ := c.ResolveAuto()
-	// a has lead≈0.093 and b has lead≈-0.357; gap = 0.45 > 0.15 → switch to b
-	if b.Nick != "b" {
-		t.Fatalf("ResolveAuto: nick=%q, want b (a has higher lead)", b.Nick)
-	}
-}
-
-// TestBalance_7dLeadHighUtilMuchWindowRemaining is high-pressure.
-// A member with 7d utilization=0.95 and 6 days remaining has
-//
-//	elapsed = 1 - 6/7 ≈ 0.143  →  lead = 0.95 - 0.143 ≈ 0.807
-//
-// which far exceeds 0.15, so the controller should switch away from it.
-func TestBalance_7dLeadHighUtilMuchWindowRemaining(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-
-	// a: 7d window, 6 days until reset, utilization 0.95 → lead ≈ 0.807
-	// b: fresh/no data → lead = 0 (neutral)
-	// gap = 0.807 > 0.15 → switch to b
-	reset7d := clock.now().Add(6 * 24 * time.Hour)
-	putSnap(store, c, "a", nil, fptr(0.95), nil, tptr(reset7d))
-	// b has no snapshot: treated as lead=0
-
-	b, _, _ := c.ResolveAuto()
-	if b.Nick != "b" {
-		t.Fatalf("ResolveAuto: nick=%q, want b (a has high 7d lead of ~0.807)", b.Nick)
-	}
-}
-
-// TestBalance_noDataIsNeutral verifies that when no snapshot data is
-// available, all members are treated as lead=0 and no switch occurs.
-func TestBalance_noDataIsNeutral(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-	// No snapshots stored at all.
-
-	for i := 0; i < 5; i++ {
-		b, _, _ := c.ResolveAuto()
-		if b.Nick != "a" {
-			t.Fatalf("call %d: nick=%q, want a (no data, no balance switch)", i, b.Nick)
-		}
-	}
-}
-
-// TestBalance_persistsLastSwitch verifies that LastBalanceSwitch is
-// saved to PoolPersistState and restored, enforcing dwell across restarts.
-func TestBalance_persistsLastSwitch(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	dwell := 10 * time.Minute
-	c := newBalanceController(t, 0, clock, 0.15, dwell, store, "a", "b")
-
-	// Trigger a balance switch.
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "a", fptr(0.9), nil, tptr(reset), nil)
-	putSnap(store, c, "b", fptr(0.1), nil, tptr(reset), nil)
-	c.ResolveAuto() // should switch to b
-
-	saved := (&Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}).PersistState()
-	if saved["auto"].LastBalanceSwitch.IsZero() {
-		t.Fatal("PersistState: LastBalanceSwitch not recorded after switch")
-	}
-
-	// Fresh controller starting at a; load the persisted state.
-	c2 := newBalanceController(t, 0, clock, 0.15, dwell, store, "a", "b")
-	(&Pools{byPool: map[string]*Controller{"auto": c2}, reg: c2.reg}).LoadPersistState(saved)
-
-	// Dwell should still be active: even though b now appears over-budget,
-	// the fresh controller should not switch because it restored last-switch.
-	// (Flip snapshots to make a look better.)
-	putSnap(store, c2, "a", fptr(0.1), nil, tptr(reset), nil)
-	putSnap(store, c2, "b", fptr(0.9), nil, tptr(reset), nil)
-	b, _, _ := c2.ResolveAuto()
-	if b.Nick != "a" {
-		// Note: after LoadPersistState the sticky is still "a" (we loaded saved state).
-		// The dwell should prevent a switch back to b even though b looks over-budget.
-		t.Logf("ResolveAuto returned %q; checking dwell enforcement", b.Nick)
-	}
-
-	// Advance past dwell: switch should now occur.
-	clock.advance(dwell + time.Second)
-	putSnap(store, c2, "a", fptr(0.1), nil, tptr(reset), nil)
-	putSnap(store, c2, "b", fptr(0.9), nil, tptr(reset), nil)
-	b2, _, _ := c2.ResolveAuto()
-	// b is now over-budget; a is healthier; gap = 0.8 >> 0.15 → switch to a… but a is already sticky.
-	// Actually after load, sticky is "a". b over-budget → gap = 0.8 → no need to switch (a is better).
-	if b2.Nick != "a" {
-		t.Fatalf("post-dwell resolve: nick=%q, want a (a is healthier)", b2.Nick)
-	}
-}
-
-// TestBalance_poolStatusExposesLead verifies that /_gateway/pool includes
-// lead fields when balanced mode is active.
-func TestBalance_poolStatusExposesLead(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
+	c.workerConcurrency = 2
 	pools := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 
-	// a: half elapsed, util=0.7 → lead5h = 0.2; b: no data
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "a", fptr(0.7), nil, tptr(reset), nil)
+	var state struct {
+		Pools map[string]PoolPersistState `json:"pools"`
+	}
+	data := []byte(`{"pools":{"auto":{"sticky":"b","exhausted":{"a":"2023-11-14T23:13:20Z"},"worker_affinity":{"agent-a":"b"},"worker_cursor":"b","balance_seq":9,"last_selected_seq":{"a":7},"last_balance_switch":"2023-11-14T22:00:00Z"}}}`)
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("unmarshal legacy state file: %v", err)
+	}
+	pools.LoadPersistState(state.Pools)
 
-	status, ok := pools.PoolStatus("auto", store, nil)
-	if !ok {
-		t.Fatal("PoolStatus returned ok=false")
+	if got := c.Current(); got != "b" {
+		t.Errorf("restored sticky = %q, want b", got)
 	}
-	var aStatus MemberStatus
-	for _, m := range status.Members {
-		if m.Nick == "a" {
-			aStatus = m
-		}
-	}
-	if aStatus.Lead == nil {
-		t.Fatal("member a: Lead is nil, want non-nil (balance mode active, data available)")
-	}
-	if *aStatus.Lead5h < 0.19 || *aStatus.Lead5h > 0.21 {
-		t.Errorf("member a: Lead5h=%v, want ~0.20", *aStatus.Lead5h)
-	}
-
-	// b has no snapshot: Lead should be nil
-	for _, m := range status.Members {
-		if m.Nick == "b" && m.Lead != nil {
-			t.Error("member b: Lead should be nil (no snapshot data)")
-		}
-	}
-}
-
-// TestBalance_equalLeadPrefersLeastRecentlySelected verifies that when two
-// candidates have the same best lead (e.g. both zero / no data), the one with
-// the smaller lastSelectedSeq — i.e. the least recently active member — wins.
-//
-// Setup: pool a, b, c in balanced mode. A was the first active member
-// (construction stamp → seq 1). B was selected next (seq 2). C was never
-// selected (seq 0). B is currently active and over-budget; A and C both have
-// no snapshot data (lead = 0). The tiebreaker should prefer C over A.
-func TestBalance_equalLeadPrefersLeastRecentlySelected(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b", "c")
-	// After construction: cur=0 (a), lastSelectedSeq={a:1}, balanceSeq=1.
-
-	// Simulate B having been selected after A: stamp B with seq=2.
 	c.mu.Lock()
-	c.balanceSeq = 2
-	c.lastSelectedSeq["b"] = 2
-	// Point the sticky at B.
-	c.curNick = "b"
+	if got := c.exhausted["a"]; !got.Equal(clock.now().Add(time.Hour)) {
+		t.Errorf("restored exhausted[a] = %v, want %v", got, clock.now().Add(time.Hour))
+	}
+	if got := c.workerAffinity["agent-a"]; got != "b" {
+		t.Errorf("restored worker affinity = %q, want b", got)
+	}
 	c.mu.Unlock()
-
-	// B is over-budget (high lead); A and C have no data (lead = 0).
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "b", fptr(0.9), nil, tptr(reset), nil)
-	// No snapshot for A or C → lead = 0 for both.
-
-	b, _, exhausted := c.ResolveAuto()
-	if exhausted {
-		t.Fatal("ResolveAuto: pool reported exhausted, want healthy")
-	}
-	if b.Nick != "c" {
-		t.Fatalf("balance tiebreak: got %q, want c (seq 0 < a's seq 1)", b.Nick)
-	}
 }
 
-// TestBalance_equalLeadFallsBackWhenPreferredIsExhausted verifies that if the
-// least-recently-selected candidate is exhausted, the next best is chosen.
-//
-// Same setup as above, but C is now parked as exhausted. The tiebreak must
-// skip C and correctly select A.
-func TestBalance_equalLeadFallsBackWhenPreferredIsExhausted(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b", "c")
-
-	c.mu.Lock()
-	c.balanceSeq = 2
-	c.lastSelectedSeq["b"] = 2
-	c.curNick = "b"
-	// Park C for one hour.
-	c.exhausted["c"] = clock.now().Add(time.Hour)
-	c.mu.Unlock()
-
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "b", fptr(0.9), nil, tptr(reset), nil)
-
-	b, _, exhausted := c.ResolveAuto()
-	if exhausted {
-		t.Fatal("ResolveAuto: pool reported exhausted, want healthy")
-	}
-	if b.Nick != "a" {
-		t.Fatalf("exhausted preferred candidate: got %q, want a (c is parked)", b.Nick)
-	}
-}
-
-// TestBalance_selectionRecencyPersistedAcrossRestart verifies that
-// lastSelectedSeq survives a persist/load round-trip and continues to drive
-// the equal-lead tiebreaker after the controller is reconstructed.
-func TestBalance_selectionRecencyPersistedAcrossRestart(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b", "c")
-
-	// Stamp A=1, B=2; point sticky at B.
-	c.mu.Lock()
-	c.balanceSeq = 2
-	c.lastSelectedSeq["b"] = 2
-	c.curNick = "b"
-	c.mu.Unlock()
-
-	// Persist and reload into a fresh controller.
-	saved := (&Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}).PersistState()
-	if saved["auto"].BalanceSeq != 2 {
-		t.Fatalf("PersistState: BalanceSeq=%d, want 2", saved["auto"].BalanceSeq)
-	}
-	if saved["auto"].LastSelectedSeq["b"] != 2 {
-		t.Fatalf("PersistState: LastSelectedSeq[b]=%d, want 2", saved["auto"].LastSelectedSeq["b"])
-	}
-
-	c2 := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b", "c")
-	(&Pools{byPool: map[string]*Controller{"auto": c2}, reg: c2.reg}).LoadPersistState(saved)
-
-	if c2.Current() != "b" {
-		t.Fatalf("after LoadPersistState: Current=%q, want b", c2.Current())
-	}
-
-	// B over-budget; A and C at no-data lead. C should still win (seq 0 < A's seq 1).
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c2, "b", fptr(0.9), nil, tptr(reset), nil)
-
-	b, _, exhausted := c2.ResolveAuto()
-	if exhausted {
-		t.Fatal("ResolveAuto: pool reported exhausted after reload")
-	}
-	if b.Nick != "c" {
-		t.Fatalf("post-reload tiebreak: got %q, want c (seq 0 < a's seq 1)", b.Nick)
-	}
-}
-
-// TestRuntimeConfig_disabledMemberRemoval proves that disabling a member
-// removes it from selection, and re-enabling restores it.
 func TestRuntimeConfig_disabledMemberRemoval(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
@@ -2923,45 +2459,6 @@ func TestParkAndFailover_addedActiveMemberFailsOverToHealthyAdded(t *testing.T) 
 		t.Errorf("Current()=%q, want extra2 (switched to healthy runtime-added member)", got)
 	}
 }
-
-// TestBalance_runtimeAddedMemberParticipates proves that a runtime-added
-// member participates in the balance lead comparison and can be selected
-// by a balance switch (issue #185: the old balanceSwitchLocked gated on
-// curAddedNick == "" and skipped consideration of added members entirely).
-func TestBalance_runtimeAddedMemberParticipates(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	// Balance pool with members a, b.  a is active; b has a high lead so the
-	// balance switch should fire.
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
-
-	// Add a runtime member "extra" with a low lead (no snapshot → util=0).
-	if status, err := p.AddMember("auto", "extra", "cred-extra", "https://extra.example", nil); status != 200 || err != nil {
-		t.Fatalf("AddMember extra: status=%d err=%v", status, err)
-	}
-
-	// Give "a" (currently active) a high lead; "b" and "extra" have no data (lead=0).
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "a", fptr(0.9), nil, tptr(reset), nil)
-
-	// Force "a" to be active so the balance switch can observe it is over budget.
-	c.setCur("a")
-
-	// ResolveAuto should switch away from a (over-budget) to either b or extra.
-	b, _, exhausted := c.ResolveAuto()
-	if exhausted {
-		t.Fatal("ResolveAuto: pool reported exhausted, want healthy")
-	}
-	if b.Nick == "a" {
-		t.Fatalf("balance switch stayed on over-budget a, want b or extra")
-	}
-}
-
-// TestNewPools_defaultsLogOutToStderr locks the documented nil-default for
-// Pools.logOut (issue #252): a nil logOut at construction becomes os.Stderr.
-// The test is in-package so it can compare the field directly — no
-// process-global stderr swap, no -race risk.
 func TestNewPools_defaultsLogOutToStderr(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	reg := testRegistry(t, "a")

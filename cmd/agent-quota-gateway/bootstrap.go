@@ -120,7 +120,7 @@ func warnIfPersistenceDisabled(configPath, statePath string, logOut io.Writer) {
 	if configPath == "" || statePath != "" {
 		return
 	}
-	fmt.Fprintf(logOut, "agent-quota-gateway: WARNING: config file %q has an empty state_file; runtime persistence is disabled, so sticky pointers, worker affinities, exhausted maps, balance sequence and quota snapshots do not survive a restart. Set state_file in %q and restart.\n", configPath, configPath)
+	fmt.Fprintf(logOut, "agent-quota-gateway: WARNING: config file %q has an empty state_file; runtime persistence is disabled, so sticky pointers, worker affinities, exhausted maps, and quota snapshots do not survive a restart. Set state_file in %q and restart.\n", configPath, configPath)
 }
 
 type legacyPriorityVerdict struct {
@@ -128,7 +128,6 @@ type legacyPriorityVerdict struct {
 	previous []string
 	order    []string
 	migrate  bool
-	balanced bool
 }
 
 // reconcileLegacy is the unified orchestrator for the existing-config-file
@@ -188,7 +187,6 @@ func reconcileLegacy(cfg config.Config, reg *backend.Registry, configPath string
 // newer operator intent already stored in aqg.json. It remains confined to the
 // first-deploy bootstrap path.
 func reconcileLegacyPriority(cfg config.Config, reg *backend.Registry, legacy legacyState, statePath, configPath string, logOut io.Writer) (*backend.Registry, error) {
-	spec := reg.Spec()
 	verdicts := make([]legacyPriorityVerdict, 0, len(legacy.Config))
 	var irreconcilable []string
 	for rawPool, pc := range legacy.Config {
@@ -213,11 +211,6 @@ func reconcileLegacyPriority(cfg config.Config, reg *backend.Registry, legacy le
 			previous: previous,
 			order:    order,
 		}
-		if spec.Pools[pool].Balance != "" {
-			v.balanced = true
-			verdicts = append(verdicts, v)
-			continue
-		}
 		v.migrate = !equalStringSlices(previous, order)
 		verdicts = append(verdicts, v)
 	}
@@ -230,10 +223,6 @@ func reconcileLegacyPriority(cfg config.Config, reg *backend.Registry, legacy le
 	updated := reg
 	var migrated []legacyPriorityVerdict
 	for _, v := range verdicts {
-		if v.balanced {
-			fmt.Fprintf(logOut, "agent-quota-gateway: reconcile: pool %q declares balance mode in aqg.json; legacy priority mode is superseded and will be consumed\n", v.pool)
-			continue
-		}
 		if !v.migrate {
 			continue
 		}

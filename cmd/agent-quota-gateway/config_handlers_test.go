@@ -147,6 +147,21 @@ func TestConcurrencyAppearsInPoolAndConfigViews(t *testing.T) {
 	if got := fetchPool(t, configServer.URL, "auto").Concurrency; got != 2 {
 		t.Errorf("/_gateway/config concurrency = %d, want 2", got)
 	}
+	configResp, err := http.Get(configServer.URL + "/_gateway/config")
+	if err != nil {
+		t.Fatalf("get config response: %v", err)
+	}
+	var configJSON []map[string]json.RawMessage
+	if err := json.NewDecoder(configResp.Body).Decode(&configJSON); err != nil {
+		configResp.Body.Close()
+		t.Fatalf("decode config response: %v", err)
+	}
+	configResp.Body.Close()
+	for _, field := range []string{"balance_mode", "balance_gap", "balance_dwell"} {
+		if _, ok := configJSON[0][field]; ok {
+			t.Errorf("/_gateway/config still contains retired field %q", field)
+		}
+	}
 
 	poolServer := httptest.NewServer(poolHandler(quota.NewStore(), pools, nil))
 	t.Cleanup(poolServer.Close)
@@ -379,15 +394,14 @@ func memberStatus(t *testing.T, baseURL, pool, nick string) string {
 
 // TestPriorityEndpoint drives the priority endpoint: a valid reorder is applied
 // (and expanded to a total order), an unknown nick is rejected 400, and a
-// balanced pool is rejected 409.
+// second pool accepts a priority order.
 func TestPriorityEndpoint(t *testing.T) {
 	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
 	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
 	t.Setenv("AQG_POOL_AUTO_BACKEND_C", "sk-ant-c")
-	// A separate balanced pool to exercise the 409 path.
-	t.Setenv("AQG_POOL_BAL_BACKEND_X", "sk-ant-x")
-	t.Setenv("AQG_POOL_BAL_BACKEND_Y", "sk-ant-y")
-	t.Setenv("AQG_POOL_BAL_BALANCE", "lead")
+	// A second pool exercises the ordinary priority path independently.
+	t.Setenv("AQG_POOL_EXTRA_BACKEND_X", "sk-ant-x")
+	t.Setenv("AQG_POOL_EXTRA_BACKEND_Y", "sk-ant-y")
 	srv := configMux(t, loadPools(t))
 
 	// Valid partial reorder: ["c"] expands to c first, then the rest sorted.
@@ -400,8 +414,11 @@ func TestPriorityEndpoint(t *testing.T) {
 	// Unknown nick -> 400.
 	postJSON(t, srv.URL+"/_gateway/pool/auto/priority", `["nope"]`, http.StatusBadRequest)
 
-	// Balanced pool -> 409.
-	postJSON(t, srv.URL+"/_gateway/pool/bal/priority", `["x"]`, http.StatusConflict)
+	// Priority can be set on any pool with valid members.
+	postJSON(t, srv.URL+"/_gateway/pool/extra/priority", `["x"]`, http.StatusOK)
+	if got := poolPriority(t, srv.URL, "extra"); len(got) != 2 || got[0] != "x" {
+		t.Errorf("extra effective priority=%v, want x first", got)
+	}
 }
 
 func post(t *testing.T, url string, wantStatus int) {

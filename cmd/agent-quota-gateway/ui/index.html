@@ -191,7 +191,6 @@
   }
   td.nick .prio-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
   td.nick .prio-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .balanced-note { color: var(--muted); font-style: italic; }
 
   /* The members table is intrinsically wide (7 columns, with nowrap reset
      cells). It fits at desktop widths, but once the cards stack and the
@@ -638,10 +637,6 @@
       .replace(/'/g, '&#39;');
   }
 
-  function isBalanced(view) {
-    return !!view.balance_mode && view.balance_mode.length > 0;
-  }
-
   // pollerState / pollerLabel render the per-pool poller liveness
   // indicator (issue #247). State precedence: failing > stale > ok >
   // never. A failing pool has at least one consecutive failure; a
@@ -687,7 +682,6 @@
     // the field.
     return {
       pool: String(view.pool || ''),
-      balance_mode: view.balance_mode || '',
       priority: Array.isArray(view.priority) ? view.priority.slice() : [],
       members: members,
     };
@@ -730,12 +724,7 @@
     h2.textContent = view.pool;
     head.appendChild(h2);
 
-    if (isBalanced(view)) {
-      var badge = document.createElement('span');
-      badge.className = 'badge';
-      badge.textContent = 'balanced — priority N/A';
-      head.appendChild(badge);
-    } else if (view.priority.length > 0) {
+    if (view.priority.length > 0) {
       var badge2 = document.createElement('span');
       badge2.className = 'badge';
       badge2.textContent = 'priority pool';
@@ -803,13 +792,6 @@
     h3m.textContent = 'Members';
     body.appendChild(h3m);
 
-    if (isBalanced(view)) {
-      var note = document.createElement('p');
-      note.className = 'balanced-note';
-      note.textContent = 'Balanced pools rotate automatically; manual priority is not applicable.';
-      body.appendChild(note);
-    }
-
     body.appendChild(renderMembers(view));
     section.appendChild(body);
     return section;
@@ -818,13 +800,12 @@
   // orderedMembers returns view.members as objects in effective priority order.
   // For a priority pool that is view.priority; for a plain pool with no priority
   // yet it seeds from the members' own order, so the first reorder POSTs that
-  // order and the pool becomes a priority pool. Balanced pools have no manual
-  // order — members' own order is kept. Any member missing from the priority
+  // order and the pool becomes a priority pool. Any member missing from the priority
   // list (members ranked after the listed ones, in the members' sorted order,
   // per README) is appended so no row is dropped.
   function orderedMembers(view) {
     var members = view.members || [];
-    if (isBalanced(view) || view.priority.length === 0) return members.slice();
+    if (view.priority.length === 0) return members.slice();
     var byNick = {};
     members.forEach(function (m) { byNick[m.nick] = m; });
     var result = [];
@@ -845,9 +826,9 @@
     // failover (z.ai monthly <-> Anthropic 7d) and had no single correct
     // value for a mixed pool — while the cell data always lives in
     // unified_7d_* regardless. A pool name carries no window semantics, so
-    // the header is now a fixed string. The provider switch still drives
-    // lead-routing math (poller.LongWindowFor, issue #140); only this UI
-    // label dropped its dependency on it (issue #248). CSS
+    // the header is a fixed string. Provider classification still controls
+    // whether the long window blocks chat; it does not affect this label.
+    // CSS
     // text-transform:uppercase renders these.
     var thead = document.createElement('thead');
     var trh = document.createElement('tr');
@@ -860,11 +841,10 @@
     table.appendChild(thead);
 
     // Rows render in priority order (issue #222). Show the rank number + ↑/↓
-    // reorder controls only when there is something to reorder: a non-balanced
-    // pool with >=2 members. Balanced pools rotate automatically, and a lone
-    // member has no order — both get a plain nick cell.
+    // reorder controls only when there is something to reorder: a pool with
+    // >=2 members. A lone member has no order and gets a plain nick cell.
     var ordered = orderedMembers(view);
-    var showReorder = !isBalanced(view) && ordered.length >= 2;
+    var showReorder = ordered.length >= 2;
 
     var tbody = document.createElement('tbody');
     ordered.forEach(function (m, idx) {
@@ -1555,8 +1535,8 @@
     if (base) { body.base_url = base; }
 
     // A priority target needs an explicit placement that includes this nick;
-    // there is no implicit insertion. Plain/balanced targets carry none.
-    var isPriorityTarget = !isBalanced(target) && target.priority.length > 0;
+    // there is no implicit insertion. Other targets carry none.
+    var isPriorityTarget = target.priority.length > 0;
     if (isPriorityTarget) {
       var suggestion = target.priority.slice().concat([nick]).join(', ');
       var placementStr = window.prompt(
@@ -1655,9 +1635,9 @@
     var body = { to: to };
 
     // A priority target with no existing slot for this nick needs explicit
-    // placement; there is no implicit insertion. Plain/balanced targets, and
+    // placement; there is no implicit insertion. Other targets, and
     // overwriting an existing same-nick slot, need none.
-    var isPriorityTarget = !isBalanced(target) && target.priority.length > 0;
+    var isPriorityTarget = target.priority.length > 0;
     var existingSlot = false;
     target.members.forEach(function (m) { if (m.nick === nick) existingSlot = true; });
     if (isPriorityTarget && !existingSlot) {

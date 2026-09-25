@@ -5,6 +5,7 @@
 package configfile
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,6 +101,20 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 	// Map DTO to backend.Spec.
 	spec := backend.Spec{Pools: make(map[string]backend.PoolSpec, len(dto.Pools))}
 	for poolKey, poolDTO := range dto.Pools {
+		for _, legacy := range []struct {
+			name      string
+			value     json.RawMessage
+			stringVal bool
+		}{
+			{name: "balance", value: poolDTO.Balance, stringVal: true},
+			{name: "balance_gap", value: poolDTO.BalanceGap},
+			{name: "balance_dwell", value: poolDTO.BalanceDwell, stringVal: true},
+		} {
+			if legacyBalanceValueIsEnabled(legacy.value, legacy.stringVal) {
+				return config.Config{}, nil, fmt.Errorf("config file %q: pool %q sets pools.%s; balanced routing was removed and concurrency replaces it", path, poolKey, legacy.name)
+			}
+		}
+
 		var concurrency *int
 		if len(poolDTO.Concurrency) > 0 {
 			var value int
@@ -112,13 +127,10 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 			concurrency = &value
 		}
 		poolSpec := backend.PoolSpec{
-			BaseURL:      poolDTO.BaseURL,
-			Members:      make(map[string]backend.MemberSpec, len(poolDTO.Members)),
-			Priority:     poolDTO.Priority,
-			Balance:      poolDTO.Balance,
-			BalanceGap:   poolDTO.BalanceGap,
-			BalanceDwell: backend.Duration{D: poolDTO.BalanceDwell.D},
-			Concurrency:  concurrency,
+			BaseURL:     poolDTO.BaseURL,
+			Members:     make(map[string]backend.MemberSpec, len(poolDTO.Members)),
+			Priority:    poolDTO.Priority,
+			Concurrency: concurrency,
 		}
 		for nickKey, memberDTO := range poolDTO.Members {
 			poolSpec.Members[nickKey] = backend.MemberSpec{
@@ -174,11 +186,8 @@ func Marshal(cfg config.Config, reg *backend.Registry) ([]byte, error) {
 	spec := reg.Spec()
 	for name, ps := range spec.Pools {
 		pd := poolDTO{
-			Members:      make(map[string]memberDTO, len(ps.Members)),
-			Priority:     ps.Priority,
-			Balance:      ps.Balance,
-			BalanceGap:   ps.BalanceGap,
-			BalanceDwell: backend.Duration{D: ps.BalanceDwell.D},
+			Members:  make(map[string]memberDTO, len(ps.Members)),
+			Priority: ps.Priority,
 		}
 		if ps.Concurrency != nil {
 			pd.Concurrency = json.RawMessage(strconv.Itoa(*ps.Concurrency))
@@ -196,6 +205,25 @@ func Marshal(cfg config.Config, reg *backend.Registry) ([]byte, error) {
 		dto.Pools[name] = pd
 	}
 	return json.MarshalIndent(&dto, "", "  ")
+}
+
+// legacyBalanceValueIsEnabled reports whether a decoded legacy balance field
+// contains anything other than its retired zero value. RawMessage preserves
+// null and wrong-typed values so neither can silently pass as a zero value.
+func legacyBalanceValueIsEnabled(raw json.RawMessage, stringValue bool) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	value := bytes.TrimSpace(raw)
+	if bytes.Equal(value, []byte("null")) {
+		return true
+	}
+	if stringValue {
+		var decoded string
+		return json.Unmarshal(value, &decoded) != nil || decoded != ""
+	}
+	var decoded float64
+	return json.Unmarshal(value, &decoded) != nil || decoded != 0
 }
 
 // Writer coalesces config-file writes with a debounce window and writes
@@ -453,9 +481,9 @@ type poolDTO struct {
 	BaseURL      string               `json:"base_url"`
 	Members      map[string]memberDTO `json:"members"`
 	Priority     []string             `json:"priority"`
-	Balance      string               `json:"balance"`
-	BalanceGap   float64              `json:"balance_gap"`
-	BalanceDwell backend.Duration     `json:"balance_dwell"`
+	Balance      json.RawMessage      `json:"balance,omitempty"`
+	BalanceGap   json.RawMessage      `json:"balance_gap,omitempty"`
+	BalanceDwell json.RawMessage      `json:"balance_dwell,omitempty"`
 	Concurrency  json.RawMessage      `json:"concurrency,omitempty"`
 }
 

@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 const testDefaultBaseURL = "https://api.anthropic.com"
@@ -222,13 +221,13 @@ func TestLoadAllowEmpty_zeroPoolsOK(t *testing.T) {
 
 // TestLoadAllowEmpty_stillValidatesSyntax proves relaxing the zero-pool
 // guard does not relax any other validation: an unrecognized key, an empty
-// credential, and an invalid balance mode must still fail fast through both
-// public entry points, Load and LoadAllowEmpty.
+// credential, and a removed balance setting must still fail fast through
+// both public entry points, Load and LoadAllowEmpty.
 func TestLoadAllowEmpty_stillValidatesSyntax(t *testing.T) {
 	cases := map[string][]string{
-		"unrecognized key":     {"AQG_POOL_AUTO_BACKED_A=cred"},
-		"empty credential":     {"AQG_POOL_AUTO_BACKEND_A="},
-		"invalid balance mode": {"AQG_POOL_AUTO_BACKEND_A=cred", "AQG_POOL_AUTO_BALANCE=bogus"},
+		"unrecognized key":        {"AQG_POOL_AUTO_BACKED_A=cred"},
+		"empty credential":        {"AQG_POOL_AUTO_BACKEND_A="},
+		"removed balance setting": {"AQG_POOL_AUTO_BACKEND_A=cred", "AQG_POOL_AUTO_BALANCE="},
 	}
 	for name, env := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -365,24 +364,6 @@ func TestLoadFrom_priorityRejectsBadInput(t *testing.T) {
 		}
 	}
 }
-
-func TestLoadFrom_balanceParsed(t *testing.T) {
-	reg, err := loadFrom([]string{
-		"AQG_POOL_SUB_BALANCE=lead",
-		"AQG_POOL_SUB_BACKEND_A=cred-a",
-		"AQG_POOL_SUB_BACKEND_B=cred-b",
-	}, testDefaultBaseURL)
-	if err != nil {
-		t.Fatalf("loadFrom: %v", err)
-	}
-	if got := reg.PoolBalanceGap("sub"); got != defaultBalanceGap {
-		t.Errorf("PoolBalanceGap(sub) = %v, want default %v", got, defaultBalanceGap)
-	}
-	if got := reg.PoolBalanceDwell("sub"); got != defaultBalanceDwell {
-		t.Errorf("PoolBalanceDwell(sub) = %v, want default %v", got, defaultBalanceDwell)
-	}
-}
-
 func TestLoadFrom_concurrency(t *testing.T) {
 	reg, err := loadFrom([]string{
 		"AQG_POOL_AUTO_BACKEND_A=cred-a",
@@ -414,7 +395,7 @@ func TestLoadFrom_concurrencyDoesNotCreateUnknownPool(t *testing.T) {
 	}
 }
 
-func TestLoadFrom_concurrencyRejectsInvalidValuesAndBalance(t *testing.T) {
+func TestLoadFrom_concurrencyRejectsInvalidValues(t *testing.T) {
 	for _, value := range []string{"not-an-int", "0", "-1"} {
 		t.Run(value, func(t *testing.T) {
 			_, err := loadFrom([]string{
@@ -426,113 +407,21 @@ func TestLoadFrom_concurrencyRejectsInvalidValuesAndBalance(t *testing.T) {
 			}
 		})
 	}
-	_, err := loadFrom([]string{
-		"AQG_POOL_AUTO_BACKEND_A=cred-a",
-		"AQG_POOL_AUTO_BALANCE=lead",
-		"AQG_POOL_AUTO_CONCURRENCY=2",
-	}, testDefaultBaseURL)
-	if err == nil || !strings.Contains(err.Error(), "auto") || !strings.Contains(err.Error(), "BALANCE=lead") {
-		t.Errorf("balance conflict error = %v, want pool-specific BALANCE=lead conflict", err)
-	}
 }
 
-func TestLoadFrom_balanceWithCustomTuning(t *testing.T) {
-	reg, err := loadFrom([]string{
-		"AQG_POOL_SUB_BALANCE=lead",
-		"AQG_POOL_SUB_BALANCE_GAP=0.20",
-		"AQG_POOL_SUB_BALANCE_DWELL=10m",
-		"AQG_POOL_SUB_BACKEND_A=cred-a",
-		"AQG_POOL_SUB_BACKEND_B=cred-b",
-	}, testDefaultBaseURL)
-	if err != nil {
-		t.Fatalf("loadFrom: %v", err)
-	}
-	if got := reg.PoolBalanceGap("sub"); got != 0.20 {
-		t.Errorf("PoolBalanceGap(sub) = %v, want 0.20", got)
-	}
-	if got := reg.PoolBalanceDwell("sub"); got != 10*time.Minute {
-		t.Errorf("PoolBalanceDwell(sub) = %v, want 10m", got)
-	}
-}
-
-func TestLoadFrom_balanceAbsentReturnsZero(t *testing.T) {
-	reg, err := loadFrom([]string{"AQG_POOL_AUTO_BACKEND_A=cred-a"}, testDefaultBaseURL)
-	if err != nil {
-		t.Fatalf("loadFrom: %v", err)
-	}
-	if got := reg.PoolBalanceGap("auto"); got != 0 {
-		t.Errorf("PoolBalanceGap(non-balance pool) = %v, want 0", got)
-	}
-	if got := reg.PoolBalanceDwell("auto"); got != 0 {
-		t.Errorf("PoolBalanceDwell(non-balance pool) = %v, want 0", got)
-	}
-}
-
-func TestLoadFrom_balanceRejectsBadInput(t *testing.T) {
-	cases := map[string][]string{
-		"unsupported mode": {
-			"AQG_POOL_SUB_BALANCE=round-robin",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-		},
-		"conflict with priority": {
-			"AQG_POOL_SUB_BALANCE=lead",
-			"AQG_POOL_SUB_PRIORITY=a",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-			"AQG_POOL_SUB_BACKEND_B=cred-b",
-		},
-		"balance for pool with no backends": {
-			"AQG_POOL_SUB_BALANCE=lead",
-			"AQG_POOL_OTHER_BACKEND_A=cred-a",
-		},
-		"gap without balance": {
-			"AQG_POOL_SUB_BALANCE_GAP=0.15",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-		},
-		"dwell without balance": {
-			"AQG_POOL_SUB_BALANCE_DWELL=5m",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-		},
-		"invalid gap (zero)": {
-			"AQG_POOL_SUB_BALANCE=lead",
-			"AQG_POOL_SUB_BALANCE_GAP=0",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-		},
-		"invalid gap (non-numeric)": {
-			"AQG_POOL_SUB_BALANCE=lead",
-			"AQG_POOL_SUB_BALANCE_GAP=high",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-		},
-		// 15 is the classic percent/fraction mix-up (meant 0.15); a gap >= 1.0
-		// is unreachable and silently disables balancing, so it must be
-		// rejected at load (issue #215).
-		"invalid gap (>= 1.0)": {
-			"AQG_POOL_SUB_BALANCE=lead",
-			"AQG_POOL_SUB_BALANCE_GAP=15",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-		},
-		"invalid dwell (zero)": {
-			"AQG_POOL_SUB_BALANCE=lead",
-			"AQG_POOL_SUB_BALANCE_DWELL=0s",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-		},
-		"invalid dwell (non-duration)": {
-			"AQG_POOL_SUB_BALANCE=lead",
-			"AQG_POOL_SUB_BALANCE_DWELL=fast",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-		},
-		"duplicate balance var": {
-			"AQG_POOL_SUB_BALANCE=lead",
-			"AQG_POOL_sub_BALANCE=lead",
-			"AQG_POOL_SUB_BACKEND_A=cred-a",
-		},
-	}
-	for name, env := range cases {
-		if _, err := loadFrom(env, testDefaultBaseURL); err == nil {
-			t.Errorf("%s: expected error, got nil", name)
+func TestLoadFrom_rejectsRemovedBalanceEnvVariables(t *testing.T) {
+	for _, suffix := range []string{"BALANCE", "BALANCE_GAP", "BALANCE_DWELL", "BALANCE_EXTRA"} {
+		for _, value := range []string{"", "lead"} {
+			key := "AQG_POOL_AUTO_" + suffix
+			t.Run(suffix+"/"+value, func(t *testing.T) {
+				_, err := loadFrom([]string{"AQG_POOL_AUTO_BACKEND_A=cred-a", key + "=" + value}, testDefaultBaseURL)
+				if err == nil || !strings.Contains(err.Error(), `pool "auto"`) || !strings.Contains(err.Error(), "concurrency replaces it") {
+					t.Errorf("loadFrom error = %v, want pool-specific concurrency migration error", err)
+				}
+			})
 		}
 	}
 }
-
 func TestContext_roundTrip(t *testing.T) {
 	b := Backend{Pool: "auto", Nick: "claude-a", Credential: "cred-a", BaseURL: testDefaultBaseURL}
 	ctx := WithBackend(context.Background(), b)
@@ -673,32 +562,6 @@ func TestBuildFromSpec_priorityParsed(t *testing.T) {
 		t.Errorf("PoolPriority(chn) = %v, want [zai m3]", got)
 	}
 }
-
-func TestBuildFromSpec_balanceParsed(t *testing.T) {
-	// Parity with TestLoadFrom_balanceParsed
-	spec := Spec{
-		Pools: map[string]PoolSpec{
-			"SUB": {
-				Balance: "lead",
-				Members: map[string]MemberSpec{
-					"A": {Credential: "cred-a"},
-					"B": {Credential: "cred-b"},
-				},
-			},
-		},
-	}
-	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
-	if err != nil {
-		t.Fatalf("BuildFromSpec: %v", err)
-	}
-	if got := reg.PoolBalanceGap("sub"); got != defaultBalanceGap {
-		t.Errorf("PoolBalanceGap(sub) = %v, want default %v", got, defaultBalanceGap)
-	}
-	if got := reg.PoolBalanceDwell("sub"); got != defaultBalanceDwell {
-		t.Errorf("PoolBalanceDwell(sub) = %v, want default %v", got, defaultBalanceDwell)
-	}
-}
-
 func TestBuildFromSpec_concurrencyAndCopyOnWrite(t *testing.T) {
 	value := 3
 	reg, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{
@@ -762,89 +625,7 @@ func TestBuildFromSpec_concurrencyRejectsInvalidValues(t *testing.T) {
 			}
 		})
 	}
-	value := 2
-	_, err := BuildFromSpec(Spec{Pools: map[string]PoolSpec{
-		"auto": {
-			Balance:     "lead",
-			Concurrency: &value,
-			Members:     map[string]MemberSpec{"a": {Credential: "cred-a"}},
-		},
-	}}, testDefaultBaseURL)
-	if err == nil || !strings.Contains(err.Error(), "auto") || !strings.Contains(err.Error(), "BALANCE=lead") {
-		t.Errorf("balance conflict error = %v, want pool-specific conflict", err)
-	}
 }
-
-func TestBuildFromSpec_balanceWithCustomTuning(t *testing.T) {
-	// Parity with TestLoadFrom_balanceWithCustomTuning
-	spec := Spec{
-		Pools: map[string]PoolSpec{
-			"SUB": {
-				Balance:      "lead",
-				BalanceGap:   0.20,
-				BalanceDwell: Duration{D: 10 * time.Minute},
-				Members: map[string]MemberSpec{
-					"A": {Credential: "cred-a"},
-					"B": {Credential: "cred-b"},
-				},
-			},
-		},
-	}
-	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
-	if err != nil {
-		t.Fatalf("BuildFromSpec: %v", err)
-	}
-	if got := reg.PoolBalanceGap("sub"); got != 0.20 {
-		t.Errorf("PoolBalanceGap(sub) = %v, want 0.20", got)
-	}
-	if got := reg.PoolBalanceDwell("sub"); got != 10*time.Minute {
-		t.Errorf("PoolBalanceDwell(sub) = %v, want 10m", got)
-	}
-}
-
-func TestBuildFromSpec_rejectsOutOfRangeBalanceGap(t *testing.T) {
-	// The config-file path funnels through BuildFromSpec; a gap >= 1.0 is
-	// unreachable and silently disables balancing, so it must fail load
-	// (issue #215). 15 is the classic percent/fraction mix-up (meant 0.15).
-	spec := Spec{
-		Pools: map[string]PoolSpec{
-			"SUB": {
-				Balance:    "lead",
-				BalanceGap: 15,
-				Members: map[string]MemberSpec{
-					"A": {Credential: "cred-a"},
-				},
-			},
-		},
-	}
-	if _, err := BuildFromSpec(spec, testDefaultBaseURL); err == nil {
-		t.Error("BuildFromSpec with balance_gap >= 1.0 should fail")
-	}
-}
-
-func TestBuildFromSpec_acceptsGapNearOne(t *testing.T) {
-	// 0.99 is a legitimate fractional gap just below the ceiling; it must load.
-	spec := Spec{
-		Pools: map[string]PoolSpec{
-			"SUB": {
-				Balance:    "lead",
-				BalanceGap: 0.99,
-				Members: map[string]MemberSpec{
-					"A": {Credential: "cred-a"},
-					"B": {Credential: "cred-b"},
-				},
-			},
-		},
-	}
-	reg, err := BuildFromSpec(spec, testDefaultBaseURL)
-	if err != nil {
-		t.Fatalf("BuildFromSpec: %v", err)
-	}
-	if got := reg.PoolBalanceGap("sub"); got != 0.99 {
-		t.Errorf("PoolBalanceGap(sub) = %v, want 0.99", got)
-	}
-}
-
 func TestBuildFromSpec_caseInsensitive(t *testing.T) {
 	// Parity with TestResolveIn_caseInsensitive
 	spec := Spec{
@@ -876,64 +657,10 @@ func TestBuildFromSpec_validatorTable(t *testing.T) {
 				"A": {Members: map[string]MemberSpec{"X": {Credential: ""}}},
 			},
 		},
-		"invalid balance mode": {
-			Pools: map[string]PoolSpec{
-				"SUB": {
-					Balance: "round-robin",
-					Members: map[string]MemberSpec{"A": {Credential: "cred-a"}},
-				},
-			},
-		},
-		"non-positive gap": {
-			Pools: map[string]PoolSpec{
-				"SUB": {
-					Balance:    "lead",
-					BalanceGap: -0.1,
-					Members:    map[string]MemberSpec{"A": {Credential: "cred-a"}},
-				},
-			},
-		},
-		"non-positive dwell": {
-			Pools: map[string]PoolSpec{
-				"SUB": {
-					Balance:      "lead",
-					BalanceDwell: Duration{D: -1 * time.Second},
-					Members:      map[string]MemberSpec{"A": {Credential: "cred-a"}},
-				},
-			},
-		},
-		"gap without balance": {
-			Pools: map[string]PoolSpec{
-				"SUB": {
-					BalanceGap: 0.15,
-					Members:    map[string]MemberSpec{"A": {Credential: "cred-a"}},
-				},
-			},
-		},
-		"dwell without balance": {
-			Pools: map[string]PoolSpec{
-				"SUB": {
-					BalanceDwell: Duration{D: 5 * time.Minute},
-					Members:      map[string]MemberSpec{"A": {Credential: "cred-a"}},
-				},
-			},
-		},
 		"priority names non-member": {
 			Pools: map[string]PoolSpec{
 				"SUB": {
 					Priority: []string{"ghost"},
-					Members: map[string]MemberSpec{
-						"A": {Credential: "cred-a"},
-						"B": {Credential: "cred-b"},
-					},
-				},
-			},
-		},
-		"priority + balance together": {
-			Pools: map[string]PoolSpec{
-				"SUB": {
-					Priority: []string{"a"},
-					Balance:  "lead",
 					Members: map[string]MemberSpec{
 						"A": {Credential: "cred-a"},
 						"B": {Credential: "cred-b"},

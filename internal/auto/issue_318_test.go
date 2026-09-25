@@ -134,30 +134,6 @@ func TestWorkerAffinity_preemptMovesOnlyGlobalSticky(t *testing.T) {
 		t.Errorf("agent-b assignment=%q, exhausted=%v, want hard affinity b after preemption", b.Nick, exhausted)
 	}
 }
-
-func TestWorkerAffinity_balanceMovesOnlyGlobalSticky(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
-	c.workerConcurrency = 2
-	if b, _, exhausted := c.ResolveWorker("agent-a"); exhausted || b.Nick != "a" {
-		t.Fatalf("agent-a initial assignment = %q, exhausted=%v, want a", b.Nick, exhausted)
-	}
-	if b, _, exhausted := c.ResolveWorker("agent-b"); exhausted || b.Nick != "b" {
-		t.Fatalf("agent-b initial assignment = %q, exhausted=%v, want b", b.Nick, exhausted)
-	}
-	c.setCur("a")
-	reset := clock.now().Add(window5h / 2)
-	putSnap(store, c, "a", fptr(0.9), nil, tptr(reset), nil)
-	global, _, exhausted := c.ResolveAuto()
-	if exhausted || global.Nick != "b" {
-		t.Fatalf("balance route = %q, exhausted=%v, want global switch to b", global.Nick, exhausted)
-	}
-	if assigned, _, exhausted := c.ResolveWorker("agent-a"); exhausted || assigned.Nick != "a" {
-		t.Errorf("agent-a assignment=%q, exhausted=%v, want hard affinity a after balance", assigned.Nick, exhausted)
-	}
-}
-
 func TestWorkerAffinity_unavailableMemberReassignsOnlyAffectedWorker(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	p := NewPools(workerRegistryWithConcurrency(t, 2, "a", "b"), nil, clock.now, io.Discard)
