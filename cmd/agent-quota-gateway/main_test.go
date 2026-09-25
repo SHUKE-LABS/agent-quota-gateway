@@ -1655,3 +1655,52 @@ func TestGracefulShutdown_drainsServerBeforeCancellingWriters(t *testing.T) {
 		t.Fatal("gracefulShutdown returned without cancelling writers")
 	}
 }
+
+func TestClearHandlerStatuslessSnapshotDoesNotRepark(t *testing.T) {
+	scrubPoolEnv(t)
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "cred-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "cred-b")
+	registry, err := backend.Load("https://api.z.ai/api/anthropic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := quota.NewStore()
+	pools := auto.NewPools(registry, store, nil, io.Discard)
+	b, ok := registry.ResolveIn("auto", "a")
+	if !ok {
+		t.Fatal("ResolveIn(auto, a) not found")
+	}
+	util := 1.0
+	reset := time.Now().UTC().Add(time.Hour)
+	store.Put("a", quota.Snapshot{Unified5hUtilization: &util, Unified5hReset: &reset, AsOf: time.Now().UTC()})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(backend.WithBackend(context.Background(), b))
+	resp := &http.Response{StatusCode: http.StatusInternalServerError, Header: make(http.Header), Request: req, Body: io.NopCloser(strings.NewReader("failed"))}
+	if err := pools.ModifyResponse(resp); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(clearHandler(pools))
+	t.Cleanup(srv.Close)
+	clearResp, err := http.Post(srv.URL+"/_gateway/clear?pool=auto&nick=a", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearResp.Body.Close()
+	if clearResp.StatusCode != http.StatusOK {
+		t.Fatalf("clear status=%d, want 200", clearResp.StatusCode)
+	}
+	_, _, known, exhausted := pools.Route("auto")
+	if !known || exhausted {
+		t.Fatalf("Route after clear known=%v exhausted=%v; want an eligible member", known, exhausted)
+	}
+	status, ok := pools.PoolStatus("auto", store, nil)
+	aStatus := ""
+	for _, member := range status.Members {
+		if member.Nick == "a" {
+			aStatus = member.Status
+		}
+	}
+	if !ok || aStatus == "exhausted" || aStatus == "" {
+		t.Fatalf("pool status after clear = %+v; want a eligible", status)
+	}
+}

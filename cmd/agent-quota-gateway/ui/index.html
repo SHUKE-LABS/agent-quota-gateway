@@ -1040,7 +1040,8 @@
   // renderQuota paints one rolling-window cell. utilization is a 0..1
   // fraction (null/undefined when the window has no data). Missing data
   // renders a muted "-"; present data renders a clamped progress bar with
-  // a NN% label. Reset times live in their own columns (see formatReset).
+  // a floored NN% label, so a sub-cap value never reads 100%. Reset times
+  // live in their own columns (see formatReset).
   function renderQuota(cell, utilization) {
     cell.textContent = '';
     if (utilization == null || typeof utilization !== 'number' || isNaN(utilization)) {
@@ -1051,7 +1052,7 @@
       return;
     }
     var pct = Math.max(0, Math.min(100, utilization * 100));
-    var label = Math.round(pct) + '%';
+    var label = Math.floor(pct) + '%';
 
     var wrap = document.createElement('div');
     wrap.className = 'quota-bar';

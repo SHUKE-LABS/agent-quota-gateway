@@ -2,7 +2,10 @@ package auto
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +13,17 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
+
+func statuslessFailure(t *testing.T, c *Controller, nick string, status int) *http.Response {
+	t.Helper()
+	b := c.resolve(t, nick)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(backend.WithBackend(context.Background(), b))
+	resp := &http.Response{StatusCode: status, Header: make(http.Header), Request: req, Body: io.NopCloser(strings.NewReader("upstream failure"))}
+	if err := c.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+	return resp
+}
 
 // putUtil files a snapshot reporting nick's 5h window fully (or partially)
 // consumed in the store, mirroring what the poller writes for a z.ai /
@@ -35,6 +49,16 @@ func putUtil7d(t *testing.T, store *quota.Store, c *Controller, nick string, uti
 	})
 }
 
+func putRejected(t *testing.T, store *quota.Store, c *Controller, nick string, util float64, reset time.Time) {
+	t.Helper()
+	store.Put(c.resolve(t, nick).QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
+		Unified5hReset:       &reset,
+		AsOf:                 reset.Add(-time.Hour),
+	})
+}
+
 // exhaustedUntil is a test-only locked wrapper over exhaustedUntilLocked so
 // the merge of the live-429 park and the store signal can be asserted
 // directly.
@@ -54,6 +78,7 @@ func newPriorityControllerWithStore(t *testing.T, start int, clock *fixedClock, 
 		t.Setenv(backend.EnvPrefix+"AUTO_BACKEND_"+strings.ToUpper(n), "cred-"+n)
 	}
 	t.Setenv(backend.EnvPrefix+"AUTO_PRIORITY", priorityCSV)
+	t.Setenv(backend.EnvPrefix+"AUTO_BASE_URL", "https://api.z.ai/api/anthropic")
 	reg, err := backend.Load(testDefaultBaseURL)
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
@@ -61,11 +86,8 @@ func newPriorityControllerWithStore(t *testing.T, start int, clock *fixedClock, 
 	return NewController(reg, "auto", start, store, clock.now, io.Discard)
 }
 
-// TestResolveAuto_failsOffStoreExhaustedMember is the core regression: a
-// member the store reports at 100% utilization (future reset) must be failed
-// off even though no live 429 ever reached ModifyResponse — the situation a
-// poller-tracked z.ai member produces.
-func TestResolveAuto_failsOffStoreExhaustedMember(t *testing.T) {
+// A full statusless store snapshot is not enough to fail a member off.
+func TestResolveAuto_keepsStatuslessFullSnapshotEligible(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
 	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard) // sticky on a
@@ -79,8 +101,8 @@ func TestResolveAuto_failsOffStoreExhaustedMember(t *testing.T) {
 	if retry != 0 {
 		t.Errorf("ResolveAuto retry=%v, want 0", retry)
 	}
-	if b.Nick != "b" {
-		t.Errorf("ResolveAuto picked %q, want b (a is store-exhausted)", b.Nick)
+	if b.Nick != "a" {
+		t.Errorf("ResolveAuto picked %q, want a (full snapshot alone is eligible)", b.Nick)
 	}
 }
 
@@ -228,7 +250,7 @@ func TestResolveAuto_allLiveParkedFutureResetsStillExhausted(t *testing.T) {
 
 // TestStoreExhaustion_priorityFailsOffAndPreemptsBack walks the full
 // lifecycle for a priority pool whose highest-priority member is a
-// poller-tracked backend: it is failed off on the store signal alone, the
+// poller-tracked backend: it is failed off after a failed upstream request, the
 // preemptor schedules a wake at its precise reset, and once that reset passes
 // the pool is preempted back to it.
 func TestStoreExhaustion_priorityFailsOffAndPreemptsBack(t *testing.T) {
@@ -242,8 +264,9 @@ func TestStoreExhaustion_priorityFailsOffAndPreemptsBack(t *testing.T) {
 
 	reset := clock.now().Add(time.Hour)
 	putUtil(t, store, c, "zai", 1.0, reset)
+	statuslessFailure(t, c, "zai", http.StatusInternalServerError)
 
-	// Fail off zai to m3 on the store signal — no 429 was ever observed.
+	// The full snapshot and failed response together fail off zai.
 	if b, _, _ := c.ResolveAuto(); b.Nick != "m3" {
 		t.Fatalf("ResolveAuto picked %q, want m3 (zai store-exhausted)", b.Nick)
 	}
@@ -267,20 +290,16 @@ func TestStoreExhaustion_priorityFailsOffAndPreemptsBack(t *testing.T) {
 	}
 }
 
-// TestResolveAuto_failsOffOn7dStoreExhaustion proves the 7d (weekly) window
-// drives failover too: a member whose 5h window is healthy but whose 7d cap
-// is spent is failed off, with the wait anchored to the 7d reset. Before
-// this, only the 5h window was checked, so a 7d-exhausted poller-tracked
-// member (which emits no clean proxy-path 429) was never failed off.
-func TestResolveAuto_failsOffOn7dStoreExhaustion(t *testing.T) {
+// A full long window alone leaves the member eligible.
+func TestResolveAuto_keepsFullLongWindowEligibleWithoutFailure(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
 	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard) // sticky on a
 
 	putUtil7d(t, store, c, "a", 1.0, clock.now().Add(48*time.Hour)) // weekly cap spent; 5h untouched
 
-	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "b" {
-		t.Errorf("ResolveAuto picked %q exhausted=%v, want b / false (a is 7d-exhausted)", b.Nick, exhausted)
+	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "a" {
+		t.Errorf("ResolveAuto picked %q exhausted=%v, want a / false (full window alone is eligible)", b.Nick, exhausted)
 	}
 }
 
@@ -336,10 +355,8 @@ func TestResolveAuto_zaiLongWindowDoesNotExhaust(t *testing.T) {
 	}
 }
 
-// TestResolveAuto_zaiFifthHourStillParks proves the fix is surgical: the 5h
-// (TOKENS_LIMIT) chat window still parks a Z.AI member. With both windows at
-// the cap, the member is failed off — but on the 5h signal, which is the real
-// chat quota, not the monthly tool quota.
+// The z.ai 5h chat window can park after a failed request; the monthly tool
+// window must not lengthen its bound.
 func TestResolveAuto_zaiFifthHourStillParks(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
@@ -355,6 +372,7 @@ func TestResolveAuto_zaiFifthHourStillParks(t *testing.T) {
 		Unified7dReset:       &reset7d,
 		AsOf:                 clock.now(),
 	})
+	statuslessFailure(t, c, "a", http.StatusInternalServerError)
 
 	if b, _, exhausted := c.ResolveAuto(); exhausted || b.Nick != "b" {
 		t.Errorf("ResolveAuto picked %q exhausted=%v, want b / false (a's 5h chat window is spent)", b.Nick, exhausted)
@@ -420,7 +438,7 @@ func TestExhaustedUntil_mergesLiveParkAndStore(t *testing.T) {
 	parkAt := clock.now().Add(time.Hour)      // live 429 park (representative reset)
 	storeAt := clock.now().Add(3 * time.Hour) // store 5h reset, later
 	c.park("a", parkAt)
-	putUtil(t, store, c, "a", 1.0, storeAt)
+	putRejected(t, store, c, "a", 1.0, storeAt)
 
 	if got, ok := c.exhaustedUntil("a"); !ok || !got.Equal(storeAt) {
 		t.Errorf("exhaustedUntil = %v,%v, want %v,true (store reset is later)", got, ok, storeAt)
@@ -601,10 +619,10 @@ func TestSnapRejects_liveCczShape(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	util := 0.0
 	live := quota.Snapshot{
-		UnifiedStatus:       unifiedStatusRejected,
+		UnifiedStatus:        unifiedStatusRejected,
 		Unified5hUtilization: &util,
 		Unified7dUtilization: &util,
-		AsOf:                clock.now().Add(-30 * time.Second),
+		AsOf:                 clock.now().Add(-30 * time.Second),
 	}
 
 	for _, longBlocks := range []bool{true, false} {
@@ -788,7 +806,7 @@ func TestStoreExhaustedUntil_rejectedStatusNilResetSynthesizesBound(t *testing.T
 	store := quota.NewStore()
 	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
 
-	util := 0.4 // below the cap — "rejected" status alone is the signal
+	util := 0.4                           // below the cap — "rejected" status alone is the signal
 	asOf := clock.now().Add(-time.Minute) // fresh enough for the new gate
 	want := asOf.Add(defaultExhaustionWindow)
 
@@ -827,6 +845,7 @@ func TestStoreExhaustedUntil_anchoredAtAsOfNotNow(t *testing.T) {
 	asOf := clock.now().Add(-30 * time.Second) // fresh: 30s < 5m threshold
 	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
 		Unified5hUtilization: &util,
+		Unified5hStatus:      unifiedStatusRejected,
 		AsOf:                 asOf,
 	})
 
@@ -880,7 +899,7 @@ func TestReconcile_freshHealthyStoreRetiresStalePark(t *testing.T) {
 	store := quota.NewStore()
 	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
 
-	c.park("a", clock.now().Add(3*time.Hour))                      // live-429 park, future reset
+	c.park("a", clock.now().Add(3*time.Hour))                                 // live-429 park, future reset
 	putFresh(t, store, c, "a", 0.61, clock.now().Add(time.Hour), clock.now()) // fresh, below cap
 
 	if got, ok := c.exhaustedUntil("a"); ok {
@@ -918,7 +937,7 @@ func TestReconcile_storeBlockingStaysParked(t *testing.T) {
 	parkAt := clock.now().Add(time.Hour)
 	storeAt := clock.now().Add(3 * time.Hour) // later, and blocking (at cap)
 	c.park("a", parkAt)
-	putFresh(t, store, c, "a", 1.0, storeAt, clock.now()) // fresh but at cap → blocks
+	putRejected(t, store, c, "a", 1.0, storeAt)
 
 	got, ok := c.exhaustedUntil("a")
 	if !ok || !got.Equal(storeAt) {
@@ -1065,7 +1084,7 @@ func TestStoreExhaustion_runtimePriorityPreemptsBack(t *testing.T) {
 
 	// Store a utilization snapshot on a, marking it exhausted.
 	reset := clock.now().Add(time.Hour)
-	putUtil(t, store, c, "a", 1.0, reset)
+	putRejected(t, store, c, "a", 1.0, reset)
 
 	// Move to the other member (b) to set up the preempt-back scenario.
 	// This simulates having failed over to the lower-priority member.
@@ -1092,41 +1111,11 @@ func TestStoreExhaustion_runtimePriorityPreemptsBack(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// issue #251 — store-asserted freshness-bound park
+// Statusless freshness and recorded parks
 // ----------------------------------------------------------------------------
 //
-// The tests below pin the AC #6 four-consumer table, the AC #8
-// flap-prevention guarantee, the AC #9 frozen-entry preservation, the
-// AC #5 operator-surface path (MemberStatus.Parked + ClearExhaustedNick)
-// and the AC #10 corrected invariant. Each row corresponds to one row
-// of the table in the issue / plan.
-
-// TestStoreFreshnessBlocks_storeExhaustedUntilLocked (AC #6 row 1):
-// a fresh at-cap snapshot now contributes a synthesized AsOf+5h bound
-// even when the reset is nil or already past — pre-#251 the same shape
-// returned false because the no-status branch required reset != nil AND
-// now.Before(*reset). The fix is the AC #2 over-park anchored at AsOf.
-func TestStoreFreshnessBlocks_storeExhaustedUntilLocked(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
-
-	util := 1.0
-	asOf := clock.now().Add(-time.Minute)
-	want := asOf.Add(defaultExhaustionWindow)
-	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
-		Unified5hUtilization: &util,
-		AsOf:                 asOf,
-		// Unified5hReset deliberately nil.
-	})
-
-	c.mu.Lock()
-	got, ok := c.storeExhaustedUntilLocked("a")
-	c.mu.Unlock()
-	if !ok || !got.Equal(want) {
-		t.Errorf("storeExhaustedUntilLocked = %v,%v, want %v,true (AC #2 synthesize)", got, ok, want)
-	}
-}
+// These tests keep freshness behavior covered for reconciliation and
+// response classification while statusless snapshots no longer create parks.
 
 // TestStoreFreshnessBlocks_storeReconcilesParkLocked (AC #6 row 2):
 // a fresh at-cap snapshot does NOT retire a live-429 park — strictly
@@ -1215,68 +1204,6 @@ func TestStoreFreshnessBlocks_recoverParkedKeepsPark(t *testing.T) {
 	}
 }
 
-// TestStoreFreshnessBlocks_flapPrevention (AC #8): a member blocked by
-// the assert-once rule, then not polled (snapshot ages past
-// storeSnapshotFreshness), stays parked until its bound elapses. This
-// is the failure mode the plan's approach section explicitly closes:
-// "the moment it blocks, the pool fails over, the member stops being
-// polled, and its snapshot ages past storeSnapshotFreshness within
-// minutes — so the block lifts, the member is selected again, 429s
-// again, and the pool flaps on the poll cycle." The fix writes the
-// park once into c.exhausted via refreshStoreParksLocked so the
-// recompute on subsequent resolves cannot lift it.
-func TestStoreFreshnessBlocks_flapPrevention(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
-
-	util := 1.0
-	asOf := clock.now().Add(-time.Minute)
-	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
-		Unified5hUtilization: &util,
-		AsOf:                 asOf,
-	})
-
-	// (1) Drive a resolve to assert the park via refreshStoreParksLocked.
-	c.ResolveAuto()
-
-	c.mu.Lock()
-	_, ok := c.exhaustedUntilLocked("a")
-	c.mu.Unlock()
-	if !ok {
-		t.Fatal("after first ResolveAuto: a not exhausted, want parked (assert-once write)")
-	}
-
-	// (2) Advance clock past storeSnapshotFreshness WITHOUT re-polling.
-	// The store snapshot stays stale on purpose — the poller only tracks
-	// the active member, so this is exactly the failed-off shape.
-	clock.advance(10 * time.Minute)
-
-	// (3) Drive another resolve. The recompute on the routing path
-	// would now say "not blocking" because the snapshot is stale. The
-	// assert-once write in c.exhausted must keep the park in place; the
-	// member must NOT become selectable again.
-	c.ResolveAuto()
-
-	c.mu.Lock()
-	_, ok = c.exhaustedUntilLocked("a")
-	c.mu.Unlock()
-	if !ok {
-		t.Error("after second ResolveAuto with stale snapshot: a not exhausted, want still parked (AC #8 flap prevention)")
-	}
-
-	// (4) And the assert-once bound is anchored at AsOf+5h, so the
-	// park survives for the over-park horizon even with no further
-	// poller writes.
-	wantBound := asOf.Add(defaultExhaustionWindow)
-	c.mu.Lock()
-	gotBound, ok := c.exhausted["a"]
-	c.mu.Unlock()
-	if !ok || !gotBound.Equal(wantBound) {
-		t.Errorf("c.exhausted[a] = %v,%v, want %v,true (AsOf + 5h asserted-once)", gotBound, ok, wantBound)
-	}
-}
-
 // TestStoreFreshnessBlocks_frozenEntryPreserved (AC #9): #125's contract
 // — a member whose snapshot froze at utilization 1.0 before being failed
 // away from is selectable once that snapshot is stale. The freshness
@@ -1313,136 +1240,6 @@ func TestStoreFreshnessBlocks_frozenEntryPreserved(t *testing.T) {
 	c.mu.Unlock()
 	if ok {
 		t.Errorf("c.exhausted[a] present, want absent (stale snapshot must not park)")
-	}
-}
-
-// TestStoreFreshnessBlocks_operatorSurface (AC #5): the assert-once
-// park lands in c.exhausted (same map the live-429 parks use), so:
-// (a) MemberStatus.Parked is true — MemberStatus reports via
-//     liveParkActiveLocked which reads c.exhausted.
-// (b) ClearExhaustedNick returns true (a park was present) and the
-//     member becomes selectable on the next ResolveAuto because the
-//     recompute, with no fresh snapshot re-asserting, no longer
-//     blocks.
-// (c) MemberStatus.Status reports "exhausted" pre-clear, "idle"
-//     post-clear — the routing path's view tracks the operator.
-//
-// The README documents this escape hatch ("a clear is a one-shot
-// re-probe that sticks only once the member has recovered or its
-// snapshot went stale"); the test pins every line of that promise.
-func TestStoreFreshnessBlocks_operatorSurface(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
-
-	util := 1.0
-	asOf := clock.now().Add(-time.Minute)
-	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
-		Unified5hUtilization: &util,
-		AsOf:                 asOf,
-	})
-
-	// (1) Drive a resolve to assert the park.
-	c.ResolveAuto()
-
-	// Status: "exhausted", Parked: true. MemberStatus reads via
-	// liveParkActiveLocked, which reads c.exhausted.
-	got := c.poolStatus(store, nil, nil)
-	if st := memberStatus_(got, "a"); st != "exhausted" {
-		t.Errorf("after assert-once: a status=%q, want exhausted (store-derived union)", st)
-	}
-	if !memberParked_(got, "a") {
-		t.Errorf("after assert-once: a Parked=false, want true (AC #5: Parked reflects the assert-once entry in c.exhausted)")
-	}
-
-	// (2) Operator clear path returns true (a park was present) and
-	// drops the entry from c.exhausted.
-	if cleared, _ := c.ClearExhaustedNick("a"); !cleared {
-		t.Fatalf("ClearExhaustedNick(a) = false, want true (AC #5: operator-clear drops the store-derived park)")
-	}
-	c.mu.Lock()
-	_, hasPark := c.exhausted["a"]
-	c.mu.Unlock()
-	if hasPark {
-		t.Errorf("after ClearExhaustedNick: c.exhausted[a] still present, want absent")
-	}
-
-	// (3) Without a fresh re-poll, the recompute no longer blocks — the
-	// snapshot AsOf is still within storeSnapshotFreshness *of the
-	// original reading*, but the assert-once is gone and a fresh
-	// ResolveAuto would re-assert. Drive one — it re-asserts (the
-	// snapshot is still on file as fresh), so the routing path keeps
-	// "exhausted" + Parked:true. To prove "stick once stale", advance
-	// the clock past storeSnapshotFreshness first so the no-recompute
-	// path applies.
-	clock.advance(10 * time.Minute) // AsOf is now stale
-	c.ResolveAuto()
-	if _, _, exhausted := c.ResolveAuto(); exhausted {
-		// Two resolves: first one re-asserts in c.exhausted (the snapshot
-		// is still at AsOf=now-11m, past the freshness gate), but a
-		// subsequent assert on the same snapshot refines by writing the
-		// same bound — both reads keep the park. The cleaner pin is on
-		// the parity with the post-clear state, which we already
-		// checked above and at the second resolve below.
-		_ = exhausted
-	}
-	// Drive one more resolve with the stale snapshot — the recompute
-	// says "not blocking" because AsOf is stale, the assert-once
-	// path is closed by the freshness gate. No re-assertion.
-	c.mu.Lock()
-	_, hasPark2 := c.exhausted["a"]
-	c.mu.Unlock()
-	if hasPark2 {
-		t.Errorf("stale snapshot re-asserted the cleared park, want no re-assert (AC #5: clear sticks once the snapshot aged)")
-	}
-}
-
-// TestStoreFreshnessBlocks_invariant (AC #10): the corrected invariant
-// — !snapRejects ⇒ the union would not contribute — still holds post
-// change. Two cases pin it:
-// (a) !snapRejects (store reads healthy) ⇒ no entry in c.exhausted
-//     after a resolve; the union returns (_, false).
-// (b) snapRejects (store blocks) ⇒ entry in c.exhausted; the union
-//     returns the bound.
-func TestStoreFreshnessBlocks_invariant(t *testing.T) {
-	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	store := quota.NewStore()
-	c := NewController(testRegistry(t, "a", "b"), "auto", 0, store, clock.now, io.Discard)
-
-	// Case (a): store says healthy — fresh, below cap.
-	util := 0.5
-	putFresh(t, store, c, "a", 0.5, clock.now().Add(time.Hour), clock.now())
-	c.ResolveAuto()
-	c.mu.Lock()
-	bound, hasPark := c.exhausted["a"]
-	reset, unionOK := c.exhaustedUntilLocked("a")
-	c.mu.Unlock()
-	if hasPark {
-		t.Errorf("case (a): c.exhausted[a] present (%v), want absent (healthy store ⇒ no park)", bound)
-	}
-	if unionOK {
-		t.Errorf("case (a): union returns ok=true (%v), want false (healthy store ⇒ not exhausted)", reset)
-	}
-
-	// Case (b): store blocks — fresh, at cap.
-	util = 1.0
-	asOf := clock.now()
-	reset2 := clock.now().Add(time.Hour)
-	store.Put(c.resolve(t, "a").QuotaKey(), quota.Snapshot{
-		Unified5hUtilization: &util,
-		Unified5hReset:       &reset2,
-		AsOf:                 asOf,
-	})
-	c.ResolveAuto()
-	c.mu.Lock()
-	bound, hasPark = c.exhausted["a"]
-	reset, unionOK = c.exhaustedUntilLocked("a")
-	c.mu.Unlock()
-	if !hasPark {
-		t.Errorf("case (b): c.exhausted[a] absent, want present (blocking store ⇒ asserted park)")
-	}
-	if !unionOK || !reset.Equal(bound) {
-		t.Errorf("case (b): union returned %v,%v, want %v,true", reset, unionOK, bound)
 	}
 }
 

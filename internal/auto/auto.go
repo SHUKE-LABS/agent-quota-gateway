@@ -39,23 +39,13 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
-// defaultExhaustionWindow is the conservative fallback parking time for a
-// backend that 429s without a usable reset header. The 5h figure is the
-// documented upper bound of the unified short window; a real 429 carries
-// an absolute reset we use instead, so this only covers a missing or
-// already-past timestamp (where no precise value exists). Parking for a
-// bounded window guarantees forward progress — a backend marked exhausted
-// is never re-selected until it is known to have recovered.
+// defaultExhaustionWindow is the conservative fallback bound when a failed
+// upstream response confirms a full statusless window but no usable reset is
+// available. The five-hour bound is anchored to the quota snapshot's AsOf.
 const defaultExhaustionWindow = 5 * time.Hour
 
-// exhaustionUtilizationThreshold is the unified-window utilization at or
-// above which a member is treated as exhausted from the quota store alone,
-// without waiting for a live HTTP 429 on the proxy path. 1.0 means "the
-// window reports fully consumed" — the value z.ai / MiniMaxi report at cap
-// (via the poller) and that Anthropic reports in its rate-limit headers.
-// Keeping it at the cap preserves the sticky-until-exhausted design: a
-// member is failed off proactively only once its window is genuinely spent,
-// never merely busy.
+// exhaustionUtilizationThreshold is the full-window utilization value used
+// with a failed upstream response to identify statusless quota exhaustion.
 const exhaustionUtilizationThreshold = 1.0
 
 // unifiedStatusRejected is the per-window unified-status value Anthropic
@@ -324,7 +314,7 @@ func (p *Pools) Current(poolName string) (backend.Backend, bool) {
 	return c.CurrentBackend(), true
 }
 
-// ClearExhausted drops the named pool's live-429 parks (see
+// ClearExhausted drops the named pool's recorded parks (see
 // Controller.ClearExhausted). ok is false for an unknown pool.
 // releasedElsewhere names, per nick, the sibling pools a propagated
 // credential park was also released in (issue #254 AC5/AC12).
@@ -337,9 +327,9 @@ func (p *Pools) ClearExhausted(poolName string) (cleared []string, releasedElsew
 	return cleared, releasedElsewhere, true
 }
 
-// ClearExhaustedNick drops one member's live-429 park in the named pool (see
+// ClearExhaustedNick drops one member's recorded park in the named pool (see
 // Controller.ClearExhaustedNick). ok is false for an unknown pool; cleared
-// reports whether a live park was actually present for the nick.
+// reports whether a recorded park was actually present for the nick.
 // releasedElsewhere names the sibling pools a propagated credential park was
 // also released in (issue #254 AC5/AC12).
 func (p *Pools) ClearExhaustedNick(poolName, nick string) (cleared bool, releasedElsewhere []string, ok bool) {
@@ -351,7 +341,7 @@ func (p *Pools) ClearExhaustedNick(poolName, nick string) (cleared bool, release
 	return cleared, releasedElsewhere, true
 }
 
-// ClearAllExhausted drops live-429 parks across every pool, returning a
+// ClearAllExhausted drops recorded parks across every pool, returning a
 // map of pool name to the nicks cleared (pools with nothing parked are
 // omitted). Clearing every pool already releases every propagated credential
 // park by construction, so there is no separate cross-pool surface to report
@@ -394,13 +384,13 @@ type MemberStatus struct {
 	// froze at the last full config render while the badge moved (issue #159).
 	Disabled bool `json:"disabled"`
 
-	// Parked reports whether a live-429 park is currently holding this member
+	// Parked reports whether an explicit failed-response park is currently holding this member
 	// out of rotation — present, reset still in the future, and not reconciled
 	// away by a fresh healthy store snapshot (issue #145). It is the gate for
 	// the per-nick "clear park" affordance (issue #147): exactly the set of
 	// parks ClearExhaustedNick can usefully drop. Distinct from Status:
-	// store-sourced exhaustion also reads "exhausted" but is not Parked, since
-	// clearing the live park cannot move it.
+	// a status-bearing rejected store window can report "exhausted" without
+	// being Parked, since clearing the recorded park cannot move it.
 	Parked bool `json:"parked"`
 
 	// Lead fields are populated only for pools in balanced mode.
@@ -1590,18 +1580,10 @@ type Controller struct {
 	// under c.mu.
 	curNick string
 
-	// exhausted maps a nick to the absolute time its blocking window
-	// resets. Presence means "exhausted-until-reset"; entries are cleared
-	// lazily once now >= reset. Populated by both live-429 parks
-	// (record429 / parkAndFailover) and the #251 no-status-at-cap
-	// assert-once write from refreshStoreParksLocked — the latter only
-	// when the freshness-gated recompute (snap.AsOf) blocks the member,
-	// so the rejected-status branch still relies on the
-	// storeExhaustedUntilLocked union read at routing time. The dual
-	// population is intentional: the operator surface
-	// (MemberStatus.Parked via liveParkActiveLocked, POST /_gateway/clear,
-	// ClearExhaustedNick) reads c.exhausted alone and must see the
-	// store-derived park so AC #5 (visibility + clearability) holds.
+	// exhausted maps a nick to the absolute time its blocking window resets.
+	// Entries come from failed upstream responses or explicit live parks and
+	// clear lazily once now >= reset. Status-bearing store snapshots can add a
+	// separate bound at read time; statusless snapshots alone do not park.
 	exhausted map[string]time.Time
 
 	// lastProbeAttempt records the most recent recovery-probe attempt time
@@ -1968,7 +1950,6 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	defer c.mu.Unlock()
 
 	c.clearExpiredLocked()
-	c.refreshStoreParksLocked()
 
 	// A member-less pool (freshly created runtime pool with no members yet)
 	// has an empty curNick; skip the healthy-current branch and fall through
@@ -2053,14 +2034,16 @@ func (c *Controller) parkedNicksSnapshot() []string {
 	return nicks
 }
 
-// ClearExhausted drops every live-429 park for this pool, including any
+// ClearExhausted drops every recorded park for this pool, including any
 // store-unrepresentable credential park — local or propagated from a sibling
-// pool (issue #254) — making each member immediately selectable again (still
-// subject to the quota store's own fully-consumed window check). It exists to
+// pool (issue #254) — making each member immediately selectable again unless
+// a status-bearing rejected window still blocks it. A statusless full
+// snapshot alone does not recreate the park. It exists to
 // undo parks written by a transient or erroneous upstream 429 — e.g. an
 // account that got 429'd by a misconfigured request but in fact still has
-// quota. It does NOT touch store-sourced exhaustion, which reflects polled
-// reality and clears on its own reset. Returns the nicks whose park was
+// quota or whose full statusless window did not prove exhaustion. It does
+// NOT clear status-bearing rejected windows, which remain store-derived and
+// clear on reset. Returns the nicks whose park was
 // cleared, sorted, plus — for any of those nicks that carried a propagated
 // credential park — the sibling pools the clear also released it in (issue
 // #254 AC5/AC12); nil when nothing here was ever propagated.
@@ -2105,13 +2088,13 @@ func (c *Controller) ClearExhausted() (cleared []string, releasedElsewhere map[s
 	return cleared, releasedElsewhere
 }
 
-// ClearExhaustedNick drops a single member's live-429 park (issue #147),
+// ClearExhaustedNick drops a single member's recorded park (issue #147),
 // including any store-unrepresentable credential park (issue #254) — the
 // per-nick counterpart to ClearExhausted: an operator escape hatch to
 // un-stick one over-parked member without clearing the whole pool. Same
-// "live-park only, never store" contract — store-sourced exhaustion is left
-// untouched and a genuinely-exhausted member simply re-parks via record429 on
-// its next 429. Returns whether a live park was actually present (false is a
+// recorded-park-only contract — status-bearing rejected windows remain
+// untouched. A statusless full snapshot can re-park only after a failed
+// upstream response. Returns whether a park was actually present (false is a
 // harmless no-op for an unknown or un-parked nick), plus the sibling pools
 // the clear also released the propagated park in (issue #254 AC5/AC12).
 // notifyMutate fires only when something changed.
@@ -2531,6 +2514,25 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 	if !ok {
 		return nil
 	}
+	if resp.StatusCode == http.StatusTooManyRequests && isCodexBackend(b) {
+		// Preserve Codex's response-meter parsing and reset calculation for
+		// a capped window reported on this very 429.
+		if reset, precise, full := codexExhaustion429(resp, c.now()); full {
+			return c.parkAndFailoverWithSource(resp, b.Nick, reset, "hit 429", true, precise)
+		}
+	}
+	// Classify the original upstream status before any branch rewrites it to a
+	// gateway 503. A statusless full window is only exhaustion evidence when
+	// this same request failed upstream. Credential rejection and native
+	// Anthropic overload have their own handling below.
+	if (resp.StatusCode < 200 || resp.StatusCode >= 300) &&
+		!isCredentialRejected(resp.StatusCode) &&
+		!(resp.StatusCode == anthropicOverloadStatusCode && isNativeAnthropicBackend(b)) {
+		if reset, precise, full := c.statuslessFailureBound(resp, b); full {
+			return c.parkAndFailoverWithSource(resp, b.Nick, reset,
+				fmt.Sprintf("returned %d with a full quota window", resp.StatusCode), true, precise)
+		}
+	}
 
 	switch {
 	case resp.StatusCode == anthropicOverloadStatusCode && isNativeAnthropicBackend(b):
@@ -2552,30 +2554,9 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 			rewriteTo503Throttle(resp, zaiThrottleRetryAfterSeconds)
 			return nil
 		}
-		// ChatGPT-Codex members (issue #304) meter via the x-codex-* family
-		// and signal depletion with a capped window — no
-		// anthropic-ratelimit-* headers, so the generic classifier below
-		// sees a policy 429 and never parks (a depleted seat then sticks as
-		// sticky forever; the reported bug). This branch owns classification
-		// END-TO-END from the response headers: it never falls through to
-		// isGenuineExhaustionSignal, whose store lookup would park a
-		// headerless policy 429 off a prior fresh capped snapshot (AC3; same
-		// ordering rationale as the z.ai branch above — keyed before the
-		// exhaustion classifier so store state cannot misclassify the
-		// response).
+		// Codex 429s with a capped window were handled above. A sub-cap
+		// reached-type marker remains a same-member throttle.
 		if isCodexBackend(b) {
-			if reset, windowFact, genuine := codexExhaustion429(resp, c.now()); genuine {
-				// Always store-unrepresentable: a codex snapshot has no
-				// status field, so windowBlocks' no-status branch reads it
-				// as blocking only while AsOf is fresh (≤ storeSnapshotFreshness)
-				// — the park bound is never durably store-derivable, and
-				// issue #254's credentialPark propagation is the correct
-				// sibling-pool channel. windowFact comes from the bound's
-				// composition (see codexExhaustion429): fully-precise bounds
-				// stay retirable on real later evidence, fallback-containing
-				// bounds are protected like a credential fact.
-				return c.parkAndFailoverWithSource(resp, b.Nick, reset, "hit 429", true, windowFact)
-			}
 			// usage_limit_reached with no capped window: the marker alone is
 			// not depletion evidence (issue #314 — parking here stranded the
 			// last enabled seat until a manual /_gateway/clear), but it does
@@ -2638,6 +2619,82 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 	default:
 		return nil
 	}
+}
+
+// statuslessFailureBound combines the latest measured windows with fields on
+// this upstream response. The observer normally merges the response before
+// ModifyResponse runs; reading its headers here also covers direct callers
+// and keeps classification tied to the original upstream response. Only a
+// fresh, eligible, statusless window at the cap contributes a bound.
+func (c *Controller) statuslessFailureBound(resp *http.Response, b backend.Backend) (time.Time, bool, bool) {
+	if isNativeAnthropicBackend(b) && resp.Header.Get(quota.HeaderUnifiedStatus) != "" {
+		return time.Time{}, false, false
+	}
+	now := c.now()
+	var snap quota.Snapshot
+	if c.store != nil {
+		snap = c.store.Get(b.QuotaKey())
+	}
+	observed := quota.Extract(resp)
+	responseWindow := observed.Unified5hUtilization != nil || observed.Unified5hReset != nil || observed.Unified5hStatus != "" ||
+		observed.Unified7dUtilization != nil || observed.Unified7dReset != nil || observed.Unified7dStatus != ""
+	if isCodexBackend(b) {
+		codex := quota.ExtractCodex(resp.Header, now)
+		if codex.HasData() {
+			observed.OverlayCodex(snap, codex)
+			responseWindow = true
+		}
+	}
+	if responseWindow {
+		if observed.Unified5hUtilization != nil {
+			snap.Unified5hUtilization = observed.Unified5hUtilization
+		}
+		if observed.Unified5hReset != nil {
+			snap.Unified5hReset = observed.Unified5hReset
+		}
+		if observed.Unified5hStatus != "" {
+			snap.Unified5hStatus = observed.Unified5hStatus
+		}
+		if observed.Unified7dUtilization != nil {
+			snap.Unified7dUtilization = observed.Unified7dUtilization
+		}
+		if observed.Unified7dReset != nil {
+			snap.Unified7dReset = observed.Unified7dReset
+		}
+		if observed.Unified7dStatus != "" {
+			snap.Unified7dStatus = observed.Unified7dStatus
+		}
+		snap.AsOf = now
+	}
+	if snap.AsOf.IsZero() || now.Sub(snap.AsOf) > storeSnapshotFreshness {
+		return time.Time{}, false, false
+	}
+	var bound time.Time
+	full, precise := false, true
+	for _, w := range [...]struct {
+		util   *float64
+		status string
+		reset  *time.Time
+		use    bool
+	}{
+		{snap.Unified5hUtilization, snap.Unified5hStatus, snap.Unified5hReset, true},
+		{snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset, poller.LongWindowBlocksExhaustion(b.BaseURL)},
+	} {
+		if !w.use || w.status != "" || w.util == nil || *w.util < exhaustionUtilizationThreshold {
+			continue
+		}
+		candidate := snap.AsOf.Add(defaultExhaustionWindow)
+		if w.reset != nil && w.reset.After(now) {
+			candidate = *w.reset
+		} else {
+			precise = false
+		}
+		if !full || candidate.After(bound) {
+			bound = candidate
+		}
+		full = true
+	}
+	return bound, precise, full && bound.After(now)
 }
 
 // isCredentialRejected reports whether code means the backend's credential
@@ -3192,12 +3249,9 @@ func (c *Controller) clearProbeInFlight(quotaKey string) {
 	c.mu.Unlock()
 }
 
-// clearExpiredLocked drops exhausted marks whose reset has passed, so a
-// recovered backend becomes selectable again. After #251 the c.exhausted
-// map holds both live-429 parks and no-status at-cap store-derived parks
-// (refreshStoreParksLocked), and aging is a single loop because the
-// invariant — once now reaches the bound, the park falls — is the same
-// for both sources. Caller holds c.mu.
+// clearExpiredLocked drops parks whose reset has passed, so a recovered
+// backend becomes selectable again. The map holds parks recorded from failed
+// upstream responses and explicit live-429 signals. Caller holds c.mu.
 func (c *Controller) clearExpiredLocked() {
 	now := c.now()
 	for nick, reset := range c.exhausted {
@@ -3212,120 +3266,9 @@ func (c *Controller) clearExpiredLocked() {
 	}
 }
 
-// refreshStoreParksLocked promotes each no-status at-cap store snapshot
-// into c.exhausted, once per resolve, so the existing
-// exhaustedUntilLocked / isExhaustedLocked / liveParkActiveLocked /
-// ClearExhaustedNick / MemberStatus.Parked surfaces all see it (AC #4 /
-// AC #5 in #251). It is the assert-once counterpart to the read-side
-// freshness rule in windowBlocks:
-//
-//   - A freshness-gated predicate alone would erase the block it just
-//     asserted: the moment it blocks, the pool fails over, the member
-//     stops being polled, and its snapshot ages past
-//     storeSnapshotFreshness within minutes — so the block lifts, the
-//     member is selected again, 429s again, and the pool flaps on the
-//     poll cycle. Writing the park once into c.exhausted removes the
-//     feedback loop and reuses the existing park-aging lifecycle
-//     (clearExpiredLocked).
-//   - Scope is intentionally narrow: the **no-status at-cap** parks
-//     only. The "rejected" status branch stays on its existing
-//     storeExhaustedUntilLocked union read — folding those
-//     future-bound status parks into c.exhausted would corrupt the
-//     #134 half-open picker (nextParkedButResetPassedLocked), and #251
-//     scopes its change to the no-status pathway anyway. Concretely:
-//     util at the cap, no status, fresh AsOf → assert; otherwise leave
-//     to the read-side union.
-//   - Once asserted, the park persists in c.exhausted until either
-//     clearExpiredLocked ages it out by wall-clock against the bound or
-//     an operator-clear path (POST /_gateway/clear /
-//     ClearExhaustedNick) drops it. A fresh at-cap snapshot re-asserts
-//     on the next resolve, so a clear is a one-shot re-probe that
-//     sticks only once the member has recovered or its snapshot went
-//     stale — the AC #5 "operator escape hatch" semantics.
-//   - The bound is anchored at snap.AsOf (see storeBlockBoundLocked),
-//     so a now-anchored re-arm on every read is closed (AC #3).
-//     Lengthening happens; shortening does not — a
-//     freeze-then-recover-then-AtCap-again sequence should not quietly
-//     re-park via a now-older AsOf.
-//   - notifyMutate is NOT called per resolve: c.exhausted is runtime
-//     observation, written on every resolve; calling the
-//     persister-backed callback here would flood the state file.
-//     The 429-sourced park path (record429) gates notifyMutate on an
-//     actual rotation; the store-derived path has no rotation to
-//     signal, so we stay quiet.
-//
-// Caller holds c.mu.
-func (c *Controller) refreshStoreParksLocked() {
-	if c.store == nil || len(c.members) == 0 {
-		return
-	}
-	now := c.now()
-	for _, m := range c.members {
-		nick := m.Nick
-		if c.disabled[nick] {
-			continue
-		}
-		idx := c.indexOf(nick)
-		if idx < 0 {
-			continue
-		}
-		b := c.backendAt(idx)
-		snap := c.store.Get(b.QuotaKey())
-		// Status-bearing snapshots are out of scope: the rejected
-		// status branch is a #251 non-goal, and folding it into
-		// c.exhausted would corrupt the #134 half-open picker (see
-		// function doc). Skip and let the existing union read handle
-		// it on the routing path.
-		if snap.Unified5hStatus != "" || snap.Unified7dStatus != "" {
-			continue
-		}
-		// No-status at-cap. Reuse the freshness-and-util gate inline so
-		// the assert-once width mirrors the read predicate exactly.
-		var blocks bool
-		for _, w := range [...]struct {
-			util  *float64
-			reset *time.Time
-			use   bool
-		}{
-			{snap.Unified5hUtilization, snap.Unified5hReset, true},
-			{snap.Unified7dUtilization, snap.Unified7dReset, poller.LongWindowBlocksExhaustion(b.BaseURL)},
-		} {
-			if !w.use {
-				continue
-			}
-			if w.util == nil || *w.util < exhaustionUtilizationThreshold {
-				continue
-			}
-			if snap.AsOf.IsZero() || now.Sub(snap.AsOf) > storeSnapshotFreshness {
-				continue
-			}
-			blocks = true
-			break
-		}
-		if !blocks {
-			continue
-		}
-		bound, ok := c.storeBlockBoundLocked(nick)
-		if !ok {
-			// Safety net: the freshness gate above agreed the window
-			// blocks, but storeBlockBoundLocked would refuse if neither
-			// a usable reset nor a non-zero AsOf is present (the
-			// no-AsOf now-anchored fallback). In practice the gate
-			// above rules that out, so this branch should not fire —
-			// logged defensively to keep the assert-once map clean.
-			continue
-		}
-		existing, exists := c.exhausted[nick]
-		if exists && !bound.After(existing) {
-			continue
-		}
-		c.exhausted[nick] = bound
-	}
-}
-
 // isExhaustedLocked reports whether nick is currently unselectable, by
-// either signal: the live-429 park or the quota store's fully-consumed
-// window. Caller holds c.mu.
+// either a recorded failed-response park or a status-bearing rejected
+// quota window. Caller holds c.mu.
 func (c *Controller) isExhaustedLocked(nick string) bool {
 	_, ok := c.exhaustedUntilLocked(nick)
 	return ok
@@ -3337,8 +3280,9 @@ func (c *Controller) isExhaustedLocked(nick string) bool {
 // entry in c.credentialPark — local or propagated from a sibling pool (issue
 // #254). It is the gate for MemberStatus.Parked / the per-nick clear button
 // (issue #147) — the exact condition under which ClearExhaustedNick has a park
-// to drop AND that park is what is keeping the member parked. Store-sourced
-// exhaustion is deliberately excluded: clearing the live park cannot move it.
+// to drop AND that park is what is keeping the member parked. Status-bearing
+// store exhaustion is deliberately excluded: clearing the recorded park
+// cannot move it.
 // A credentialPark entry with windowFact true (the header-less-429 residue) is
 // still subject to storeReconcilesParkLocked, same as c.exhausted — it is a
 // quota-window fact the store can retire early. windowFact false (401/403) is
@@ -3358,23 +3302,13 @@ func (c *Controller) liveParkActiveLocked(nick string) bool {
 }
 
 // exhaustedUntilLocked returns the time nick stays unselectable and whether
-// it is exhausted at all, unifying three exhaustion signals: the explicit
-// park set by a live 429 (record429, in c.exhausted), a store-unrepresentable
-// credential park local to or propagated into this pool (c.credentialPark,
-// issue #254), and the quota store's fully-consumed window (poller- or
-// header-sourced, computed on read via storeExhaustedUntilLocked). When more
+// it is exhausted at all, unifying three exhaustion signals: a recorded park
+// from a failed response, a store-unrepresentable credential park local to
+// or propagated into this pool (c.credentialPark, issue #254), and an
+// explicit rejected status from the quota store (computed by
+// storeExhaustedUntilLocked). When more
 // than one applies the later reset wins, so a member is never re-selected
 // while any signal still blocks it.
-//
-// issue #251: refreshStoreParksLocked asserts no-status at-cap store
-// blocks into c.exhausted once per resolve. Those entries live in the
-// same map as the live-429 parks, so this union's read of c.exhausted
-// sees them. The storeExhaustedUntilLocked contribution then closes the
-// gap for status-bearing snapshots whose recompute the assert-once
-// path explicitly skipped (the #134 / #251 design intent). When both
-// apply the later reset wins — so a frozen-stale-but-still-blocking
-// read-side path can't override an assert-once park that has been
-// cleared by an operator.
 //
 // Caller holds c.mu.
 func (c *Controller) exhaustedUntilLocked(nick string) (time.Time, bool) {
@@ -3418,34 +3352,11 @@ func (c *Controller) exhaustedUntilLocked(nick string) (time.Time, bool) {
 	return reset, ok
 }
 
-// storeReconcilesParkLocked reports whether the polled quota store is fresh
-// and healthy enough to retire a member's stale live-429 park (issue #145).
-// It is true only when the store holds the member's data (HasData), that
-// snapshot is recent (within storeSnapshotFreshness of now), AND it shows no
-// blocking window (snapRejects == false). It returns false for a nil store,
-// an unknown nick, an empty snapshot (store.Get on a missing key returns a
-// stamped-but-empty snapshot whose !snapRejects would otherwise read healthy),
-// a frozen/stale snapshot (the poller refreshes only the active member, so a
-// failed-off member's entry freezes — it must keep aging by wall-clock), or a
-// snapshot whose window still blocks.
-//
-// Relationship to the union (issue #251): the
-// "snapRejects / storeExhaustedUntilLocked cannot both fire" invariant the
-// pre-#251 comment cited rested on snapRejects being strictly more
-// conservative than the storeExhaustedUntilLocked union. Post-#251 a
-// fresh at-cap snapshot returns true from snapRejects AND the union
-// returns snap.AsOf + 5h — snapRejects is no longer more conservative,
-// because assert-once in ResolveAuto writes the union's bound into
-// c.exhausted so the two signals converge on a single parked map entry
-// rather than arguing over which fires first. The invariant still holds
-// in the form `!snapRejects ⇒ the union would not contribute` (a
-// non-rejecting snapshot cannot imply a park); the divergence is on the
-// reverse direction. The assert-once write is what bridges them — and
-// what makes `MemberStatus.Parked`, ClearExhaustedNick, and
-// `POST /_gateway/clear` show the same park the union computes.
-//
-// Caller holds c.mu; the store has its own lock and never calls back
-// into the controller.
+// storeReconcilesParkLocked reports whether a fresh healthy store snapshot
+// can retire a previously recorded quota-window park. A statusless full
+// snapshot keeps an existing park in place, but cannot create one by itself.
+// Empty or stale snapshots never clear a park. Caller holds c.mu; the store
+// has its own lock and never calls back into the controller.
 func (c *Controller) storeReconcilesParkLocked(nick string) bool {
 	if c.store == nil {
 		return false
@@ -3466,45 +3377,11 @@ func (c *Controller) storeReconcilesParkLocked(nick string) bool {
 	return !snapRejects(snap, now, poller.LongWindowBlocksExhaustion(b.BaseURL))
 }
 
-// storeBlockBoundLocked returns the bound a blocking store snapshot implies
-// for nick, or (_, false) when no window contributes. The bound is anchored
-// to the per-window reset when the snapshot carries a usable one (still in
-// the future), otherwise to snap.AsOf + defaultExhaustionWindow — the
-// deliberate over-park from issue #251's approach section: five hours idle
-// with a working alternate beats riding a member at a 100% error rate,
-// and `POST /_gateway/clear` is the operator's escape hatch (#145 cannot
-// shorten it because the failing member is no longer polled, so its
-// snapshot cannot go fresh and the reconciliation short-circuit never
-// fires).
-//
-// A window "contributes" exactly when windowBlocks says it is still
-// blocking — the same read predicate used everywhere else. For a
-// "rejected" status that honours the per-window reset: a future or nil
-// reset blocks, an elapsed reset does not (issue #286). This deliberately
-// dropped the earlier "rejected is authoritative regardless of reset"
-// bypass, which anchored an elapsed-reset rejected window at AsOf+5h and
-// kept a recovered member parked past its own 5h reset. The no-reset
-// rejected snapshot still contributes with the AsOf+5h fallback — it has
-// no reset to honour and no freshness proxy to lean on (#134) — but that
-// fallback is bounded and ages out.
-//
-// The AsOf+5h fallback bound is anchored at snap.AsOf, NOT now — a
-// now-anchored bound recomputed per read re-arms on every call and parks
-// the member permanently with no entry to expire; the AsOf anchor pins the
-// bound to the moment the snapshot was taken, so a frozen entry's bound is
-// deterministic across reads until that AsOf+5h elapses (AC #3 / AC #11 in
-// #251). Once even that bound is in the past, storeBlockBoundLocked returns
-// (_, false): a store-derived bound contributes only while future, so an
-// already-elapsed fallback is never recreated on the next read (#286).
-//
-// Combined across windows by taking the latest bound: never the 7d reset
-// for a 5h-only exhaustion, never vice versa. Z.AI/Zhipu's long window
-// is dropped here — its monthly slot is a web-search/reader/zread tool
-// quota, not chat throughput (issue #192).
-//
-// Caller holds c.mu; the store has its own lock and never calls back into
-// the controller. Returns (zero, false) for no store / unknown nick /
-// no blocking window.
+// storeBlockBoundLocked returns the bound for a status-bearing rejected
+// store window. Statusless full windows are deliberately omitted here: they
+// become exhaustion evidence only when combined with a failed upstream
+// response in statuslessFailureBound. Provider window eligibility remains
+// enforced by LongWindowBlocksExhaustion. Caller holds c.mu.
 func (c *Controller) storeBlockBoundLocked(nick string) (time.Time, bool) {
 	if c.store == nil {
 		return time.Time{}, false
@@ -3545,7 +3422,10 @@ func (c *Controller) storeBlockBoundLocked(nick string) (time.Time, bool) {
 	var bound time.Time
 	have := false
 	for _, w := range windows {
-		if !w.use {
+		// Statusless utilization is evidence only alongside a failed
+		// upstream response, which is recorded in c.exhausted. A full
+		// store snapshot alone cannot make a member unavailable.
+		if !w.use || w.status == "" {
 			continue
 		}
 		// A window contributes exactly when windowBlocks says it is still
@@ -3555,8 +3435,7 @@ func (c *Controller) storeBlockBoundLocked(nick string) (time.Time, bool) {
 		// here — rather than treating the verdict as authoritative
 		// regardless of reset — is what lets a member leave `exhausted`
 		// once its 5h window resets, instead of being re-parked to
-		// AsOf + 5h on every read. The no-status branch is unchanged: its
-		// status is "", so the reset gate was never the deciding factor.
+		// AsOf + 5h on every read.
 		if !windowBlocks(w.util, w.status, w.reset, snap.AsOf, now) {
 			continue
 		}
@@ -3627,45 +3506,13 @@ func (c *Controller) storeExhaustedUntilLocked(nick string) (time.Time, bool) {
 	return c.storeBlockBoundLocked(nick)
 }
 
-// windowBlocks reports whether a unified rate-limit window is actually
-// rejecting requests, deciding by whichever signal the snapshot carries:
-//
-//   - When the window has a status (Anthropic header path), the status is
-//     authoritative. Only "rejected" blocks — Anthropic reports a window at
-//     utilization 1.0 with status "allowed"/"allowed_warning" while still
-//     serving it (the soft-cap / overage / fallback zone). Treating 1.0 as
-//     exhausted there wrongly parks a member Anthropic would happily serve,
-//     which can lock an entire pool out as "all exhausted". A "rejected"
-//     status whose reset has already passed reads as not blocking — the
-//     reset gate is the only freshness the status branch honours, so a
-//     frozen post-#134 snapshot can't keep a recovered backend parked
-//     forever (issue #134 deadlock). A "rejected" status with a nil reset
-//     still blocks: the snapshot is genuinely authoritative about the
-//     window state and we have no reset to bound it.
-//   - When the window has no status (poller-tracked z.ai / MiniMaxi / Ark,
-//     which report only a utilization fraction), fall back to the cap, but
-//     ONLY while the snapshot is fresh: the no-status branch reads the
-//     measurement's actual age via asOf against storeSnapshotFreshness, not
-//     the reset field. The reset field is the *preferred bound* used by the
-//     park-asserting path (storeExhaustedUntilLocked → storeBlockBoundLocked);
-//     on the read side it is no longer the freshness proxy. The poller only
-//     tracks the active member, so a failed-off member's entry freezes at
-//     its last good asOf; once that ages past storeSnapshotFreshness the
-//     entry is stale and must read not blocking — otherwise a transient
-//     overload 429 on a recovered member is falsely parked (issue #125 /
-//     #251).
-//
-// Coupling (issue #251 AC #12): the freshness gate's effective window is
-// "configured poll interval vs storeSnapshotFreshness". With the stock
-// internal/poller defaultInterval of 2m against this threshold's 5m,
-// fresh snapshots comfortably clear the gate (3m margin). A configured
-// poll interval at or above the threshold inverts the rule — fresh
-// snapshots go stale most of the time, a working member flips in and out
-// of the park on each poll, which is the opposite failure mode from the
-// never-reset one this change closes. Operators tuning poll frequency
-// must keep the interval strictly below the threshold; #247 is expected
-// to derive the threshold from the interval so this constraint becomes
-// structural rather than a numbers-discipline.
+// windowBlocks reports whether a quota window supplies exhaustion evidence.
+// An explicit status is authoritative: only rejected blocks, and an elapsed
+// rejected reset no longer blocks. Without a status, a fresh full window is a
+// positive signal used with an original failed upstream response; it does
+// not independently make a store-backed member unavailable. The five-minute
+// AsOf freshness bound prevents a frozen poller snapshot from representing
+// current quota state. Long-window eligibility is applied by each caller.
 func windowBlocks(util *float64, status string, reset *time.Time, asOf time.Time, now time.Time) bool {
 	if status != "" {
 		if status != unifiedStatusRejected {

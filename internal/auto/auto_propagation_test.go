@@ -231,11 +231,9 @@ func TestCredentialPark_wholePoolClearReleasesEverywhere(t *testing.T) {
 	}
 }
 
-// TestCredentialPark_storeSourcedExhaustionSurvivesClear pins the tail of
-// AC5: a clear releases only the reactive/credential park, never
-// store-sourced exhaustion — a nick also blocked by a polled window stays
-// unavailable in that pool after the clear.
-func TestCredentialPark_storeSourcedExhaustionSurvivesClear(t *testing.T) {
+// A full statusless snapshot in a sibling pool does not recreate a cleared
+// credential park without a later failed upstream request.
+func TestCredentialPark_statuslessSnapshotDoesNotSurviveClear(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
 	p := loadMovePools(t, clock, propagationEnv())
@@ -250,23 +248,19 @@ func TestCredentialPark_storeSourcedExhaustionSurvivesClear(t *testing.T) {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
 
-	// b independently also has a polled at-cap snapshot for ccz — a
-	// store-sourced block, wholly unrelated to the propagated credential
-	// park.
+	// b independently also has a polled at-cap snapshot for ccz.
 	reset := clock.now().Add(2 * time.Hour)
 	putUtil(t, store, p.byPool["b"], "ccz", 1.0, reset)
-	// Force the assert-once write so the block lives in c.exhausted too,
-	// matching how a real resolve would observe it.
 	if _, _, _, exhausted := p.Route("b"); exhausted {
-		t.Fatalf("pool b unexpectedly fully exhausted before clear")
+		t.Fatalf("pool b unexpectedly exhausted before clear")
 	}
 
 	if _, _, ok := p.ClearExhaustedNick("a", "ccz"); !ok {
 		t.Fatalf("ClearExhaustedNick(a, ccz) ok=false")
 	}
 
-	if until, ok := p.byPool["b"].exhaustedUntil("ccz"); !ok || until.Before(clock.now()) {
-		t.Errorf("pool b: ccz exhaustedUntil=%v ok=%v, want still blocked by the store-sourced window", until, ok)
+	if until, ok := p.byPool["b"].exhaustedUntil("ccz"); ok {
+		t.Errorf("pool b: ccz exhaustedUntil=%v ok=%v, want eligible after clear", until, ok)
 	}
 }
 

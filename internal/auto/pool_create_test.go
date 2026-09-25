@@ -32,7 +32,7 @@ func loadPoolsWithStore(t *testing.T, clock *fixedClock, store *quota.Store, env
 // env-declared pool does. The poller — now reading its pool set dynamically
 // (issue #202) — is what fills that store for poller-tracked members (Z.AI),
 // so without this the runtime pool would never detect exhaustion or fail over.
-func TestRuntimePool_failsOverOnStoreExhaustion(t *testing.T) {
+func TestRuntimePool_keepsStatuslessFullSnapshotEligible(t *testing.T) {
 	clock := newMoveClock()
 	store := quota.NewStore()
 	p := loadPoolsWithStore(t, clock, store, map[string]string{
@@ -51,7 +51,7 @@ func TestRuntimePool_failsOverOnStoreExhaustion(t *testing.T) {
 
 	// "a" is the active sticky (first member added). The store reports it fully
 	// consumed — util 1.0, no status: the shape a poller-tracked Z.AI member
-	// produces — so Route must fail the runtime pool over to the healthy "b".
+	// produces — it remains eligible until an upstream request fails.
 	c, ok := p.controller("rt")
 	if !ok {
 		t.Fatalf("controller(rt) not found")
@@ -65,8 +65,8 @@ func TestRuntimePool_failsOverOnStoreExhaustion(t *testing.T) {
 	if exhausted {
 		t.Fatalf("Route(rt): exhausted=true, want false (b is healthy)")
 	}
-	if b.Nick != "b" {
-		t.Errorf("Route(rt) picked %q, want b (a is store-exhausted)", b.Nick)
+	if b.Nick != "a" {
+		t.Errorf("Route(rt) picked %q, want a (full snapshot alone is not exhaustion)", b.Nick)
 	}
 }
 
