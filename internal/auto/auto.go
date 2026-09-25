@@ -415,9 +415,10 @@ type MemberStatus struct {
 
 // PoolStatus is the /_gateway/pool response for one pool.
 type PoolStatus struct {
-	Pool    string         `json:"pool"`
-	Active  string         `json:"active"`
-	Members []MemberStatus `json:"members"`
+	Pool        string         `json:"pool"`
+	Active      string         `json:"active"`
+	Concurrency int            `json:"concurrency"`
+	Members     []MemberStatus `json:"members"`
 
 	// Poller carries the per-pool liveness observation (issue #247):
 	// last successful poll, last error and its time, consecutive-
@@ -437,6 +438,7 @@ type PoolStatus struct {
 // all credentials redacted.
 type PoolConfigView struct {
 	Pool         string                 `json:"pool"`
+	Concurrency  int                    `json:"concurrency"`
 	BalanceMode  string                 `json:"balance_mode,omitempty"`
 	BalanceGap   float64                `json:"balance_gap,omitempty"`
 	BalanceDwell string                 `json:"balance_dwell,omitempty"`
@@ -973,7 +975,7 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 	for _, name := range names {
 		c := snapshot[name]
 		c.mu.Lock()
-		view := PoolConfigView{Pool: name}
+		view := PoolConfigView{Pool: name, Concurrency: c.workerConcurrency}
 
 		// Balance settings.
 		if c.balanceGap > 0 {
@@ -1462,37 +1464,12 @@ func (p *Pools) propagateCredentialPark(originPool, nick string, reset time.Time
 			continue
 		}
 		c.mu.Lock()
-		changed := c.invalidateWorkerNickLocked(nick)
+		changed := false
 		if existing, ok := c.credentialPark[nick]; !ok || reset.After(existing.reset) {
 			c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact}
 			changed = true
 		}
 		if changed {
-			c.notifyMutate()
-		}
-		c.mu.Unlock()
-	}
-}
-
-// invalidateSharedWorkerNick removes assignments to nick from every sibling
-// pool that contains the same account. Windowed quota failures are observed
-// through the shared quota store; clearing the affinity now also keeps a
-// worker from retaining a stale pin until its own next request.
-func (p *Pools) invalidateSharedWorkerNick(originPool, nick string) {
-	reg := p.CurrentRegistry()
-	for _, name := range reg.PoolNames() {
-		if name == originPool {
-			continue
-		}
-		if _, ok := reg.ResolveIn(name, nick); !ok {
-			continue
-		}
-		c, ok := p.controller(name)
-		if !ok {
-			continue
-		}
-		c.mu.Lock()
-		if c.invalidateWorkerNickLocked(nick) {
 			c.notifyMutate()
 		}
 		c.mu.Unlock()
@@ -1547,9 +1524,6 @@ func (p *Pools) propagateCredentialParkClear(originPool, nick string) []string {
 func (p *Pools) wireCredentialParkPropagation(c *Controller) {
 	c.propagatePark = func(nick string, reset time.Time, windowFact bool) {
 		p.propagateCredentialPark(c.name(), nick, reset, windowFact)
-	}
-	c.propagateWorkerInvalidation = func(nick string) {
-		p.invalidateSharedWorkerNick(c.name(), nick)
 	}
 	c.propagateParkClear = func(nick string) []string {
 		return p.propagateCredentialParkClear(c.name(), nick)
@@ -1727,14 +1701,19 @@ type Controller struct {
 	// clear. Accessed only under c.mu.
 	credentialPark map[string]credentialParkEntry
 
-	// workerAffinity stores hard per-worker assignments for this pool. A
-	// mapped worker bypasses global sticky, balance, and preempt decisions as
-	// long as its member remains available. Accessed only under c.mu.
+	// workerAffinity stores the last member assigned to each worker. Above
+	// concurrency 1, a mapped worker bypasses global sticky, balance, and
+	// preempt while its member remains in the current availability window.
+	// Stale targets are rechecked on that worker's next request. Accessed only
+	// under c.mu.
 	workerAffinity map[string]string
-	// workerCursor names the next effective-order member to inspect for a new
-	// affinity. Empty starts at the first healthy member. It is persisted by
-	// member nick so runtime order changes can reconcile it safely.
+	// workerCursor names the next member in the current window for a new
+	// assignment. It is persisted by member nick so order changes can
+	// reconcile it safely.
 	workerCursor string
+	// workerConcurrency is the configured number of available members allowed
+	// to serve namespaced workers. One delegates those requests to ResolveAuto.
+	workerConcurrency int
 
 	// propagatePark, when set, mirrors a just-asserted store-unrepresentable
 	// park into every sibling pool holding the same nick (issue #254 AC1/AC2).
@@ -1751,9 +1730,6 @@ type Controller struct {
 	// response can name them. Wired alongside propagatePark; nil for a bare
 	// Controller. Always called with c.mu NOT held.
 	propagateParkClear func(nick string) []string
-	// propagateWorkerInvalidation clears same-nick worker assignments in
-	// sibling pools after an upstream response makes this member unavailable.
-	propagateWorkerInvalidation func(nick string)
 }
 
 // NewController builds the sticky selector over the members of poolName
@@ -1805,6 +1781,7 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		reg:                reg,
 		members:            members,
 		priority:           effectiveOrder(reg.PoolPriority(poolName), nicks),
+		workerConcurrency:  reg.PoolConcurrency(poolName),
 		store:              store,
 		exhausted:          make(map[string]time.Time),
 		credentialPark:     make(map[string]credentialParkEntry),
@@ -1862,13 +1839,14 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 }
 
 // reconcileLocked re-derives this controller's membership, disabled set,
-// effective priority, and balance parameters from reg (the new authoritative
-// registry after a copy-on-write mutation, issue #198), preserving runtime
-// observation for members that survive: the sticky pointer, exhausted marks,
-// balance sequence, and the local-snapshot set. Observation for members no
-// longer in reg is pruned. If the active sticky member left the pool, the
-// pointer force-switches to the next healthy member (as on a removal/429); a
-// pool that just gained its first member anchors its pointer. Caller holds c.mu.
+// effective priority, balance parameters, and worker concurrency from reg
+// (the new authoritative registry after a copy-on-write mutation, issue #198).
+// It preserves runtime observations; stale worker targets, including removed
+// members, are rechecked on the worker's next request. Other per-member
+// observations for removed members are pruned. If the active sticky member
+// left the pool, the pointer force-switches to the next healthy member (as on
+// a removal/429); a pool that just gained its first member anchors its pointer.
+// Caller holds c.mu.
 func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	c.reg = reg
 	nicks := reg.PoolNicks(c.name()) // sorted
@@ -1889,6 +1867,7 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	c.members = members
 	c.disabled = disabled
 	c.priority = effectiveOrder(reg.PoolPriority(c.name()), nicks)
+	c.workerConcurrency = reg.PoolConcurrency(c.name())
 	c.balanceGap = reg.PoolBalanceGap(c.name())
 	c.balanceDwell = reg.PoolBalanceDwell(c.name())
 
@@ -1970,62 +1949,126 @@ func (c *Controller) workerOrderLocked() []string {
 	return c.allMemberNicksLocked()
 }
 
-// normalizeWorkerCursorLocked moves a stale or unavailable cursor to the
-// first currently healthy member. It returns whether the persisted cursor
-// changed. Caller holds c.mu.
+// workerWindowLocked returns the first workerConcurrency available members
+// in effective order. A value above the member count naturally includes all
+// available members. Caller holds c.mu.
+func (c *Controller) workerWindowLocked() []string {
+	if c.workerConcurrency <= 0 {
+		return nil
+	}
+	order := c.workerOrderLocked()
+	limit := c.workerConcurrency
+	if limit > len(order) {
+		limit = len(order)
+	}
+	window := make([]string, 0, limit)
+	for _, nick := range order {
+		if c.isUnavailableLocked(nick) {
+			continue
+		}
+		window = append(window, nick)
+		if len(window) == limit {
+			break
+		}
+	}
+	return window
+}
+
+// normalizeWorkerCursorLocked moves a cursor outside the current worker
+// window to its first member. It returns whether the persisted cursor changed.
+// Caller holds c.mu.
 func (c *Controller) normalizeWorkerCursorLocked() bool {
-	if c.workerCursor != "" && c.indexOf(c.workerCursor) >= 0 && !c.isUnavailableLocked(c.workerCursor) {
-		return false
+	window := c.workerWindowLocked()
+	for _, nick := range window {
+		if nick == c.workerCursor && c.workerCursor != "" {
+			return false
+		}
 	}
 	old := c.workerCursor
 	c.workerCursor = ""
-	for _, nick := range c.workerOrderLocked() {
-		if !c.isUnavailableLocked(nick) {
-			c.workerCursor = nick
-			break
-		}
+	if len(window) > 0 {
+		c.workerCursor = window[0]
 	}
 	return old != c.workerCursor
 }
 
-// nextWorkerMemberLocked returns the next healthy nick from the per-pool
-// worker cursor and the next healthy cursor after it. Caller holds c.mu.
+// nextWorkerMemberLocked returns the next nick from the current worker window
+// and the following window member as cursor. Caller holds c.mu.
 func (c *Controller) nextWorkerMemberLocked() (nick, nextCursor string, ok bool) {
-	order := c.workerOrderLocked()
-	if len(order) == 0 {
+	window := c.workerWindowLocked()
+	if len(window) == 0 {
 		return "", "", false
 	}
 	start := 0
-	for i, candidate := range order {
+	for i, candidate := range window {
 		if candidate == c.workerCursor {
 			start = i
 			break
 		}
 	}
-	for offset := 0; offset < len(order); offset++ {
-		i := (start + offset) % len(order)
-		candidate := order[i]
-		if c.isUnavailableLocked(candidate) {
-			continue
+	return window[start], window[(start+1)%len(window)], true
+}
+
+// nextWorkerReassignmentLocked chooses the least-used member in the current
+// window, breaking ties from the round-robin cursor. That keeps workers on
+// unaffected members in place while filling a newly opened fallback slot.
+// Caller holds c.mu.
+func (c *Controller) nextWorkerReassignmentLocked() (nick, nextCursor string, ok bool) {
+	window := c.workerWindowLocked()
+	if len(window) == 0 {
+		return "", "", false
+	}
+	counts := make(map[string]int, len(window))
+	for _, candidate := range window {
+		counts[candidate] = 0
+	}
+	for _, assigned := range c.workerAffinity {
+		if _, inWindow := counts[assigned]; inWindow {
+			counts[assigned]++
 		}
-		for step := 1; step <= len(order); step++ {
-			after := order[(i+step)%len(order)]
-			if !c.isUnavailableLocked(after) {
-				return candidate, after, true
-			}
+	}
+	min := int(^uint(0) >> 1)
+	for _, candidate := range window {
+		if counts[candidate] < min {
+			min = counts[candidate]
 		}
-		return candidate, candidate, true
+	}
+	start := 0
+	for i, candidate := range window {
+		if candidate == c.workerCursor {
+			start = i
+			break
+		}
+	}
+	for offset := 0; offset < len(window); offset++ {
+		i := (start + offset) % len(window)
+		if counts[window[i]] == min {
+			return window[i], window[(i+1)%len(window)], true
+		}
 	}
 	return "", "", false
 }
 
-// reconcileWorkerAffinityLocked drops assignments to members that were
-// removed, disabled, or made unavailable, and repairs a cursor that no longer
-// names a healthy member. Caller holds c.mu.
+// reconcileWorkerAffinityLocked clears all assignments at concurrency 1.
+// Above 1, it leaves stale member references for ResolveWorker to reassign on
+// that worker's next request, and repairs the round-robin cursor. A worker that
+// never returns can therefore leave a stale runtime entry in the state file.
+// Caller holds c.mu.
 func (c *Controller) reconcileWorkerAffinityLocked() bool {
 	changed := false
-	for worker, nick := range c.workerAffinity {
-		if !backend.IsValidWorkerNickname(worker) || c.indexOf(nick) < 0 || c.isUnavailableLocked(nick) {
+	if c.workerConcurrency <= 1 {
+		if len(c.workerAffinity) > 0 || c.workerCursor != "" {
+			clear(c.workerAffinity)
+			c.workerCursor = ""
+			changed = true
+		}
+		if changed {
+			c.notifyMutate()
+		}
+		return changed
+	}
+	for worker := range c.workerAffinity {
+		if !backend.IsValidWorkerNickname(worker) {
 			delete(c.workerAffinity, worker)
 			changed = true
 		}
@@ -2035,20 +2078,6 @@ func (c *Controller) reconcileWorkerAffinityLocked() bool {
 	}
 	if changed {
 		c.notifyMutate()
-	}
-	return changed
-}
-
-// invalidateWorkerNickLocked clears every worker assignment to nick after a
-// response or runtime observation makes that member unavailable. Caller holds
-// c.mu.
-func (c *Controller) invalidateWorkerNickLocked(nick string) bool {
-	changed := false
-	for worker, assigned := range c.workerAffinity {
-		if assigned == nick {
-			delete(c.workerAffinity, worker)
-			changed = true
-		}
 	}
 	return changed
 }
@@ -2164,22 +2193,31 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	return backend.Backend{}, 0, true
 }
 
-// ResolveWorker returns the hard-affinity member for worker. Existing healthy
-// assignments do not consult or move the global sticky pointer. A new or
-// invalidated assignment consumes the next healthy member in the per-pool
-// effective order. When no member is healthy, it reports the same pool-dry
-// wait without assigning an unavailable nick.
+// ResolveWorker routes worker through global sticky behavior when concurrency
+// is 1. Above 1, workers keep hard affinity within the first N available
+// members in effective order. When no member is available, it reports the
+// same pool-dry wait without assigning an unavailable nick.
 func (c *Controller) ResolveWorker(worker string) (backend.Backend, time.Duration, bool) {
 	if !backend.IsValidWorkerNickname(worker) {
 		return backend.Backend{}, 0, true
 	}
 	c.mu.Lock()
+	if c.workerConcurrency <= 1 {
+		c.mu.Unlock()
+		return c.ResolveAuto()
+	}
 	defer c.mu.Unlock()
 
 	c.clearExpiredLocked()
 	mutated := c.normalizeWorkerCursorLocked()
+	window := c.workerWindowLocked()
+	inWindow := make(map[string]bool, len(window))
+	for _, nick := range window {
+		inWindow[nick] = true
+	}
+	reassignment := false
 	if nick, exists := c.workerAffinity[worker]; exists {
-		if c.indexOf(nick) >= 0 && !c.isUnavailableLocked(nick) {
+		if inWindow[nick] {
 			if b, ok := c.backendByNickLocked(nick); ok {
 				if mutated {
 					c.notifyMutate()
@@ -2189,9 +2227,17 @@ func (c *Controller) ResolveWorker(worker string) (backend.Backend, time.Duratio
 		}
 		delete(c.workerAffinity, worker)
 		mutated = true
+		reassignment = true
 	}
 
-	if nick, nextCursor, ok := c.nextWorkerMemberLocked(); ok {
+	var nick, nextCursor string
+	var ok bool
+	if reassignment {
+		nick, nextCursor, ok = c.nextWorkerReassignmentLocked()
+	} else {
+		nick, nextCursor, ok = c.nextWorkerMemberLocked()
+	}
+	if ok {
 		c.workerAffinity[worker] = nick
 		c.workerCursor = nextCursor
 		if b, ok := c.backendByNickLocked(nick); ok {
@@ -2486,7 +2532,7 @@ func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller, pollerMap
 		}
 		members = append(members, ms)
 	}
-	out := PoolStatus{Pool: c.name(), Active: c.curNick, Members: members}
+	out := PoolStatus{Pool: c.name(), Active: c.curNick, Concurrency: c.workerConcurrency, Members: members}
 	// Per-pool poller liveness (issue #247, review of #267): the gate
 	// is config-based (the active backend's BaseURL matches a
 	// registered proprietary provider), not the poller's state map.
@@ -2612,16 +2658,19 @@ func (c *Controller) loadCredentialPark(credentialPark map[string]CredentialPark
 	}
 }
 
-// loadWorkerAffinity restores valid worker assignments after routing and
-// credential parks have been loaded. It retains assignments to healthy
-// non-sticky members and drops invalid identities or members that are missing,
-// disabled, or currently unavailable.
+// loadWorkerAffinity restores worker identities after routing and credential
+// parks have been loaded. Assignments are rechecked against the current window
+// on first use, so stale targets remain available as reassign markers.
 func (c *Controller) loadWorkerAffinity(affinity map[string]string, cursor string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.workerAffinity = make(map[string]string, len(affinity))
+	if c.workerConcurrency <= 1 {
+		c.workerCursor = ""
+		return
+	}
 	for worker, nick := range affinity {
-		if !backend.IsValidWorkerNickname(worker) || c.indexOf(nick) < 0 || c.isUnavailableLocked(nick) {
+		if !backend.IsValidWorkerNickname(worker) || nick == "" {
 			continue
 		}
 		c.workerAffinity[worker] = nick
@@ -2648,7 +2697,7 @@ func (c *Controller) persistState() PoolPersistState {
 	if len(c.workerAffinity) > 0 {
 		affinity := make(map[string]string, len(c.workerAffinity))
 		for worker, nick := range c.workerAffinity {
-			if backend.IsValidWorkerNickname(worker) && c.indexOf(nick) >= 0 && !c.isUnavailableLocked(nick) {
+			if backend.IsValidWorkerNickname(worker) && nick != "" {
 				affinity[worker] = nick
 			}
 		}
@@ -3255,7 +3304,6 @@ func (c *Controller) record429WithSource(nick string, reset time.Time, storeUnre
 	c.mu.Lock()
 
 	c.exhausted[nick] = reset
-	c.invalidateWorkerNickLocked(nick)
 	if storeUnrepresentable {
 		c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact}
 	}
@@ -3278,9 +3326,6 @@ func (c *Controller) record429WithSource(nick string, reset time.Time, storeUnre
 	}
 	c.mu.Unlock()
 
-	if c.propagateWorkerInvalidation != nil {
-		c.propagateWorkerInvalidation(nick)
-	}
 	if storeUnrepresentable && c.propagatePark != nil {
 		c.propagatePark(nick, reset, windowFact)
 	}

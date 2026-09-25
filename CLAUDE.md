@@ -53,6 +53,7 @@ Env grammar (`internal/backend`):
 - `AQG_POOL_<POOL>_BACKEND_<NICK>=<cred>[|<url>]` — a member; `|<url>` overrides the pool's upstream
 - `AQG_POOL_<POOL>_PRIORITY=<nick>,<nick>` — ordered preference (vs. default random start + round-robin failover)
 - `AQG_POOL_<POOL>_BALANCE=lead` + `BALANCE_GAP` + `BALANCE_DWELL` — opt-in utilization-balanced routing
+- `AQG_POOL_<POOL>_CONCURRENCY=<int>` — namespaced worker concurrency; defaults to 1 and cannot exceed 1 with `BALANCE=lead`
 
 Pool/nick names are normalized (lowercased, `_`→`-`): `AQG_POOL_Z_AI_BACKEND_KEY_A`
 is pool `z-ai`, member `key-a`, selected by sending `z-ai` as the bearer token.
@@ -86,10 +87,13 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
 3. The router returns **403 unknown selector** (fail closed, no upstream
    round-trip), **503 + Retry-After** (whole pool exhausted — wait until
    the soonest member resets; 503 not 429 so Claude Code retries and
-   auto-resumes rather than ending the turn, issue #203), or the global
-   sticky backend / healthy member assigned to that worker, stored on the
-   request context. Worker affinity ignores balance and preemption and is
-   reassigned only when its member becomes unavailable.
+   auto-resumes rather than ending the turn, issue #203), or the selected
+   backend stored on the request context. With concurrency 1, worker routes
+   use the same global sticky, failover, balance, and preempt behavior as
+   ordinary requests and store no assignment. Above 1, workers are assigned
+   round-robin within the first N available members in effective priority
+   order (or sorted nick order); a worker is reassigned on its next request
+   when its member is unavailable or outside that window.
 4. `proxy.New`'s director reads the resolved backend, picks the auth
    scheme by credential prefix (`sk-ant-oat*`→`Bearer`+`oauth-2025-04-20`
    beta; `sk-ant-api*`→`x-api-key`; else `Bearer` no beta), and forwards

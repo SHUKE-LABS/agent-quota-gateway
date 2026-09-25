@@ -136,6 +136,34 @@ func TestConfigEndpoint_redactsCredentials(t *testing.T) {
 	}
 }
 
+func TestConcurrencyAppearsInPoolAndConfigViews(t *testing.T) {
+	scrubPoolEnv(t)
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "cred-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "cred-b")
+	t.Setenv("AQG_POOL_AUTO_CONCURRENCY", "2")
+	pools := loadPools(t)
+
+	configServer := configMux(t, pools)
+	if got := fetchPool(t, configServer.URL, "auto").Concurrency; got != 2 {
+		t.Errorf("/_gateway/config concurrency = %d, want 2", got)
+	}
+
+	poolServer := httptest.NewServer(poolHandler(quota.NewStore(), pools, nil))
+	t.Cleanup(poolServer.Close)
+	resp, err := http.Get(poolServer.URL + "/_gateway/pool")
+	if err != nil {
+		t.Fatalf("get pool view: %v", err)
+	}
+	defer resp.Body.Close()
+	var views []auto.PoolStatus
+	if err := json.NewDecoder(resp.Body).Decode(&views); err != nil {
+		t.Fatalf("decode pool view: %v", err)
+	}
+	if len(views) != 1 || views[0].Pool != "auto" || views[0].Concurrency != 2 {
+		t.Errorf("/_gateway/pool views = %+v, want auto concurrency 2", views)
+	}
+}
+
 // TestCreatePoolEndpoint drives POST /_gateway/pool: a valid request returns
 // 201 with the normalized pool name, the pool then surfaces in GET
 // /_gateway/config, and a duplicate name returns 409. base_url is no longer

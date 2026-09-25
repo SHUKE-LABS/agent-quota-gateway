@@ -38,6 +38,7 @@ import (
 //	AQG_POOL_<POOL>_BALANCE=lead                   // opt-in balanced routing (optional)
 //	AQG_POOL_<POOL>_BALANCE_GAP=<fraction>         // min lead gap to trigger a switch
 //	AQG_POOL_<POOL>_BALANCE_DWELL=<duration>       // min time between balance switches
+//	AQG_POOL_<POOL>_CONCURRENCY=<int>              // max members serving worker namespaces (default 1)
 //
 // <POOL> and <NICK> are normalized (see normalizeName): lowercased, with
 // underscores folded to hyphens, so AQG_POOL_Z_AI_BACKEND_KEY_A is
@@ -61,6 +62,7 @@ const (
 	balanceSuffix      = "_BALANCE"
 	balanceGapSuffix   = "_BALANCE_GAP"
 	balanceDwellSuffix = "_BALANCE_DWELL"
+	concurrencySuffix  = "_CONCURRENCY"
 )
 
 // priorityListSep separates nicks in an AQG_POOL_<POOL>_PRIORITY value.
@@ -143,7 +145,8 @@ type Spec struct {
 // keyed by nick (any string; normalized the same way env vars are).
 // Balance is the routing mode; only "lead" is supported. Priority is the
 // ordered preference list (highest first). BalanceGap and BalanceDwell
-// tune balanced routing; 0 means use the default.
+// tune balanced routing; 0 means use the default. A nil Concurrency means
+// the default of 1; a non-nil value must be at least 1.
 type PoolSpec struct {
 	BaseURL      string
 	Members      map[string]MemberSpec
@@ -151,6 +154,7 @@ type PoolSpec struct {
 	Balance      string
 	BalanceGap   float64
 	BalanceDwell Duration // Duration is a string wrapper for time.Duration parsing
+	Concurrency  *int
 }
 
 // MemberSpec is one backend's credential and optional per-member base URL
@@ -226,6 +230,10 @@ type pool struct {
 	// pool. Set to defaultBalanceDwell when AQG_POOL_<POOL>_BALANCE_DWELL
 	// is absent.
 	balanceDwell time.Duration
+
+	// concurrency bounds how many available members may serve worker namespaces.
+	// One uses the global sticky route.
+	concurrency int
 }
 
 // Load builds a Registry from AQG_POOL_* environment variables, using
@@ -261,6 +269,8 @@ func BuildFromSpec(spec Spec, defaultBaseURL string) (*Registry, error) {
 		poolBalanceGapOrigin:   make(map[string]string),
 		poolBalanceDwell:       make(map[string]time.Duration),
 		poolBalanceDwellOrigin: make(map[string]string),
+		poolConcurrency:        make(map[string]int),
+		poolConcurrencyOrigin:  make(map[string]string),
 		originKey:              make(map[string]string),
 		declaredPools:          make(map[string]bool),
 	}
@@ -374,6 +384,10 @@ func BuildFromSpec(spec Spec, defaultBaseURL string) (*Registry, error) {
 			p.poolBalanceDwell[poolName] = poolSpec.BalanceDwell.D
 			p.poolBalanceDwellOrigin[poolName] = fmt.Sprintf("pools.%s.balance_dwell", poolKey)
 		}
+		if poolSpec.Concurrency != nil {
+			p.poolConcurrency[poolName] = *poolSpec.Concurrency
+			p.poolConcurrencyOrigin[poolName] = fmt.Sprintf("pools.%s.concurrency", poolKey)
+		}
 	}
 
 	// Spec path (config file + runtime mutations): an empty registry is a valid
@@ -398,11 +412,11 @@ type rawMember struct {
 // a Registry.
 type parsed struct {
 	members []rawMember
-	// declaredPools lists every pool name the source declared, including a
-	// pool with zero members. The env path leaves it nil (an env pool always
-	// has at least one member); the file/spec path fills it from every pool
-	// key so an operator-created-but-empty pool (issue #198, folding in the
-	// old AddedPools) materializes in the Registry instead of vanishing.
+	// declaredPools lists pool names declared without members. The file/spec
+	// path records every pool key so an operator-created-but-empty pool (issue
+	// #198, folding in the old AddedPools) materializes instead of vanishing.
+	// Env pools are materialized from their members; auxiliary settings cannot
+	// create a pool by themselves.
 	declaredPools          map[string]bool
 	originKey              map[string]string // pool/nick -> origin key for errors
 	poolBaseURL            map[string]string // pool -> declared default upstream
@@ -415,6 +429,8 @@ type parsed struct {
 	poolBalanceGapOrigin   map[string]string
 	poolBalanceDwell       map[string]time.Duration
 	poolBalanceDwellOrigin map[string]string
+	poolConcurrency        map[string]int
+	poolConcurrencyOrigin  map[string]string
 }
 
 // loadFrom is Load's testable core: it takes "KEY=VALUE" entries in the
@@ -443,7 +459,10 @@ func loadFromWithRequireNonEmpty(environ []string, defaultBaseURL string, requir
 		poolBalanceGapOrigin:   make(map[string]string),
 		poolBalanceDwell:       make(map[string]time.Duration),
 		poolBalanceDwellOrigin: make(map[string]string),
+		poolConcurrency:        make(map[string]int),
+		poolConcurrencyOrigin:  make(map[string]string),
 		originKey:              make(map[string]string),
+		declaredPools:          make(map[string]bool),
 	}
 
 	for _, kv := range environ {
@@ -520,6 +539,23 @@ func loadFromWithRequireNonEmpty(environ []string, defaultBaseURL string, requir
 			continue
 		}
 
+		if poolPart, ok := strings.CutSuffix(rest, concurrencySuffix); ok {
+			poolName := normalizeName(poolPart)
+			if poolName == "" {
+				return nil, fmt.Errorf("backend: %s has an empty pool name", key)
+			}
+			if prev, dup := p.poolConcurrencyOrigin[poolName]; dup {
+				return nil, fmt.Errorf("backend: %s and %s both set the concurrency for pool %q", prev, key, poolName)
+			}
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return nil, fmt.Errorf("backend: %s for pool %q must be an integer >= 1", key, poolName)
+			}
+			p.poolConcurrencyOrigin[poolName] = key
+			p.poolConcurrency[poolName] = n
+			continue
+		}
+
 		// _BALANCE_GAP and _BALANCE_DWELL must be checked before _BALANCE
 		// because _BALANCE would otherwise match any key ending in _BALANCE
 		// (it does not — CutSuffix requires an exact suffix — but the
@@ -574,7 +610,7 @@ func loadFromWithRequireNonEmpty(environ []string, defaultBaseURL string, requir
 			continue
 		}
 
-		return nil, fmt.Errorf("backend: %s is not a recognised AQG_POOL_ key (expected suffixes: _BASE_URL, _BACKEND_<NICK>, _PRIORITY, _BALANCE, _BALANCE_GAP, _BALANCE_DWELL)", key)
+		return nil, fmt.Errorf("backend: %s is not a recognised AQG_POOL_ key (expected suffixes: _BASE_URL, _BACKEND_<NICK>, _PRIORITY, _BALANCE, _BALANCE_GAP, _BALANCE_DWELL, _CONCURRENCY)", key)
 	}
 
 	// Env cold-start path: a fully empty environment is ordinarily a
@@ -590,9 +626,9 @@ func loadFromWithRequireNonEmpty(environ []string, defaultBaseURL string, requir
 // fully validated Registry, or an error.
 //
 // All semantic checks live here: empty credential, invalid balance mode,
-// non-positive gap/dwell, base URL validity, memberless-pool base URL,
-// priority names a non-member, gap/dwell without balance, priority+balance
-// exclusion.
+// concurrency below one, non-positive gap/dwell, base URL validity,
+// memberless-pool base URL, priority names a non-member, gap/dwell without
+// balance, priority+balance exclusion, and balance+concurrency exclusion.
 func buildRegistry(defaultBaseURL string, p parsed, requireNonEmpty bool) (*Registry, error) {
 	// On the env cold-start path a configuration with no pools and no members
 	// at all is an error (the operator forgot to configure anything; an empty
@@ -605,6 +641,24 @@ func buildRegistry(defaultBaseURL string, p parsed, requireNonEmpty bool) (*Regi
 	// misconfiguration. Routing then fails closed with 403 unknown selector.
 	if requireNonEmpty && len(p.members) == 0 && len(p.declaredPools) == 0 {
 		return nil, fmt.Errorf("backend: no backends configured")
+	}
+	for poolName, concurrency := range p.poolConcurrency {
+		if concurrency < 1 {
+			return nil, fmt.Errorf("backend: %s for pool %q must be an integer >= 1", p.poolConcurrencyOrigin[poolName], poolName)
+		}
+		if p.declaredPools[poolName] {
+			continue // Explicit file/spec pool; zero members are valid there.
+		}
+		hasMembers := false
+		for _, member := range p.members {
+			if member.pool == poolName {
+				hasMembers = true
+				break
+			}
+		}
+		if !hasMembers {
+			return nil, fmt.Errorf("backend: %s sets concurrency for pool %q, which has no backends", p.poolConcurrencyOrigin[poolName], poolName)
+		}
 	}
 
 	// Check empty credentials and normalize member origins for errors
@@ -657,7 +711,11 @@ func buildRegistry(defaultBaseURL string, p parsed, requireNonEmpty bool) (*Regi
 			if u, ok := p.poolBaseURL[name]; ok {
 				base = u
 			}
-			pl = &pool{name: name, byNick: make(map[string]Backend), baseURL: base}
+			concurrency := 1
+			if configured, ok := p.poolConcurrency[name]; ok {
+				concurrency = configured
+			}
+			pl = &pool{name: name, byNick: make(map[string]Backend), baseURL: base, concurrency: concurrency}
 			pools[name] = pl
 		}
 		return pl
@@ -768,6 +826,10 @@ func buildRegistry(defaultBaseURL string, p parsed, requireNonEmpty bool) (*Regi
 		if len(pool.priority) > 0 {
 			return nil, fmt.Errorf("backend: pool %q declares both %s and %s; balanced mode and priority routing are mutually exclusive",
 				poolName, p.poolBalanceOrigin[poolName], p.poolPriorityOrigin[poolName])
+		}
+		if pool.concurrency > 1 {
+			return nil, fmt.Errorf("backend: pool %q declares both %s and %s; concurrency above 1 is incompatible with BALANCE=lead",
+				poolName, p.poolBalanceOrigin[poolName], p.poolConcurrencyOrigin[poolName])
 		}
 		pool.balance = mode
 		if gap, ok := p.poolBalanceGap[poolName]; ok {
@@ -898,6 +960,16 @@ func (r *Registry) PoolPriority(poolName string) []string {
 	return out
 }
 
+// PoolConcurrency returns the configured worker concurrency for poolName.
+// It is always at least 1; an unknown pool also returns the default 1.
+func (r *Registry) PoolConcurrency(poolName string) int {
+	p, ok := r.pools[normalizeName(poolName)]
+	if !ok {
+		return 1
+	}
+	return p.concurrency
+}
+
 // PoolBalanceGap returns the minimum lead difference the pool requires
 // before switching the active member in balanced mode. Returns 0 when the
 // pool is not in balanced mode or is unknown — the auto controller treats 0
@@ -945,6 +1017,10 @@ func (r *Registry) Spec() Spec {
 		ps := PoolSpec{
 			Members: make(map[string]MemberSpec, len(p.byNick)),
 			Balance: p.balance,
+		}
+		if p.concurrency > 1 {
+			concurrency := p.concurrency
+			ps.Concurrency = &concurrency
 		}
 		// A pool whose effective base URL is just the gateway default is
 		// emitted with an empty base_url (inherits): it keeps the shape clean

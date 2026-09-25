@@ -82,6 +82,7 @@ func TestLoadFile_success(t *testing.T) {
 					"b": {"credential": "sk-ant-oat-bbb"}
 				},
 				"priority": ["a", "b"],
+				"concurrency": 3,
 				"balance": "",
 				"balance_gap": 0,
 				"balance_dwell": ""
@@ -121,11 +122,33 @@ func TestLoadFile_success(t *testing.T) {
 	if got := registry.PoolPriority("auto"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
 		t.Errorf("PoolPriority(auto) = %v, want [a b]", got)
 	}
+	if got := registry.PoolConcurrency("auto"); got != 3 {
+		t.Errorf("PoolConcurrency(auto) = %d, want 3", got)
+	}
+	if got := registry.PoolConcurrency("balanced"); got != 1 {
+		t.Errorf("PoolConcurrency(balanced) = %d, want default 1", got)
+	}
 	if got := registry.PoolBalanceGap("balanced"); got != 0.2 {
 		t.Errorf("PoolBalanceGap(balanced) = %v, want 0.2", got)
 	}
 	if got := registry.PoolBalanceDwell("balanced"); got != 10*time.Minute {
 		t.Errorf("PoolBalanceDwell(balanced) = %v, want 10m", got)
+	}
+}
+
+func TestLoadFile_concurrencyRejectsInvalidValuesWithPoolName(t *testing.T) {
+	for _, value := range []string{`"not-an-int"`, `0`, `-1`, `1.5`} {
+		t.Run(value, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "aqg.json")
+			content := `{"pools":{"auto":{"concurrency":` + value + `,"members":{"a":{"credential":"cred-a"}}}}}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err := LoadFile(path)
+			if err == nil || !strings.Contains(err.Error(), "pools.auto.concurrency") {
+				t.Errorf("LoadFile error = %v, want pools.auto.concurrency error", err)
+			}
+		})
 	}
 }
 

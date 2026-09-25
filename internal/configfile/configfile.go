@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
@@ -99,6 +100,17 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 	// Map DTO to backend.Spec.
 	spec := backend.Spec{Pools: make(map[string]backend.PoolSpec, len(dto.Pools))}
 	for poolKey, poolDTO := range dto.Pools {
+		var concurrency *int
+		if len(poolDTO.Concurrency) > 0 {
+			var value int
+			if err := json.Unmarshal(poolDTO.Concurrency, &value); err != nil {
+				return config.Config{}, nil, fmt.Errorf("config file %q: pools.%s.concurrency must be an integer >= 1: %w", path, poolKey, err)
+			}
+			if value < 1 {
+				return config.Config{}, nil, fmt.Errorf("config file %q: pools.%s.concurrency must be an integer >= 1", path, poolKey)
+			}
+			concurrency = &value
+		}
 		poolSpec := backend.PoolSpec{
 			BaseURL:      poolDTO.BaseURL,
 			Members:      make(map[string]backend.MemberSpec, len(poolDTO.Members)),
@@ -106,6 +118,7 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 			Balance:      poolDTO.Balance,
 			BalanceGap:   poolDTO.BalanceGap,
 			BalanceDwell: backend.Duration{D: poolDTO.BalanceDwell.D},
+			Concurrency:  concurrency,
 		}
 		for nickKey, memberDTO := range poolDTO.Members {
 			poolSpec.Members[nickKey] = backend.MemberSpec{
@@ -166,6 +179,9 @@ func Marshal(cfg config.Config, reg *backend.Registry) ([]byte, error) {
 			Balance:      ps.Balance,
 			BalanceGap:   ps.BalanceGap,
 			BalanceDwell: backend.Duration{D: ps.BalanceDwell.D},
+		}
+		if ps.Concurrency != nil {
+			pd.Concurrency = json.RawMessage(strconv.Itoa(*ps.Concurrency))
 		}
 		if ps.BaseURL != cfg.AnthropicBaseURL {
 			pd.BaseURL = ps.BaseURL
@@ -440,6 +456,7 @@ type poolDTO struct {
 	Balance      string               `json:"balance"`
 	BalanceGap   float64              `json:"balance_gap"`
 	BalanceDwell backend.Duration     `json:"balance_dwell"`
+	Concurrency  json.RawMessage      `json:"concurrency,omitempty"`
 }
 
 // memberDTO is one backend's credential and optional base URL override.

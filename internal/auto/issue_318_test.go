@@ -14,9 +14,30 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
+func workerRegistryWithConcurrency(t *testing.T, concurrency int, nicks ...string) *backend.Registry {
+	t.Helper()
+	reg := testRegistry(t, nicks...)
+	spec := reg.Spec()
+	pool := spec.Pools["auto"]
+	pool.Concurrency = &concurrency
+	spec.Pools["auto"] = pool
+	updated, err := backend.BuildFromSpec(spec, testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("BuildFromSpec with concurrency: %v", err)
+	}
+	return updated
+}
+
+func newWorkerPriorityController(t *testing.T, concurrency, start int, clock *fixedClock, logOut io.Writer, priorityCSV string, nicks ...string) *Controller {
+	t.Helper()
+	c := newPriorityController(t, start, clock, logOut, priorityCSV, nicks...)
+	c.workerConcurrency = concurrency
+	return c
+}
+
 func TestWorkerAffinity_firstUseRoundRobinAndHardAffinity(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	p := NewPools(testRegistry(t, "c", "a", "b"), nil, clock.now, io.Discard)
+	p := NewPools(workerRegistryWithConcurrency(t, 3, "c", "a", "b"), nil, clock.now, io.Discard)
 
 	for _, tc := range []struct{ worker, want string }{{"agent-a", "a"}, {"agent-b", "b"}, {"agent-c", "c"}} {
 		b, _, ok, exhausted := p.RouteWorker("auto", tc.worker)
@@ -35,7 +56,7 @@ func TestWorkerAffinity_firstUseRoundRobinAndHardAffinity(t *testing.T) {
 
 func TestWorkerAffinity_concurrentFirstRequestsConverge(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	p := NewPools(testRegistry(t, "a", "b", "c"), nil, clock.now, io.Discard)
+	p := NewPools(workerRegistryWithConcurrency(t, 3, "a", "b", "c"), nil, clock.now, io.Discard)
 	const sameWorkerRequests = 64
 	results := make(chan string, sameWorkerRequests+2)
 	var wg sync.WaitGroup
@@ -95,7 +116,7 @@ func TestWorkerAffinity_concurrentFirstRequestsConverge(t *testing.T) {
 
 func TestWorkerAffinity_preemptMovesOnlyGlobalSticky(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	c := newPriorityController(t, -1, clock, io.Discard, "a,b", "a", "b")
+	c := newWorkerPriorityController(t, 2, -1, clock, io.Discard, "a,b", "a", "b")
 	if b, _, exhausted := c.ResolveWorker("agent-a"); exhausted || b.Nick != "a" {
 		t.Fatalf("agent-a initial assignment = %q, exhausted=%v, want a", b.Nick, exhausted)
 	}
@@ -118,6 +139,7 @@ func TestWorkerAffinity_balanceMovesOnlyGlobalSticky(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
 	c := newBalanceController(t, 0, clock, 0.15, 0, store, "a", "b")
+	c.workerConcurrency = 2
 	if b, _, exhausted := c.ResolveWorker("agent-a"); exhausted || b.Nick != "a" {
 		t.Fatalf("agent-a initial assignment = %q, exhausted=%v, want a", b.Nick, exhausted)
 	}
@@ -138,7 +160,7 @@ func TestWorkerAffinity_balanceMovesOnlyGlobalSticky(t *testing.T) {
 
 func TestWorkerAffinity_unavailableMemberReassignsOnlyAffectedWorker(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	p := NewPools(testRegistry(t, "a", "b"), nil, clock.now, io.Discard)
+	p := NewPools(workerRegistryWithConcurrency(t, 2, "a", "b"), nil, clock.now, io.Discard)
 	for _, tc := range []struct {
 		worker string
 		want   string
@@ -162,7 +184,7 @@ func TestWorkerAffinity_unavailableMemberReassignsOnlyAffectedWorker(t *testing.
 func TestWorkerAffinity_storeQuotaExhaustionReassignsOnlyAffectedWorker(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
-	p := NewPools(testRegistry(t, "a", "b"), store, clock.now, io.Discard)
+	p := NewPools(workerRegistryWithConcurrency(t, 2, "a", "b"), store, clock.now, io.Discard)
 	for _, tc := range []struct {
 		worker string
 		want   string
@@ -186,7 +208,7 @@ func TestWorkerAffinity_realFailureInvalidatesAllMappingsToNick(t *testing.T) {
 	for _, status := range []int{http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-			p := NewPools(testRegistry(t, "a", "b"), nil, clock.now, io.Discard)
+			p := NewPools(workerRegistryWithConcurrency(t, 2, "a", "b"), nil, clock.now, io.Discard)
 			for _, worker := range []string{"agent-one", "agent-two", "agent-three"} {
 				if _, _, ok, exhausted := p.RouteWorker("auto", worker); !ok || exhausted {
 					t.Fatalf("initial assignment for %s failed", worker)
@@ -204,17 +226,10 @@ func TestWorkerAffinity_realFailureInvalidatesAllMappingsToNick(t *testing.T) {
 			if err := p.ModifyResponse(resp); err != nil {
 				t.Fatalf("ModifyResponse: %v", err)
 			}
-			c := p.byPool["auto"]
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			if _, ok := c.workerAffinity["agent-one"]; ok {
-				t.Error("mapping to failed nick a was retained for agent-one")
-			}
-			if _, ok := c.workerAffinity["agent-three"]; ok {
-				t.Error("mapping to failed nick a was retained for agent-three")
-			}
-			if got := c.workerAffinity["agent-two"]; got != "b" {
-				t.Errorf("unrelated mapping agent-two=%q, want b", got)
+			for _, worker := range []string{"agent-one", "agent-two", "agent-three"} {
+				if got, _, _, _ := p.RouteWorker("auto", worker); got.Nick != "b" {
+					t.Errorf("%s after real failure = %q, want reassignment to b", worker, got.Nick)
+				}
 			}
 		})
 	}
@@ -227,13 +242,16 @@ func TestWorkerAffinity_sharedCredentialFailureInvalidatesSiblingPool(t *testing
 			scrubPoolEnv(t)
 			t.Setenv(backend.EnvPrefix+"ONE_BACKEND_A", "cred-a")
 			t.Setenv(backend.EnvPrefix+"ONE_BACKEND_B", "cred-b")
+			t.Setenv(backend.EnvPrefix+"ONE_CONCURRENCY", "2")
 			t.Setenv(backend.EnvPrefix+"TWO_BACKEND_A", "cred-a")
 			t.Setenv(backend.EnvPrefix+"TWO_BACKEND_C", "cred-c")
+			t.Setenv(backend.EnvPrefix+"TWO_CONCURRENCY", "2")
 			reg, err := backend.Load(testDefaultBaseURL)
 			if err != nil {
 				t.Fatalf("backend.Load: %v", err)
 			}
-			p := NewPools(reg, nil, clock.now, io.Discard)
+			store := quota.NewStore()
+			p := NewPools(reg, store, clock.now, io.Discard)
 			if got, _, _, _ := p.RouteWorker("one", "agent-shared"); got.Nick != "a" {
 				t.Fatalf("pool one assignment=%q, want a", got.Nick)
 			}
@@ -255,15 +273,16 @@ func TestWorkerAffinity_sharedCredentialFailureInvalidatesSiblingPool(t *testing
 			if err := p.ModifyResponse(resp); err != nil {
 				t.Fatalf("ModifyResponse: %v", err)
 			}
-
-			c := p.byPool["two"]
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			if _, ok := c.workerAffinity["agent-shared"]; ok {
-				t.Error("sibling pool retained worker affinity to failed shared nick a")
+			if status == http.StatusTooManyRequests {
+				reset := clock.now().Add(time.Hour)
+				store.Put("a", quota.Snapshot{Unified5hStatus: "rejected", Unified5hReset: &reset, AsOf: clock.now()})
 			}
-			if got := c.workerAffinity["agent-other"]; got != "c" {
-				t.Errorf("sibling unrelated mapping=%q, want c", got)
+
+			if got, _, _, _ := p.RouteWorker("two", "agent-shared"); got.Nick != "c" {
+				t.Errorf("sibling worker after shared failure = %q, want c", got.Nick)
+			}
+			if got, _, _, _ := p.RouteWorker("two", "agent-other"); got.Nick != "c" {
+				t.Errorf("sibling unaffected worker moved to %q, want c", got.Nick)
 			}
 		})
 	}
@@ -272,7 +291,7 @@ func TestWorkerAffinity_sharedCredentialFailureInvalidatesSiblingPool(t *testing
 func TestWorkerAffinity_transientFailuresRetainMapping(t *testing.T) {
 	t.Run("native Anthropic 529", func(t *testing.T) {
 		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-		p := NewPools(testRegistry(t, "a", "b"), nil, clock.now, io.Discard)
+		p := NewPools(workerRegistryWithConcurrency(t, 2, "a", "b"), nil, clock.now, io.Discard)
 		if b, _, _, _ := p.RouteWorker("auto", "agent-a"); b.Nick != "a" {
 			t.Fatalf("initial assignment=%q, want a", b.Nick)
 		}
@@ -288,6 +307,7 @@ func TestWorkerAffinity_transientFailuresRetainMapping(t *testing.T) {
 	t.Run("Codex reached-type sub-cap 429", func(t *testing.T) {
 		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 		c := codexController(t, clock, io.Discard, nil, "a", "b")
+		c.workerConcurrency = 2
 		if b, _, exhausted := c.ResolveWorker("agent-a"); exhausted || b.Nick != "a" {
 			t.Fatalf("initial assignment=%q, exhausted=%v, want a", b.Nick, exhausted)
 		}
@@ -306,7 +326,7 @@ func TestWorkerAffinity_transientFailuresRetainMapping(t *testing.T) {
 
 func TestWorkerAffinity_persistsAndDropsUnavailableAssignments(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	reg := testRegistry(t, "a", "b")
+	reg := workerRegistryWithConcurrency(t, 2, "a", "b")
 	p := NewPools(reg, nil, clock.now, io.Discard)
 	if got, _, _, _ := p.RouteWorker("auto", "agent-a"); got.Nick != "a" {
 		t.Fatalf("agent-a initial assignment=%q, want a", got.Nick)
@@ -337,10 +357,13 @@ func TestWorkerAffinity_persistsAndDropsUnavailableAssignments(t *testing.T) {
 	}}
 	c3 := NewPools(reg, nil, clock.now, io.Discard)
 	c3.LoadPersistState(state)
+	if got, _, _, _ := c3.RouteWorker("auto", "agent-a"); got.Nick != "b" {
+		t.Errorf("restored stale agent-a assignment=%q, want reassignment to b", got.Nick)
+	}
 	c := c3.byPool["auto"]
 	c.mu.Lock()
-	if _, ok := c.workerAffinity["agent-a"]; ok {
-		t.Error("load retained mapping to currently unavailable member a")
+	if got := c.workerAffinity["agent-a"]; got != "b" {
+		t.Errorf("reassigned agent-a mapping=%q, want b", got)
 	}
 	if got := c.workerAffinity["agent-b"]; got != "b" {
 		t.Errorf("load changed healthy mapping agent-b=%q, want b", got)
@@ -353,7 +376,7 @@ func TestWorkerAffinity_persistsAndDropsUnavailableAssignments(t *testing.T) {
 
 func TestWorkerAffinity_runtimeDisableReconcilesAssignments(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	p := NewPools(testRegistry(t, "a", "b"), nil, clock.now, io.Discard)
+	p := NewPools(workerRegistryWithConcurrency(t, 2, "a", "b"), nil, clock.now, io.Discard)
 	if got, _, _, _ := p.RouteWorker("auto", "agent-a"); got.Nick != "a" {
 		t.Fatalf("agent-a initial assignment=%q, want a", got.Nick)
 	}
@@ -363,25 +386,19 @@ func TestWorkerAffinity_runtimeDisableReconcilesAssignments(t *testing.T) {
 	if status, err := p.SetMemberDisabled("auto", "a", true); status != http.StatusOK || err != nil {
 		t.Fatalf("disable a: status=%d err=%v", status, err)
 	}
-	c := p.byPool["auto"]
-	c.mu.Lock()
-	if _, ok := c.workerAffinity["agent-a"]; ok {
-		t.Error("runtime disable retained agent-a mapping to disabled member a")
+	if got, _, _, _ := p.RouteWorker("auto", "agent-a"); got.Nick != "b" {
+		t.Errorf("agent-a after disabling a = %q, want b", got.Nick)
 	}
-	if got := c.workerAffinity["agent-b"]; got != "b" {
-		t.Errorf("unrelated mapping agent-b=%q, want b", got)
+	if got, _, _, _ := p.RouteWorker("auto", "agent-b"); got.Nick != "b" {
+		t.Errorf("unaffected agent-b after disable = %q, want b", got.Nick)
 	}
-	c.mu.Unlock()
-
 	if status, err := p.SetMemberDisabled("auto", "a", false); status != http.StatusOK || err != nil {
 		t.Fatalf("enable a: status=%d err=%v", status, err)
 	}
 	if status, err := p.RemoveMember("auto", "b"); status != http.StatusOK || err != nil {
 		t.Fatalf("remove b: status=%d err=%v", status, err)
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.workerAffinity["agent-b"]; ok {
-		t.Error("runtime removal retained agent-b mapping to removed member b")
+	if got, _, _, _ := p.RouteWorker("auto", "agent-b"); got.Nick != "a" {
+		t.Errorf("agent-b after removing b = %q, want a", got.Nick)
 	}
 }
