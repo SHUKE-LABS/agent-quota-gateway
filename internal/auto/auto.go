@@ -368,6 +368,12 @@ type MemberStatus struct {
 	Status         string          `json:"status"`          // "active", "exhausted", "idle", "disabled"
 	ExhaustedUntil *time.Time      `json:"exhausted_until"` // RFC 3339 or null
 	Snapshot       *quota.Snapshot `json:"snapshot"`        // null when no snapshot recorded
+	// InWindow is true only at concurrency >1 when this member is in the
+	// current available worker window.
+	InWindow bool `json:"in_window"`
+	// Workers lists sorted worker affinities targeting this member, including
+	// stale assignments that will be rechecked on the worker's next request.
+	Workers []string `json:"workers,omitempty"`
 
 	// Disabled mirrors c.disabled[nick] — the same source the "disabled"
 	// status string derives from, so the two can never disagree. The UI's
@@ -557,6 +563,31 @@ func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 	// truth). effectiveOrder expansion (unlisted members rank last) happens on
 	// reconcile, matching NewController.
 	next, err := p.reg.WithPriority(name, validOrder)
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+	p.applyRegistryLocked(next, name)
+	p.markConfigDirtyLocked()
+	return http.StatusOK, nil
+}
+
+// SetConcurrency changes the named pool's worker concurrency at runtime.
+// Existing worker assignments are reconciled against the new window lazily:
+// workers outside it move on their next namespaced request. Returns
+// (httpStatus, error) with credential-free error messages.
+func (p *Pools) SetConcurrency(poolName string, concurrency int) (int, error) {
+	name := backend.NormalizeName(poolName)
+	if concurrency < 1 {
+		return http.StatusBadRequest, fmt.Errorf("concurrency must be at least 1")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.byPool[name]; !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+
+	next, err := p.reg.WithPoolConcurrency(name, concurrency)
 	if err != nil {
 		return http.StatusBadRequest, err
 	}
@@ -2374,8 +2405,24 @@ func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller, pollerMap
 	// here. The unified collection covers all members regardless of origin.
 	effective := c.allMemberNicksLocked()
 	members := make([]MemberStatus, 0, len(effective))
+	inWindow := make(map[string]bool)
+	workersByNick := make(map[string][]string)
+	if c.workerConcurrency > 1 {
+		for _, nick := range c.workerWindowLocked() {
+			inWindow[nick] = true
+		}
+		for worker, nick := range c.workerAffinity {
+			workersByNick[nick] = append(workersByNick[nick], worker)
+		}
+	}
 	for _, nick := range effective {
-		ms := MemberStatus{Nick: nick, Disabled: c.disabled[nick]}
+		ms := MemberStatus{
+			Nick:     nick,
+			Disabled: c.disabled[nick],
+			InWindow: inWindow[nick],
+			Workers:  workersByNick[nick],
+		}
+		sort.Strings(ms.Workers)
 		// exhausted is checked before the sticky (curNick) arm: "active" must
 		// mean the sticky member that is ALSO currently available. A sticky
 		// member that is parked is treated as unavailable by the routing path

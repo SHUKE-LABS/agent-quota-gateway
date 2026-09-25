@@ -169,6 +169,11 @@ A real upstream quota rejection or credential failure makes the member
 unavailable in every pool that shares the nick; each mapped worker is
 reassigned within its pool window on its next request.
 
+The dashboard shows each pool's concurrency in its header and lets you edit
+it when the pool has at least two members. When concurrency is above `1`, the
+members table shows worker counts and marks the current window; workers still
+recorded on a member outside that window are shown as pending reassignment.
+
 Worker assignments and the next first-use cursor are runtime routing
 observations in the configured state file. At concurrency above `1`, a stale
 assignment is checked against the current window and reassigned on that
@@ -882,6 +887,8 @@ restarting is the wrong tool.
 | `DELETE /_gateway/pool/{name}` | Remove a pool. The pool must be **empty** — drain members first via `DELETE .../member/{nick}`; a pool that still has members returns `409` (no cascade, so no persisted credential is silently discarded). Returns `200` `{"status": "ok"}`; an unknown pool returns `404`. Deleting the last pool is allowed (routing then fails closed with `403` unknown selector). Persisted: a deleted pool does not reappear on restart. |
 | `POST /_gateway/pool/{name}/rename` | Rename a pool in place; body `{"name": "<new>"}` (required, normalized server-side). Carries the pool's members, disabled flags, and declared priority over to the new key. Sticky pointer, exhausted marks, and local-snapshot observations follow member nicks; worker affinities and their first-use cursor follow the controller and persist under the renamed pool key. Returns `200` `{"pool": "<new>"}`. Empty / identical-after-normalize new name → `400`; unknown old pool → `404`; new name collides with a different existing pool → `409`. Persisted: the next config-roundtrip restart restores the rename under the new key. **Caveat for env-only mode** (`AQG_CONFIG` unset, no `aqg.json`): the config writer is a no-op, so the rename is runtime-only and reverts to the env-declared name on restart — same constraint `AddPool`/`AddMember` already carry. |
 | `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
+| `POST /_gateway/pool/{name}/concurrency` | Set worker concurrency at runtime; body `{"concurrency": N}` with integer `N >= 1`. Values above the member count are accepted, as in config. Unknown pool → `404`; invalid value → `400`. A changed window reassigns affected workers on their next namespaced request and is written to `aqg.json` when config-file persistence is enabled. |
+| `GET /_gateway/pool` | Live member status. Each member includes `in_window` (whether it is in the current worker window; always `false` at concurrency `1`) and sorted `workers` (recorded worker affinities targeting it, omitted when empty). Affinities remain listed when outside the window until that worker makes its next request. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
 | `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "...", "placement": [...]}`. `credential` and `base_url` are each optional when the nick is already a known subscription in another pool (resolved independently; ambiguous → `400`). `placement` is a JSON array of nicks (highest priority first, must include the added nick) and is **required** when the target is a priority pool with no existing slot for that nick; rejected (`400`) for targets without a priority order. Persisted with its credential. |

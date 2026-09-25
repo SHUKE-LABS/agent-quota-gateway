@@ -258,6 +258,49 @@ func priorityHandler(pools *auto.Pools, persistence configfile.PersistenceState)
 	}
 }
 
+type concurrencyRequest struct {
+	Concurrency *int `json:"concurrency"`
+}
+
+// concurrencyHandler serves POST /_gateway/pool/{name}/concurrency — sets a
+// pool's runtime worker concurrency. Registry validation also accepts values
+// above the member count, matching the config-file contract.
+func concurrencyHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		poolName := backend.NormalizeName(r.PathValue("name"))
+		if poolName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "pool name is required"})
+			return
+		}
+
+		var req concurrencyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
+			return
+		}
+		if req.Concurrency == nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "concurrency is required"})
+			return
+		}
+
+		status, err := pools.SetConcurrency(poolName, *req.Concurrency)
+		if err != nil {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		configfile.ApplyPersistenceHeader(w, persistence)
+		w.WriteHeader(http.StatusOK)
+		body := map[string]any{"status": "ok"}
+		configfile.ApplyEnvOnlyBodyField(body, persistence)
+		_ = json.NewEncoder(w).Encode(body)
+	}
+}
+
 // disableMemberHandler serves POST /_gateway/pool/{name}/member/{nick}/disable —
 // disables a pool member, making it unselectable until re-enabled.
 func disableMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {

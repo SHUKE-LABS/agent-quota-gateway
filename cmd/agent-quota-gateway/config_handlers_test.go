@@ -46,6 +46,7 @@ func configMuxWithPersistence(t *testing.T, pools *auto.Pools, persistence confi
 	mux.HandleFunc("DELETE /_gateway/pool/{name}", deletePoolHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/rename", renamePoolHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/priority", priorityHandler(pools, persistence))
+	mux.HandleFunc("POST /_gateway/pool/{name}/concurrency", concurrencyHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/move", moveMemberHandler(pools, persistence))
@@ -176,6 +177,61 @@ func TestConcurrencyAppearsInPoolAndConfigViews(t *testing.T) {
 	}
 	if len(views) != 1 || views[0].Pool != "auto" || views[0].Concurrency != 2 {
 		t.Errorf("/_gateway/pool views = %+v, want auto concurrency 2", views)
+	}
+}
+
+func TestConcurrencyEndpointValidatesAndPersists(t *testing.T) {
+	scrubPoolEnv(t)
+	unsetenv(t, "AQG_CONFIG")
+	unsetenv(t, "AQG_STATE_FILE")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "aqg.json")
+	t.Setenv("AQG_CONFIG", cfgPath)
+	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
+	t.Setenv("AQG_POOL_AUTO_BACKEND_B", "sk-ant-b")
+	t.Setenv("AQG_POOL_AUTO_BASE_URL", testBase)
+
+	var log bytes.Buffer
+	resolvedCfg, _, path, err := resolveConfig("", &log)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if path != cfgPath {
+		t.Fatalf("config path=%q, want %q", path, cfgPath)
+	}
+	_, registry, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+	cw := configfile.NewWriter(cfgPath, func() ([]byte, error) {
+		return configfile.Marshal(resolvedCfg, pools.CurrentRegistry())
+	})
+	pools.SetOnConfigChange(cw.MarkDirty)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { cw.Run(ctx); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	srv := configMux(t, pools)
+
+	postJSON(t, srv.URL+"/_gateway/pool/auto/concurrency", `{"concurrency":0}`, http.StatusBadRequest)
+	postJSON(t, srv.URL+"/_gateway/pool/auto/concurrency", `{"concurrency":"x"}`, http.StatusBadRequest)
+	postJSON(t, srv.URL+"/_gateway/pool/ghost/concurrency", `{"concurrency":3}`, http.StatusNotFound)
+	postJSON(t, srv.URL+"/_gateway/pool/auto/concurrency", `{"concurrency":3}`, http.StatusOK)
+
+	if got := fetchPool(t, srv.URL, "auto").Concurrency; got != 3 {
+		t.Fatalf("/_gateway/config concurrency=%d, want 3", got)
+	}
+	waitForDiskContain(t, cfgPath, `"concurrency": 3`)
+	_, persisted, err := configfile.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile after mutation: %v", err)
+	}
+	if got := persisted.PoolConcurrency("auto"); got != 3 {
+		t.Errorf("persisted concurrency=%d, want 3", got)
 	}
 }
 
@@ -1386,6 +1442,7 @@ func TestMutationHandler_envOnly_statusOKShape(t *testing.T) {
 		{name: "disable member", method: http.MethodPost, path: "/_gateway/pool/auto/member/a/disable", wantStatus: http.StatusOK},
 		{name: "enable member", method: http.MethodPost, path: "/_gateway/pool/auto/member/a/enable", wantStatus: http.StatusOK},
 		{name: "set priority", method: http.MethodPost, path: "/_gateway/pool/auto/priority", body: `["b","a"]`, wantStatus: http.StatusOK},
+		{name: "set concurrency", method: http.MethodPost, path: "/_gateway/pool/auto/concurrency", body: `{"concurrency":2}`, wantStatus: http.StatusOK},
 	}
 
 	for _, tc := range cases {
@@ -1539,8 +1596,8 @@ func TestMutationHandler_envOnly_poolNamedShape(t *testing.T) {
 // TestMutationHandler_envOnly_fullFamily is a sanity sweep over every
 // mutation handler (issue #246 review note #2): each one returns a 200
 // or 201 in env-only mode and carries the persistence header. Together
-// with the body-shape tests above, this confirms AC3 across all 9
-// mutation handlers.
+// with the body-shape tests above, this confirms the persistence contract
+// across the runtime-config mutations exercised here.
 //
 // The sweep uses two pre-configured pools plus two more set up at
 // runtime so deletePool (which needs an empty pool) and moveMember
@@ -1561,6 +1618,7 @@ func TestMutationHandler_envOnly_fullFamily(t *testing.T) {
 		want   int
 	}{
 		{"POST", "/_gateway/pool/auto/priority", `["b","a"]`, 200},
+		{"POST", "/_gateway/pool/auto/concurrency", `{"concurrency":2}`, 200},
 		{"POST", "/_gateway/pool/plain/member/x/disable", ``, 200},
 		{"POST", "/_gateway/pool/plain/member/x/enable", ``, 200},
 		{"POST", "/_gateway/pool/plain/member/y", `{"credential":"sk-ant-y"}`, 200},

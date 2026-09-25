@@ -895,6 +895,22 @@ func (r *Registry) WithPriority(poolName string, order []string) (*Registry, err
 	return BuildFromSpec(spec, r.defaultBaseURL)
 }
 
+// WithPoolConcurrency returns a fresh Registry with the worker concurrency
+// for poolName set to concurrency. BuildFromSpec validates the value against
+// the same rules as a config-file load, while Spec→BuildFromSpec keeps the
+// source Registry immutable.
+func (r *Registry) WithPoolConcurrency(poolName string, concurrency int) (*Registry, error) {
+	poolName = normalizeName(poolName)
+	spec := r.Spec()
+	ps, ok := spec.Pools[poolName]
+	if !ok {
+		return nil, fmt.Errorf("backend: unknown pool %q", poolName)
+	}
+	ps.Concurrency = &concurrency
+	spec.Pools[poolName] = ps
+	return BuildFromSpec(spec, r.defaultBaseURL)
+}
+
 // WithPoolCreated returns a fresh Registry with a new empty plain pool named
 // name (issue #198 folds the old runtime AddedPools into the config file). The
 // pool inherits the gateway default upstream until members declare their own.
