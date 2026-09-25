@@ -105,7 +105,7 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 		reqPath = normalizeRequestPath(basePath, reqPath)
 		r.URL.Path = joinPath(basePath, reqPath)
 
-		stampAuth(r.Header, b.Credential)
+		StampAuth(r.Header, b.Credential)
 	}
 
 	// ModifyResponse runs after headers are received but before the body
@@ -147,10 +147,10 @@ func New(observer ResponseObserver, modifier ResponseModifier) (http.Handler, er
 	return rp, nil
 }
 
-// stampAuth replaces any inbound credential with the resolved backend's,
-// choosing the scheme from the credential's class. See New for the
-// three-way mapping.
-func stampAuth(h http.Header, credential string) {
+// StampAuth replaces any inbound credential with credential, choosing the
+// scheme from its class. The proxy director and gateway-originated upstream
+// requests share this mapping so credentials are sent consistently.
+func StampAuth(h http.Header, credential string) {
 	cred := strings.TrimSpace(credential)
 	switch {
 	case isOAuthToken(cred):

@@ -20,6 +20,7 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/activity"
 	"github.com/shukebeta/agent-quota-gateway/internal/auto"
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
+	"github.com/shukebeta/agent-quota-gateway/internal/codexhello"
 	"github.com/shukebeta/agent-quota-gateway/internal/config"
 	"github.com/shukebeta/agent-quota-gateway/internal/configfile"
 	"github.com/shukebeta/agent-quota-gateway/internal/logging"
@@ -283,6 +284,28 @@ func run(configFlag string) error {
 	// pool handler can attach per-pool poller liveness to its response
 	// (issue #247); Run is started below.
 	qp := poller.NewDynamic(pools.PoolNames, pools.Current, pools.MarkLocalSnapshot, store, nil, 0, nil, nil)
+	// Codex weekly-reset hello is a separate background path from proprietary
+	// quota polling. Its member view is rebuilt from the current copy-on-write
+	// registry each tick so runtime additions, disables, and removals take
+	// effect without a restart. Registry order is stable, and the service
+	// deduplicates shared nicks across pools before sending.
+	hello := codexhello.New(codexhello.Config{
+		Members: func() []backend.Backend {
+			current := pools.CurrentRegistry()
+			var members []backend.Backend
+			for _, poolName := range current.PoolNames() {
+				for _, nick := range current.PoolNicks(poolName) {
+					if member, ok := current.ResolveIn(poolName, nick); ok {
+						members = append(members, member)
+					}
+				}
+			}
+			return members
+		},
+		MarkLocal: pools.MarkLocalSnapshot,
+		Store:     store,
+		Log:       os.Stderr,
+	})
 
 	mux := http.NewServeMux()
 	persistence := configWriter.PersistenceStateOf()
@@ -356,6 +379,7 @@ func run(configFlag string) error {
 	// handlers can attach per-pool poller liveness to their responses
 	// (issue #247).
 	go qp.Run(ctx)
+	go hello.Run(ctx)
 
 	// The preemptor returns a priority pool to a higher-priority member once
 	// that member's quota window resets, so a freshly-reset preferred backend
