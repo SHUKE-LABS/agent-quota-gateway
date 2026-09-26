@@ -330,6 +330,7 @@
   .status[data-status="exhausted"] { color: var(--danger); border-color: var(--danger); }
   .status[data-status="disabled"] { color: var(--muted); }
   .status[data-status="idle"] { color: var(--accent); border-color: var(--accent); }
+  .status[data-status="serving"] { color: var(--accent); border-color: var(--accent); }
 
   /* Per-member enable/disable control. Encodes the member's *current* state,
      not the action the click will perform. The click still routes through
@@ -965,9 +966,8 @@
       var tdS = document.createElement('td');
       var status = document.createElement('span');
       status.className = 'status';
-      status.setAttribute('data-status', m.status || 'idle');
       status.setAttribute('data-role', 'status');
-      status.textContent = m.status || 'idle';
+      applyStatusPresentation(status, m, view.concurrency);
       tdS.appendChild(status);
       tr.appendChild(tdS);
 
@@ -1115,6 +1115,19 @@
       names: names,
       title: names ? names + (pending ? ' (moves on next request)' : '') : '',
     };
+  }
+
+  function statusPresentation(concurrency, member) {
+    var status = member.status || 'idle';
+    if (status === 'disabled' || status === 'exhausted' || status === 'active') return status;
+    var workers = workerPresentation(concurrency, member);
+    return workers.serving && workers.count > 0 ? 'serving' : status;
+  }
+
+  function applyStatusPresentation(badge, member, concurrency) {
+    var status = statusPresentation(concurrency, member);
+    badge.setAttribute('data-status', status);
+    badge.textContent = status;
   }
 
   function applyWorkerPresentation(cell, member, concurrency) {
@@ -1502,10 +1515,7 @@
         s.members.forEach(function (m) { if (m.nick === nick) match = m; });
         if (!match) return;
         var badge = tr.querySelector('[data-role="status"]');
-        if (badge) {
-          badge.setAttribute('data-status', match.status || 'idle');
-          badge.textContent = match.status || 'idle';
-        }
+        if (badge) applyStatusPresentation(badge, match, s.concurrency);
         var workerCell = tr.querySelector('[data-role="workers"]');
         if (workerCell) applyWorkerPresentation(workerCell, match, s.concurrency);
         var serving = tr.querySelector('[data-role="serving"]');
