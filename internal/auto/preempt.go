@@ -1,19 +1,9 @@
-// This file adds reset-driven preempt-back (issue #31) on top of the
-// priority routing introduced in #29. Phase 1 made a priority pool prefer
-// its highest-priority member for the *initial pick* and the *failover
-// target*, but once a pool fell over to a lower-priority member it rode it
-// until that member itself 429'd. A member like z-ai resets its short
-// window on a rolling schedule and grants a large budget, so to actually
-// drain that budget the pool must return to it promptly each time its
-// window resets — not wait for the active fallback to burn out.
-//
-// The Preemptor is a single background goroutine fronting every priority
-// pool. It watches when a higher-priority member than the one currently
-// active will recover and, on that reset, switches the pool back to it. It
-// is generic and config-driven: only pools that opted into priority via
-// AQG_POOL_<POOL>_PRIORITY are touched, so equal-strength pools never
-// preempt and their prompt cache is never interrupted. No vendor or model
-// name appears here.
+// This file adds reset-driven preempt-back (issue #31) to the ordered routing
+// model. When a pool has failed over to a lower-ranked member, the Preemptor
+// watches for a higher-ranked member's quota reset and returns the pool to it
+// on that reset. It follows the same effective order as ordinary routing,
+// including the sorted nick default for pools without a declared order.
+// No vendor or model name appears here.
 package auto
 
 import (
@@ -26,8 +16,8 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
-// defaultPreemptInterval is the preemptor's polling cadence. When no priority
-// pool has a parked higher-priority member to wait for, the loop idles at this
+// defaultPreemptInterval is the preemptor's polling cadence. When no nonempty
+// pool has a parked higher-ranked member to wait for, the loop idles at this
 // interval rather than spinning. A scheduled reset within the interval still
 // takes precedence — the loop wakes at the exact reset — but a reset scheduled
 // farther out is capped at this interval (issue #288): sleeping until an
@@ -36,18 +26,17 @@ import (
 // all preempt-back for the entire window.
 const defaultPreemptInterval = 5 * time.Minute
 
-// Preemptor returns a priority pool to a higher-priority member when that
-// member's quota window resets. The zero value is not usable; build it
+// Preemptor returns a pool to a higher-ranked member when that member's quota
+// window resets. The zero value is not usable; build it
 // with NewPreemptor. State (the per-member dedup record) lives only here
 // and is touched only from Run's single goroutine, so it needs no mutex;
 // every read or write of Controller state goes through the controller's
 // own lock.
 type Preemptor struct {
 	// controllers resolves the pools to evaluate fresh on every tick, taken
-	// under Pools' read lock, so a pool created at runtime (AddPool) — or an
-	// existing pool later given a priority order — is picked up without a
-	// restart (issue #202). tick() skips non-priority pools, so returning all
-	// of them is correct and cheap; the empty case only arises with zero pools.
+	// under Pools' read lock, so runtime-created pools are picked up without a
+	// restart (issue #202). tick() skips empty pools, so returning all of them
+	// is correct and cheap; the empty case only arises with zero pools.
 	controllers func() []*Controller
 	store       *quota.Store
 	interval    time.Duration
@@ -68,8 +57,7 @@ type Preemptor struct {
 // NewPreemptor builds a Preemptor over the pools in p. It reads p's current
 // controller set fresh on every tick (via p.sortedControllers, under Pools'
 // lock), so runtime-created pools are picked up automatically; tick() itself
-// skips any pool that has not declared a priority order, so equal-strength
-// pools never preempt. store supplies the precise unified_5h_reset; interval
+// skips empty pools. store supplies the precise unified_5h_reset; interval
 // defaults to 5 minutes, now to time.Now, and logOut to os.Stderr when their
 // zero value is passed.
 func NewPreemptor(p *Pools, store *quota.Store, interval time.Duration, now func() time.Time, logOut io.Writer) *Preemptor {
@@ -109,9 +97,7 @@ func newPreemptorFunc(controllers func() []*Controller, store *quota.Store, inte
 // performs any due switches and returns the duration until the next
 // evaluation; Run then sleeps until then (or until ctx is done). An empty
 // pool set is an ordinary idle tick, so a pool added later is picked up by
-// the next pass. A deployment with only equal-strength pools also idles at
-// the fallback interval doing nothing, since tick() skips every non-priority
-// pool. Run blocks; callers start it in a goroutine.
+// the next pass. Run blocks; callers start it in a goroutine.
 func (p *Preemptor) Run(ctx context.Context) {
 	for {
 		wait := p.tick()
@@ -125,9 +111,9 @@ func (p *Preemptor) Run(ctx context.Context) {
 	}
 }
 
-// tick performs one preempt-back evaluation across every priority pool and
+// tick performs one preempt-back evaluation across every nonempty pool and
 // returns how long to sleep before the next one. For each pool it walks the
-// members ranked strictly above the active one, highest priority first, and
+// members ranked strictly above the active one, in effective order, and
 // either switches now (the member has recovered) or records when it will,
 // scheduling the loop to wake at the soonest such reset. The returned wait is
 // capped at the interval: a reset within the interval is slept to exactly,
@@ -154,12 +140,12 @@ func (p *Preemptor) tick() time.Duration {
 
 	for _, c := range p.controllers() {
 		v := c.preemptView()
-		if !v.isPriority {
+		if !v.hasOrder {
 			continue
 		}
 
 		var target string
-		for _, m := range v.higher { // highest priority first
+		for _, m := range v.higher { // highest rank first
 			// The precise window reset from the quota store (populated for
 			// Anthropic via headers, for z-ai/MiniMaxi via the poller) is
 			// preferred over the controller's conservative park.
@@ -173,7 +159,7 @@ func (p *Preemptor) tick() time.Duration {
 			isAvailable := !m.exhausted
 
 			if isAvailable {
-				// A higher-priority member the controller already considers
+				// A higher-ranked member the controller already considers
 				// healthy is sitting unused — switch back to it now. Anchor the
 				// dedup on its store reset (whether past or still future) so
 				// that, should the member be re-limited the instant we switch
@@ -218,7 +204,7 @@ func (p *Preemptor) tick() time.Duration {
 
 		if target != "" {
 			if c.PreemptTo(target) {
-				fmt.Fprintf(p.logOut, "preempt[%s]: %s -> %s (higher-priority member recovered)\n", c.name(), v.current, target)
+				fmt.Fprintf(p.logOut, "preempt[%s]: %s -> %s (higher-ranked member recovered)\n", c.name(), v.current, target)
 			}
 		}
 	}
@@ -237,19 +223,18 @@ func (p *Preemptor) tick() time.Duration {
 	return p.interval
 }
 
-// preemptView is a read-only snapshot of a priority controller's state the
-// preemptor needs to schedule and decide a preempt-back. isPriority is
-// false (and higher nil) for a non-priority pool, which the preemptor
-// skips.
+// preemptView is a read-only snapshot of a controller's state the preemptor
+// needs to schedule and decide a preempt-back. hasOrder is false only for an
+// empty pool, which has no routing target to preempt.
 type preemptView struct {
-	isPriority bool
-	current    string
-	// higher lists the members ranked strictly above the active one,
-	// highest priority first, with each member's current park state.
+	hasOrder bool
+	current  string
+	// higher lists members ranked strictly above the active one, first in the
+	// shared effective order, with each member's current park state.
 	higher []memberState
 }
 
-// memberState describes one higher-priority member at snapshot time.
+// memberState describes one higher-ranked member at snapshot time.
 type memberState struct {
 	nick      string
 	quotaKey  string    // the quota.Store key, for the precise reset lookup
@@ -259,21 +244,21 @@ type memberState struct {
 
 // preemptView snapshots the members ranked above the active one. It clears
 // expired marks first so a member whose park already elapsed reads as
-// healthy. Returns the zero view for a non-priority pool.
+// healthy. Returns the zero view for an empty pool.
 func (c *Controller) preemptView() preemptView {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	pri := c.effectivePriorityLocked()
-	if len(pri) == 0 {
+	order := c.effectiveOrderLocked()
+	if len(order) == 0 {
 		return preemptView{}
 	}
 	c.clearExpiredLocked()
 
 	cur := c.curNick
 	curRank := c.rankLocked(cur)
-	v := preemptView{isPriority: true, current: cur}
-	for _, nick := range pri { // highest priority first
+	v := preemptView{hasOrder: true, current: cur}
+	for _, nick := range order {
 		if c.rankLocked(nick) >= curRank {
 			continue // only members strictly above the active one
 		}
@@ -281,7 +266,7 @@ func (c *Controller) preemptView() preemptView {
 		if idx < 0 {
 			continue
 		}
-		// Skip only operator-disabled members: a disabled higher-priority
+		// Skip only operator-disabled members: a disabled higher-ranked
 		// member must not appear in the view, otherwise tick() reads it as
 		// healthy (!exhausted), targets it, and breaks before reaching the
 		// next available preferred member — while PreemptTo then refuses it.
@@ -302,10 +287,10 @@ func (c *Controller) preemptView() preemptView {
 
 // PreemptTo switches the pool's sticky pointer back to nick. It is the
 // preempt-back counterpart to the reactive failover in record429: where
-// failover steps *down* to a healthy fallback, PreemptTo steps *up* to a
-// recovered preferred member. It refuses (returns false, leaving the
-// pointer put) for a pool with no declared priority, an unknown nick, a
-// nick that is not strictly higher priority than the current member, or a
+// failover steps down to a healthy fallback, PreemptTo steps up to a
+// recovered higher-ranked member. It refuses (returns false, leaving the
+// pointer put) for an empty pool, an unknown nick, a nick that is not
+// strictly higher-ranked than the current member, or a
 // nick that is still unavailable (exhausted or disabled) — so a preempt never
 // lands on a member known to be rate-limited or operator-disabled, and never
 // moves the pool away from its preference. Atomic under c.mu.
@@ -313,7 +298,7 @@ func (c *Controller) PreemptTo(nick string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.effectivePriorityLocked()) == 0 {
+	if len(c.effectiveOrderLocked()) == 0 {
 		return false
 	}
 	c.clearExpiredLocked()
@@ -371,15 +356,14 @@ func (c *Controller) noteRecovered(nick string) {
 	}
 }
 
-// rankLocked returns nick's position in the pool's priority order (lower is
-// higher priority). effectiveOrder places every member in the effective
-// priority, so a real member always has a rank; an unknown nick sorts last.
+// rankLocked returns nick's position in the effective order (lower ranks
+// first). Every member has a rank; an unknown nick sorts last.
 // Caller holds c.mu.
 func (c *Controller) rankLocked(nick string) int {
-	for i, n := range c.effectivePriorityLocked() {
+	for i, n := range c.effectiveOrderLocked() {
 		if n == nick {
 			return i
 		}
 	}
-	return len(c.effectivePriorityLocked())
+	return len(c.effectiveOrderLocked())
 }

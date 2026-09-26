@@ -283,8 +283,8 @@ func TestIntegration_fullStack(t *testing.T) {
 // pool whose first member's upstream 429s comes back to the client as a
 // 503 (switchable), the sticky pointer advances, and the client's retry
 // lands on the healthy member and succeeds. The upstream 429s the first
-// distinct credential it sees so the test is robust to the pool's random
-// start member. It also confirms the quota view follows the switch.
+// distinct credential it sees so the test does not depend on a configured
+// member nick. It also confirms the quota view follows the switch.
 func TestIntegration_autoFailover(t *testing.T) {
 	var mu sync.Mutex
 	firstKey := ""

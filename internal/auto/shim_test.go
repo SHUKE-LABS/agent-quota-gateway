@@ -40,9 +40,6 @@ func (c *Controller) setDisabledLocked(nick string, off bool) {
 }
 
 func (c *Controller) setPriorityOverrideEffectiveLocked(order []string) {
-	if len(order) == 0 {
-		c.priority = nil
-	} else {
-		c.priority = effectiveOrder(order, c.allMemberNicksLocked())
-	}
+	c.declaredPriority = append([]string(nil), order...)
+	c.order = effectiveOrder(c.declaredPriority, c.allMemberNicksLocked())
 }

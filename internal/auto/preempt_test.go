@@ -74,11 +74,14 @@ func TestPreemptTo_refusesNonHigher(t *testing.T) {
 	}
 }
 
-func TestPreemptTo_nonPriorityPoolNoOp(t *testing.T) {
+func TestPreemptTo_sortedDefaultPool(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	c := newController(t, 0, clock, io.Discard, "a", "b") // no priority declared
-	if c.PreemptTo("b") {
-		t.Fatal("PreemptTo on a non-priority pool = true, want false")
+	c := newController(t, 1, clock, io.Discard, "a", "b") // sorted default; current b
+	if !c.PreemptTo("a") {
+		t.Fatal("PreemptTo(a) = false, want true for the higher-ranked sorted member")
+	}
+	if got := c.Current(); got != "a" {
+		t.Fatalf("Current() = %q, want a after sorted-default preempt", got)
 	}
 }
 
@@ -319,26 +322,32 @@ func TestPreempt_logsSwitchWithoutCredentials(t *testing.T) {
 	}
 }
 
-// TestNewPreemptor_tickSkipsNonPriorityPools proves that while NewPreemptor
-// collects all controllers, tick() skips non-priority ones — so equal-strength
-// pools never preempt, and Run stays idle at the default interval.
-func TestNewPreemptor_tickSkipsNonPriorityPools(t *testing.T) {
+// TestNewPreemptor_preemptsSortedDefault proves undeclared pools use their
+// sorted member order for recovery preempt-back too.
+func TestNewPreemptor_preemptsSortedDefault(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	// Single non-priority pool → controller collected, but tick() skips it.
+	// Single undeclared pool → controller uses sorted order [a,b].
 	reg := testRegistry(t, "a", "b")
 	pools := NewPools(reg, nil, clock.now, io.Discard)
+	c, ok := pools.controller("auto")
+	if !ok {
+		t.Fatal("auto controller missing")
+	}
+	c.setCur("b")
 	p := NewPreemptor(pools, quota.NewStore(), 0, clock.now, io.Discard)
 	if len(p.controllers()) != 1 {
 		t.Fatalf("collected %d controllers, want 1 (all pools collected)", len(p.controllers()))
 	}
 
-	// tick() should skip the non-priority controller and return the idle interval.
+	// b is a healthy fallback relative to a, so tick should preempt to a.
 	if wait := p.tick(); wait != defaultPreemptInterval {
-		t.Fatalf("tick wait=%v, want %v (non-priority skipped, idle interval)", wait, defaultPreemptInterval)
+		t.Fatalf("tick wait=%v, want idle interval after immediate switch", wait)
+	}
+	if got := c.Current(); got != "a" {
+		t.Fatalf("current=%q, want a after sorted-default preempt", got)
 	}
 
-	// Run should stay idle (not spin) even with controllers collected.
-	// Verify tick() continues to return the idle interval.
+	// With the pool at the first rank, subsequent passes remain idle.
 	for i := 0; i < 3; i++ {
 		if wait := p.tick(); wait != defaultPreemptInterval {
 			t.Fatalf("tick %d wait=%v, want %v (stays idle)", i, wait, defaultPreemptInterval)
@@ -542,7 +551,7 @@ func TestPreempt_allowedWarningPreemptsBack(t *testing.T) {
 	store := quota.NewStore()
 	c := newPriorityController(t, -1, clock, io.Discard, "a,b", "b", "a")
 	c.store = store // wire the shared store, as NewPools does in production
-	c.setCur("b")  // on lower-priority b; a is preferred but not parked
+	c.setCur("b")   // on lower-priority b; a is preferred but not parked
 
 	qReset := clock.now().Add(time.Hour)
 	util := 1.0
@@ -574,7 +583,7 @@ func TestPreempt_rejectedStoreBlocksPreemptBack(t *testing.T) {
 	store := quota.NewStore()
 	c := newPriorityController(t, -1, clock, io.Discard, "a,b", "b", "a")
 	c.store = store // wire the shared store, as NewPools does in production
-	c.setCur("b")  // on lower-priority b; a has no live park but store says rejected
+	c.setCur("b")   // on lower-priority b; a has no live park but store says rejected
 
 	qReset := clock.now().Add(2 * time.Hour)
 	util := 1.0

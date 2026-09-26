@@ -40,10 +40,9 @@ import (
 // underscores folded to hyphens, so AQG_POOL_Z_AI_BACKEND_KEY_A is
 // addressed as pool "z-ai", member "key-a".
 //
-// PRIORITY is optional and opt-in: when present, the pool prefers its
-// listed members in order (highest first) for the auto controller's
-// initial pick and failover target; when absent, the pool keeps the
-// default random-start, round-robin behaviour. It carries no credential.
+// PRIORITY is optional: when present, the pool uses its listed members
+// first (highest first), followed by unlisted members in sorted nick order.
+// When absent, every member is ordered by nick. It carries no credential.
 const EnvPrefix = "AQG_POOL_"
 
 // baseURLSuffix, backendInfix, prioritySuffix, and concurrencySuffix are
@@ -152,8 +151,8 @@ type pool struct {
 	baseURL string
 
 	// priority is the operator-declared preference order (highest first),
-	// a subset of nicks. nil when the pool declared no AQG_POOL_<POOL>_PRIORITY
-	// — that pool keeps the default random-start, round-robin behaviour.
+	// a subset of nicks. nil when the pool declared no AQG_POOL_<POOL>_PRIORITY;
+	// the controller then derives sorted nick order for routing.
 	priority []string
 
 	// concurrency bounds how many available members may serve worker namespaces.
@@ -219,7 +218,7 @@ func BuildFromSpec(spec Spec, defaultBaseURL string) (*Registry, error) {
 		poolName := normalizedPools[poolKey]
 
 		// Record the pool name so it materializes even with zero members
-		// (an operator-created plain pool awaiting its first member).
+		// (an operator-created empty pool awaiting its first member).
 		p.declaredPools[poolName] = true
 
 		// Normalize member nicks and detect collisions within the pool.
@@ -478,7 +477,7 @@ func buildRegistry(defaultBaseURL string, p parsed, requireNonEmpty bool) (*Regi
 	// On the env cold-start path a configuration with no pools and no members
 	// at all is an error (the operator forgot to configure anything; an empty
 	// gateway serves nothing). A pool with zero members is allowed: it is an
-	// operator-created plain pool awaiting its first member (issue #198), so the
+	// operator-created empty pool awaiting its first member (issue #198), so the
 	// check is on the union, not on members alone. The spec path passes
 	// requireNonEmpty=false: an empty aqg.json is a deliberate operator-arrived
 	// state — deleting the last pool at runtime (issue #232) must both persist
@@ -594,7 +593,7 @@ func buildRegistry(defaultBaseURL string, p parsed, requireNonEmpty bool) (*Regi
 
 	// A base URL declared for a pool with no members is almost certainly a
 	// typo'd nick; fail closed rather than silently ignore it. An
-	// operator-created empty plain pool carries no base_url, so this guard
+	// operator-created empty pool carries no base_url, so this guard
 	// still fires only on the typo case (issue #198 pre-creates empty pools,
 	// so the test is now "declared base_url but zero members", not "pool
 	// absent from the built map").
@@ -724,8 +723,8 @@ func (r *Registry) PoolNicks(poolName string) []string {
 
 // PoolPriority returns the pool's declared preference order (highest
 // first), or nil when the pool is unknown or declared no priority. The
-// returned slice is a copy. A non-nil result is the auto controller's
-// signal to use priority-ordered selection instead of random/round-robin.
+// returned slice is a copy. An empty result means the controller should use
+// the sorted nick default, not a separate routing mode.
 func (r *Registry) PoolPriority(poolName string) []string {
 	p, ok := r.pools[normalizeName(poolName)]
 	if !ok || len(p.priority) == 0 {
@@ -875,10 +874,9 @@ func (r *Registry) WithMemberDisabled(poolName, nick string, disabled bool) (*Re
 	return BuildFromSpec(spec, r.defaultBaseURL)
 }
 
-// WithPriority returns a fresh Registry with poolName's priority order set to
-// order (highest first). An empty order clears the priority, returning the
-// pool to random-start/round-robin. Membership and duplicate checks run in
-// BuildFromSpec.
+// WithPriority returns a fresh Registry with poolName's declared order set to
+// order (highest first). An empty order clears the declaration and returns the
+// pool to sorted nick order. Membership and duplicate checks run in BuildFromSpec.
 func (r *Registry) WithPriority(poolName string, order []string) (*Registry, error) {
 	poolName = normalizeName(poolName)
 	spec := r.Spec()
@@ -911,7 +909,7 @@ func (r *Registry) WithPoolConcurrency(poolName string, concurrency int) (*Regis
 	return BuildFromSpec(spec, r.defaultBaseURL)
 }
 
-// WithPoolCreated returns a fresh Registry with a new empty plain pool named
+// WithPoolCreated returns a fresh Registry with a new empty pool named
 // name (issue #198 folds the old runtime AddedPools into the config file). The
 // pool inherits the gateway default upstream until members declare their own.
 func (r *Registry) WithPoolCreated(name string) (*Registry, error) {

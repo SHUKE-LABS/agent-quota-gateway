@@ -51,11 +51,14 @@ Env grammar (`internal/backend`):
 
 - `AQG_POOL_<POOL>_BASE_URL=<upstream>` — pool default upstream
 - `AQG_POOL_<POOL>_BACKEND_<NICK>=<cred>[|<url>]` — a member; `|<url>` overrides the pool's upstream
-- `AQG_POOL_<POOL>_PRIORITY=<nick>,<nick>` — ordered preference (vs. default random start + round-robin failover)
+- `AQG_POOL_<POOL>_PRIORITY=<nick>,<nick>` — optional declared order; unlisted members follow sorted nick order, and an undeclared pool uses sorted nick order throughout
 - `AQG_POOL_<POOL>_CONCURRENCY=<int>` — namespaced worker concurrency; defaults to 1
 
 Pool/nick names are normalized (lowercased, `_`→`-`): `AQG_POOL_Z_AI_BACKEND_KEY_A`
 is pool `z-ai`, member `key-a`, selected by sending `z-ai` as the bearer token.
+A **member nick** is the subscription/account identity and shared quota key.
+A **worker nickname** is the stable routing identity in `/_aqg/w/...`, including
+the worker nick used by mat; it is not a member nick.
 There is deliberately no protocol field or protocol environment marker.
 Anthropic-facing and Responses-facing clients select separate pool names;
 the gateway does not infer application class from credentials, hosts, or
@@ -89,10 +92,10 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
    auto-resumes rather than ending the turn, issue #203), or the selected
    backend stored on the request context. With concurrency 1, worker routes
   use the same global sticky, failover, and preempt behavior as
-   ordinary requests and store no assignment. Above 1, workers are assigned
-   round-robin within the first N available members in effective priority
-   order (or sorted nick order); a worker is reassigned on its next request
-   when its member is unavailable or outside that window.
+  ordinary requests and store no assignment. Above 1, workers are assigned
+  round-robin within the first N available members in effective order; a
+  worker is reassigned on its next request when its member is unavailable or
+  outside that window.
 4. `proxy.New`'s director reads the resolved backend, picks the auth
    scheme by credential prefix (`sk-ant-oat*`→`Bearer`+`oauth-2025-04-20`
    beta; `sk-ant-api*`→`x-api-key`; else `Bearer` no beta), and forwards
@@ -131,12 +134,15 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
   here so `backend` does not import `auto` (which depends on it).
 - `internal/auto/` — the routing brain. One in-memory `Controller` per
   pool (`auto.go`); `Pools` bundles them and implements `PoolRouter`.
-  Sticky-reactive-zero-probe rotation, priority routing, runtime
+  Sticky-reactive-zero-probe routing over a declared order or the sorted nick
+  default, runtime
   mutations that write through to the config file (add/remove/move/disable
   members, priority, create pool — via a copy-on-write registry swap +
   `Controller.reconcileLocked`, issue #198), pool status views, and the
-  preemptor (`preempt.go`) that returns a priority pool to a higher member
-  once its window resets.
+  preemptor (`preempt.go`) that returns the route to a higher-ranked member
+  on the existing reset-driven cadence. Undeclared pools use sorted nick order
+  for startup, failover, worker windows, and preempt-back; this replaces the
+  former random-start/round-robin failover behavior.
 - `internal/proxy/` — thin `httputil.ReverseProxy` wrapper; director
   stamps credential + upstream from the context.
 - `internal/quota/` — Anthropic unified rate-limit header extraction +

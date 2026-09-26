@@ -1146,13 +1146,12 @@ func TestController_concurrent(t *testing.T) {
 	}
 }
 
-func TestNewController_randomStartIsValid(t *testing.T) {
+func TestNewController_sortedDefaultStartsAtFirstNick(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	valid := map[string]bool{"a": true, "b": true, "c": true}
 	for i := 0; i < 20; i++ {
 		c := NewController(testRegistry(t, "a", "b", "c"), "auto", -1, nil, clock.now, io.Discard)
-		if got := c.Current(); !valid[got] {
-			t.Fatalf("random start produced invalid nick %q", got)
+		if got := c.Current(); got != "a" {
+			t.Fatalf("sorted-default start=%q, want first nick a", got)
 		}
 	}
 }
@@ -1227,12 +1226,12 @@ func newPriorityController(t *testing.T, start int, clock *fixedClock, logOut io
 	return NewController(reg, "auto", start, nil, clock.now, logOut)
 }
 
-// TestPriority_startsAtHighest proves a priority pool anchors its initial
-// sticky pointer on the highest-priority member, not a random one — even
+// TestPriority_startsAtHighest proves a declared order anchors its initial
+// sticky pointer on its first member — even
 // though nicks sort to [a b c], priority [c,a,b] starts on c.
 func TestPriority_startsAtHighest(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	for i := 0; i < 10; i++ { // start < 0 is "auto"; must be deterministic under priority
+	for i := 0; i < 10; i++ { // start < 0 selects the first available declared-order member
 		c := newPriorityController(t, -1, clock, io.Discard, "c,a,b", "a", "b", "c")
 		if got := c.Current(); got != "c" {
 			t.Fatalf("priority start = %q, want c (highest priority)", got)
@@ -1266,9 +1265,9 @@ func TestPriority_failoverClimbsToHighest(t *testing.T) {
 }
 
 // TestPriority_failoverPicksHighestNotNeighbour proves the target is
-// chosen by priority, not by adjacency to the current index. Priority is
-// [c,b,a]; sitting on the lowest-priority a, a 429 jumps straight to the
-// highest-priority healthy member c (round-robin would have picked b).
+// chosen by declared rank, not adjacency to the current member. Priority is
+// [c,b,a]; sitting on the lowest-ranked a, a 429 jumps straight to the
+// highest-ranked healthy member c.
 func TestPriority_failoverPicksHighestNotNeighbour(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	// start index 0 == nick "a" (nicks sort to [a b c]); a is lowest priority.
@@ -1303,11 +1302,10 @@ func TestPriority_subsetRanksUnlistedLast(t *testing.T) {
 	}
 }
 
-// TestPriority_staysOnLowerUntil429 documents the Phase 1 limitation: once
-// a priority pool fails over to a lower-priority member, it does not
-// preempt back when the higher-priority member recovers — it rides the
-// current member until that member itself 429s. (Preempt-back is #31.)
-func TestPriority_staysOnLowerUntil429(t *testing.T) {
+// TestController_staysOnFallbackUntilPreemptorRuns proves ordinary request
+// resolution remains sticky after recovery; the background preemptor performs
+// the reset-driven switch.
+func TestController_staysOnFallbackUntilPreemptorRuns(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newPriorityController(t, -1, clock, io.Discard, "b,a", "a", "b")
 
@@ -1329,7 +1327,7 @@ func TestPriority_staysOnLowerUntil429(t *testing.T) {
 }
 
 // TestController_loadState verifies that a persisted sticky nick and exhausted
-// map are restored correctly, overriding the random initial pick.
+// map are restored correctly, overriding the sorted initial pick.
 func TestController_loadState(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "a", "b", "c") // starts at a (index 0)
@@ -1551,8 +1549,8 @@ func TestController_loadState_missingStickyLogs(t *testing.T) {
 	if !strings.Contains(out, "persisted sticky=old") {
 		t.Fatalf("expected log about missing sticky, got: %q", out)
 	}
-	if !strings.Contains(out, "random") {
-		t.Fatalf("expected 'random' reason in log for plain pool, got: %q", out)
+	if !strings.Contains(out, "sorted default") {
+		t.Fatalf("expected sorted-default reason in log for undeclared pool, got: %q", out)
 	}
 }
 
@@ -1776,7 +1774,7 @@ func TestRuntimeConfig_disabledMemberRemoval(t *testing.T) {
 	c.setDisabledLocked("a", true)
 	c.mu.Unlock()
 
-	// Next resolve should skip a and pick b (round-robin from a).
+	// Next resolve should skip unavailable a and pick highest-ranked b.
 	b, _, exhausted := c.ResolveAuto()
 	if exhausted || b.Nick != "b" {
 		t.Fatalf("after disabling a: got %q, exhausted=%v, want b healthy", b.Nick, exhausted)
@@ -1789,8 +1787,7 @@ func TestRuntimeConfig_disabledMemberRemoval(t *testing.T) {
 
 	// After re-enable, a is still unselected (b is sticky) but a is
 	// available for failover again. Park b and c so a is the only healthy
-	// member: the switch must land on the re-enabled a, proving enable
-	// restored its selectability (round-robin would otherwise prefer c).
+	// member: the switch must land on the re-enabled a.
 	c.mu.Lock()
 	c.exhausted["b"] = clock.now().Add(time.Hour)
 	c.exhausted["c"] = clock.now().Add(time.Hour)
@@ -1869,7 +1866,7 @@ func TestRuntimeConfig_priorityOverrideFailover(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
 
-	// Start on a (random for plain pool, but deterministic here).
+	// Start on a (the sorted-default first member).
 	if got := c.Current(); got != "a" {
 		t.Fatalf("initial current=%q, want a", got)
 	}
@@ -1901,7 +1898,7 @@ func TestRuntimeConfig_priorityRoundTrip(t *testing.T) {
 	c := newController(t, 0, clock, io.Discard, "a", "b", "c")
 	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg, store: quota.NewStore()}
 
-	// Partial priority ["b"] expands to [b,a,c]; disable c.
+	// Partial priority ["b"] derives effective order [b,a,c]; disable c.
 	if status, err := p.SetPriority("auto", []string{"b"}); status != 200 || err != nil {
 		t.Fatalf("SetPriority: status=%d err=%v", status, err)
 	}
@@ -1914,12 +1911,15 @@ func TestRuntimeConfig_priorityRoundTrip(t *testing.T) {
 		cc, _ := pp.controller("auto")
 		cc.mu.Lock()
 		defer cc.mu.Unlock()
-		if len(cc.priority) != 3 {
-			t.Fatalf("%s: priority length=%d, want 3", label, len(cc.priority))
+		if len(cc.declaredPriority) != 1 || cc.declaredPriority[0] != "b" {
+			t.Fatalf("%s: declared priority=%v, want [b]", label, cc.declaredPriority)
 		}
-		for i, got := range cc.priority {
+		if len(cc.order) != len(want) {
+			t.Fatalf("%s: effective order=%v, want %v", label, cc.order, want)
+		}
+		for i, got := range cc.order {
 			if got != want[i] {
-				t.Errorf("%s: priority[%d]=%q, want %q", label, i, got, want[i])
+				t.Errorf("%s: order[%d]=%q, want %q", label, i, got, want[i])
 			}
 		}
 		if !cc.disabled["c"] {

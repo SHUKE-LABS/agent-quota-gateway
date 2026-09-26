@@ -15,8 +15,8 @@ import (
 // propagationEnv builds a 3-pool env (a, b, c) sharing one nick "ccz" — the
 // #254 shared-credential shape (nick ccz live in four pools in the field
 // report) — plus a pool-private second member in each so a park on ccz has
-// somewhere healthy to fail over to. Each pool's priority pins ccz first so
-// NewPools' otherwise-random start is deterministic.
+// somewhere healthy to fail over to. Each pool's declared order ranks ccz
+// first, making the intended sticky start explicit.
 func propagationEnv() map[string]string {
 	return map[string]string{
 		backend.EnvPrefix + "A_BACKEND_CCZ": "cred-ccz",
@@ -268,7 +268,7 @@ func TestCredentialPark_statuslessSnapshotDoesNotSurviveClear(t *testing.T) {
 // half-open picker (nextParkedButResetPassedLocked) must never forward a
 // live client request to a nick whose only park is credential-fatal, even
 // once its live-429 sibling's reset has elapsed and it would otherwise be
-// the round-robin pick.
+// the highest-ranked eligible member.
 func TestCredentialPark_halfOpenPickerSkipsPropagatedPark(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := newController(t, 0, clock, nil, "x", "y")
