@@ -1025,7 +1025,7 @@ func TestReconcile_soleMemberRoutesAfterReconcile(t *testing.T) {
 // TestReconcile_poolStatusFlipsNonStickyMember proves routing and the
 // /_gateway/pool UI agree through the shared exhaustedUntilLocked chokepoint.
 // A NON-sticky parked member is used deliberately: poolStatus returns
-// "active" for the sticky member before it ever reaches exhaustedUntilLocked,
+// "serving" for the sticky member before it ever reaches exhaustedUntilLocked,
 // so only a non-sticky member exercises the reconcile on the UI path. Its
 // status flips "exhausted" -> "idle" once the store reads fresh-healthy.
 func TestReconcile_poolStatusFlipsNonStickyMember(t *testing.T) {
@@ -1316,8 +1316,8 @@ func TestStoreExhaustedUntil_rejectedFutureResetThenElapsedClears(t *testing.T) 
 		t.Fatalf("post-reset exhaustedUntil(a) = %v,%v, want _,false (reset elapsed)", got, ok)
 	}
 	ps = c.poolStatus(store, nil, nil)
-	if s := memberStatus_(ps, "a"); s != "active" { // a is the sticky (curNick) member
-		t.Errorf("post-reset poolStatus a = %q, want active (sticky member recovered)", s)
+	if s := memberStatus_(ps, "a"); s != "serving" { // a is the sticky (curNick) member
+		t.Errorf("post-reset poolStatus a = %q, want serving (sticky member recovered)", s)
 	}
 	if eu := memberExhaustedUntil_(ps, "a"); eu != nil {
 		t.Errorf("post-reset a.ExhaustedUntil = %v, want nil", eu)
@@ -1329,7 +1329,7 @@ func TestStoreExhaustedUntil_rejectedFutureResetThenElapsedClears(t *testing.T) 
 
 // TestPoolStatus_rejectedElapsedResetNonStickyIdle covers the AC #2 non-sticky
 // arm of issue #286: a recovered member that is not the sticky one reports
-// "idle" (not "active") on /_gateway/pool, with no exhausted_until.
+// "idle" (not "serving") on /_gateway/pool, with no exhausted_until.
 func TestPoolStatus_rejectedElapsedResetNonStickyIdle(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()

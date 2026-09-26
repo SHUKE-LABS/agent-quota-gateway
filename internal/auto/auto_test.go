@@ -1601,8 +1601,8 @@ func TestPools_poolStatus(t *testing.T) {
 		byNick[m.Nick] = m
 	}
 
-	if byNick["a"].Status != "active" {
-		t.Errorf("a status=%q, want active", byNick["a"].Status)
+	if byNick["a"].Status != "serving" {
+		t.Errorf("a status=%q, want serving", byNick["a"].Status)
 	}
 	if byNick["b"].Status != "idle" {
 		t.Errorf("b status=%q, want idle", byNick["b"].Status)
@@ -1623,8 +1623,8 @@ func TestPools_poolStatus(t *testing.T) {
 	for _, m := range status2.Members {
 		byNick2[m.Nick] = m
 	}
-	if byNick2["b"].Status != "active" {
-		t.Errorf("after a 429, b status=%q, want active", byNick2["b"].Status)
+	if byNick2["b"].Status != "serving" {
+		t.Errorf("after a 429, b status=%q, want serving", byNick2["b"].Status)
 	}
 	if byNick2["a"].Status != "exhausted" {
 		t.Errorf("after a 429, a status=%q, want exhausted", byNick2["a"].Status)
@@ -1637,12 +1637,12 @@ func TestPools_poolStatus(t *testing.T) {
 // TestPools_stickyParkedReportsExhausted is the regression for issue #146:
 // when the pool's sticky member is itself parked, both /_gateway/pool
 // (poolStatus) and /_gateway/config (EffectiveConfig) must report it
-// "exhausted", not "active" — matching the routing path, which 429s it.
+// "exhausted", not "serving" — matching the routing path, which 429s it.
 func TestPools_stickyParkedReportsExhausted(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	// Single-member pool: after a 429 there is nowhere to fail over, so the
 	// sticky pointer stays on the parked member a — exactly the sticky+parked
-	// case the old "active"-before-"exhausted" ordering misreported.
+	// case the old sticky-before-"exhausted" ordering misreported.
 	c := newController(t, 0, clock, io.Discard, "a")
 	pools := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
 	store := quota.NewStore()

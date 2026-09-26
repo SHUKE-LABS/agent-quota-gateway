@@ -280,7 +280,6 @@
   table.members td.reset { color: var(--muted); white-space: nowrap; }
   table.members td.workers { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   table.members td.workers.pending { opacity: 0.5; }
-  .serving { color: var(--ok); font-size: 10px; font-weight: 600; text-transform: uppercase; }
 
   /* Compact quota bar: a track with a fill, plus a NN% label. Falls back
      to a plain "-" text node when the window has no utilization yet.
@@ -326,11 +325,10 @@
     color: var(--muted);
     background: var(--bg);
   }
-  .status[data-status="active"] { color: var(--ok); border-color: var(--ok); }
   .status[data-status="exhausted"] { color: var(--danger); border-color: var(--danger); }
   .status[data-status="disabled"] { color: var(--muted); }
   .status[data-status="idle"] { color: var(--accent); border-color: var(--accent); }
-  .status[data-status="serving"] { color: var(--accent); border-color: var(--accent); }
+  .status[data-status="serving"] { color: var(--ok); border-color: var(--ok); }
 
   /* Per-member enable/disable control. Encodes the member's *current* state,
      not the action the click will perform. The click still routes through
@@ -905,15 +903,6 @@
         rank.textContent = String(idx + 1);
         wrap.appendChild(rank);
 
-        if (showWorkers) {
-          var serving = document.createElement('span');
-          serving.className = 'serving';
-          serving.setAttribute('data-role', 'serving');
-          serving.textContent = 'serving';
-          serving.style.display = 'none';
-          wrap.appendChild(serving);
-        }
-
         var name = document.createElement('span');
         name.className = 'nick-name';
         name.textContent = m.nick;
@@ -944,14 +933,6 @@
         tdN.appendChild(wrap);
       } else {
         tdN.textContent = m.nick;
-        if (showWorkers) {
-          var soloServing = document.createElement('span');
-          soloServing.className = 'serving';
-          soloServing.setAttribute('data-role', 'serving');
-          soloServing.textContent = ' serving';
-          soloServing.style.display = 'none';
-          tdN.appendChild(soloServing);
-        }
       }
       tr.appendChild(tdN);
 
@@ -967,7 +948,7 @@
       var status = document.createElement('span');
       status.className = 'status';
       status.setAttribute('data-role', 'status');
-      applyStatusPresentation(status, m, view.concurrency);
+      applyStatusPresentation(status, m);
       tdS.appendChild(status);
       tr.appendChild(tdS);
 
@@ -1117,15 +1098,12 @@
     };
   }
 
-  function statusPresentation(concurrency, member) {
-    var status = member.status || 'idle';
-    if (status === 'disabled' || status === 'exhausted' || status === 'active') return status;
-    var workers = workerPresentation(concurrency, member);
-    return workers.serving && workers.count > 0 ? 'serving' : status;
+  function statusPresentation(member) {
+    return member.status || 'idle';
   }
 
-  function applyStatusPresentation(badge, member, concurrency) {
-    var status = statusPresentation(concurrency, member);
+  function applyStatusPresentation(badge, member) {
+    var status = statusPresentation(member);
     badge.setAttribute('data-status', status);
     badge.textContent = status;
   }
@@ -1515,13 +1493,9 @@
         s.members.forEach(function (m) { if (m.nick === nick) match = m; });
         if (!match) return;
         var badge = tr.querySelector('[data-role="status"]');
-        if (badge) applyStatusPresentation(badge, match, s.concurrency);
+        if (badge) applyStatusPresentation(badge, match);
         var workerCell = tr.querySelector('[data-role="workers"]');
         if (workerCell) applyWorkerPresentation(workerCell, match, s.concurrency);
-        var serving = tr.querySelector('[data-role="serving"]');
-        if (serving) {
-          serving.style.display = workerPresentation(s.concurrency, match).serving ? '' : 'none';
-        }
         // Sync the toggle from the live disabled flag so it can't freeze "On"
         // while the badge reads "disabled" after an out-of-band disable (issue
         // #159). Mirrors the render-time logic at the toggle's creation.

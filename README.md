@@ -783,7 +783,7 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
   "poller": { "last_success": "2026-07-13T11:58:42Z", "consecutive_failures": 0, "stale": false },
   "members": [
     { "nick": "a", "status": "exhausted", "exhausted_until": "2026-06-15T18:00:00Z", "snapshot": { ... }, "disabled": false, "parked": true  },
-    { "nick": "b", "status": "active",    "exhausted_until": null,                   "snapshot": { ... }, "disabled": false, "parked": false },
+    { "nick": "b", "status": "serving",   "exhausted_until": null,                   "snapshot": { ... }, "disabled": false, "parked": false },
     { "nick": "c", "status": "idle",      "exhausted_until": null,                   "snapshot": null,    "disabled": false, "parked": false },
     { "nick": "d", "status": "disabled",  "exhausted_until": null,                   "snapshot": null,    "disabled": true,  "parked": false }
   ]
@@ -794,10 +794,13 @@ curl http://127.0.0.1:8080/_gateway/pool?pool=auto
 
 | Value | Meaning |
 |-------|---------|
-| `active` | Currently selected by the sticky pointer **and** available — `exhausted` outranks `active`, so a sticky member that is also parked reports `exhausted`, not `active` |
+| `serving` | An available routing target: the global sticky target at every concurrency, or at concurrency above 1 an additional member with an assigned worker inside the current window. `disabled` and `exhausted` take precedence. This describes routing eligibility, not an in-flight request. |
 | `exhausted` | Unavailable — either a recorded failed-response park or a status-bearing rejected store window; `exhausted_until` is the bound |
-| `idle` | Healthy and not currently active |
+| `idle` | Healthy but not currently serving. Being inside the worker window without an assigned worker is eligibility, not serving. |
 | `disabled` | Taken out of selection and failover by the runtime disable toggle — `disabled` outranks every other state, so a disabled member always reports `disabled` regardless of its quota |
+
+The top-level `active` field remains the single global sticky nick. It is not a
+list of all serving members.
 
 `exhausted_until` is an RFC 3339 timestamp when `status == "exhausted"`,
 `null` otherwise. `snapshot` is the same `quota.Snapshot` object
@@ -940,7 +943,7 @@ order, and per-member `nick` / `base_url` / `disabled` /
     "priority": ["b", "a", "c"],
     "members": [
       { "nick": "a", "base_url": "https://api.anthropic.com", "disabled": true,  "status": "disabled" },
-      { "nick": "b", "base_url": "https://api.anthropic.com", "disabled": false, "status": "active" }
+      { "nick": "b", "base_url": "https://api.anthropic.com", "disabled": false, "status": "serving" }
     ]
   }
 ]
@@ -1147,8 +1150,8 @@ it was freed in (a whole-pool clear can release several nicks at once):
 ```
 
 A single-file management page is served at `GET /_gateway/ui`. Open it in a
-browser to view every pool, its priority order, the active member, and each
-member's live status (`active` / `exhausted` / `disabled` / `idle`), and to
+browser to view every pool, its priority order, the global sticky target, and
+each member's live status (`serving` / `exhausted` / `disabled` / `idle`), and to
 reorder priority, toggle enable/disable, or **clear a single member's live-429
 park**. The per-member "Clear park" button appears only on a member the gateway
 currently reports `parked: true`; clicking it confirms (it overrides the
@@ -1164,12 +1167,14 @@ contains no auth and no build step — it inherits the gateway's trust boundary.
 write controls to any client that can reach the port; the network
 ACL/firewall restricting the port is the only gate.
 
-At concurrency above 1, the dashboard shows a healthy non-sticky member as
-`serving` in the Status badge when it has assigned workers and is in the active
-worker window. The global sticky member keeps the `active` badge; out-of-window
-assignments remain pending, and `disabled` or `exhausted` status takes
-precedence. This is a dashboard presentation distinction; the API `status`
-continues to describe the global sticky route.
+At concurrency 1, the available global sticky member reports `serving` without
+a worker assignment. At concurrency above 1, additional available members
+report `serving` only when they have an assigned worker inside the current
+window. The dashboard displays that API status directly in the Status badge;
+it keeps worker counts and shows out-of-window assignments as pending. A
+member inside the window without an assignment stays `idle`, and `disabled` or
+`exhausted` takes precedence. `serving` describes a routing target, not an
+in-flight request.
 
 A rolling-window utilization cell (5h or long) renders `-` once its reset has
 already elapsed, mirroring what the adjacent reset cell and status badge

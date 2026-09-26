@@ -189,6 +189,139 @@ func TestWorkerStatus_reportsWindowAndDeferredAffinity(t *testing.T) {
 	}
 }
 
+func TestWorkerStatus_servingRequiresStickyOrAssignedInWindow(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := NewController(workerPriorityRegistry(t, 3, "a,b,c,d,e,f", "a", "b", "c", "d", "e", "f"), "auto", 0, nil, clock.now, io.Discard)
+	c.curNick = "a"
+	c.workerAffinity = map[string]string{
+		"worker-b": "b",
+		"worker-d": "d",
+		"worker-e": "e",
+		"worker-f": "f",
+	}
+	c.exhausted["f"] = clock.now().Add(time.Hour)
+	p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
+	if code, err := p.SetMemberDisabled("auto", "e", true); code != http.StatusOK || err != nil {
+		t.Fatalf("SetMemberDisabled(e): status=%d err=%v", code, err)
+	}
+
+	status, ok := p.PoolStatus("auto", quota.NewStore(), nil)
+	if !ok {
+		t.Fatal("PoolStatus(auto) missing")
+	}
+	if status.Active != "a" {
+		t.Fatalf("active=%q, want global sticky nick a", status.Active)
+	}
+	byNick := make(map[string]MemberStatus, len(status.Members))
+	for _, member := range status.Members {
+		byNick[member.Nick] = member
+	}
+	for nick, want := range map[string]string{
+		"a": "serving", // global sticky target needs no worker affinity
+		"b": "serving", // assigned worker is inside the window
+		"c": "idle",    // in the window, but no assigned worker
+		"d": "idle",    // stale assignment is pending outside the window
+		"e": "disabled",
+		"f": "exhausted",
+	} {
+		if got := byNick[nick].Status; got != want {
+			t.Errorf("%s status=%q, want %q", nick, got, want)
+		}
+	}
+	if byNick["c"].InWindow != true || len(byNick["c"].Workers) != 0 {
+		t.Errorf("window-only member c=%+v, want eligible with no assignment", byNick["c"])
+	}
+	if byNick["d"].InWindow || strings.Join(byNick["d"].Workers, ",") != "worker-d" {
+		t.Errorf("stale assignment d=%+v, want out-of-window with worker-d still visible", byNick["d"])
+	}
+	for nick, worker := range map[string]string{"e": "worker-e", "f": "worker-f"} {
+		if strings.Join(byNick[nick].Workers, ",") != worker {
+			t.Errorf("%s workers=%v, want stale assignment %s", nick, byNick[nick].Workers, worker)
+		}
+	}
+
+	configStatuses := make(map[string]string)
+	for _, view := range p.EffectiveConfig() {
+		for _, member := range view.Members {
+			configStatuses[member.Nick] = member.Status
+		}
+	}
+	for nick, member := range byNick {
+		if got := configStatuses[nick]; got != member.Status {
+			t.Errorf("config status for %s=%q, pool status=%q", nick, got, member.Status)
+		}
+	}
+
+	if code, err := p.SetConcurrency("auto", 1); code != http.StatusOK || err != nil {
+		t.Fatalf("SetConcurrency(1): status=%d err=%v", code, err)
+	}
+	status, _ = p.PoolStatus("auto", quota.NewStore(), nil)
+	byNick = make(map[string]MemberStatus, len(status.Members))
+	for _, member := range status.Members {
+		byNick[member.Nick] = member
+	}
+	for nick, want := range map[string]string{
+		"a": "serving",
+		"b": "idle",
+		"c": "idle",
+		"d": "idle",
+		"e": "disabled",
+		"f": "exhausted",
+	} {
+		if got := byNick[nick].Status; got != want {
+			t.Errorf("concurrency 1: %s status=%q, want %q", nick, got, want)
+		}
+	}
+}
+
+func TestWorkerStatus_disabledAndExhaustedOverrideStickyWorkers(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	for _, tc := range []struct {
+		name string
+		want string
+		set  func(*Controller)
+	}{
+		{name: "disabled", want: "disabled", set: func(c *Controller) { c.disabled["b"] = true }},
+		{name: "exhausted", want: "exhausted", set: func(c *Controller) { c.exhausted["b"] = clock.now().Add(time.Hour) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewController(workerPriorityRegistry(t, 2, "a,b,c", "a", "b", "c"), "auto", 0, nil, clock.now, io.Discard)
+			c.curNick = "b"
+			c.workerAffinity = map[string]string{"worker-b": "b"}
+			tc.set(c)
+			p := &Pools{byPool: map[string]*Controller{"auto": c}, reg: c.reg}
+
+			status, ok := p.PoolStatus("auto", quota.NewStore(), nil)
+			if !ok {
+				t.Fatal("PoolStatus(auto) missing")
+			}
+			if got := memberStatus(status, "b"); got != tc.want {
+				t.Errorf("sticky member b status=%q, want %q", got, tc.want)
+			}
+			workers := []string(nil)
+			for _, member := range status.Members {
+				if member.Nick == "b" {
+					workers = member.Workers
+				}
+			}
+			if got := strings.Join(workers, ","); got != "worker-b" {
+				t.Errorf("b workers=%q, want worker-b", got)
+			}
+			configStatus := ""
+			for _, view := range p.EffectiveConfig() {
+				for _, member := range view.Members {
+					if member.Nick == "b" {
+						configStatus = member.Status
+					}
+				}
+			}
+			if configStatus != tc.want {
+				t.Errorf("config status for b=%q, want %q", configStatus, tc.want)
+			}
+		})
+	}
+}
+
 func TestSetConcurrency_reassignsOnlyWorkersOutsideLoweredWindow(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	p := NewPools(workerRegistryWithConcurrency(t, 3, "a", "b", "c"), nil, clock.now, io.Discard)

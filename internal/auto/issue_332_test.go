@@ -162,8 +162,8 @@ func TestCredentialDryPoolRecoveryClearsSiblingParks(t *testing.T) {
 		if !ok {
 			t.Fatalf("PoolStatus(%s) missing", pool)
 		}
-		if memberStatus(status, "shared") != "active" || memberParked(status, "shared") {
-			t.Errorf("pool %s shared member status=%q parked=%v, want active/false", pool, memberStatus(status, "shared"), memberParked(status, "shared"))
+		if memberStatus(status, "shared") != "serving" || memberParked(status, "shared") {
+			t.Errorf("pool %s shared member status=%q parked=%v, want serving/false", pool, memberStatus(status, "shared"), memberParked(status, "shared"))
 		}
 		for _, member := range status.Members {
 			if member.Nick == "shared" && member.ExhaustedUntil != nil {
@@ -551,8 +551,8 @@ func TestCredentialDryPoolWorkerRecoveryRoutesNormally(t *testing.T) {
 			if !ok {
 				t.Fatal("PoolStatus(auto) missing")
 			}
-			if memberStatus(status, "a") != "active" || memberParked(status, "a") {
-				t.Errorf("recovered worker member status=%q parked=%v, want active/false", memberStatus(status, "a"), memberParked(status, "a"))
+			if memberStatus(status, "a") != "serving" || memberParked(status, "a") {
+				t.Errorf("recovered worker member status=%q parked=%v, want serving/false", memberStatus(status, "a"), memberParked(status, "a"))
 			}
 			for _, member := range status.Members {
 				if member.Nick == "a" && member.ExhaustedUntil != nil {
