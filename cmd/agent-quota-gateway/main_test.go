@@ -726,15 +726,20 @@ func TestPoolAndConfigEndpointsShareServingStatus(t *testing.T) {
 	for _, nick := range []string{"a", "b", "c", "d"} {
 		t.Setenv("AQG_POOL_AUTO_BACKEND_"+strings.ToUpper(nick), "sk-ant-"+nick)
 	}
+	t.Setenv("AQG_POOL_AUTO_PRIORITY", "a,b,c,d")
 	t.Setenv("AQG_POOL_AUTO_CONCURRENCY", "3")
 	registry, err := backend.Load("https://api.anthropic.com")
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
 	pools := auto.NewPools(registry, nil, nil, io.Discard)
-	for _, worker := range []string{"worker-a", "worker-b", "worker-c"} {
-		if member, _, ok, exhausted := pools.RouteWorker("auto", worker); !ok || exhausted || member.Nick == "" {
-			t.Fatalf("RouteWorker(%s) = %q ok=%v exhausted=%v", worker, member.Nick, ok, exhausted)
+	for _, route := range []struct{ worker, nick string }{
+		{worker: "worker-a", nick: "a"},
+		{worker: "worker-b", nick: "b"},
+		{worker: "worker-c", nick: "c"},
+	} {
+		if member, _, ok, exhausted := pools.RouteWorker("auto", route.worker); !ok || exhausted || member.Nick != route.nick {
+			t.Fatalf("RouteWorker(%s) = %q ok=%v exhausted=%v, want %s", route.worker, member.Nick, ok, exhausted, route.nick)
 		}
 	}
 	if code, err := pools.SetConcurrency("auto", 2); code != http.StatusOK || err != nil {
@@ -764,6 +769,9 @@ func TestPoolAndConfigEndpointsShareServingStatus(t *testing.T) {
 	}
 	if current, ok := pools.Current("auto"); !ok || poolView.Active != current.Nick {
 		t.Fatalf("pool active=%q current=%+v ok=%v, want global sticky nick", poolView.Active, current, ok)
+	}
+	if poolView.Active != "a" {
+		t.Fatalf("pool active=%q, want priority-anchored sticky nick a", poolView.Active)
 	}
 
 	configResp, err := http.Get(srv.URL + "/_gateway/config")
@@ -795,12 +803,24 @@ func TestPoolAndConfigEndpointsShareServingStatus(t *testing.T) {
 	var pendingFound bool
 	var inWindowWorkerFound bool
 	poolStatusByNick := make(map[string]auto.MemberStatus, len(poolView.Members))
+	wantStatus := map[string]string{"a": "serving", "b": "serving", "c": "idle", "d": "idle"}
+	wantInWindow := map[string]bool{"a": true, "b": true, "c": false, "d": false}
+	wantWorkers := map[string]string{"a": "worker-a", "b": "worker-b", "c": "worker-c", "d": ""}
 	for _, member := range poolView.Members {
 		poolStatusByNick[member.Nick] = member
+		if member.Status != wantStatus[member.Nick] {
+			t.Errorf("member %s status=%q, want %q", member.Nick, member.Status, wantStatus[member.Nick])
+		}
+		if member.InWindow != wantInWindow[member.Nick] {
+			t.Errorf("member %s in_window=%v, want %v", member.Nick, member.InWindow, wantInWindow[member.Nick])
+		}
+		if got := strings.Join(member.Workers, ","); got != wantWorkers[member.Nick] {
+			t.Errorf("member %s workers=%q, want %q", member.Nick, got, wantWorkers[member.Nick])
+		}
 		if configStatus[member.Nick] != member.Status {
 			t.Errorf("member %s: config status=%q, pool status=%q", member.Nick, configStatus[member.Nick], member.Status)
 		}
-		if !member.InWindow && len(member.Workers) > 0 {
+		if member.Nick != poolView.Active && !member.InWindow && len(member.Workers) > 0 {
 			pendingFound = true
 			if member.Status != "idle" {
 				t.Errorf("pending member %s status=%q, want idle", member.Nick, member.Status)
