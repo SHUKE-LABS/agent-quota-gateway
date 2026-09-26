@@ -467,13 +467,14 @@ func (p *Pools) AllPoolStatuses(store *quota.Store, pl *poller.Poller) []PoolSta
 }
 
 // CredentialParkPersist is the persisted shape of one credentialPark entry
-// (issue #254 AC7). WindowFact mirrors credentialParkEntry.windowFact so a
-// reload keeps applying store-reconciliation (#145) and the preemptor's
-// precise-reset supersession to the header-less-429 residue, without ever
-// treating a reloaded 401/403 entry as reconcilable by either.
+// (issue #254 AC7, #332). WindowFact mirrors credentialParkEntry.windowFact;
+// AuthRejected distinguishes 401/403 parks from quota fallback parks, which
+// may have the same WindowFact value. Its zero value keeps legacy entries on
+// the non-auth route.
 type CredentialParkPersist struct {
-	Reset      time.Time `json:"reset"`
-	WindowFact bool      `json:"window_fact,omitempty"`
+	Reset        time.Time `json:"reset"`
+	WindowFact   bool      `json:"window_fact,omitempty"`
+	AuthRejected bool      `json:"auth_rejected,omitempty"`
 }
 
 // PoolPersistState is the serializable routing state for one pool.
@@ -1432,9 +1433,9 @@ func nickNotResolvableError(nick string, reg *backend.Registry) error {
 // controller it happens to be writing (issue #254 AC6). An existing later
 // reset wins, because propagation can be delayed behind a sibling's own
 // observation and overwriting it would shorten the active park. Equal resets
-// retain the existing entry so its windowFact classification is preserved
-// (issue #275).
-func (p *Pools) propagateCredentialPark(originPool, nick string, reset time.Time, windowFact bool) {
+// retain the existing entry so its windowFact/authRejected
+// classifications are preserved (issues #275, #332).
+func (p *Pools) propagateCredentialPark(originPool, nick string, reset time.Time, windowFact, authRejected bool) {
 	reg := p.CurrentRegistry()
 	for _, name := range reg.PoolNames() {
 		if name == originPool {
@@ -1450,10 +1451,41 @@ func (p *Pools) propagateCredentialPark(originPool, nick string, reset time.Time
 		c.mu.Lock()
 		changed := false
 		if existing, ok := c.credentialPark[nick]; !ok || reset.After(existing.reset) {
-			c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact}
+			c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact, authRejected: authRejected}
 			changed = true
 		}
 		if changed {
+			c.notifyMutate()
+		}
+		c.mu.Unlock()
+	}
+}
+
+// propagateCredentialParkAuthClear releases only auth-rejection parks in
+// sibling pools. It also removes the matching exhausted record written by
+// the same auth rejection, while preserving a different quota reset that may
+// have been recorded for the nick in the meantime.
+func (p *Pools) propagateCredentialParkAuthClear(originPool, nick string) {
+	reg := p.CurrentRegistry()
+	for _, name := range reg.PoolNames() {
+		if name == originPool {
+			continue
+		}
+		if _, ok := reg.ResolveIn(name, nick); !ok {
+			continue
+		}
+		c, ok := p.controller(name)
+		if !ok {
+			continue
+		}
+		c.mu.Lock()
+		entry, had := c.credentialPark[nick]
+		if had && entry.authRejected {
+			delete(c.credentialPark, nick)
+			if reset, hasExhausted := c.exhausted[nick]; hasExhausted && reset.Equal(entry.reset) {
+				delete(c.exhausted, nick)
+			}
+			c.reanchorLocked()
 			c.notifyMutate()
 		}
 		c.mu.Unlock()
@@ -1506,11 +1538,14 @@ func (p *Pools) propagateCredentialParkClear(originPool, nick string) []string {
 // pool-name string, so a later rename (RenamePool) is picked up via c.name()
 // at call time instead of propagating under a stale name.
 func (p *Pools) wireCredentialParkPropagation(c *Controller) {
-	c.propagatePark = func(nick string, reset time.Time, windowFact bool) {
-		p.propagateCredentialPark(c.name(), nick, reset, windowFact)
+	c.propagatePark = func(nick string, reset time.Time, windowFact, authRejected bool) {
+		p.propagateCredentialPark(c.name(), nick, reset, windowFact, authRejected)
 	}
 	c.propagateParkClear = func(nick string) []string {
 		return p.propagateCredentialParkClear(c.name(), nick)
+	}
+	c.propagateAuthParkClear = func(nick string) {
+		p.propagateCredentialParkAuthClear(c.name(), nick)
 	}
 }
 
@@ -1520,20 +1555,22 @@ func (p *Pools) wireCredentialParkPropagation(c *Controller) {
 // disagree on which retirement paths besides wall-clock aging, an explicit
 // clear, and a successful recovery probe may drop the entry early:
 //
-//   - windowFact == false: a 401/403 credential rejection. This is a fact
+//   - authRejected == true: a 401/403 credential rejection. This is a fact
 //     about the credential itself, not a quota window — a fresh, healthy
 //     store snapshot proves nothing about whether a since-revoked credential
 //     still authenticates (the snapshot could easily predate the
 //     revocation), so storeReconcilesParkLocked (#145) and the preemptor's
-//     precise-reset supersession (noteRecovered) must never touch it.
-//   - windowFact == true: a 429 whose resetFrom fell back to
-//     defaultExhaustionWindow (the AC2 residue) — a real quota-window fact
-//     the gateway simply lacks a precise bound for. The store or a later
-//     precise reset CAN retire this early, exactly as it would for an
-//     ordinary c.exhausted entry, so both mechanisms apply.
+//     precise-reset supersession (noteRecovered) must never touch it. Older
+//     persisted entries have no authRejected bit and remain non-auth parks.
+//   - authRejected == false: a quota fallback park whose precise bound is
+//     unavailable, or a legacy persisted entry whose origin is unknown.
+//     Quota fallback parks can have either windowFact value: authRejected is
+//     the request-routing discriminator, while windowFact controls store
+//     reconciliation. A missing persisted authRejected bit stays false.
 type credentialParkEntry struct {
-	reset      time.Time
-	windowFact bool
+	reset        time.Time
+	windowFact   bool
+	authRejected bool
 }
 
 // Controller is the sticky selector for one pool. The zero value is not
@@ -1684,7 +1721,7 @@ type Controller struct {
 	// test via NewController, where there is no sibling to reach. Always
 	// called with c.mu NOT held — see record429WithSource's doc for why
 	// holding it here would risk a lock-order inversion.
-	propagatePark func(nick string, reset time.Time, windowFact bool)
+	propagatePark func(nick string, reset time.Time, windowFact, authRejected bool)
 
 	// propagateParkClear, when set, releases nick's propagated credential
 	// park in every sibling pool holding it (issue #254 AC5/AC12), returning
@@ -1692,6 +1729,11 @@ type Controller struct {
 	// response can name them. Wired alongside propagatePark; nil for a bare
 	// Controller. Always called with c.mu NOT held.
 	propagateParkClear func(nick string) []string
+
+	// propagateAuthParkClear releases only mirrored 401/403 credential parks.
+	// Request-path recovery uses this narrower callback so an independent quota
+	// park for the same nick remains intact.
+	propagateAuthParkClear func(nick string)
 }
 
 // NewController builds the sticky selector over the members of poolName
@@ -2076,9 +2118,9 @@ func (c *Controller) isUnavailableLocked(nick string) bool {
 }
 
 // ResolveAuto returns the backend a request to this pool should use now.
-// When the whole pool is exhausted it returns exhausted=true with the
-// soonest-resetting member and the wait until that reset; the caller
-// emits an honest 429.
+// A pool dry solely from auth-rejection parks returns the first parked member
+// for a real request; other dry pools return exhausted=true with the
+// soonest-resetting member and its wait.
 func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2097,6 +2139,15 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	// Current is unavailable; find a healthy replacement.
 	if nick, ok := c.firstHealthyNickLocked(); ok {
 		c.setActiveMemberLocked(nick)
+		if b, ok := c.backendByNickLocked(nick); ok {
+			return b, 0, false
+		}
+	}
+
+	// A pool dry solely from auth-rejection parks retries real client traffic
+	// against the first parked member in effective order. A quota park, even a
+	// fallback park whose windowFact is false, keeps the synthetic dry response.
+	if nick, ok := c.authOnlyDryPoolNickLocked(); ok {
 		if b, ok := c.backendByNickLocked(nick); ok {
 			return b, 0, false
 		}
@@ -2186,6 +2237,11 @@ func (c *Controller) ResolveWorker(worker string) (backend.Backend, time.Duratio
 
 	if mutated {
 		c.notifyMutate()
+	}
+	if nick, ok := c.authOnlyDryPoolNickLocked(); ok {
+		if b, ok := c.backendByNickLocked(nick); ok {
+			return b, 0, false
+		}
 	}
 	// The worker has no assignment while every member is unavailable. The
 	// returned backend is only used for the existing pool-dry response path.
@@ -2305,6 +2361,31 @@ func (c *Controller) ClearExhaustedNick(nick string) (cleared bool, releasedElse
 		releasedElsewhere = c.propagateParkClear(nick)
 	}
 	return true, releasedElsewhere
+}
+
+// clearAuthRejectedPark retires only the auth-rejection park written for nick
+// and its matching exhausted record. A different exhausted reset may be a
+// quota park recorded while this request was in flight, so it is preserved.
+// The matching auth park is then released from sibling pools.
+func (c *Controller) clearAuthRejectedPark(nick string) bool {
+	c.mu.Lock()
+	entry, ok := c.credentialPark[nick]
+	if !ok || !entry.authRejected {
+		c.mu.Unlock()
+		return false
+	}
+	delete(c.credentialPark, nick)
+	if reset, hasExhausted := c.exhausted[nick]; hasExhausted && reset.Equal(entry.reset) {
+		delete(c.exhausted, nick)
+	}
+	c.reanchorLocked()
+	c.notifyMutate()
+	c.mu.Unlock()
+
+	if c.propagateAuthParkClear != nil {
+		c.propagateAuthParkClear(nick)
+	}
+	return true
 }
 
 // Current returns the nick of the active sticky backend, or "" for a
@@ -2557,7 +2638,11 @@ func (c *Controller) loadCredentialPark(credentialPark map[string]CredentialPark
 		if c.indexOf(nick) < 0 {
 			continue
 		}
-		c.credentialPark[nick] = credentialParkEntry{reset: persisted.Reset, windowFact: persisted.WindowFact}
+		c.credentialPark[nick] = credentialParkEntry{
+			reset:        persisted.Reset,
+			windowFact:   persisted.WindowFact,
+			authRejected: persisted.AuthRejected,
+		}
 	}
 }
 
@@ -2613,7 +2698,7 @@ func (c *Controller) persistState() PoolPersistState {
 	if len(c.credentialPark) > 0 {
 		cp := make(map[string]CredentialParkPersist, len(c.credentialPark))
 		for k, v := range c.credentialPark {
-			cp[k] = CredentialParkPersist{Reset: v.reset, WindowFact: v.windowFact}
+			cp[k] = CredentialParkPersist{Reset: v.reset, WindowFact: v.windowFact, AuthRejected: v.authRejected}
 		}
 		ps.CredentialPark = cp
 	}
@@ -2641,8 +2726,8 @@ func (c *Controller) persistState() PoolPersistState {
 // unavailable (removed, disabled, or exhausted), switching to the first healthy
 // member when one exists and otherwise to the soonest-resetting non-removed
 // member. It is a no-op when the current member is healthy. Used at startup
-// after runtime config (including removed-member tombstones) is restored on top
-// of the persisted sticky pointer. Caller holds c.mu.
+// after runtime config is restored and when recovery makes a member selectable.
+// Caller holds c.mu.
 func (c *Controller) reanchorLocked() {
 	if len(c.members) == 0 {
 		return
@@ -2694,6 +2779,12 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 	b, ok := backend.FromContext(resp.Request.Context())
 	if !ok {
 		return nil
+	}
+	// Any response except another credential rejection retires the auth park
+	// before normal handling; in particular, a following 429 establishes its
+	// ordinary quota park.
+	if !isCredentialRejected(resp.StatusCode) {
+		c.clearAuthRejectedPark(b.Nick)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests && isCodexBackend(b) {
 		// Preserve Codex's response-meter parsing and reset calculation for
@@ -2796,7 +2887,7 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 		// windowFact=false: no quota window is involved at all, so neither
 		// the store's freshness reconciliation nor the preemptor's precise
 		// reset may ever retire this park early.
-		return c.parkAndFailoverWithSource(resp, b.Nick, c.now().Add(defaultExhaustionWindow), fmt.Sprintf("returned %d", resp.StatusCode), true, false)
+		return c.parkAndFailoverCredentialRejected(resp, b.Nick, c.now().Add(defaultExhaustionWindow), fmt.Sprintf("returned %d", resp.StatusCode))
 	default:
 		return nil
 	}
@@ -3019,7 +3110,15 @@ func (c *Controller) parkAndFailover(resp *http.Response, nick string, reset tim
 // — see that method's doc for what the flags mean and how propagation is
 // kept deadlock-free.
 func (c *Controller) parkAndFailoverWithSource(resp *http.Response, nick string, reset time.Time, reason string, storeUnrepresentable, windowFact bool) error {
-	res := c.record429WithSource(nick, reset, storeUnrepresentable, windowFact)
+	return c.parkAndFailoverWithCause(resp, nick, reset, reason, storeUnrepresentable, windowFact, false)
+}
+
+func (c *Controller) parkAndFailoverCredentialRejected(resp *http.Response, nick string, reset time.Time, reason string) error {
+	return c.parkAndFailoverWithCause(resp, nick, reset, reason, true, false, true)
+}
+
+func (c *Controller) parkAndFailoverWithCause(resp *http.Response, nick string, reset time.Time, reason string, storeUnrepresentable, windowFact, authRejected bool) error {
+	res := c.record429WithCause(nick, reset, storeUnrepresentable, windowFact, authRejected)
 
 	if res.allExhausted {
 		if recovered := c.tryRecoverParked(); recovered != "" {
@@ -3173,17 +3272,20 @@ func (c *Controller) record429(nick string, reset time.Time) record429Result {
 	return c.record429WithSource(nick, reset, false, false)
 }
 
-// record429WithSource is record429 plus explicit flags for whether the bound
-// is representable in the shared quota store (issue #254). When
-// storeUnrepresentable is true — the 401/403 credential-fatal park, or a 429
-// whose resetFrom fell back to defaultExhaustionWindow — the park is also
-// written into c.credentialPark and propagated to every sibling pool holding
-// the nick, since no store-derived signal will ever teach them about it.
-// windowFact (meaningful only when storeUnrepresentable is true) distinguishes
-// the header-less-429 subclass (true — a real quota-window fact eligible for
-// storeReconcilesParkLocked and the preemptor's precise-reset supersession)
-// from the 401/403 subclass (false — a credential fact neither may retire
-// early); see credentialParkEntry's doc for the full reasoning.
+// record429WithSource is record429 plus a flag for whether the bound is
+// representable in the shared quota store (issue #254). It is the quota path;
+// authRejected remains false. See record429WithCause for how unrepresentable
+// parks are classified and propagated.
+func (c *Controller) record429WithSource(nick string, reset time.Time, storeUnrepresentable, windowFact bool) record429Result {
+	return c.record429WithCause(nick, reset, storeUnrepresentable, windowFact, false)
+}
+
+// record429WithCause records a park and, when storeUnrepresentable is true,
+// stores and propagates its classification to sibling pools. authRejected is
+// the explicit #332 discriminator set only for a 401/403. windowFact instead
+// controls whether store reconciliation can retire a quota fallback: a Codex
+// capped-window 429 without a usable reset has authRejected=false and
+// windowFact=false. See credentialParkEntry for the full classification.
 //
 // Propagation happens AFTER c.mu is released. c.propagatePark, when set,
 // reaches into sibling controllers' own mu one at a time; taking a second
@@ -3194,12 +3296,12 @@ func (c *Controller) record429(nick string, reset time.Time) record429Result {
 // upholds instead is "never hold two Controller.mu locks at once", which
 // (*Pools).propagateCredentialPark also honours by locking one sibling at a
 // time). See that function's doc for the full argument.
-func (c *Controller) record429WithSource(nick string, reset time.Time, storeUnrepresentable, windowFact bool) record429Result {
+func (c *Controller) record429WithCause(nick string, reset time.Time, storeUnrepresentable, windowFact, authRejected bool) record429Result {
 	c.mu.Lock()
 
 	c.exhausted[nick] = reset
 	if storeUnrepresentable {
-		c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact}
+		c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact, authRejected: authRejected}
 	}
 	c.clearExpiredLocked() // housekeeping; never clears the future reset just set
 
@@ -3221,7 +3323,7 @@ func (c *Controller) record429WithSource(nick string, reset time.Time, storeUnre
 	c.mu.Unlock()
 
 	if storeUnrepresentable && c.propagatePark != nil {
-		c.propagatePark(nick, reset, windowFact)
+		c.propagatePark(nick, reset, windowFact, authRejected)
 	}
 	return result
 }
@@ -3802,6 +3904,40 @@ func (c *Controller) firstHealthyNickLocked() (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// authOnlyDryPoolNickLocked returns the first enabled member in effective
+// order when every enabled member is unavailable solely because of an
+// explicitly marked auth-rejection park. A same-reset exhausted entry is the
+// mirror written with that auth park; a different exhausted or store-derived
+// quota reset disqualifies the pool. Caller holds c.mu.
+func (c *Controller) authOnlyDryPoolNickLocked() (string, bool) {
+	order := c.effectivePriorityLocked()
+	if len(order) == 0 {
+		order = c.allMemberNicksLocked()
+	}
+
+	now := c.now()
+	first := ""
+	for _, nick := range order {
+		if c.disabled[nick] {
+			continue
+		}
+		entry, ok := c.credentialPark[nick]
+		if !ok || !entry.authRejected || !now.Before(entry.reset) {
+			return "", false
+		}
+		if reset, hasExhausted := c.exhausted[nick]; hasExhausted && now.Before(reset) && !reset.Equal(entry.reset) {
+			return "", false
+		}
+		if _, quotaParked := c.storeExhaustedUntilLocked(nick); quotaParked {
+			return "", false
+		}
+		if first == "" {
+			first = nick
+		}
+	}
+	return first, first != ""
 }
 
 // nextParkedButResetPassedLocked returns the nick of a parked member whose

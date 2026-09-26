@@ -1414,7 +1414,7 @@ func TestExhaustedUntil_independentParkSurvivesStoreClear(t *testing.T) {
 	// A 401/403 credential park (windowFact false) — never reconciled by the
 	// store, so it is the clean independent-signal fixture.
 	c.mu.Lock()
-	c.credentialPark["a"] = credentialParkEntry{reset: parkReset, windowFact: false}
+	c.credentialPark["a"] = credentialParkEntry{reset: parkReset, windowFact: false, authRejected: true}
 	c.mu.Unlock()
 
 	// Past the store reset but before the credential park reset: still blocked,
