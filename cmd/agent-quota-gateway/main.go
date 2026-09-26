@@ -189,8 +189,8 @@ func run(configFlag string) error {
 	}
 
 	// pools fronts every configured pool with its own sticky controller.
-	// Each controller starts at a random member (start < 0) so no probe
-	// traffic is needed to anchor it; its quota snapshot fills in from the
+	// Each controller starts at the first member in effective order (start < 0)
+	// without probe traffic; its quota snapshot fills in from the
 	// first real response. The controllers consult the shared store so a
 	// member the poller or headers report fully consumed is failed off even
 	// without a live 429 — the only exhaustion signal poller-tracked
@@ -386,18 +386,16 @@ func run(configFlag string) error {
 	go qp.Run(ctx)
 	go hello.Run(ctx)
 
-	// The preemptor returns a priority pool to a higher-priority member once
-	// that member's quota window resets, so a freshly-reset preferred backend
-	// is drained promptly instead of riding the active fallback until it 429s.
-	// It only touches pools that declared AQG_POOL_<POOL>_PRIORITY and returns
-	// immediately when none did. It shares the shutdown context.
+	// The preemptor returns a pool to a higher-ranked member once that member's
+	// quota window resets, using either the declared order or sorted nick default.
+	// It shares the shutdown context.
 	pre := auto.NewPreemptor(pools, store, 0, nil, nil)
 	go pre.Run(ctx)
 
 	// The recovery loop re-checks parked non-active members on a bounded
 	// cadence (issue #242). It fills the gap left by tryRecoverParked
-	// (allExhausted only) and the preemptor (priority pools only): a plain
-	// pool whose parked nick is no longer the active sticky backend — e.g.
+	// (allExhausted only) and preempt-back. A parked nick that is no longer the
+	// active sticky backend — e.g.
 	// because a healthy sibling has taken over, including one added after
 	// the park — had no remaining self-heal path. It only clears the live
 	// park; it never moves the sticky pointer. It is a no-op when no

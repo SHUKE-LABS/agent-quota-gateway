@@ -150,9 +150,11 @@ claude
 ```
 
 The selector still names the AQG pool through `Authorization` (or the
-existing `X-Api-Key` fallback). The worker nickname is taken from the URL and
-used only as routing identity; it is not an AQG member nick, a credential, or
-an authentication mechanism. The namespace is removed before proxying, so the
+existing `X-Api-Key` fallback). A **worker nickname** is the routing identity
+from the URL, including the worker nick used by mat. A **member nick** names a
+subscription/account and is the shared quota key across pools. These are
+separate identities; neither is a credential or authentication mechanism.
+The namespace is removed before proxying, so the
 upstream receives the same API path and query it would receive without the
 namespace. No worker field is added to `backends.json`.
 
@@ -280,10 +282,8 @@ AQG_POOL_Z_AI_BACKEND_Y=vendor-key-y|https://mirror.example/anthropic
 AQG_POOL_RESPONSES_BASE_URL=https://openai-compatible.example/api/v1
 AQG_POOL_RESPONSES_BACKEND_RESPONSES_KEY=openai-compatible-token
 
-# A mixed pool that prefers one member over another. PRIORITY makes the
-# pool start on (and fail over toward) the highest-priority healthy member
-# instead of a random one — drain the preferred backend first, fall to the
-# next when it 429s.
+# A mixed pool with an explicit member order. Unlisted members follow in
+# sorted nick order.
 AQG_POOL_CHN_BACKEND_ZAI=zai-key
 AQG_POOL_CHN_BACKEND_M3=m3-key
 AQG_POOL_CHN_PRIORITY=zai,m3
@@ -295,44 +295,46 @@ its own. Do not put Anthropic-facing and Responses-facing members in the
 same pool: pool selection is the client/operator contract, not an inferred
 protocol classification.
 
-### Priority within a pool
+### Ordered routing within a pool
 
-By default a pool's members are interchangeable: the controller starts on a
-random one and, on a `429`, fails over round-robin (spreading load and
-preserving each account's prompt cache — see
-[Pools and selectors](#pools-and-selectors)). That is ideal for a pool of
-equal-strength subscriptions.
+Every nonempty pool uses one effective member order. With no declared
+priority, members are ordered by member nick in sorted order. With
+`AQG_POOL_<POOL>_PRIORITY=<nick>,<nick>,...`, the declared nicks come first
+in that order, followed by every unlisted member in sorted nick order. The
+declaration remains optional; an omitted or empty list means the sorted
+default.
 
-When a pool mixes a *preferred* backend with a weaker fallback, declare an
-order with `AQG_POOL_<POOL>_PRIORITY=<nick>,<nick>,...` (highest first):
+An ordinary request starts on the first available member in effective order
+and stays sticky there until that member is unavailable. Failover selects the
+highest-ranked available member. This applies to every pool and intentionally
+changes undeclared pools from random startup and round-robin failover to
+sorted startup and failover. The order is by member nick only — vendor and
+model names do not affect routing.
 
-- The pool **starts on** its highest-priority member instead of a random one.
-- On a `429` it **fails over to** the highest-priority *healthy* member, so
-  failover always climbs back toward the preferred backend.
-- Members omitted from the list rank after the listed ones, in sorted order.
-- The variable is **opt-in**: a pool without it keeps the random-start,
-  round-robin behaviour unchanged. Listing a nonexistent nick (or a pool
-  with no members) is a startup error.
+At concurrency above one, the first N available members in the same effective
+order form the worker window. New workers are assigned round-robin within that
+window. Existing worker affinity stays put while its member remains available
+inside the window; an affected worker is reassigned on its next request. A
+member outside the current window is reserved for new worker assignments,
+though an incumbent fallback may keep its sticky route until reassessment.
+Concurrency one uses the shared global sticky route for ordinary and
+namespaced requests.
 
-The order is by member nick only — no vendor or model names appear in the
-gateway's routing logic, so adding a new vendor's subscription is a config
-change, never a code change.
+Preempt-back uses this same order, including the sorted default. When a
+higher-ranked member recovers while a lower-ranked member is active, the
+background preemptor returns the ordinary route on its existing reset-driven
+cadence. A reset within the five-minute cadence is handled at its reset time;
+a farther reset is rechecked at each cadence mark. Recovery does not force a
+synchronous switch or add an upstream probe. A member that resets but is
+immediately rate-limited again is not selected repeatedly; reactive `429`
+failover keeps precedence. Worker affinities outside the window return on
+their own next request.
 
-A priority pool also **preempts back**: when a higher-priority member's
-quota window resets while a lower-priority member is active, the gateway
-switches the pool back to the recovered member so a freshly-reset preferred
-backend is drained promptly instead of riding the fallback until it `429`s.
-It uses the precise `unified_5h_reset` when known (Anthropic via headers,
-other vendors via the quota poller), falls back to the member's parked reset
-otherwise, and re-evaluates every pool on a bounded cadence: a reset
-scheduled within the cadence is slept to exactly, while one farther out is
-re-checked at each cadence mark — so a mid-sleep park or recovery on any
-pool is never held up by a far-future reset scheduled elsewhere. A member
-that resets but is immediately rate-limited again is not switched to
-repeatedly — reactive `429` failover keeps precedence. Pools without a
-static `PRIORITY` declaration never preempt unless priority is set at runtime
-via `POST /_gateway/pool/{name}/priority`, so their prompt cache is never
-interrupted.
+An explicit order can be set or cleared through
+`POST /_gateway/pool/{name}/priority`; posting `[]` returns routing to sorted
+nick order. Adding a member to a pool without an explicit declaration needs no
+placement. The declaration can stay partial: unlisted members follow in
+sorted order.
 
 ## Environment variables
 
@@ -344,8 +346,8 @@ classes and configure each pool's `BASE_URL` and members accordingly.
 |----------|---------|-------|
 | `AQG_POOL_<POOL>_BACKEND_<NICK>` | _(at least one required)_ | A pool member's credential, optionally `=<cred>\|<base-url>` to override the pool default upstream for that member. `<POOL>` and `<NICK>` are normalized (`AQG_POOL_Z_AI_BACKEND_KEY_A` → pool `z-ai`, member `key-a`). |
 | `AQG_POOL_<POOL>_BASE_URL` | `ANTHROPIC_BASE_URL` | The pool's default upstream; scheme and host are required. Omit it for pools that hit `api.anthropic.com`. |
-| `AQG_POOL_<POOL>_PRIORITY` | _(optional)_ | Comma-separated member nicks, highest priority first (e.g. `zai,m3`). When set, the pool starts on and fails over toward the highest-priority healthy member instead of random/round-robin. Unlisted members rank last (sorted). Carries no credential. See [Priority within a pool](#priority-within-a-pool). |
-| `AQG_POOL_<POOL>_CONCURRENCY` | `1` | Number of available members that may serve namespaced workers. Values above 1 use the first N available members in effective priority order (or sorted nick order), reassigning workers when their member leaves the window. |
+| `AQG_POOL_<POOL>_PRIORITY` | _(optional)_ | Comma-separated member nicks, highest ranked first (e.g. `zai,m3`). Unlisted members follow in sorted order; without a declaration all members use sorted nick order. Carries no credential. See [Ordered routing within a pool](#ordered-routing-within-a-pool). |
+| `AQG_POOL_<POOL>_CONCURRENCY` | `1` | Number of available members that may serve namespaced workers. Values above 1 use the first N available members in effective order, reassigning workers when their member leaves the window. |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single non-loopback overlay/IP address (e.g. a Tailscale address, `100.64.0.0/10` / `fd7a:115c:a1e0::/48`; or any other overlay/LAN address the deployment trusts, such as an OpenVPN `10.8.0.0/24`) instead of loopback, so other machines that can reach it share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
@@ -594,18 +596,15 @@ Codex weekly hello below is independent of member selection:
   requests can all reach the parked member; the gateway does not add a probe.
   Quota parks, including fallback parks, continue to produce the pool's
   synthetic `503` with the quota `Retry-After`.
-- **No routing probe.** The starting member is chosen at random on startup
-  (or by declared priority — see below) and the gateway never contacts a
-  member just to measure quota. The Codex hello starts the upstream weekly
+- **No routing probe.** The starting member is the first available one in
+  effective order (or a valid persisted sticky member), and the gateway never
+  contacts a member just to measure quota. The Codex hello starts the upstream weekly
   session after its stored reset; its quota headers update the shared
   snapshot, but it never moves the sticky pointer or changes exhaustion
   state. Rolling 5-hour windows remain anchored to real use.
 
-A pool may opt out of the random start and round-robin failover by
-declaring a preference order with `AQG_POOL_<POOL>_PRIORITY` — see
-[Priority within a pool](#priority-within-a-pool). This changes only
-*which* healthy member is picked; the request-driven routing model is
-otherwise unchanged.
+See [Ordered routing within a pool](#ordered-routing-within-a-pool) for the
+sorted default, explicit priority declarations, and recovery timing.
 
 ### What the client sees on an upstream 429 or native Anthropic 529
 
@@ -897,15 +896,15 @@ restarting is the wrong tool.
 | `GET /_gateway/config` | Effective configuration for every pool, **credentials redacted** |
 | `GET /_gateway/debug` | Current request-logging state: `{"log_requests": bool}` (issue #301). |
 | `POST /_gateway/debug` | Hot-toggle request logging on a running gateway; body `{"log_requests": true\|false}` (field required, missing → `400`). Takes effect on the **next request** — no restart, no dropped connections — and flushes to `aqg.json`'s `debug.log_requests` via the same debounced write every mutation uses, so it survives restart. In env-only mode the toggle is in-memory only and the response says so (`X-AQG-Persistence: env_only`). Non-GET/POST returns `405`. The dump itself is the stderr request dump described under `AQG_DEBUG_LOG_REQUESTS`: credentials redacted, bodies truncated. |
-| `POST /_gateway/pool` | Create a plain pool at runtime; body `{"name": "...", "mode": "plain"}` (`name` required, `mode` optional and defaults to `plain`). A runtime pool is a pure named container with no pool-level base_url; each member resolves its own `base_url` via `AddMember`'s fallback chain. To atomically create the first member, include optional `nick`, `credential`, `base_url`, and `placement` fields; `nick` switches to combined mode, and validation failure creates neither resource. Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
+| `POST /_gateway/pool` | Create a pool at runtime; body `{"name": "...", "mode": "plain"}` (`name` required; `mode` is optional, and legacy `"plain"` remains accepted as an alias for the single pool model). Unsupported mode values return `400`. A runtime pool has no pool-level `base_url`; each member resolves its own via `AddMember`'s fallback chain. To atomically create the first member, include optional `nick`, `credential`, and `base_url`; validation failure creates neither resource. Returns `201` with `{"pool": "<name>"}`. The pool starts empty; a name that collides with an env-defined or existing runtime pool returns `409`. Persisted and re-instantiated on restart. |
 | `DELETE /_gateway/pool/{name}` | Remove a pool. The pool must be **empty** — drain members first via `DELETE .../member/{nick}`; a pool that still has members returns `409` (no cascade, so no persisted credential is silently discarded). Returns `200` `{"status": "ok"}`; an unknown pool returns `404`. Deleting the last pool is allowed (routing then fails closed with `403` unknown selector). Persisted: a deleted pool does not reappear on restart. |
 | `POST /_gateway/pool/{name}/rename` | Rename a pool in place; body `{"name": "<new>"}` (required, normalized server-side). Carries the pool's members, disabled flags, and declared priority over to the new key. Sticky pointer, exhausted marks, and local-snapshot observations follow member nicks; worker affinities and their first-use cursor follow the controller and persist under the renamed pool key. Returns `200` `{"pool": "<new>"}`. Empty / identical-after-normalize new name → `400`; unknown old pool → `404`; new name collides with a different existing pool → `409`. Persisted: the next config-roundtrip restart restores the rename under the new key. **Caveat for env-only mode** (`AQG_CONFIG` unset, no `aqg.json`): the config writer is a no-op, so the rename is runtime-only and reverts to the env-declared name on restart — same constraint `AddPool`/`AddMember` already carry. |
-| `POST /_gateway/pool/{name}/priority` | Set a runtime priority override; body is a JSON array of nicks, highest first. Enables preempt-back for the pool. |
+| `POST /_gateway/pool/{name}/priority` | Set the declared member order; body is a JSON array of nicks, highest ranked first. Partial lists append unlisted members in sorted order. Posting `[]` clears the declaration and restores sorted nick order. |
 | `POST /_gateway/pool/{name}/concurrency` | Set worker concurrency at runtime; body `{"concurrency": N}` with integer `N >= 1`. Values above the member count are accepted, as in config. Unknown pool → `404`; invalid value → `400`. A changed window reassigns affected workers on their next namespaced request and is written to `aqg.json` when config-file persistence is enabled. |
 | `GET /_gateway/pool` | Live member status. Each member includes `in_window` (whether it is in the current worker window; always `false` at concurrency `1`) and sorted `workers` (recorded worker affinities targeting it, omitted when empty). Affinities remain listed when outside the window until that worker makes its next request. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
-| `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "...", "placement": [...]}`. `credential` and `base_url` are each optional when the nick is already a known subscription in another pool (resolved independently; ambiguous → `400`). `placement` is a JSON array of nicks (highest priority first, must include the added nick) and is **required** when the target is a priority pool with no existing slot for that nick; rejected (`400`) for targets without a priority order. Persisted with its credential. |
+| `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "...", "placement": [...]}`. `credential` and `base_url` are each optional when the nick is already a known subscription in another pool (resolved independently; ambiguous → `400`). `placement` is a JSON array of nicks (highest ranked first, must include the added nick) and is **required** when the target has an explicit order and no existing slot for that nick; rejected (`400`) for targets using the sorted default. Persisted with its credential. |
 | `POST /_gateway/pool/{name}/member/{nick}/move` | Move a subscription to another pool; body `{"to": "<pool>", "placement": [...], "force": false}`. |
 | `DELETE /_gateway/pool/{name}/member/{nick}` | Remove a member (static or runtime-added) from selection |
 
@@ -918,7 +917,7 @@ curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/disable
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/a/enable
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/d \
   -d '{"credential": "sk-ant-...", "base_url": "https://api.anthropic.com"}'
-# add into a priority pool — placement is required when the nick has no existing slot
+# add into an explicitly ordered pool — placement is required for a new slot
 curl -X POST http://127.0.0.1:8080/_gateway/pool/priority/member/d \
   -d '{"credential": "sk-ant-...", "placement": ["d", "a", "b"]}'
 curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/member/d/move \
@@ -932,9 +931,12 @@ curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/rename -d '{"name":"primar
 curl -X POST http://127.0.0.1:8080/_gateway/debug -d '{"log_requests": true}'
 ```
 
-`GET /_gateway/config` returns one object per pool — the effective priority
-order, and per-member `nick` / `base_url` / `disabled` /
-`status`. **No credential ever appears** in the response, a log, or an error.
+`GET /_gateway/config` returns one object per pool — the expanded declared
+order in `priority` when one exists, and per-member `nick` / `base_url` /
+`disabled` / `status`. With no declaration, `priority` is omitted or empty
+even though routing uses sorted nick order. The `members` array remains sorted
+by member nick. **No credential ever appears** in the response, a log, or an
+error.
 
 ```json
 [
@@ -1022,18 +1024,18 @@ adds a runtime member. The JSON body is `{"credential": "...", "base_url": "..."
   needs no explicit `base_url`. The fallback is recorded as the member's resolved
   URL, so `aqg.json` stays self-describing. Returns `400` if the base_url is
   ambiguous across other pools.
-- `placement` — a JSON array of nicks, highest priority first; **must include**
-  the added nick. Required when the target pool is in priority mode — there is no
-  implicit insertion position. Rejected with `400` for targets without a priority order.
+- `placement` — a JSON array of nicks, highest ranked first; **must include**
+  the added nick. Required when the target has an explicit order — there is no
+  implicit insertion position. Rejected with `400` for targets using sorted order.
 
 On success the member is written through to the config file *with its
 credential* (mode `0600`) and re-read at startup. Status codes: `200` on
 success; `400` on a missing or empty nick, invalid JSON body, missing credential
 (nick not in any other pool), a credential conflicting with the nick's existing
 credential (bijection), invalid `base_url`, ambiguous `base_url` across pools,
-missing `placement` for a priority target with no existing slot, unknown nick in
+missing `placement` for an explicitly ordered target with no existing slot, unknown nick in
 `placement`, `placement` not containing the added nick, duplicate nick in
-`placement`, or `placement` supplied for a non-priority target; `404` on an
+`placement`, or `placement` supplied for a sorted-default target; `404` on an
 unknown pool; `409` when the nick is already a member.
 `DELETE /_gateway/pool/{name}/member/{nick}` removes a member from selection and
 returns `200`; `404` on an unknown pool and `400` on a missing nick or a nick not
@@ -1077,10 +1079,10 @@ survives restart. The JSON body
 is `{"to": "<pool>", "placement": [...], "force": false}`:
 
 - `to` (required) is the target pool. Moving to the same pool returns `400`.
-- `placement` is an explicit priority order (highest first, comma/array) that
+- `placement` is an explicit member order (highest ranked first, comma/array) that
   **must include** the moved nick. It is **required** when the target is a
-  priority pool and has no existing slot for the nick — there is no implicit
-  top/bottom/sorted insertion. It is not accepted for a target without a priority order
+  pool with an explicit order and has no existing slot for the nick — there is no implicit
+  top/bottom/sorted insertion. It is not accepted for a target using sorted order
   (`400`) and is unnecessary when overwriting an existing same-nick slot (the
   slot is preserved).
 - `force` confirms an overwrite when the target already has a member with the
@@ -1726,11 +1728,11 @@ block the proxy path or trigger probe storms. The flush-on-unpark goes
 through the persister, so a restart cannot resurrect a stale park the
 recovery probe has cleared.
 
-**Background recovery of parked non-active members.** A plain pool whose
-parked nick is no longer the active sticky backend — because a healthy
-sibling (possibly added after the park) has taken over — falls outside
-both the all-exhausted probe above and the priority preemptor (which
-only visits higher-priority members). For that shape the gateway runs a
+**Background recovery of parked non-active members.** A pool whose parked
+nick is no longer the active sticky backend — because a healthy sibling
+(possibly added after the park) has taken over — falls outside both the
+all-exhausted probe above and preempt-back when the parked member ranks below
+the active one. For that shape the gateway runs a
 bounded-cadence background loop that re-checks every parked non-active
 probe-eligible member (issue #242):
 

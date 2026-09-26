@@ -7,28 +7,20 @@ import (
 	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 )
 
-// TestRemove_fromPriorityPoolPrunesOverride is the core #120 regression: a
-// runtime priority override must drop a removed nick on the immediate next
-// EffectiveConfig call — no restart needed. Before the fix, removeMemberLocked
-// never touched c.priorityOverride, so the UI kept showing the stale entry
-// until loadRuntimeConfig finally filtered it on the next restart.
-//
-// The bug only fires for pools whose priority is in the runtime override
-// (c.priorityOverride != nil), not the env-declared c.priority — env-declared
-// priority is read once at startup and loadRuntimeConfig does not rewrite it,
-// so restart would NOT fix the env case (separate ticket shape). The fixture
-// installs the override explicitly via SetPriority.
-func TestRemove_fromPriorityPoolPrunesOverride(t *testing.T) {
+// TestRemove_fromDeclaredOrderPrunesMember is the core #120 regression:
+// removing a member must prune the declared order immediately, without a
+// restart. The fixture installs an order through SetPriority before removal.
+func TestRemove_fromDeclaredOrderPrunesMember(t *testing.T) {
 	clock := newMoveClock()
 	env := map[string]string{
 		backend.EnvPrefix + "DST_BACKEND_P": "cred-p",
 		backend.EnvPrefix + "DST_BACKEND_Q": "cred-q",
 		backend.EnvPrefix + "DST_BACKEND_R": "cred-r",
-		// No DST_PRIORITY — start as a plain pool, install the override below.
+		// No DST_PRIORITY — start with the sorted default, declare an order below.
 	}
 	p := loadMovePools(t, clock, env)
 
-	// Install a runtime priority override [p, q, r] so c.priorityOverride is set.
+	// Install a runtime declared order [p, q, r].
 	if status, err := p.SetPriority("dst", []string{"p", "q", "r"}); status != http.StatusOK || err != nil {
 		t.Fatalf("SetPriority: status=%d err=%v", status, err)
 	}
@@ -58,13 +50,9 @@ func TestRemove_fromPriorityPoolPrunesOverride(t *testing.T) {
 	}
 }
 
-// TestRemove_runtimeAddedFromPriorityPoolPrunesOverride proves the fix
-// also covers runtime-added members placed into a priority pool — the
-// Add path expands the override over addedMembersLocked (see
-// setPriorityOverrideEffectiveLocked at :1724), so the override legitimately
-// orders runtime-added nicks. After Remove, the override must drop the
-// runtime-added nick too.
-func TestRemove_runtimeAddedFromPriorityPoolPrunesOverride(t *testing.T) {
+// TestRemove_runtimeAddedFromDeclaredOrderPrunesMember proves removing a
+// runtime-added member also prunes it from the declared order.
+func TestRemove_runtimeAddedFromDeclaredOrderPrunesMember(t *testing.T) {
 	clock := newMoveClock()
 	env := map[string]string{
 		backend.EnvPrefix + "DST_BACKEND_P": "cred-p",
@@ -78,8 +66,7 @@ func TestRemove_runtimeAddedFromPriorityPoolPrunesOverride(t *testing.T) {
 		t.Fatalf("AddMember a: status=%d err=%v", status, err)
 	}
 
-	// Sanity: priority now lists a first (env plus added-member expansion),
-	// then the env order.
+	// Sanity: the declared order now lists a first, then the env order.
 	if got := poolPriority(t, p, "dst"); len(got) == 0 || got[0] != "a" {
 		t.Fatalf("dst priority after Add = %v, want a first", got)
 	}
@@ -94,9 +81,7 @@ func TestRemove_runtimeAddedFromPriorityPoolPrunesOverride(t *testing.T) {
 			t.Errorf("dst priority = %v still contains removed runtime-added nick a", got)
 		}
 	}
-	// After Remove, the priority list should match the original env-declared
-	// order (the Add expanded override was rebuilt over the post-Remove
-	// effective set, which is just the env members).
+	// After Remove, the declaration should match the original env order.
 	want := []string{"p", "q"}
 	if len(got) != len(want) {
 		t.Fatalf("dst priority after Remove = %v, want %v", got, want)
@@ -108,18 +93,16 @@ func TestRemove_runtimeAddedFromPriorityPoolPrunesOverride(t *testing.T) {
 	}
 }
 
-// TestRemove_lastMemberFromPriorityPoolClearsOverride proves that removing
-// the last priority-pool member drops the override entirely — the pool
-// becomes a plain pool and the UI hides the priority column. The fix sets
-// priorityOverride to nil when the filtered list is empty.
-func TestRemove_lastMemberFromPriorityPoolClearsOverride(t *testing.T) {
+// TestRemove_lastMemberClearsDeclaredOrder proves that removing
+// the last member also clears the now-empty declared order.
+func TestRemove_lastMemberClearsDeclaredOrder(t *testing.T) {
 	clock := newMoveClock()
 	env := map[string]string{
 		backend.EnvPrefix + "DST_BACKEND_P": "cred-p",
 	}
 	p := loadMovePools(t, clock, env)
 
-	// Install a runtime override covering the only member.
+	// Install an order covering the only member.
 	if status, err := p.SetPriority("dst", []string{"p"}); status != http.StatusOK || err != nil {
 		t.Fatalf("SetPriority: status=%d err=%v", status, err)
 	}
@@ -132,24 +115,23 @@ func TestRemove_lastMemberFromPriorityPoolClearsOverride(t *testing.T) {
 	}
 
 	if got := poolPriority(t, p, "dst"); len(got) != 0 {
-		t.Errorf("dst priority after removing the last member = %v, want empty (override should be nil)", got)
+		t.Errorf("dst priority after removing the last member = %v, want empty", got)
 	}
 }
 
-// TestRemove_fromPlainPoolLeavesNilOverride proves the fix is a no-op for
-// pools that have no runtime priority override. The pool stays plain; the
-// override (which was nil) is still nil after Remove.
-func TestRemove_fromPlainPoolLeavesNilOverride(t *testing.T) {
+// TestRemove_fromSortedDefaultLeavesDeclarationEmpty proves removal preserves the
+// omitted declaration on a pool using the sorted default.
+func TestRemove_fromSortedDefaultLeavesDeclarationEmpty(t *testing.T) {
 	clock := newMoveClock()
 	env := map[string]string{
 		backend.EnvPrefix + "DST_BACKEND_P": "cred-p",
 		backend.EnvPrefix + "DST_BACKEND_Q": "cred-q",
-		// No DST_PRIORITY — dst is a plain pool.
+		// No DST_PRIORITY — dst uses the sorted default.
 	}
 	p := loadMovePools(t, clock, env)
 
 	if got := poolPriority(t, p, "dst"); len(got) != 0 {
-		t.Fatalf("dst priority before Remove = %v, want empty (plain pool has no override)", got)
+		t.Fatalf("dst priority before Remove = %v, want empty (sorted default has no declaration)", got)
 	}
 
 	if status, err := p.RemoveMember("dst", "p"); status != http.StatusOK || err != nil {
@@ -157,6 +139,6 @@ func TestRemove_fromPlainPoolLeavesNilOverride(t *testing.T) {
 	}
 
 	if got := poolPriority(t, p, "dst"); len(got) != 0 {
-		t.Errorf("dst priority after Remove on plain pool = %v, want empty (override stays nil)", got)
+		t.Errorf("dst priority after Remove on sorted-default pool = %v, want empty", got)
 	}
 }

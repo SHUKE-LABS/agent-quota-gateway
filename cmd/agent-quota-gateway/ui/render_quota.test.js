@@ -45,6 +45,22 @@ vm.runInContext(`${html.slice(start, end)};
   this.renderQuota = renderQuota;
   this.formatReset = formatReset;`, context);
 
+const orderedStart = html.indexOf('  function orderedMembers(');
+const orderedEnd = html.indexOf('\n  function renderMembers(', orderedStart);
+assert.ok(orderedStart >= 0 && orderedEnd > orderedStart, 'effective row ordering helper exists');
+vm.runInContext(`${html.slice(orderedStart, orderedEnd)}; this.orderedMembers = orderedMembers;`, context);
+assert.deepEqual(
+  Array.from(context.orderedMembers({ priority: [], members: [{ nick: 'a' }, { nick: 'b' }, { nick: 'c' }] }), (m) => m.nick),
+  ['a', 'b', 'c'],
+  'undeclared rows follow sorted member order',
+);
+assert.deepEqual(
+  Array.from(context.orderedMembers({ priority: ['b', 'a', 'c'], members: [{ nick: 'a' }, { nick: 'b' }, { nick: 'c' }] }), (m) => m.nick),
+  ['b', 'a', 'c'],
+  'declared rows follow expanded effective order',
+);
+assert.ok(!html.includes('priority pool'), 'dashboard does not label pools by routing type');
+
 for (const [utilization, expected] of [[0.995, '99%'], [1, '100%']]) {
   const cell = element();
   context.renderQuota(cell, utilization);
@@ -129,6 +145,76 @@ context.postJSON = (url, body) => {
   return Promise.resolve({ ok: true });
 };
 context.refreshAfter = () => Promise.resolve();
+
+const reorderStart = html.indexOf('  function movePriority(');
+const reorderEnd = html.indexOf('\n  function editConcurrency(', reorderStart);
+assert.ok(reorderStart >= 0 && reorderEnd > reorderStart, 'reorder handler exists');
+vm.runInContext(`${html.slice(reorderStart, reorderEnd)}; this.movePriority = movePriority;`, context);
+context.cssEscape = (value) => value;
+context.root = {
+  querySelector: () => ({
+    querySelectorAll: () => ['a', 'b', 'c'].map((nick) => ({ getAttribute: () => nick })),
+  }),
+};
+context.movePriority('auto', 2, 0);
+assert.equal(requests[0].url, '/_gateway/pool/auto/priority');
+assert.deepEqual(Array.from(requests[0].body), ['c', 'a', 'b'], 'reorder writes the full explicit member order');
+requests.length = 0;
+
+const addStart = html.indexOf('  function addSubscription(');
+const addEnd = html.indexOf('\n  function removeMember(', addStart);
+assert.ok(addStart >= 0 && addEnd > addStart, 'add subscription handler exists');
+vm.runInContext(`${html.slice(addStart, addEnd)}; this.addSubscription = addSubscription;`, context);
+const addFields = (pool) => ({
+  nick: { value: 'new-member' },
+  cred: { value: '' },
+  base: { value: '' },
+  pool: { value: pool },
+  poolName: { value: '' },
+});
+const addPrompts = [];
+context.window.prompt = (message) => { addPrompts.push(message); return null; };
+context.currentViews = [{ pool: 'default', priority: [], members: [{ nick: 'a' }] }];
+context.NEW_POOL = '__new__';
+const beforeDefaultAdd = requests.length;
+context.addSubscription(addFields('default'));
+assert.equal(addPrompts.length, 0, 'adding to sorted-default pool needs no placement prompt');
+assert.equal(requests.length, beforeDefaultAdd + 1, 'sorted-default add is submitted directly');
+assert.equal(requests.at(-1).body.placement, undefined, 'sorted-default add omits placement');
+
+context.currentViews = [{ pool: 'ordered', priority: ['a', 'b'], members: [{ nick: 'a' }, { nick: 'b' }] }];
+context.addSubscription(addFields('ordered'));
+assert.equal(addPrompts.length, 1, 'adding to explicitly ordered pool requests placement');
+
+const moveStart = html.indexOf('  function moveMember(');
+const moveEnd = html.indexOf('\n  function postMove(', moveStart);
+assert.ok(moveStart >= 0 && moveEnd > moveStart, 'move handler exists');
+vm.runInContext(`${html.slice(moveStart, moveEnd)}; this.moveMember = moveMember;`, context);
+const moves = [];
+context.postMove = (from, nick, body) => { moves.push({ from, nick, body }); };
+const movePrompts = [];
+context.window.prompt = (message) => { movePrompts.push(message); return 'default'; };
+context.currentViews = [
+  { pool: 'source', priority: [], members: [{ nick: 'moving' }] },
+  { pool: 'default', priority: [], members: [{ nick: 'a' }] },
+];
+context.moveMember('source', 'moving');
+assert.equal(movePrompts.length, 1, 'move into sorted-default pool only asks for target');
+assert.equal(moves.length, 1);
+assert.equal(moves[0].body.placement, undefined, 'sorted-default move omits placement');
+
+movePrompts.length = 0;
+context.window.prompt = (message) => {
+  movePrompts.push(message);
+  return movePrompts.length === 1 ? 'ordered' : null;
+};
+context.currentViews = [
+  { pool: 'source', priority: [], members: [{ nick: 'moving' }] },
+  { pool: 'ordered', priority: ['a', 'b'], members: [{ nick: 'a' }, { nick: 'b' }] },
+];
+context.moveMember('source', 'moving');
+assert.equal(movePrompts.length, 2, 'move into explicitly ordered pool asks for placement');
+requests.length = 0;
 vm.runInContext(`${html.slice(editStart, editEnd)}; this.editConcurrency = editConcurrency;`, context);
 for (const raw of ['0', '4', 'abc']) {
   context.window.prompt = (message, value) => { promptPrefill = value; return raw; };

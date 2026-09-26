@@ -477,6 +477,71 @@ func TestPriorityEndpoint(t *testing.T) {
 	}
 }
 
+func TestConfigEndpoint_keepsDeclarationSeparateFromSortedDefault(t *testing.T) {
+	for _, nick := range []string{"C", "A", "B"} {
+		t.Setenv("AQG_POOL_AUTO_BACKEND_"+nick, "cred-"+strings.ToLower(nick))
+		t.Setenv("AQG_POOL_ORDERED_BACKEND_"+nick, "cred-"+strings.ToLower(nick))
+	}
+	t.Setenv("AQG_POOL_ORDERED_PRIORITY", "B")
+	pools := loadPools(t)
+	srv := configMux(t, pools)
+
+	find := func(pool string) auto.PoolConfigView {
+		t.Helper()
+		for _, view := range fetchAllPools(t, srv.URL) {
+			if view.Pool == pool {
+				return view
+			}
+		}
+		t.Fatalf("pool %q missing from config", pool)
+		return auto.PoolConfigView{}
+	}
+
+	defaultView := find("auto")
+	if len(defaultView.Priority) != 0 {
+		t.Errorf("undeclared priority=%v, want omitted/empty", defaultView.Priority)
+	}
+	if got := []string{defaultView.Members[0].Nick, defaultView.Members[1].Nick, defaultView.Members[2].Nick}; strings.Join(got, ",") != "a,b,c" {
+		t.Errorf("undeclared members=%v, want sorted [a b c]", got)
+	}
+	orderedView := find("ordered")
+	if got := strings.Join(orderedView.Priority, ","); got != "b,a,c" {
+		t.Errorf("declared partial order=%q, want expanded [b a c]", got)
+	}
+
+	postJSON(t, srv.URL+"/_gateway/pool/ordered/priority", `[]`, http.StatusOK)
+	cleared := find("ordered")
+	if len(cleared.Priority) != 0 {
+		t.Errorf("cleared priority=%v, want omitted/empty", cleared.Priority)
+	}
+	if got := []string{cleared.Members[0].Nick, cleared.Members[1].Nick, cleared.Members[2].Nick}; strings.Join(got, ",") != "a,b,c" {
+		t.Errorf("members after clear=%v, want sorted [a b c]", got)
+	}
+	if got := pools.CurrentRegistry().PoolPriority("ordered"); len(got) != 0 {
+		t.Errorf("registry declaration after clear=%v, want empty", got)
+	}
+}
+
+func TestCreatePool_plainModeRemainsCompatibilityAlias(t *testing.T) {
+	pools := emptyPools(t)
+	srv := configMux(t, pools)
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"legacy","mode":"plain","nick":"a","credential":"cred-a","base_url":"https://a.example"}`, http.StatusCreated)
+	view := fetchPool(t, srv.URL, "legacy")
+	if len(view.Members) != 1 || view.Members[0].Nick != "a" {
+		t.Fatalf("created legacy pool members=%+v, want [a]", view.Members)
+	}
+	if len(view.Priority) != 0 {
+		t.Errorf("new pool priority=%v, want omitted/empty sorted default", view.Priority)
+	}
+
+	postJSON(t, srv.URL+"/_gateway/pool", `{"name":"unsupported","mode":"balanced"}`, http.StatusBadRequest)
+	for _, candidate := range fetchAllPools(t, srv.URL) {
+		if candidate.Pool == "unsupported" {
+			t.Fatal("pool with unsupported mode was created")
+		}
+	}
+}
+
 func post(t *testing.T, url string, wantStatus int) {
 	t.Helper()
 	resp, err := http.Post(url, "application/json", nil)

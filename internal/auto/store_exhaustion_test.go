@@ -194,11 +194,9 @@ func TestResolveAuto_storePastResetStaysSticky(t *testing.T) {
 // via the normal record429 / store-write path; if the upstream still
 // 429s, the next request gets a fresh exhausted=true.
 //
-// The pick is round-robin from the current sticky position. With
-// cur=0 and a two-member pool {a, b}, the half-open scan starts at
-// idx=(0+1)%2=1 (b) — but b has no record429 history either, and the
-// helper accepts any member without a future-reset park entry. So the
-// pick is deterministic on cur: it picks the next member past cur.
+// The pick follows effective member order. Since a and b are both exhausted
+// by quota snapshots without future-reset park entries, the first ranked
+// member is eligible for the half-open request.
 func TestResolveAuto_allStoreExhaustedHalfOpenProbes(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
@@ -214,8 +212,8 @@ func TestResolveAuto_allStoreExhaustedHalfOpenProbes(t *testing.T) {
 	if retry != 0 {
 		t.Errorf("ResolveAuto retry=%v, want 0 (half-open path), not the soonest store reset", retry)
 	}
-	if b.Nick != "a" && b.Nick != "b" {
-		t.Errorf("ResolveAuto pointed at %q, want one of {a, b} (the half-open scan must pick a real member)", b.Nick)
+	if b.Nick != "a" {
+		t.Errorf("ResolveAuto pointed at %q, want first ranked member a for the half-open request", b.Nick)
 	}
 }
 

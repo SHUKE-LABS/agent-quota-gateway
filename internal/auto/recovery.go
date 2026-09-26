@@ -1,17 +1,16 @@
 // This file adds the background recovery loop for parked non-active members
 // (issue #242). The allExhausted recovery probe in tryRecoverParked only runs
-// when every member of a pool is parked on the request path, and the priority
-// preemptor only visits higher-priority members when a priority pool is
-// already serving a fallback — so a plain pool whose parked nick is no longer
-// the active sticky backend (because a healthy sibling — possibly added after
-// the park — has taken over) had no remaining self-heal path. This loop fills
+// when every member of a pool is parked on the request path, and the ordered
+// preemptor only watches members ranked above the active sticky backend. A
+// lower-ranked parked member can therefore still need an independent recovery
+// path while a healthier, higher-ranked sibling is active. This loop fills
 // that gap by re-checking parked non-active members on a bounded cadence.
 //
 // The loop is deliberately narrow:
 //
 //   - It runs out-of-band from the proxy path, so a healthy pool pays no
 //     synchronous latency. The controller's own bookkeeping (lastProbeAttempt
-//     + probeInFlight, issue #124) coalesces any overlap with a concurrent
+//   - probeInFlight, issue #124) coalesces any overlap with a concurrent
 //     request-path probe of the same quota key, so the two paths cannot
 //     storm the same upstream.
 //   - It only clears the live park via noteRecovered; it never moves the

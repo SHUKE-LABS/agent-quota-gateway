@@ -124,8 +124,9 @@ type createPoolRequest struct {
 	Placement  []string `json:"placement"`
 }
 
-// createPoolHandler serves POST /_gateway/pool — creates a plain pool at
-// runtime. On success it returns 201 with {"pool": "<normalized-name>"}.
+// createPoolHandler serves POST /_gateway/pool — creates a pool at runtime.
+// The legacy mode value "plain" is accepted as an alias for the single pool
+// model. On success it returns 201 with {"pool": "<normalized-name>"}.
 // In env-only mode (issue #246) the response body gains a
 // "persistence":"env_only" field and the X-AQG-Persistence header is set
 // so an operator hitting the API directly sees the change is in-memory
@@ -223,10 +224,9 @@ func renamePoolHandler(pools *auto.Pools, persistence configfile.PersistenceStat
 	}
 }
 
-// priorityHandler serves POST /_gateway/pool/{name}/priority — sets a
-// runtime priority override for the pool. The request body must be a JSON
-// array of nicks (highest priority first). The override is expanded to a
-// total order (unlisted members rank last in sorted order).
+// priorityHandler serves POST /_gateway/pool/{name}/priority — sets or clears
+// the pool's declared member order. The request body is a JSON array of nicks
+// (highest ranked first); unlisted members follow in sorted order.
 func priorityHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
@@ -359,12 +359,12 @@ func enableMemberHandler(pools *auto.Pools, persistence configfile.PersistenceSt
 type addMemberRequest struct {
 	Credential string   `json:"credential"` // optional; resolved from a known nick when omitted
 	BaseURL    string   `json:"base_url"`   // optional; resolved (known nick) or pool default (new nick) when omitted
-	Placement  []string `json:"placement"`  // required for a priority target with no existing slot
+	Placement  []string `json:"placement"`  // required for an explicitly ordered target with no existing slot
 }
 
 // addMemberHandler serves POST /_gateway/pool/{name}/member/{nick} —
 // adds a runtime member to a pool. Credential and base_url are optional for a
-// known subscription; a priority target requires an explicit placement.
+// known subscription; an explicitly ordered target requires a placement.
 func addMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
@@ -411,7 +411,7 @@ func addMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState
 // moveMemberRequest is the JSON request body for moving a pool member.
 type moveMemberRequest struct {
 	To        string   `json:"to"`        // required target pool
-	Placement []string `json:"placement"` // required for priority target with no existing slot
+	Placement []string `json:"placement"` // required for explicitly ordered target with no existing slot
 	Force     bool     `json:"force"`     // confirm overwrite of a conflicting same-nick target
 }
 

@@ -747,13 +747,6 @@
     h2.textContent = view.pool;
     head.appendChild(h2);
 
-    if (view.priority.length > 0) {
-      var badge2 = document.createElement('span');
-      badge2.className = 'badge';
-      badge2.textContent = 'priority pool';
-      head.appendChild(badge2);
-    }
-
     // Per-pool poller liveness (issue #247). Renders only when the
     // server provided a poller block — Anthropic / untracked pools see
     // no delta. State drives both the colour (CSS data-state hook) and
@@ -819,7 +812,7 @@
 
     section.appendChild(head);
 
-    // One card body: the "Members" table, ordered by priority, with the rank +
+    // One card body: the "Members" table, ordered by effective routing order, with the rank +
     // ↑/↓ reorder controls folded into each row's leading Nick cell (issue
     // #222). Collapsing the former two-column (priority | members) grid makes
     // order consistency and row alignment structural instead of CSS-dependent.
@@ -834,12 +827,10 @@
     return section;
   }
 
-  // orderedMembers returns view.members as objects in effective priority order.
-  // For a priority pool that is view.priority; for a plain pool with no priority
-  // yet it seeds from the members' own order, so the first reorder POSTs that
-  // order and the pool becomes a priority pool. Any member missing from the priority
-  // list (members ranked after the listed ones, in the members' sorted order,
-  // per README) is appended so no row is dropped.
+  // orderedMembers returns view.members in effective routing order. The config
+  // response includes an expanded declared order when one exists; otherwise
+  // its sorted members already represent the derived default. Reordering
+  // either view writes an explicit declaration.
   function orderedMembers(view) {
     var members = view.members || [];
     if (view.priority.length === 0) return members.slice();
@@ -1244,7 +1235,7 @@
     var hint = document.createElement('p');
     hint.className = 'addsub-hint';
     hint.textContent = 'Choose a target pool, or pick "New pool…" to create a ' +
-      'runtime plain pool (name required) — a nick is optional there and, ' +
+      'runtime pool (name required) — a nick is optional there and, ' +
       'if given, is added as the pool’s first member (base_url is optional; ' +
       'it defaults to the gateway default upstream).';
     section.appendChild(hint);
@@ -1655,13 +1646,13 @@
     if (cred) { body['credential'] = cred; }
     if (base) { body.base_url = base; }
 
-    // A priority target needs an explicit placement that includes this nick;
-    // there is no implicit insertion. Other targets carry none.
-    var isPriorityTarget = target.priority.length > 0;
-    if (isPriorityTarget) {
+    // An explicitly ordered target needs placement that includes this nick;
+    // a pool using the sorted default accepts the member without a prompt.
+    var hasExplicitOrder = target.priority.length > 0;
+    if (hasExplicitOrder) {
       var suggestion = target.priority.slice().concat([nick]).join(', ');
       var placementStr = window.prompt(
-        'Pool "' + pool + '" is a priority pool. Enter the full priority order ' +
+        'Pool "' + pool + '" has an explicit member order. Enter the full order ' +
         '(comma-separated, highest first). It must include "' + nick + '":',
         suggestion);
       if (placementStr == null) { return; }
@@ -1755,16 +1746,16 @@
 
     var body = { to: to };
 
-    // A priority target with no existing slot for this nick needs explicit
+    // An explicitly ordered target with no existing slot for this nick needs explicit
     // placement; there is no implicit insertion. Other targets, and
     // overwriting an existing same-nick slot, need none.
-    var isPriorityTarget = target.priority.length > 0;
+    var hasExplicitOrder = target.priority.length > 0;
     var existingSlot = false;
     target.members.forEach(function (m) { if (m.nick === nick) existingSlot = true; });
-    if (isPriorityTarget && !existingSlot) {
+    if (hasExplicitOrder && !existingSlot) {
       var suggestion = target.priority.slice().concat([nick]).join(', ');
       var placementStr = window.prompt(
-        'Target "' + to + '" is a priority pool. Enter the full priority order ' +
+        'Target "' + to + '" has an explicit member order. Enter the full order ' +
         '(comma-separated, highest first). It must include "' + nick + '":',
         suggestion);
       if (placementStr == null) { return; }

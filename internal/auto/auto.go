@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -142,8 +141,8 @@ type Pools struct {
 }
 
 // NewPools builds one Controller per pool in reg. Each controller starts
-// at a random member (start < 0) so no probe traffic is needed to anchor
-// it. store is the shared quota store the controllers consult to fail off a
+// at the first member in effective order (start < 0), without probe traffic.
+// store is the shared quota store the controllers consult to fail off a
 // member reported fully consumed (poller- or header-sourced) even without a
 // live 429; a nil store disables that signal and keeps pure 429-driven
 // failover. now defaults to time.Now and logOut to os.Stderr when nil.
@@ -525,9 +524,9 @@ func (p *Pools) LoadPersistState(states map[string]PoolPersistState) {
 	}
 }
 
-// SetPriority sets the runtime priority override for the named pool.
-// The order list is validated (all nicks must exist in the pool, no duplicates,
-// no empty strings) and then expanded via effectiveOrder() to a total order.
+// SetPriority sets or clears the declared member order for the named pool.
+// The list is validated (all nicks must exist in the pool, no duplicates,
+// no empty strings); effectiveOrder() derives the total routing order.
 // Returns (httpStatus, error) with error containing a credential-free message.
 func (p *Pools) SetPriority(poolName string, order []string) (int, error) {
 	name := backend.NormalizeName(poolName)
@@ -646,8 +645,8 @@ func (p *Pools) SetMemberDisabled(poolName, nick string, off bool) (int, error) 
 // AddMember adds a runtime member to a pool. Credential and baseURL are optional
 // for a *known* subscription: when omitted, they are resolved by scanning the
 // other pools for the same nick (credential and base_url resolve independently).
-// A priority target requires an explicit placement (must include nick), reusing
-// the move path's validation; other targets must carry none. A base_url
+// An explicitly ordered target requires placement (must include nick), reusing
+// the move path's validation; sorted-default targets must carry none. A base_url
 // that stays unresolved after the cross-pool scan and the unanimous in-pool
 // borrow (empty pool, or members disagreeing, issue #248) falls back to the
 // gateway default upstream (issue #302). The resolved concrete base_url is
@@ -744,11 +743,10 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 			resolvedURL = p.gatewayDefaultBaseURLLocked()
 		}
 	}
-	// Placement: a priority target needs an explicit order including nick; a
-	// target without a priority order must not carry one.
-	isPriorityTarget := len(c.effectivePriorityLocked()) > 0
+	// Placement is required only when the target has a declared member order.
+	hasDeclaredOrder := len(c.declaredPriority) > 0
 	var normPlacement []string
-	if isPriorityTarget {
+	if hasDeclaredOrder {
 		var status int
 		var err error
 		normPlacement, status, err = c.validatePlacementLocked(normalized, placement)
@@ -758,7 +756,7 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 		}
 	} else if len(placement) > 0 {
 		c.mu.Unlock()
-		return http.StatusBadRequest, fmt.Errorf("placement is only applicable to a priority target pool")
+		return http.StatusBadRequest, fmt.Errorf("placement is only applicable to an explicitly ordered pool")
 	}
 	c.mu.Unlock()
 
@@ -768,7 +766,7 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 	if err != nil {
 		return http.StatusBadRequest, err
 	}
-	if isPriorityTarget {
+	if hasDeclaredOrder {
 		next, err = next.WithPriority(name, normPlacement)
 		if err != nil {
 			return http.StatusBadRequest, err
@@ -821,9 +819,9 @@ func (p *Pools) RemoveMember(poolName, nick string) (int, error) {
 // an add to the target pool carrying the source member's credential and
 // resolved base URL. Returns (httpStatus, error) with a credential-free message.
 //
-// Placement: moving into a priority pool that has no existing slot for nick
+// Placement: moving into an explicitly ordered pool with no existing slot for nick
 // requires an explicit placement order (which must include nick) — there is no
-// implicit insertion. Moving into a target without a priority order, or onto an existing
+// implicit insertion. Moving into a sorted-default target, or onto an existing
 // same-nick slot, needs no placement.
 //
 // Conflict: an existing same-nick member in the target whose credential and
@@ -874,8 +872,8 @@ func (p *Pools) MoveMember(fromPool, nick, toPool string, placement []string, fo
 		}
 		// Existing slot: no placement needed (identical → effective no-op on dst).
 	} else {
-		isPriorityTarget := len(dst.effectivePriorityLocked()) > 0
-		if isPriorityTarget {
+		hasDeclaredOrder := len(dst.declaredPriority) > 0
+		if hasDeclaredOrder {
 			var status int
 			var err error
 			normPlacement, status, err = dst.validatePlacementLocked(normalized, placement)
@@ -885,7 +883,7 @@ func (p *Pools) MoveMember(fromPool, nick, toPool string, placement []string, fo
 			}
 		} else if len(placement) > 0 {
 			dst.mu.Unlock()
-			return http.StatusBadRequest, fmt.Errorf("placement is only applicable to a priority target pool")
+			return http.StatusBadRequest, fmt.Errorf("placement is only applicable to an explicitly ordered pool")
 		}
 	}
 	dst.mu.Unlock()
@@ -912,14 +910,14 @@ func (p *Pools) MoveMember(fromPool, nick, toPool string, placement []string, fo
 	return http.StatusOK, nil
 }
 
-// validatePlacementLocked checks an explicit placement order for a priority
+// validatePlacementLocked checks an explicit placement order for a declared-order
 // target into which nick is being added: every entry must be a current target
 // member (or nick itself), with no empties or duplicates, and the order must
 // include nick (no implicit insertion). It returns the normalized placement on
 // success. Caller holds c.mu.
 func (c *Controller) validatePlacementLocked(nick string, placement []string) ([]string, int, error) {
 	if len(placement) == 0 {
-		return nil, http.StatusBadRequest, fmt.Errorf("explicit placement is required to move into priority pool %s", c.name())
+		return nil, http.StatusBadRequest, fmt.Errorf("explicit placement is required for ordered pool %s", c.name())
 	}
 	prospective := make(map[string]bool)
 	for _, m := range c.allMemberNicksLocked() {
@@ -954,9 +952,9 @@ func (c *Controller) validatePlacementLocked(nick string, placement []string) ([
 }
 
 // EffectiveConfig returns the effective configuration for all pools,
-// with credentials fully redacted. Each pool's view includes its effective
-// priority (runtime override when set, else env priority),
-// and per-member status including the disabled flag.
+// with credentials fully redacted. A declared priority is expanded to the
+// current member set; undeclared pools keep priority omitted while routing
+// still uses their derived sorted order.
 func (p *Pools) EffectiveConfig() []PoolConfigView {
 	snapshot := p.controllersSnapshot()
 	names := make([]string, 0, len(snapshot))
@@ -971,11 +969,9 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 		c.mu.Lock()
 		view := PoolConfigView{Pool: name, Concurrency: c.workerConcurrency}
 
-		// Effective priority.
-		pri := c.effectivePriorityLocked()
-		if len(pri) > 0 {
-			view.Priority = make([]string, len(pri))
-			copy(view.Priority, pri)
+		// Keep the declaration distinct from its derived routing order.
+		if len(c.declaredPriority) > 0 {
+			view.Priority = append([]string(nil), c.order...)
 		}
 
 		// Members: the effective set (static + runtime-added − removed), sorted.
@@ -1013,7 +1009,7 @@ func (p *Pools) PersistState() map[string]PoolPersistState {
 	return out
 }
 
-// CreatePoolWithMember atomically creates a plain pool and optionally its first
+// CreatePoolWithMember atomically creates a pool and optionally its first
 // member. All member validation runs before the registry is swapped (issue #240).
 func (p *Pools) CreatePoolWithMember(name, mode, nick, credential, baseURL string, placement []string) (int, error) {
 	normalized := backend.NormalizeName(name)
@@ -1079,7 +1075,7 @@ func (p *Pools) CreatePoolWithMember(name, mode, nick, credential, baseURL strin
 			return http.StatusBadRequest, err
 		}
 		if len(placement) > 0 {
-			return http.StatusBadRequest, fmt.Errorf("placement is only applicable to a priority target pool")
+			return http.StatusBadRequest, fmt.Errorf("placement is only applicable to an explicitly ordered pool")
 		}
 	}
 	p.reg = next
@@ -1093,8 +1089,8 @@ func (p *Pools) CreatePoolWithMember(name, mode, nick, credential, baseURL strin
 
 // registry (issue #198: runtime pools are config, not a separate state-file
 // overlay) and inserting a controller so the proxy can route to it
-// immediately. name is normalized; mode defaults to "plain" and only "plain"
-// is supported. The pool starts empty (no members, inherits the gateway
+// immediately. name is normalized; mode defaults to the single pool model, and
+// legacy "plain" is accepted as an alias. The pool starts empty (no members, inherits the gateway
 // default upstream); members are added afterward via AddMember. Returns
 // (httpStatus, error) with a credential-free message; (StatusCreated, nil) on
 // success.
@@ -1588,13 +1584,16 @@ type Controller struct {
 	// disables the signal, leaving pure 429-driven failover.
 	store *quota.Store
 
-	// priority is the effective preference order (highest first): the
-	// operator-declared nicks first, then any unlisted members in sorted
-	// order. It is re-derived from the registry on every reconcile (issue
-	// #198 collapses the old static/override split — the registry priority is
-	// the single source). nil for a pool with no declared priority, which
-	// keeps the default random-start, round-robin-failover behaviour.
-	priority []string
+	// priority is the operator-declared preference list (highest first), kept
+	// separate from order so a missing declaration remains distinguishable
+	// from its derived sorted routing order. It is re-derived from the registry
+	// on every reconcile (issue #198).
+	declaredPriority []string
+	// order is the effective total order shared by initial selection, ordinary
+	// failover, worker assignment, and preempt-back. It expands a declared
+	// priority with sorted unlisted members, or is the sorted nick order when
+	// priority is undeclared.
+	order []string
 
 	// disabled maps member nicks to a disabled flag: a disabled member is
 	// unselectable regardless of exhaustion state until re-enabled. It is
@@ -1722,11 +1721,10 @@ type Controller struct {
 }
 
 // NewController builds the sticky selector over the members of poolName
-// in reg. When start < 0 the initial sticky backend is chosen at random
-// (the spec's rotating start index — no probe, so any starting point is
-// equally valid); otherwise start selects the index deterministically
-// (used by tests). now defaults to time.Now and logOut to os.Stderr when
-// nil.
+// in reg. When start < 0 the initial sticky backend is the first available
+// member in effective order; otherwise start selects the member index
+// deterministically (used by tests). now defaults to time.Now and logOut to
+// os.Stderr when nil.
 func NewController(reg *backend.Registry, poolName string, start int, store *quota.Store, now func() time.Time, logOut io.Writer) *Controller {
 	if now == nil {
 		now = time.Now
@@ -1765,11 +1763,12 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		local[n] = struct{}{}
 	}
 
-	nicks := configNicks // used only for effectiveOrder below; not stored
+	declared := reg.PoolPriority(poolName)
 	c := &Controller{
 		reg:                reg,
 		members:            members,
-		priority:           effectiveOrder(reg.PoolPriority(poolName), nicks),
+		declaredPriority:   declared,
+		order:              effectiveOrder(declared, configNicks),
 		workerConcurrency:  reg.PoolConcurrency(poolName),
 		store:              store,
 		exhausted:          make(map[string]time.Time),
@@ -1803,17 +1802,15 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		return c
 	}
 	if start < 0 {
-		// A priority pool anchors on its highest-priority member (nothing is
-		// exhausted at construction, so that is priority[0]); a plain pool
-		// starts at a random member as before.
-		if len(c.priority) > 0 {
-			if idx := c.indexOf(c.priority[0]); idx >= 0 {
-				start = idx
-			} else {
-				start = 0
-			}
+		// Select the first currently available member. This also accounts for
+		// config-disabled members and restored quota snapshots; persisted sticky
+		// state is applied afterward and remains authoritative until recovery.
+		if nick, ok := c.firstHealthyNickLocked(); ok {
+			start = c.indexOf(nick)
+		} else if len(c.order) > 0 {
+			start = c.indexOf(c.order[0])
 		} else {
-			start = randIndex(n)
+			start = 0
 		}
 	}
 	start = ((start % n) + n) % n
@@ -1822,7 +1819,7 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 }
 
 // reconcileLocked re-derives this controller's membership, disabled set,
-// effective priority and worker concurrency from reg
+// effective order and worker concurrency from reg
 // (the new authoritative registry after a copy-on-write mutation, issue #198).
 // It preserves runtime observations; stale worker targets, including removed
 // members, are rechecked on the worker's next request. Other per-member
@@ -1849,7 +1846,8 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	}
 	c.members = members
 	c.disabled = disabled
-	c.priority = effectiveOrder(reg.PoolPriority(c.name()), nicks)
+	c.declaredPriority = reg.PoolPriority(c.name())
+	c.order = effectiveOrder(c.declaredPriority, nicks)
 	c.workerConcurrency = reg.PoolConcurrency(c.name())
 
 	// Prune runtime observation for members that left the pool.
@@ -1890,15 +1888,10 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	}
 }
 
-// effectiveOrder expands a declared priority subset into a total order
-// over the pool's members: the declared nicks first (highest priority
-// first), then any members not named in the declaration, in their stable
-// sorted order. It returns nil when no priority was declared, which is the
-// signal to keep the default random/round-robin behaviour.
+// effectiveOrder builds a total order over the pool's members: declared nicks
+// first (highest priority first), then unlisted members in sorted order. With
+// no declaration, every member is sorted by nick.
 func effectiveOrder(declared, nicks []string) []string {
-	if len(declared) == 0 {
-		return nil
-	}
 	seen := make(map[string]bool, len(declared))
 	out := make([]string, 0, len(nicks))
 	for _, nick := range declared {
@@ -1907,7 +1900,9 @@ func effectiveOrder(declared, nicks []string) []string {
 			out = append(out, nick)
 		}
 	}
-	for _, nick := range nicks {
+	sortedNicks := append([]string(nil), nicks...)
+	sort.Strings(sortedNicks)
+	for _, nick := range sortedNicks {
 		if !seen[nick] {
 			out = append(out, nick)
 		}
@@ -1915,14 +1910,9 @@ func effectiveOrder(declared, nicks []string) []string {
 	return out
 }
 
-// workerOrderLocked is the stable first-use cycle for worker assignments:
-// effective priority order when configured, otherwise the sorted member order.
-// Caller holds c.mu.
+// workerOrderLocked returns the shared effective routing order. Caller holds c.mu.
 func (c *Controller) workerOrderLocked() []string {
-	if len(c.priority) > 0 {
-		return c.priority
-	}
-	return c.allMemberNicksLocked()
+	return c.effectiveOrderLocked()
 }
 
 // workerWindowLocked returns the first workerConcurrency available members
@@ -2132,12 +2122,10 @@ func (c *Controller) allMemberNicksLocked() []string {
 	return out
 }
 
-// effectivePriorityLocked returns the effective priority order for this pool,
-// re-derived from the registry on reconcile (issue #198 collapsed the old
-// static/override split into a single config-sourced order). Returns nil for a
-// non-priority pool. Caller holds c.mu.
-func (c *Controller) effectivePriorityLocked() []string {
-	return c.priority
+// effectiveOrderLocked returns the total routing order, re-derived from the
+// registry on reconcile. Caller holds c.mu.
+func (c *Controller) effectiveOrderLocked() []string {
+	return c.order
 }
 
 // isUnavailableLocked reports whether nick is currently unavailable for
@@ -2196,8 +2184,8 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	// with a future reset. Forwarding one request through to such a
 	// member refreshes the store via the normal record429 / store-write
 	// path, breaking the deadlock where a pool of all-parked members
-	// never sees a forwarded request and never self-heals. We pick
-	// round-robin from the current position and return it with
+	// never sees a forwarded request and never self-heals. We pick the first
+	// eligible member in effective order and return it with
 	// exhausted=false so the middleware forwards.
 	if nick, ok := c.nextParkedButResetPassedLocked(); ok {
 		c.setActiveMemberLocked(nick)
@@ -2608,9 +2596,9 @@ func (c *Controller) loadState(sticky string, exhausted map[string]time.Time, lo
 	if c.indexOf(sticky) >= 0 {
 		c.curNick = sticky
 	} else if sticky != "" {
-		reason := "random"
-		if len(c.priority) > 0 {
-			reason = "priority"
+		reason := "sorted default"
+		if len(c.declaredPriority) > 0 {
+			reason = "declared order"
 		}
 		fmt.Fprintf(c.logOut, "loadState[%s]: persisted sticky=%s not in current pool members; keeping %s (%s)\n",
 			c.name(), sticky, c.curNick, reason)
@@ -3892,38 +3880,13 @@ func (c *Controller) backendByNickLocked(nick string) (backend.Backend, bool) {
 	return backend.Backend{}, false
 }
 
-// firstHealthyNickLocked finds the nick to fail over to. For a priority pool
-// it returns the highest-priority available member; for a plain pool it scans
-// round-robin from just after the current sticky position so switches spread
-// across the pool. Covers all members in the unified collection.
+// firstHealthyNickLocked returns the highest-ranked available member in the
+// shared effective order. Covers all members in the unified collection.
 // Returns ("", false) when all are unavailable. Caller holds c.mu.
 func (c *Controller) firstHealthyNickLocked() (string, bool) {
-	if pri := c.effectivePriorityLocked(); len(pri) > 0 {
-		for _, nick := range pri {
-			if !c.isUnavailableLocked(nick) {
-				return nick, true
-			}
-		}
-		return "", false
-	}
-
-	// Plain pool: scan round-robin from just after the current position.
-	effectiveNicks := c.allMemberNicksLocked()
-	n := len(effectiveNicks)
-	if n == 0 {
-		return "", false
-	}
-	startIdx := 0
-	for i, nick := range effectiveNicks {
-		if nick == c.curNick {
-			startIdx = i
-			break
-		}
-	}
-	for off := 1; off <= n; off++ {
-		idx := (startIdx + off) % n
-		if !c.isUnavailableLocked(effectiveNicks[idx]) {
-			return effectiveNicks[idx], true
+	for _, nick := range c.effectiveOrderLocked() {
+		if !c.isUnavailableLocked(nick) {
+			return nick, true
 		}
 	}
 	return "", false
@@ -3935,10 +3898,7 @@ func (c *Controller) firstHealthyNickLocked() (string, bool) {
 // mirror written with that auth park; a different exhausted or store-derived
 // quota reset disqualifies the pool. Caller holds c.mu.
 func (c *Controller) authOnlyDryPoolNickLocked() (string, bool) {
-	order := c.effectivePriorityLocked()
-	if len(order) == 0 {
-		order = c.allMemberNicksLocked()
-	}
+	order := c.effectiveOrderLocked()
 
 	now := c.now()
 	first := ""
@@ -3971,9 +3931,7 @@ func (c *Controller) authOnlyDryPoolNickLocked() (string, bool) {
 // and break the issue #134 deadlock where a pool of all-parked members
 // never sees a forwarded request.
 //
-// The pick is round-robin from the current sticky position, matching
-// firstHealthyNickLocked's scan order, so a flapping pool doesn't
-// repeatedly hammer the same member.
+// The pick follows effective member order, matching ordinary failover.
 //
 // "Reset has elapsed" here means: the live-429 map entry (c.exhausted)
 // either is absent or carries a past reset. Disabled / removed members
@@ -3981,24 +3939,9 @@ func (c *Controller) authOnlyDryPoolNickLocked() (string, bool) {
 //
 // Caller holds c.mu.
 func (c *Controller) nextParkedButResetPassedLocked() (string, bool) {
-	effectiveNicks := c.allMemberNicksLocked()
-	if len(effectiveNicks) == 0 {
-		return "", false
-	}
-
-	startIdx := 0
-	for i, nick := range effectiveNicks {
-		if nick == c.curNick {
-			startIdx = i
-			break
-		}
-	}
-
+	order := c.effectiveOrderLocked()
 	now := c.now()
-	n := len(effectiveNicks)
-	for off := 1; off <= n; off++ {
-		idx := (startIdx + off) % n
-		nick := effectiveNicks[idx]
+	for _, nick := range order {
 		if c.disabled[nick] {
 			continue
 		}
@@ -4180,14 +4123,4 @@ func retryAfterSeconds(d time.Duration) int {
 		secs = 1
 	}
 	return secs
-}
-
-// randIndex returns a pseudo-random index in [0, n). Go auto-seeds the
-// global source, so the start backend differs across process restarts
-// without any explicit seeding. n is always >= 1 here.
-func randIndex(n int) int {
-	if n <= 1 {
-		return 0
-	}
-	return rand.Intn(n)
 }
