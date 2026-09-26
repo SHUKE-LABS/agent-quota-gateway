@@ -52,9 +52,12 @@ contract from nick, token prefix, hostname, or request body.
   status code, except those response paths handle specially: a `429` (quota),
   and a `401`/`403` (the backend's credential was rejected — revoked, expired,
   or the account pulled), which fail the pool over to a healthy member rather
-  than stick to a dead account; a native Anthropic `529` overload becomes a
-  same-member `503` with `Retry-After: 60`. See
-  [Pools and selectors](#pools-and-selectors).
+  than stick to a dead account. If every enabled member is parked only for
+  `401`/`403`, later client requests retry the first parked member in effective
+  order; concurrent requests may all reach that upstream. A recovered
+  credential is released by its next non-`401`/`403` response. A native
+  Anthropic `529` overload becomes a same-member `503` with `Retry-After: 60`.
+  See [Pools and selectors](#pools-and-selectors).
 - One log line per request (method, path, status, duration, request ID).
   Request bodies, response bodies, and credential headers are never
   logged.
@@ -582,7 +585,15 @@ Codex weekly hello below is independent of member selection:
   credential is equally dead there, and no sibling pool would otherwise learn
   that fact until its own next `401`. The park is cleared, everywhere it was
   copied to, by `POST /_gateway/clear` once the account is restored, or
-  retried automatically when the window elapses.
+  retried automatically when the window elapses. If all enabled members are
+  unavailable only because of these auth-rejection parks, the next real
+  client request is forwarded to the first parked member in effective order.
+  A repeated `401`/`403` is returned with `Retry-After`; any other upstream
+  status releases that auth park across sibling pools before normal response
+  handling (so a `429` still applies its quota park). Concurrent client
+  requests can all reach the parked member; the gateway does not add a probe.
+  Quota parks, including fallback parks, continue to produce the pool's
+  synthetic `503` with the quota `Retry-After`.
 - **No routing probe.** The starting member is chosen at random on startup
   (or by declared priority — see below) and the gateway never contacts a
   member just to measure quota. The Codex hello starts the upstream weekly

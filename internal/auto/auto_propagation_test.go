@@ -275,8 +275,8 @@ func TestCredentialPark_halfOpenPickerSkipsPropagatedPark(t *testing.T) {
 
 	c.mu.Lock()
 	c.curNick = "x"
-	c.credentialPark["x"] = credentialParkEntry{reset: clock.now().Add(time.Hour)} // still future — must be skipped
-	c.exhausted["y"] = clock.now().Add(-time.Minute)                               // live-429 reset already elapsed
+	c.credentialPark["x"] = credentialParkEntry{reset: clock.now().Add(time.Hour), authRejected: true} // still future — must be skipped
+	c.exhausted["y"] = clock.now().Add(-time.Minute)                                                   // live-429 reset already elapsed
 	c.mu.Unlock()
 
 	nick, ok := c.nextParkedButResetPassed()
@@ -361,6 +361,9 @@ func TestCredentialPark_persistRoundTrip(t *testing.T) {
 	}
 	if entry.WindowFact {
 		t.Errorf("PersistState()[b].CredentialPark[ccz].WindowFact=true, want false (401/403 subclass)")
+	}
+	if !entry.AuthRejected {
+		t.Errorf("PersistState()[b].CredentialPark[ccz].AuthRejected=false, want true (401/403 cause)")
 	}
 
 	p2 := loadMovePools(t, clock, propagationEnv())
@@ -492,9 +495,9 @@ func TestCredentialPark_propagationRetainsLatestReset(t *testing.T) {
 	// the delayed sibling update is delivered.
 	originalAPropagation := ca.propagatePark
 	var delayedAPropagation func()
-	ca.propagatePark = func(nick string, reset time.Time, windowFact bool) {
+	ca.propagatePark = func(nick string, reset time.Time, windowFact, authRejected bool) {
 		delayedAPropagation = func() {
-			originalAPropagation(nick, reset, windowFact)
+			originalAPropagation(nick, reset, windowFact, authRejected)
 		}
 	}
 	ca.record429WithSource("ccz", olderReset, true, true)
@@ -508,9 +511,9 @@ func TestCredentialPark_propagationRetainsLatestReset(t *testing.T) {
 	// propagation in a controlled order.
 	originalBPropagation := cb.propagatePark
 	cb.propagatePark = nil
-	cb.record429WithSource("ccz", newerReset, true, false)
+	cb.record429WithCause("ccz", newerReset, true, false, true)
 	cb.propagatePark = originalBPropagation
-	p.propagateCredentialPark("b", "ccz", newerReset, false)
+	p.propagateCredentialPark("b", "ccz", newerReset, false, true)
 	delayedAPropagation()
 
 	for _, pool := range []string{"a", "b", "c"} {
@@ -631,7 +634,7 @@ func TestNoteRecovered_clearsWindowFactNotAuthFatal(t *testing.T) {
 	c.exhausted["x"] = clock.now().Add(5 * time.Hour)
 	c.credentialPark["x"] = credentialParkEntry{reset: clock.now().Add(5 * time.Hour), windowFact: true}
 	c.exhausted["y"] = clock.now().Add(5 * time.Hour)
-	c.credentialPark["y"] = credentialParkEntry{reset: clock.now().Add(5 * time.Hour), windowFact: false}
+	c.credentialPark["y"] = credentialParkEntry{reset: clock.now().Add(5 * time.Hour), windowFact: false, authRejected: true}
 	c.mu.Unlock()
 
 	c.noteRecovered("x")

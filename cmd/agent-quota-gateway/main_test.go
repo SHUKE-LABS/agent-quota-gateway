@@ -610,6 +610,65 @@ func TestPoolHandler_singlePool(t *testing.T) {
 	}
 }
 
+func TestPoolHandler_authCredentialRecoveryReportsActive(t *testing.T) {
+	scrubPoolEnv(t)
+	t.Setenv("AQG_POOL_AUTO_BACKEND_SOLO", "sk-ant-oat-solo")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+	b, ok := registry.ResolveIn("auto", "solo")
+	if !ok {
+		t.Fatal("solo backend missing")
+	}
+	rejected := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header:     make(http.Header),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(backend.WithBackend(context.Background(), b)),
+		Body:       io.NopCloser(strings.NewReader("auth rejected")),
+	}
+	if err := pools.ModifyResponse(rejected); err != nil {
+		t.Fatalf("ModifyResponse 401: %v", err)
+	}
+	if got, _, ok, exhausted := pools.Route("auto"); !ok || exhausted || got.Nick != "solo" {
+		t.Fatalf("Route after auth park=%q ok=%v exhausted=%v, want solo/true/false", got.Nick, ok, exhausted)
+	}
+	recovered := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(backend.WithBackend(context.Background(), b)),
+		Body:       io.NopCloser(strings.NewReader("ok")),
+	}
+	if err := pools.ModifyResponse(recovered); err != nil {
+		t.Fatalf("ModifyResponse 200: %v", err)
+	}
+
+	srv := httptest.NewServer(poolHandler(quota.NewStore(), pools, nil))
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL + "/_gateway/pool?pool=auto")
+	if err != nil {
+		t.Fatalf("GET /_gateway/pool: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /_gateway/pool status=%d, want 200", resp.StatusCode)
+	}
+	var got struct {
+		Members []auto.MemberStatus `json:"members"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode pool status: %v", err)
+	}
+	if len(got.Members) != 1 {
+		t.Fatalf("members=%+v, want the single solo member", got.Members)
+	}
+	member := got.Members[0]
+	if member.Nick != "solo" || member.Status != "active" || member.Parked || member.ExhaustedUntil != nil {
+		t.Errorf("GET /_gateway/pool member=%+v, want solo active, unparked, exhausted_until null", member)
+	}
+}
+
 // TestPoolHandler_allPools verifies /_gateway/pool (no param) returns an array.
 func TestPoolHandler_allPools(t *testing.T) {
 	t.Setenv("AQG_POOL_AUTO_BACKEND_A", "sk-ant-a")
