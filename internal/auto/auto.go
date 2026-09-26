@@ -365,7 +365,7 @@ func (p *Pools) ClearAllExhausted() map[string][]string {
 // MemberStatus describes one pool member's current state for /_gateway/pool.
 type MemberStatus struct {
 	Nick           string          `json:"nick"`
-	Status         string          `json:"status"`          // "active", "exhausted", "idle", "disabled"
+	Status         string          `json:"status"`          // "serving", "exhausted", "idle", "disabled"
 	ExhaustedUntil *time.Time      `json:"exhausted_until"` // RFC 3339 or null
 	Snapshot       *quota.Snapshot `json:"snapshot"`        // null when no snapshot recorded
 	// InWindow is true only at concurrency >1 when this member is in the
@@ -395,7 +395,9 @@ type MemberStatus struct {
 
 // PoolStatus is the /_gateway/pool response for one pool.
 type PoolStatus struct {
-	Pool        string         `json:"pool"`
+	Pool string `json:"pool"`
+	// Active is the single global sticky pointer; member Status may report
+	// several serving targets when worker concurrency is above one.
 	Active      string         `json:"active"`
 	Concurrency int            `json:"concurrency"`
 	Members     []MemberStatus `json:"members"`
@@ -428,7 +430,7 @@ type PoolMemberConfigView struct {
 	Nick     string `json:"nick"`
 	BaseURL  string `json:"base_url"`
 	Disabled bool   `json:"disabled"`
-	Status   string `json:"status"` // "active", "idle", "exhausted", "disabled"
+	Status   string `json:"status"` // "serving", "idle", "exhausted", "disabled"
 }
 
 // PoolStatus returns the current status of the named pool, or ok=false for an unknown pool.
@@ -980,6 +982,7 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 		// Removal is permanent deletion, so removed members are omitted entirely
 		// — consistent with poolStatus and the selection path.
 		allMembers := c.allMemberNicksLocked()
+		statuses := c.memberStatusesLocked(allMembers)
 
 		view.Members = make([]PoolMemberConfigView, 0, len(allMembers))
 
@@ -991,25 +994,7 @@ func (p *Pools) EffectiveConfig() []PoolConfigView {
 			if b, ok := c.backendByNickLocked(nick); ok {
 				member.BaseURL = b.BaseURL
 			}
-			// Determine status. Removed members are already excluded from
-			// allMembers above, so only the disabled flag maps to "disabled".
-			// exhausted is checked before the sticky (curNick) arm so that
-			// "active" means the sticky member that is ALSO available: a sticky
-			// member that is parked reports exhausted, matching poolStatus and
-			// the selection path (isUnavailableLocked), which all use the
-			// controller clock and treat a parked member as unavailable.
-			if c.disabled[nick] {
-				member.Status = "disabled"
-			} else if _, ok := c.exhaustedUntilLocked(nick); ok {
-				// exhaustedUntilLocked returns ok=false once the park elapses by
-				// c.now(), so it is the single source of truth for the exhausted
-				// status across this view, poolStatus, and the selection path.
-				member.Status = "exhausted"
-			} else if nick == c.curNick {
-				member.Status = "active"
-			} else {
-				member.Status = "idle"
-			}
+			member.Status = statuses[nick].status
 			view.Members = append(view.Members, member)
 		}
 		c.mu.Unlock()
@@ -1965,6 +1950,57 @@ func (c *Controller) workerWindowLocked() []string {
 	return window
 }
 
+type memberStatusValue struct {
+	status         string
+	exhaustedUntil time.Time
+	inWindow       bool
+}
+
+// memberStatusesLocked derives one consistent status for each effective
+// member. The global sticky target is serving whenever it is available;
+// with worker concurrency above one, an additional member is serving only
+// when it has an affinity inside the current worker window. Eligibility in
+// the window alone does not mean a member is serving. Disabled and exhausted
+// always take precedence. Caller holds c.mu.
+func (c *Controller) memberStatusesLocked(memberNicks []string) map[string]memberStatusValue {
+	inWindow := make(map[string]bool)
+	if c.workerConcurrency > 1 {
+		for _, nick := range c.workerWindowLocked() {
+			inWindow[nick] = true
+		}
+	}
+	workerServing := make(map[string]bool)
+	for _, nick := range c.workerAffinity {
+		if inWindow[nick] {
+			workerServing[nick] = true
+		}
+	}
+
+	statuses := make(map[string]memberStatusValue, len(memberNicks))
+	for _, nick := range memberNicks {
+		status := c.memberStatusLocked(nick, workerServing[nick])
+		status.inWindow = inWindow[nick]
+		statuses[nick] = status
+	}
+	return statuses
+}
+
+// memberStatusLocked applies status precedence after memberStatusesLocked
+// has determined whether the member has an in-window worker assignment.
+// Caller holds c.mu.
+func (c *Controller) memberStatusLocked(nick string, workerServing bool) memberStatusValue {
+	if c.disabled[nick] {
+		return memberStatusValue{status: "disabled"}
+	}
+	if reset, ok := c.exhaustedUntilLocked(nick); ok {
+		return memberStatusValue{status: "exhausted", exhaustedUntil: reset}
+	}
+	if nick == c.curNick || workerServing {
+		return memberStatusValue{status: "serving"}
+	}
+	return memberStatusValue{status: "idle"}
+}
+
 // normalizeWorkerCursorLocked moves a cursor outside the current worker
 // window to its first member. It returns whether the persisted cursor changed.
 // Caller holds c.mu.
@@ -2486,12 +2522,9 @@ func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller, pollerMap
 	// here. The unified collection covers all members regardless of origin.
 	effective := c.allMemberNicksLocked()
 	members := make([]MemberStatus, 0, len(effective))
-	inWindow := make(map[string]bool)
+	statuses := c.memberStatusesLocked(effective)
 	workersByNick := make(map[string][]string)
 	if c.workerConcurrency > 1 {
-		for _, nick := range c.workerWindowLocked() {
-			inWindow[nick] = true
-		}
 		for worker, nick := range c.workerAffinity {
 			workersByNick[nick] = append(workersByNick[nick], worker)
 		}
@@ -2500,25 +2533,15 @@ func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller, pollerMap
 		ms := MemberStatus{
 			Nick:     nick,
 			Disabled: c.disabled[nick],
-			InWindow: inWindow[nick],
+			InWindow: statuses[nick].inWindow,
 			Workers:  workersByNick[nick],
 		}
 		sort.Strings(ms.Workers)
-		// exhausted is checked before the sticky (curNick) arm: "active" must
-		// mean the sticky member that is ALSO currently available. A sticky
-		// member that is parked is treated as unavailable by the routing path
-		// (isUnavailableLocked → exhaustedUntilLocked), which 429s it, so it
-		// must report exhausted here too — not a green "active" badge.
-		if c.disabled[nick] {
-			ms.Status = "disabled"
-		} else if reset, ok := c.exhaustedUntilLocked(nick); ok {
-			ms.Status = "exhausted"
-			r := reset.UTC()
+		status := statuses[nick]
+		ms.Status = status.status
+		if ms.Status == "exhausted" {
+			r := status.exhaustedUntil.UTC()
 			ms.ExhaustedUntil = &r
-		} else if nick == c.curNick {
-			ms.Status = "active"
-		} else {
-			ms.Status = "idle"
 		}
 		ms.Parked = c.liveParkActiveLocked(nick)
 		if b, ok := c.backendByNickLocked(nick); ok {

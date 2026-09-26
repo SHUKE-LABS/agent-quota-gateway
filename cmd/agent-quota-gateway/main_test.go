@@ -551,6 +551,7 @@ func TestQuotaHandler_methodGuard(t *testing.T) {
 func TestPoolHandler_singlePool(t *testing.T) {
 	t.Setenv("AQG_POOL_AUTO_BACKEND_ACCT_ONE", "sk-ant-oat-one")
 	t.Setenv("AQG_POOL_AUTO_BACKEND_ACCT_TWO", "sk-ant-oat-two")
+	t.Setenv("AQG_POOL_AUTO_CONCURRENCY", "1")
 	registry, err := backend.Load("https://api.anthropic.com")
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
@@ -596,8 +597,14 @@ func TestPoolHandler_singlePool(t *testing.T) {
 		nick := mm["nick"].(string)
 		if nick == activeNick {
 			foundActive = true
-			if mm["status"] != "active" {
-				t.Errorf("member %q status=%v, want active", nick, mm["status"])
+			if mm["status"] != "serving" {
+				t.Errorf("member %q status=%v, want serving", nick, mm["status"])
+			}
+			if mm["in_window"] != false {
+				t.Errorf("member %q in_window=%v at concurrency 1, want false", nick, mm["in_window"])
+			}
+			if _, hasWorkers := mm["workers"]; hasWorkers {
+				t.Errorf("member %q has workers at concurrency 1: %v", nick, mm["workers"])
 			}
 		}
 		// exhausted_until must be present in the JSON (null or a string), not absent.
@@ -610,7 +617,7 @@ func TestPoolHandler_singlePool(t *testing.T) {
 	}
 }
 
-func TestPoolHandler_authCredentialRecoveryReportsActive(t *testing.T) {
+func TestPoolHandler_authCredentialRecoveryReportsServing(t *testing.T) {
 	scrubPoolEnv(t)
 	t.Setenv("AQG_POOL_AUTO_BACKEND_SOLO", "sk-ant-oat-solo")
 	registry, err := backend.Load("https://api.anthropic.com")
@@ -664,8 +671,8 @@ func TestPoolHandler_authCredentialRecoveryReportsActive(t *testing.T) {
 		t.Fatalf("members=%+v, want the single solo member", got.Members)
 	}
 	member := got.Members[0]
-	if member.Nick != "solo" || member.Status != "active" || member.Parked || member.ExhaustedUntil != nil {
-		t.Errorf("GET /_gateway/pool member=%+v, want solo active, unparked, exhausted_until null", member)
+	if member.Nick != "solo" || member.Status != "serving" || member.Parked || member.ExhaustedUntil != nil {
+		t.Errorf("GET /_gateway/pool member=%+v, want solo serving, unparked, exhausted_until null", member)
 	}
 }
 
@@ -711,6 +718,129 @@ func TestPoolHandler_allPools(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("auto pool not found in response: %v", got)
+	}
+}
+
+func TestPoolAndConfigEndpointsShareServingStatus(t *testing.T) {
+	scrubPoolEnv(t)
+	for _, nick := range []string{"a", "b", "c", "d"} {
+		t.Setenv("AQG_POOL_AUTO_BACKEND_"+strings.ToUpper(nick), "sk-ant-"+nick)
+	}
+	t.Setenv("AQG_POOL_AUTO_PRIORITY", "a,b,c,d")
+	t.Setenv("AQG_POOL_AUTO_CONCURRENCY", "3")
+	registry, err := backend.Load("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+	for _, route := range []struct{ worker, nick string }{
+		{worker: "worker-a", nick: "a"},
+		{worker: "worker-b", nick: "b"},
+		{worker: "worker-c", nick: "c"},
+	} {
+		if member, _, ok, exhausted := pools.RouteWorker("auto", route.worker); !ok || exhausted || member.Nick != route.nick {
+			t.Fatalf("RouteWorker(%s) = %q ok=%v exhausted=%v, want %s", route.worker, member.Nick, ok, exhausted, route.nick)
+		}
+	}
+	if code, err := pools.SetConcurrency("auto", 2); code != http.StatusOK || err != nil {
+		t.Fatalf("SetConcurrency(2): status=%d err=%v", code, err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_gateway/pool", poolHandler(quota.NewStore(), pools, nil))
+	mux.HandleFunc("/_gateway/config", configHandler(pools, configfile.PersistenceState{}))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	poolResp, err := http.Get(srv.URL + "/_gateway/pool?pool=auto")
+	if err != nil {
+		t.Fatalf("GET /_gateway/pool: %v", err)
+	}
+	defer poolResp.Body.Close()
+	if poolResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /_gateway/pool status=%d, want 200", poolResp.StatusCode)
+	}
+	var poolView struct {
+		Active  string              `json:"active"`
+		Members []auto.MemberStatus `json:"members"`
+	}
+	if err := json.NewDecoder(poolResp.Body).Decode(&poolView); err != nil {
+		t.Fatalf("decode /_gateway/pool: %v", err)
+	}
+	if current, ok := pools.Current("auto"); !ok || poolView.Active != current.Nick {
+		t.Fatalf("pool active=%q current=%+v ok=%v, want global sticky nick", poolView.Active, current, ok)
+	}
+	if poolView.Active != "a" {
+		t.Fatalf("pool active=%q, want priority-anchored sticky nick a", poolView.Active)
+	}
+
+	configResp, err := http.Get(srv.URL + "/_gateway/config")
+	if err != nil {
+		t.Fatalf("GET /_gateway/config: %v", err)
+	}
+	defer configResp.Body.Close()
+	if configResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /_gateway/config status=%d, want 200", configResp.StatusCode)
+	}
+	var configViews []auto.PoolConfigView
+	if err := json.NewDecoder(configResp.Body).Decode(&configViews); err != nil {
+		t.Fatalf("decode /_gateway/config: %v", err)
+	}
+	var configMembers []auto.PoolMemberConfigView
+	for _, view := range configViews {
+		if view.Pool == "auto" {
+			configMembers = view.Members
+		}
+	}
+	if len(configMembers) != len(poolView.Members) {
+		t.Fatalf("config members=%d, pool members=%d", len(configMembers), len(poolView.Members))
+	}
+
+	configStatus := make(map[string]string, len(configMembers))
+	for _, member := range configMembers {
+		configStatus[member.Nick] = member.Status
+	}
+	var pendingFound bool
+	var inWindowWorkerFound bool
+	poolStatusByNick := make(map[string]auto.MemberStatus, len(poolView.Members))
+	wantStatus := map[string]string{"a": "serving", "b": "serving", "c": "idle", "d": "idle"}
+	wantInWindow := map[string]bool{"a": true, "b": true, "c": false, "d": false}
+	wantWorkers := map[string]string{"a": "worker-a", "b": "worker-b", "c": "worker-c", "d": ""}
+	for _, member := range poolView.Members {
+		poolStatusByNick[member.Nick] = member
+		if member.Status != wantStatus[member.Nick] {
+			t.Errorf("member %s status=%q, want %q", member.Nick, member.Status, wantStatus[member.Nick])
+		}
+		if member.InWindow != wantInWindow[member.Nick] {
+			t.Errorf("member %s in_window=%v, want %v", member.Nick, member.InWindow, wantInWindow[member.Nick])
+		}
+		if got := strings.Join(member.Workers, ","); got != wantWorkers[member.Nick] {
+			t.Errorf("member %s workers=%q, want %q", member.Nick, got, wantWorkers[member.Nick])
+		}
+		if configStatus[member.Nick] != member.Status {
+			t.Errorf("member %s: config status=%q, pool status=%q", member.Nick, configStatus[member.Nick], member.Status)
+		}
+		if member.Nick != poolView.Active && !member.InWindow && len(member.Workers) > 0 {
+			pendingFound = true
+			if member.Status != "idle" {
+				t.Errorf("pending member %s status=%q, want idle", member.Nick, member.Status)
+			}
+		}
+		if member.InWindow && len(member.Workers) > 0 && member.Nick != poolView.Active {
+			inWindowWorkerFound = true
+			if member.Status != "serving" {
+				t.Errorf("in-window worker member %s status=%q, want serving", member.Nick, member.Status)
+			}
+		}
+	}
+	if !pendingFound {
+		t.Fatalf("pool response has no stale worker assignment: %+v", poolView.Members)
+	}
+	if !inWindowWorkerFound {
+		t.Fatalf("pool response has no non-sticky in-window worker assignment: %+v", poolView.Members)
+	}
+	if got := poolStatusByNick[poolView.Active].Status; got != "serving" {
+		t.Errorf("global sticky member %s status=%q, want serving", poolView.Active, got)
 	}
 }
 
