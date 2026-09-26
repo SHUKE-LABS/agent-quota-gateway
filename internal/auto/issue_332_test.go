@@ -287,6 +287,50 @@ func TestCredentialDryPoolRecoveryPreservesQuotaPark(t *testing.T) {
 	}
 }
 
+func TestCredentialDryPoolAuthRetry429ReplacesAuthParkWithQuotaPark(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	p := loadMovePools(t, clock, map[string]string{
+		backend.EnvPrefix + "A_BACKEND_SHARED": "cred-shared",
+		backend.EnvPrefix + "B_BACKEND_SHARED": "cred-shared",
+	})
+	shared, _ := p.CurrentRegistry().ResolveIn("a", "shared")
+	if err := p.ModifyResponse(respAuth(shared, http.StatusUnauthorized)); err != nil {
+		t.Fatalf("ModifyResponse 401: %v", err)
+	}
+	retryBackend, _, ok, exhausted := p.Route("a")
+	if !ok || exhausted || retryBackend.Nick != "shared" {
+		t.Fatalf("auth-only retry route=%q ok=%v exhausted=%v, want shared/true/false", retryBackend.Nick, ok, exhausted)
+	}
+
+	quotaReset := clock.now().Add(time.Hour)
+	retry := resp429(retryBackend, clock, time.Hour)
+	if err := p.ModifyResponse(retry); err != nil {
+		t.Fatalf("ModifyResponse retry 429: %v", err)
+	}
+	if retry.StatusCode != http.StatusServiceUnavailable || retry.Header.Get("Retry-After") != "3600" {
+		t.Fatalf("retry response=%d Retry-After=%q, want dry-pool 503 with the quota reset", retry.StatusCode, retry.Header.Get("Retry-After"))
+	}
+
+	for pool, c := range map[string]*Controller{"a": p.byPool["a"], "b": p.byPool["b"]} {
+		c.mu.Lock()
+		entry, hasCredentialPark := c.credentialPark["shared"]
+		reset, hasQuotaPark := c.exhausted["shared"]
+		c.mu.Unlock()
+		if hasCredentialPark && entry.authRejected {
+			t.Errorf("pool %s retained auth park after retry 429", pool)
+		}
+		if pool == "a" && (!hasQuotaPark || !reset.Equal(quotaReset)) {
+			t.Errorf("origin quota park reset=%v present=%v, want %v", reset, hasQuotaPark, quotaReset)
+		}
+		if pool == "b" && hasCredentialPark {
+			t.Errorf("sibling retained auth credential park after retry 429: %+v", entry)
+		}
+	}
+	if got, wait, ok, exhausted := p.Route("a"); !ok || !exhausted || got.Nick != "shared" || wait != time.Hour {
+		t.Errorf("Route after retry 429=%q wait=%s ok=%v exhausted=%v, want quota-parked shared for 1h", got.Nick, wait, ok, exhausted)
+	}
+}
+
 func TestCredentialDryPoolKeepsQuotaFallback503(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := codexController(t, clock, io.Discard, nil, "solo")
@@ -310,6 +354,39 @@ func TestCredentialDryPoolKeepsQuotaFallback503(t *testing.T) {
 	}
 	if _, _, exhausted := c.ResolveAuto(); !exhausted {
 		t.Error("Codex quota fallback dry pool returned a real-request route, want synthetic 503 path")
+	}
+}
+
+func TestCredentialDryPoolKeepsQuotaFallback503AlongsideAuthPark(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := codexController(t, clock, io.Discard, nil, "quota", "auth")
+	if err := c.ModifyResponse(respAuth(c.resolve(t, "auth"), http.StatusUnauthorized)); err != nil {
+		t.Fatalf("ModifyResponse auth 401: %v", err)
+	}
+
+	fallback := resp429Codex(c.resolve(t, "quota"), clock,
+		codexWin{percent: "100", minutes: "300"},
+		codexWin{},
+		quota.CodexReachedTypeUsageLimit,
+	)
+	if err := c.ModifyResponse(fallback); err != nil {
+		t.Fatalf("ModifyResponse quota fallback 429: %v", err)
+	}
+	if fallback.StatusCode != http.StatusServiceUnavailable || fallback.Header.Get("Retry-After") == "" {
+		t.Fatalf("mixed fallback response=%d Retry-After=%q, want synthetic 503 with retry hint", fallback.StatusCode, fallback.Header.Get("Retry-After"))
+	}
+	c.mu.Lock()
+	quotaPark, hasQuotaPark := c.credentialPark["quota"]
+	authPark, hasAuthPark := c.credentialPark["auth"]
+	c.mu.Unlock()
+	if !hasQuotaPark || quotaPark.windowFact || quotaPark.authRejected {
+		t.Errorf("quota fallback park=%+v present=%v, want windowFact=false authRejected=false", quotaPark, hasQuotaPark)
+	}
+	if !hasAuthPark || !authPark.authRejected {
+		t.Errorf("auth park=%+v present=%v, want authRejected=true", authPark, hasAuthPark)
+	}
+	if _, _, exhausted := c.ResolveAuto(); !exhausted {
+		t.Error("mixed auth/fallback quota pool returned a real-request route, want synthetic 503 path")
 	}
 }
 
@@ -420,6 +497,90 @@ func TestCredentialDryPoolWorkerRoutesUseSameAuthOnlyRule(t *testing.T) {
 			}
 			if strings.Join(upstreamNicks, ",") != "a,a" {
 				t.Errorf("namespaced upstream member sequence=%v, want [a a]", upstreamNicks)
+			}
+		})
+	}
+}
+
+func TestCredentialDryPoolWorkerRecoveryRoutesNormally(t *testing.T) {
+	for _, concurrency := range []int{1, 2} {
+		t.Run(fmt.Sprintf("concurrency-%d", concurrency), func(t *testing.T) {
+			clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+			p := NewPools(workerPriorityRegistry(t, concurrency, "a,b", "a", "b"), nil, clock.now, io.Discard)
+			reg := p.CurrentRegistry()
+			for _, nick := range []string{"a", "b"} {
+				b, _ := reg.ResolveIn("auto", nick)
+				if err := p.ModifyResponse(respAuth(b, http.StatusUnauthorized)); err != nil {
+					t.Fatalf("ModifyResponse %s 401: %v", nick, err)
+				}
+			}
+
+			var upstreamNicks []string
+			gateway := backend.WorkerNamespaceMiddleware(backend.Middleware(p, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, ok := backend.FromContext(r.Context())
+				if !ok {
+					t.Error("namespaced upstream request missing backend context")
+					return
+				}
+				upstreamNicks = append(upstreamNicks, b.Nick)
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Request:    r,
+					Body:       io.NopCloser(strings.NewReader("recovered")),
+				}
+				if err := p.ModifyResponse(resp); err != nil {
+					t.Errorf("ModifyResponse worker 200: %v", err)
+					return
+				}
+				w.WriteHeader(resp.StatusCode)
+				_, _ = io.Copy(w, resp.Body)
+			})))
+			doRequest := func() *httptest.ResponseRecorder {
+				r := httptest.NewRequest(http.MethodPost, "/_aqg/w/worker-one/v1/messages", nil)
+				r.Header.Set("Authorization", "Bearer auto")
+				w := httptest.NewRecorder()
+				gateway.ServeHTTP(w, r)
+				return w
+			}
+
+			if first := doRequest(); first.Code != http.StatusOK || first.Body.String() != "recovered" {
+				t.Fatalf("auth-only worker retry response=%d %q, want recovered 200", first.Code, first.Body.String())
+			}
+			status, ok := p.PoolStatus("auto", quota.NewStore(), nil)
+			if !ok {
+				t.Fatal("PoolStatus(auto) missing")
+			}
+			if memberStatus(status, "a") != "active" || memberParked(status, "a") {
+				t.Errorf("recovered worker member status=%q parked=%v, want active/false", memberStatus(status, "a"), memberParked(status, "a"))
+			}
+			for _, member := range status.Members {
+				if member.Nick == "a" && member.ExhaustedUntil != nil {
+					t.Errorf("recovered worker exhausted_until=%v, want null", member.ExhaustedUntil)
+				}
+			}
+
+			c := p.byPool["auto"]
+			c.mu.Lock()
+			_, stillParked := c.credentialPark["a"]
+			c.mu.Unlock()
+			if stillParked {
+				t.Fatal("recovered worker member still has a credential park before the next request")
+			}
+			if second := doRequest(); second.Code != http.StatusOK || second.Body.String() != "recovered" {
+				t.Fatalf("normal worker request response=%d %q, want 200", second.Code, second.Body.String())
+			}
+			if strings.Join(upstreamNicks, ",") != "a,a" {
+				t.Errorf("worker upstream member sequence=%v, want [a a]", upstreamNicks)
+			}
+			c.mu.Lock()
+			assigned := c.workerAffinity["worker-one"]
+			c.mu.Unlock()
+			if concurrency > 1 && assigned != "a" {
+				t.Errorf("worker assignment after recovery=%q, want a", assigned)
+			}
+			if concurrency == 1 && assigned != "" {
+				t.Errorf("concurrency-one worker unexpectedly has affinity %q", assigned)
 			}
 		})
 	}
