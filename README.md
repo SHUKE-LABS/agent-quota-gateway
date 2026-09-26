@@ -1164,6 +1164,13 @@ contains no auth and no build step — it inherits the gateway's trust boundary.
 write controls to any client that can reach the port; the network
 ACL/firewall restricting the port is the only gate.
 
+At concurrency above 1, the dashboard shows a healthy non-sticky member as
+`serving` in the Status badge when it has assigned workers and is in the active
+worker window. The global sticky member keeps the `active` badge; out-of-window
+assignments remain pending, and `disabled` or `exhausted` status takes
+precedence. This is a dashboard presentation distinction; the API `status`
+continues to describe the global sticky route.
+
 A rolling-window utilization cell (5h or long) renders `-` once its reset has
 already elapsed, mirroring what the adjacent reset cell and status badge
 already show. Recovery from `exhausted` to `idle` happens by wall-clock; the

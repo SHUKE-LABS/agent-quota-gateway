@@ -15,6 +15,8 @@ function element() {
     children: [],
     style: {},
     textContent: '',
+    attributes: {},
+    setAttribute(name, value) { this.attributes[name] = String(value); },
     classList: {
       add(name) { classes.add(name); },
       remove(name) { classes.delete(name); },
@@ -36,6 +38,8 @@ vm.runInContext(`${html.slice(start, end)};
   this.showConcurrencyControl = showConcurrencyControl;
   this.showsWorkerColumn = showsWorkerColumn;
   this.workerPresentation = workerPresentation;
+  this.statusPresentation = statusPresentation;
+  this.applyStatusPresentation = applyStatusPresentation;
   this.applyWorkerPresentation = applyWorkerPresentation;
   this.renderQuota = renderQuota;
   this.formatReset = formatReset;`, context);
@@ -79,6 +83,34 @@ const single = context.workerPresentation(1, { in_window: true, workers: ['worke
 assert.equal(single.enabled, false);
 assert.equal(single.serving, false);
 assert.equal(single.count, 0);
+
+const poolMembers = [
+  { nick: 'sticky', status: 'active', in_window: true, workers: ['worker-a'] },
+  { nick: 'worker-serving-a', status: 'idle', in_window: true, workers: ['worker-b'] },
+  { nick: 'worker-serving-b', status: 'idle', in_window: true, workers: ['worker-c'] },
+  { nick: 'pending', status: 'idle', in_window: false, workers: ['worker-d'] },
+  { nick: 'disabled', status: 'disabled', in_window: true, workers: ['worker-e'] },
+  { nick: 'exhausted', status: 'exhausted', in_window: true, workers: ['worker-f'] },
+  { nick: 'window-only', status: 'idle', in_window: true, workers: [] },
+];
+const badges = poolMembers.map((member) => {
+  const badge = element();
+  context.applyStatusPresentation(badge, member, 2);
+  return { nick: member.nick, text: badge.textContent, dataStatus: badge.attributes['data-status'] };
+});
+assert.deepEqual(badges, [
+  { nick: 'sticky', text: 'active', dataStatus: 'active' },
+  { nick: 'worker-serving-a', text: 'serving', dataStatus: 'serving' },
+  { nick: 'worker-serving-b', text: 'serving', dataStatus: 'serving' },
+  { nick: 'pending', text: 'idle', dataStatus: 'idle' },
+  { nick: 'disabled', text: 'disabled', dataStatus: 'disabled' },
+  { nick: 'exhausted', text: 'exhausted', dataStatus: 'exhausted' },
+  { nick: 'window-only', text: 'idle', dataStatus: 'idle' },
+], 'one pool preserves global active while marking assigned in-window members serving');
+
+for (const member of poolMembers) {
+  assert.equal(context.statusPresentation(1, member), member.status, `concurrency 1 preserves ${member.nick} status`);
+}
 
 const editStart = html.indexOf('  function editConcurrency(');
 const editEnd = html.indexOf('  function toggleMember(', editStart);
