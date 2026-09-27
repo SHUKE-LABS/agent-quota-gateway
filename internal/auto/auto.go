@@ -2009,32 +2009,9 @@ func (c *Controller) normalizeWorkerCursorLocked() bool {
 	return old != c.workerCursor
 }
 
-// nextWorkerMemberLocked returns the next nick from the current worker window
-// and the following window member as cursor. Caller holds c.mu.
-func (c *Controller) nextWorkerMemberLocked() (nick, nextCursor string, ok bool) {
-	window := c.workerWindowLocked()
-	if len(window) == 0 {
-		return "", "", false
-	}
-	start := 0
-	for i, candidate := range window {
-		if candidate == c.workerCursor {
-			start = i
-			break
-		}
-	}
-	return window[start], window[(start+1)%len(window)], true
-}
-
-// nextWorkerReassignmentLocked chooses the least-used member in the current
-// window, breaking ties from the round-robin cursor. That keeps workers on
-// unaffected members in place while filling a newly opened fallback slot.
-// Caller holds c.mu.
-func (c *Controller) nextWorkerReassignmentLocked() (nick, nextCursor string, ok bool) {
-	window := c.workerWindowLocked()
-	if len(window) == 0 {
-		return "", "", false
-	}
+// workerWindowCountsLocked returns assignment counts for the supplied window.
+// Assignments outside the window do not affect its balance. Caller holds c.mu.
+func (c *Controller) workerWindowCountsLocked(window []string) map[string]int {
 	counts := make(map[string]int, len(window))
 	for _, candidate := range window {
 		counts[candidate] = 0
@@ -2044,6 +2021,19 @@ func (c *Controller) nextWorkerReassignmentLocked() (nick, nextCursor string, ok
 			counts[assigned]++
 		}
 	}
+	return counts
+}
+
+// nextWorkerReassignmentLocked chooses the least-used member in the current
+// window, breaking ties from the round-robin cursor. This spreads both new
+// assignments and workers reassigned or rebalanced on later requests. Caller
+// holds c.mu.
+func (c *Controller) nextWorkerReassignmentLocked() (nick, nextCursor string, ok bool) {
+	window := c.workerWindowLocked()
+	if len(window) == 0 {
+		return "", "", false
+	}
+	counts := c.workerWindowCountsLocked(window)
 	min := int(^uint(0) >> 1)
 	for _, candidate := range window {
 		if counts[candidate] < min {
@@ -2205,9 +2195,10 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 }
 
 // ResolveWorker routes worker through global sticky behavior when concurrency
-// is 1. Above 1, workers keep hard affinity within the first N available
-// members in effective order. When no member is available, it reports the
-// same pool-dry wait without assigning an unavailable nick.
+// is 1. Above 1, workers keep affinity within the first N available members in
+// effective order, rebalancing only when their member has at least two more
+// assignments than the least-used window member. When no member is available,
+// it reports the same pool-dry wait without assigning an unavailable nick.
 func (c *Controller) ResolveWorker(worker string) (backend.Backend, time.Duration, bool) {
 	if !backend.IsValidWorkerNickname(worker) {
 		return backend.Backend{}, 0, true
@@ -2226,28 +2217,33 @@ func (c *Controller) ResolveWorker(worker string) (backend.Backend, time.Duratio
 	for _, nick := range window {
 		inWindow[nick] = true
 	}
-	reassignment := false
 	if nick, exists := c.workerAffinity[worker]; exists {
 		if inWindow[nick] {
-			if b, ok := c.backendByNickLocked(nick); ok {
-				if mutated {
-					c.notifyMutate()
+			counts := c.workerWindowCountsLocked(window)
+			min := int(^uint(0) >> 1)
+			for _, candidate := range window {
+				if counts[candidate] < min {
+					min = counts[candidate]
 				}
-				return b, 0, false
+			}
+			// Count this worker on its current member before removing it. With a
+			// gap of at least two, the least-used destination cannot be that member.
+			if counts[nick]-min < 2 {
+				if b, ok := c.backendByNickLocked(nick); ok {
+					if mutated {
+						c.notifyMutate()
+					}
+					return b, 0, false
+				}
 			}
 		}
 		delete(c.workerAffinity, worker)
 		mutated = true
-		reassignment = true
 	}
 
 	var nick, nextCursor string
 	var ok bool
-	if reassignment {
-		nick, nextCursor, ok = c.nextWorkerReassignmentLocked()
-	} else {
-		nick, nextCursor, ok = c.nextWorkerMemberLocked()
-	}
+	nick, nextCursor, ok = c.nextWorkerReassignmentLocked()
 	if ok {
 		c.workerAffinity[worker] = nick
 		c.workerCursor = nextCursor
