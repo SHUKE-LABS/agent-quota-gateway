@@ -161,11 +161,11 @@ func TestWorkerStatus_reportsWindowAndDeferredAffinity(t *testing.T) {
 	if got := strings.Join(byNick["b"].Workers, ","); got != "worker-y" {
 		t.Errorf("b workers before next request=%v, want [worker-y]", byNick["b"].Workers)
 	}
-	if got, _, _, exhausted := p.RouteWorker("auto", "worker-a"); exhausted || got.Nick != "a" {
-		t.Errorf("worker-a in window moved to %q exhausted=%v, want a", got.Nick, exhausted)
+	if got, _, _, exhausted := p.RouteWorker("auto", "worker-a"); exhausted || got.Nick != "c" {
+		t.Errorf("worker-a on surplus a assignment moved to %q exhausted=%v, want c", got.Nick, exhausted)
 	}
-	if got, _, _, exhausted := p.RouteWorker("auto", "worker-y"); exhausted || got.Nick != "c" {
-		t.Errorf("worker-y deferred reassignment=%q exhausted=%v, want c", got.Nick, exhausted)
+	if got, _, _, exhausted := p.RouteWorker("auto", "worker-y"); exhausted || got.Nick != "a" {
+		t.Errorf("worker-y deferred reassignment=%q exhausted=%v, want least-used a", got.Nick, exhausted)
 	}
 
 	if code, err := p.SetConcurrency("auto", 1); code != http.StatusOK || err != nil {
@@ -374,6 +374,116 @@ func TestWorkerAffinity_concurrencyTwoCyclesExactlyWithinWindow(t *testing.T) {
 	}
 }
 
+func TestWorkerAffinity_rebalancesRecoveryAndPersistsState(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	reg := workerPriorityRegistry(t, 2, "a,b", "a", "b")
+	p := NewPools(reg, nil, clock.now, io.Discard)
+	c := p.byPool["auto"]
+	c.park("a", clock.now().Add(time.Hour))
+	workers := []string{"worker-1", "worker-2", "worker-3", "worker-4"}
+	for _, worker := range workers {
+		if got, _, _, exhausted := p.RouteWorker("auto", worker); exhausted || got.Nick != "b" {
+			t.Fatalf("%s with a parked = %q exhausted=%v, want b/false", worker, got.Nick, exhausted)
+		}
+	}
+
+	clock.advance(time.Hour)
+	c.mu.Lock()
+	c.clearExpiredLocked()
+	c.mu.Unlock()
+	mutations := 0
+	c.onMutate = func() { mutations++ }
+	for i, worker := range workers {
+		want := "b"
+		if i < 2 {
+			want = "a"
+		}
+		if got, _, _, exhausted := p.RouteWorker("auto", worker); exhausted || got.Nick != want {
+			t.Fatalf("%s after a recovered = %q exhausted=%v, want %s/false", worker, got.Nick, exhausted, want)
+		}
+	}
+	if mutations != 2 {
+		t.Errorf("rebalance persistence notifications = %d, want one per moved worker (2)", mutations)
+	}
+	for _, worker := range workers {
+		want := "b"
+		if worker == "worker-1" || worker == "worker-2" {
+			want = "a"
+		}
+		if got, _, _, exhausted := p.RouteWorker("auto", worker); exhausted || got.Nick != want {
+			t.Errorf("%s moved after the window balanced: %q exhausted=%v, want %s/false", worker, got.Nick, exhausted, want)
+		}
+	}
+
+	saved := p.PersistState()
+	reloaded := NewPools(reg, nil, clock.now, io.Discard)
+	reloaded.LoadPersistState(saved)
+	c = reloaded.byPool["auto"]
+	if c.workerCursor != "b" {
+		t.Fatalf("restored worker cursor = %q, want b", c.workerCursor)
+	}
+	for worker, want := range map[string]string{
+		"worker-1": "a", "worker-2": "a", "worker-3": "b", "worker-4": "b",
+	} {
+		if got := c.workerAffinity[worker]; got != want {
+			t.Errorf("restored %s assignment = %q, want %s", worker, got, want)
+		}
+	}
+	if got, _, _, exhausted := reloaded.RouteWorker("auto", "worker-new"); exhausted || got.Nick != "b" {
+		t.Errorf("new worker after reload = %q exhausted=%v, want b from restored cursor", got.Nick, exhausted)
+	}
+}
+
+func TestWorkerAffinity_rebalancesOnlyForSkewOfTwo(t *testing.T) {
+	t.Run("3/1 split moves one worker", func(t *testing.T) {
+		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+		c := NewController(workerPriorityRegistry(t, 2, "a,b", "a", "b"), "auto", 0, nil, clock.now, io.Discard)
+		c.workerAffinity = map[string]string{
+			"worker-a1": "a", "worker-a2": "a", "worker-a3": "a", "worker-b1": "b",
+		}
+		c.workerCursor = "a"
+		if got, _, exhausted := c.ResolveWorker("worker-a1"); exhausted || got.Nick != "b" {
+			t.Fatalf("worker-a1 on 3/1 split = %q exhausted=%v, want b/false", got.Nick, exhausted)
+		}
+		if got, _, exhausted := c.ResolveWorker("worker-a2"); exhausted || got.Nick != "a" {
+			t.Errorf("worker-a2 after balance = %q exhausted=%v, want a/false", got.Nick, exhausted)
+		}
+		if got, _, exhausted := c.ResolveWorker("worker-b1"); exhausted || got.Nick != "b" {
+			t.Errorf("worker-b1 after balance = %q exhausted=%v, want b/false", got.Nick, exhausted)
+		}
+		counts := map[string]int{"a": 0, "b": 0}
+		for _, nick := range c.workerAffinity {
+			counts[nick]++
+		}
+		if counts["a"] != 2 || counts["b"] != 2 {
+			t.Errorf("3/1 split after one move = %v, want a:2 b:2", counts)
+		}
+	})
+
+	t.Run("2/1 split stays", func(t *testing.T) {
+		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+		c := NewController(workerPriorityRegistry(t, 2, "a,b", "a", "b"), "auto", 0, nil, clock.now, io.Discard)
+		c.workerAffinity = map[string]string{"worker-a1": "a", "worker-a2": "a", "worker-b1": "b"}
+		c.workerCursor = "a"
+		if got, _, exhausted := c.ResolveWorker("worker-a1"); exhausted || got.Nick != "a" {
+			t.Errorf("worker-a1 on 2/1 split = %q exhausted=%v, want a/false", got.Nick, exhausted)
+		}
+		if got := c.workerAffinity["worker-a1"]; got != "a" {
+			t.Errorf("2/1 assignment changed to %q, want a", got)
+		}
+	})
+}
+
+func TestWorkerAffinity_newWorkerChoosesLeastUsedMember(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	c := NewController(workerPriorityRegistry(t, 2, "a,b", "a", "b"), "auto", 0, nil, clock.now, io.Discard)
+	c.workerAffinity = map[string]string{"worker-a1": "a", "worker-a2": "a", "worker-b1": "b"}
+	c.workerCursor = "a"
+	if got, _, exhausted := c.ResolveWorker("worker-new"); exhausted || got.Nick != "b" {
+		t.Fatalf("new worker on 2/1 split = %q exhausted=%v, want least-used b/false", got.Nick, exhausted)
+	}
+}
+
 func TestWorkerAffinity_reclaimsSecondWindowMemberAndReturnsAfterReset(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	p := NewPools(workerPriorityRegistry(t, 2, "a,b,c", "a", "b", "c"), nil, clock.now, io.Discard)
@@ -385,21 +495,27 @@ func TestWorkerAffinity_reclaimsSecondWindowMemberAndReturnsAfterReset(t *testin
 	}
 	c := p.byPool["auto"]
 	c.park("b", clock.now().Add(time.Hour))
-	for worker, want := range map[string]string{"worker-1": "a", "worker-2": "c", "worker-3": "a", "worker-4": "c"} {
+	for _, tc := range []struct{ worker, want string }{
+		{"worker-1", "c"}, // a is now two workers above the empty fallback slot.
+		{"worker-2", "a"},
+		{"worker-3", "a"},
+		{"worker-4", "c"},
+	} {
+		worker, want := tc.worker, tc.want
 		if got, _, _, exhausted := p.RouteWorker("auto", worker); exhausted || got.Nick != want {
 			t.Errorf("%s with b unavailable = %q exhausted=%v, want %s/false", worker, got.Nick, exhausted, want)
 		}
 	}
 
 	clock.advance(time.Hour)
-	for _, worker := range []string{"worker-2", "worker-4"} {
-		if got, _, _, exhausted := p.RouteWorker("auto", worker); exhausted || (got.Nick != "a" && got.Nick != "b") {
-			t.Errorf("%s after b recovered = %q exhausted=%v, want reassignment into {a,b}", worker, got.Nick, exhausted)
+	for _, worker := range []string{"worker-1", "worker-4"} {
+		if got, _, _, exhausted := p.RouteWorker("auto", worker); exhausted || got.Nick != "b" {
+			t.Errorf("%s fallback reassignment after b recovered = %q exhausted=%v, want b/false", worker, got.Nick, exhausted)
 		}
 	}
-	for _, worker := range []string{"worker-1", "worker-3"} {
+	for _, worker := range []string{"worker-2", "worker-3"} {
 		if got, _, _, exhausted := p.RouteWorker("auto", worker); exhausted || got.Nick != "a" {
-			t.Errorf("%s already in window moved after b recovered = %q exhausted=%v, want a/false", worker, got.Nick, exhausted)
+			t.Errorf("%s balanced in-window assignment changed after b recovered = %q exhausted=%v, want a/false", worker, got.Nick, exhausted)
 		}
 	}
 }

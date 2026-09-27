@@ -163,12 +163,15 @@ Each pool's `concurrency` setting controls worker routing (default `1`). At
 preempt behavior as an ordinary request, and no worker assignment is stored.
 At values above `1`, the first N available members in effective order form the
 worker window: declared `PRIORITY` order when present, otherwise sorted member
-nick order. New workers are assigned round-robin within that window. An
-assignment stays put while its member remains available and inside the window.
-If it becomes unavailable or falls outside the window, the worker is assigned
-again on its next request. This brings workers back from fallback members when
-a higher member becomes available. A transient same-member throttle or 529
-keeps the member available and does not move its workers.
+nick order. New workers are assigned to a least-used member, with ties broken
+by the round-robin cursor. An assignment stays put while its member remains
+available and inside the window unless that member has at least two more
+workers than the least-used window member; then it is rebalanced on that
+worker's next request. If a member becomes unavailable or falls outside the
+window, the worker is reassigned on its next request. When a higher member
+recovers, only workers needed to balance the window move back. A transient
+same-member throttle or 529 keeps the member available and does not move its
+workers.
 
 A real upstream quota rejection or credential failure makes the member
 unavailable in every pool that shares the nick; each mapped worker is
@@ -312,11 +315,13 @@ sorted startup and failover. The order is by member nick only — vendor and
 model names do not affect routing.
 
 At concurrency above one, the first N available members in the same effective
-order form the worker window. New workers are assigned round-robin within that
-window. Existing worker affinity stays put while its member remains available
-inside the window; an affected worker is reassigned on its next request. A
-member outside the current window is reserved for new worker assignments,
-though an incumbent fallback may keep its sticky route until reassessment.
+order form the worker window. New workers are assigned to a least-used member,
+with ties following the round-robin cursor. Existing worker affinity stays put
+while its member remains available inside the window unless its worker count
+is at least two above the least-used member; rebalance happens on that worker's
+next request. A member outside the current window is reserved for new worker
+assignments, though an incumbent fallback may keep its sticky route until
+reassessment.
 Concurrency one uses the shared global sticky route for ordinary and
 namespaced requests.
 
@@ -347,7 +352,7 @@ classes and configure each pool's `BASE_URL` and members accordingly.
 | `AQG_POOL_<POOL>_BACKEND_<NICK>` | _(at least one required)_ | A pool member's credential, optionally `=<cred>\|<base-url>` to override the pool default upstream for that member. `<POOL>` and `<NICK>` are normalized (`AQG_POOL_Z_AI_BACKEND_KEY_A` → pool `z-ai`, member `key-a`). |
 | `AQG_POOL_<POOL>_BASE_URL` | `ANTHROPIC_BASE_URL` | The pool's default upstream; scheme and host are required. Omit it for pools that hit `api.anthropic.com`. |
 | `AQG_POOL_<POOL>_PRIORITY` | _(optional)_ | Comma-separated member nicks, highest ranked first (e.g. `zai,m3`). Unlisted members follow in sorted order; without a declaration all members use sorted nick order. Carries no credential. See [Ordered routing within a pool](#ordered-routing-within-a-pool). |
-| `AQG_POOL_<POOL>_CONCURRENCY` | `1` | Number of available members that may serve namespaced workers. Values above 1 use the first N available members in effective order, reassigning workers when their member leaves the window. |
+| `AQG_POOL_<POOL>_CONCURRENCY` | `1` | Number of available members that may serve namespaced workers. Values above 1 use the first N available members in effective order, assigning new workers to the least-used member and lazily rebalancing skewed assignments. |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single non-loopback overlay/IP address (e.g. a Tailscale address, `100.64.0.0/10` / `fd7a:115c:a1e0::/48`; or any other overlay/LAN address the deployment trusts, such as an OpenVPN `10.8.0.0/24`) instead of loopback, so other machines that can reach it share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
