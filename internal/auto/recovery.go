@@ -9,10 +9,10 @@
 // The loop is deliberately narrow:
 //
 //   - It runs out-of-band from the proxy path, so a healthy pool pays no
-//     synchronous latency. The controller's own bookkeeping (lastProbeAttempt
-//   - probeInFlight, issue #124) coalesces any overlap with a concurrent
-//     request-path probe of the same quota key, so the two paths cannot
-//     storm the same upstream.
+//     synchronous latency. The controller's own bookkeeping of
+//     lastProbeAttempt and probeInFlight (issue #124) coalesces any overlap
+//     with a concurrent request-path probe of the same quota key, so the two
+//     paths cannot storm the same upstream.
 //   - It only clears the live park via noteRecovered; it never moves the
 //     sticky pointer (the healthy active member is left alone, matching
 //     issue #242's "without force-switching away from the current healthy
