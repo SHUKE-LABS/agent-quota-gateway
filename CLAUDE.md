@@ -104,7 +104,10 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
    `/responses` and `/v1/responses`. **Full method+path passthrough** — the
    selector/auth boundary gates, not a route table; `/` is the catch-all,
    `/_gateway/*` mounts directly with no selector. Request and response
-   bodies remain opaque: no schema inspection or translation.
+   bodies remain opaque: no schema inspection or translation. Sole
+   exception: the event type (and a failure's error code) at the head of a
+   `chatgpt.com` `/responses` SSE stream, peeked before headers are sent
+   (issue #345, step 6).
 5. Response observer calls `quota.Extract` (headers only) and **merges**
    the snapshot under the backend's `QuotaKey()` — but only if it carries
    a quota window. `mergeSnapshot` (`internal/quota/quota.go:218-247`)
@@ -120,8 +123,11 @@ live toggle is `aqg.json`'s `debug.log_requests` via `POST /_gateway/debug`
    or a same-member transient throttle depending on the classifier; native
    Anthropic **529** overload → synthetic same-member **503** with
    `Retry-After: 60`; **401/403** → park the dead credential and fail over (a
-   revoked account never 429s, so without this the pool would stick to it).
-   The 529 path does not change pool state.
+   revoked account never 429s, so without this the pool would stick to it);
+   a ChatGPT-Codex 2xx stream whose first decisive event is `response.failed`
+   + `server_is_overloaded` → synthetic same-member **503** with
+   `Retry-After: 30` (`internal/auto/codex_overload.go`). The 529 and Codex
+   overload paths do not change pool state.
 
 ### Packages
 

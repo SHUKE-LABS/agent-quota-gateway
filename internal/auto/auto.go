@@ -263,8 +263,9 @@ func (p *Pools) RouteWorker(poolName, workerNickname string) (backend.Backend, t
 
 // ModifyResponse is the proxy.ResponseModifier hook. It dispatches the
 // response to the controller of the pool the request resolved through,
-// so a 429 fails over within that pool only and a native Anthropic 529
-// overload is absorbed without changing pool state.
+// so a 429 fails over within that pool only, and a native Anthropic 529
+// overload or a Codex in-stream capacity failure is absorbed without changing
+// pool state.
 func (p *Pools) ModifyResponse(resp *http.Response) error {
 	if resp == nil || resp.Request == nil {
 		return nil
@@ -2753,7 +2754,7 @@ func (c *Controller) reanchorLocked() {
 	}
 }
 
-// ModifyResponse is the per-pool response hook. It acts on three classes of
+// ModifyResponse is the per-pool response hook. It acts on four classes of
 // upstream response; everything else passes through untouched.
 //
 //   - Native Anthropic 529 overload: it is a transient capacity wobble, so the
@@ -2779,6 +2780,11 @@ func (c *Controller) reanchorLocked() {
 //     over, rather than sticking to a dead account and returning the auth
 //     error to every client. A pulled account never emits a 429, so without
 //     this the pool would never migrate off it (the reported bug).
+//   - ChatGPT-Codex in-stream overload: a 2xx Responses SSE stream whose
+//     first decisive event is response.failed with server_is_overloaded
+//     ("Selected model is at capacity") becomes a synthetic same-member 503
+//     with Retry-After: 30. Only the stream prefix before any response header
+//     is sent is peeked; see peekCodexStreamOverload (issue #345).
 func (c *Controller) ModifyResponse(resp *http.Response) error {
 	if resp == nil || resp.Request == nil {
 		return nil
@@ -2895,6 +2901,17 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 		// the store's freshness reconciliation nor the preemptor's precise
 		// reset may ever retire this park early.
 		return c.parkAndFailoverCredentialRejected(resp, b.Nick, c.now().Add(defaultExhaustionWindow), fmt.Sprintf("returned %d", resp.StatusCode))
+	case isCodexBackend(b) && isCodexResponsesStream(resp):
+		// ChatGPT answers an at-capacity model with 200 and fails inside
+		// the stream; Codex ends the turn on that in-stream failure but
+		// retries an HTTP 503 per Retry-After. Model capacity is not the
+		// seat's quota, so it is a same-member throttle: never park, never
+		// fail over (issue #345).
+		if peekCodexStreamOverload(resp) {
+			fmt.Fprintf(c.logOut, "auto[%s]: %s codex in-stream %s — absorbing as same-member transient 503, not parking\n", c.name(), b.Nick, codexOverloadErrorCode)
+			rewriteTo503Throttle(resp, codexOverloadRetryAfterSeconds)
+		}
+		return nil
 	default:
 		return nil
 	}
