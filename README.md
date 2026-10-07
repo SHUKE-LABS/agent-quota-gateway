@@ -10,8 +10,11 @@ method and path to the selected upstream (Anthropic clients use
 `/v1/messages`; OpenAI-compatible clients use `/responses` or
 `/v1/responses`), preserving streaming and headers. Request and response
 payloads are opaque to the gateway: it performs no body inspection,
-translation, or provider detection. For multiple machines that
-share one set of pool credentials, an opt-in
+translation, or provider detection. The one exception is the event type
+(and a failure's error code) at the head of a ChatGPT-Codex `/responses`
+stream, peeked before any header is sent to absorb an in-stream capacity
+failure (issue #345). For multiple machines that share one set of pool
+credentials, an opt-in
 [shared mode](#shared-mode-over-tailscale) binds a non-loopback overlay/IP
 address (Tailscale, an OpenVPN overlay, or any address a fleet's own
 network trusts) so they ride one authoritative instance.
@@ -56,7 +59,9 @@ contract from nick, token prefix, hostname, or request body.
   `401`/`403`, later client requests retry the first parked member in effective
   order; concurrent requests may all reach that upstream. A recovered
   credential is released by its next non-`401`/`403` response. A native
-  Anthropic `529` overload becomes a same-member `503` with `Retry-After: 60`.
+  Anthropic `529` overload becomes a same-member `503` with `Retry-After: 60`;
+  a ChatGPT-Codex stream that fails with `server_is_overloaded` before any
+  output becomes a same-member `503` with `Retry-After: 30`.
   See [Pools and selectors](#pools-and-selectors).
 - One log line per request (method, path, status, duration, request ID).
   Request bodies, response bodies, and credential headers are never
@@ -170,8 +175,8 @@ workers than the least-used window member; then it is rebalanced on that
 worker's next request. If a member becomes unavailable or falls outside the
 window, the worker is reassigned on its next request. When a higher member
 recovers, only workers needed to balance the window move back. A transient
-same-member throttle or 529 keeps the member available and does not move its
-workers.
+same-member throttle, 529, or Codex capacity overload keeps the member
+available and does not move its workers.
 
 A real upstream quota rejection or credential failure makes the member
 unavailable in every pool that shares the nick; each mapped worker is
@@ -611,7 +616,7 @@ Codex weekly hello below is independent of member selection:
 See [Ordered routing within a pool](#ordered-routing-within-a-pool) for the
 sorted default, explicit priority declarations, and recovery timing.
 
-### What the client sees on an upstream 429 or native Anthropic 529
+### What the client sees on an upstream 429, native Anthropic 529, or Codex capacity overload
 
 On a `429` from the current member the gateway does **not** forward the
 `429`. Anthropic's `429` is a pre-stream rejection, so the gateway handles
@@ -628,6 +633,7 @@ distinct where the response paths take different actions (issue #245).
 | **Z.ai/Zhipu throttle absorbed** (issue #153 / #316) — proxy `429` is a transient `1302` concurrency throttle when no fresh full eligible window is present | `{"error":"backend throttled; same member"}` | `3` (fixed; longer than the switch hint so a single-member z.ai pool's retry lets the concurrency window free up) | the same member |
 | **Anthropic per-minute rate-limit back-off** (issue #191) — transient RPM/ITPM/OTPM throttle, clears in seconds | `{"error":"backend throttled; same member"}` | upstream `retry-after` clamped to `[1, 3]` s, defaulting to `3` | the same member |
 | **Native Anthropic overload** (issue #258) — upstream `529` capacity wobble, not quota exhaustion | `{"error":"backend throttled; same member"}` | `60` (fixed) | the same member |
+| **Codex capacity overload** (issue #345) — `chatgpt.com` answers `200` and the stream fails with `server_is_overloaded` ("Selected model is at capacity") before any output | `{"error":"backend throttled; same member"}` | `30` (fixed) | the same member |
 
 The **native Anthropic overload** flavour is selected by the upstream status and
 the backend's native `api.anthropic.com` host identity, not by reading the
@@ -635,6 +641,24 @@ streaming response body. It leaves the active member and all exhaustion state
 unchanged, strips upstream rate-limit headers, and hides Anthropic's overload
 text behind the synthetic same-member body. The 60-second wait is long enough
 to let a capacity wobble clear while remaining a transient retry signal.
+
+The **Codex capacity overload** flavour exists because ChatGPT reports an
+at-capacity model inside a `200` SSE stream, where no status classifier can
+see it, and Codex ends the turn on that in-stream failure while it retries an
+HTTP `503` after `Retry-After`. For a `chatgpt.com` member's `POST
+…/responses` answered `2xx`, `text/event-stream`, and not content-encoded, the
+gateway holds back the stream prefix until the first event that is not
+`response.created`, `response.in_progress`, `response.queued`, or
+`response.metadata` (comments are skipped; the type is read from the `data`
+JSON, as Codex reads it). If that event is `response.failed` with
+`error.code` `server_is_overloaded`, the client gets the same-member `503`
+instead; otherwise the held bytes are replayed verbatim and the stream
+continues live. End of stream, a read error, a prefix past 1 MiB, or 15 s
+without a decision passes through unchanged — the time bound keeps a stalled
+upstream from withholding headers, which Codex's own idle timeout needs to
+start. A failure after output has started is not recoverable this way and
+reaches the client as before. The active member and exhaustion state are
+unchanged.
 
 The **switch** flavour: the gateway has already advanced the sticky pointer
 to another member, so the client's retry resolves to it and succeeds,
