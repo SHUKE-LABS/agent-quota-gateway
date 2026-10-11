@@ -148,13 +148,16 @@ func Load() (Config, error) {
 	}
 
 	var writeAllow []string
-	if raw, ok := lookupEnv(EnvSharedWriteAllow); ok {
+	// Presence-aware, unlike lookupEnv: an exported-but-empty
+	// SHARED_WRITE_ALLOW= is an operator who meant to restrict writes, so it
+	// fails closed below rather than reading as "unset" and leaving them open.
+	if raw, ok := os.LookupEnv(EnvSharedWriteAllow); ok {
 		for _, entry := range strings.Split(raw, ",") {
 			if entry = strings.TrimSpace(entry); entry != "" {
 				writeAllow = append(writeAllow, entry)
 			}
 		}
-		// A set-but-blank list (e.g. ",") would otherwise read as "no
+		// A set-but-blank list ("", ",", " , ") would otherwise read as "no
 		// restriction" — the opposite of what an operator setting the knob
 		// meant. Fail closed.
 		if len(writeAllow) == 0 {

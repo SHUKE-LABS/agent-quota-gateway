@@ -2,6 +2,7 @@ package config
 
 import (
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
 )
@@ -40,7 +41,10 @@ func TestLoad_sharedWriteAllowUnsetMeansNoRestriction(t *testing.T) {
 	t.Setenv(EnvAnthropicBaseURL, "")
 	t.Setenv(EnvListenAddr, "")
 	t.Setenv(EnvSharedListenAddr, "100.91.4.56:9949")
+	// Absent, not empty: t.Setenv registers the restore, then Unsetenv
+	// removes the variable for this test.
 	t.Setenv(EnvSharedWriteAllow, "")
+	os.Unsetenv(EnvSharedWriteAllow)
 
 	cfg, err := Load()
 	if err != nil {
@@ -53,6 +57,7 @@ func TestLoad_sharedWriteAllowUnsetMeansNoRestriction(t *testing.T) {
 
 func TestLoad_sharedWriteAllowRejectsInvalid(t *testing.T) {
 	cases := map[string]string{
+		"empty":      "",
 		"blank list": " , ",
 		"name":       "admin.tailnet.ts.net",
 		"bad cidr":   "100.64.0.0/33",
