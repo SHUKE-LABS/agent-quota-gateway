@@ -609,7 +609,8 @@ func ParseZhipuForTest(body []byte, now time.Time) (quota.Snapshot, error) {
 //
 // Errors:
 //   - ErrNoProvider when no provider matches b.BaseURL (Anthropic, etc.).
-//   - The wrapped transport / non-200 / parse error from pollOne otherwise.
+//   - *StatusError for a non-200 quota-endpoint response.
+//   - The wrapped transport / parse error from pollOne otherwise.
 //
 // As in pollOne, the parsed Snapshot is returned on a non-200 response only
 // when parsing succeeds; on error the caller receives an empty Snapshot.
@@ -643,13 +644,25 @@ func Probe(ctx context.Context, b backend.Backend, client *http.Client, now func
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return quota.Snapshot{}, fmt.Errorf("status %d", resp.StatusCode)
+		return quota.Snapshot{}, &StatusError{Code: resp.StatusCode}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
 		return quota.Snapshot{}, err
 	}
 	return prov.parse(body, now())
+}
+
+// StatusError is Probe's non-200 quota-endpoint response. Its message keeps
+// the "status N" form the recovery log has always printed; the code lets the
+// operator reprobe (issue #350) tell a rejected credential (401/403) from any
+// other failure.
+type StatusError struct {
+	Code int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("status %d", e.Code)
 }
 
 // containsAny builds a matcher that reports whether the BaseURL contains

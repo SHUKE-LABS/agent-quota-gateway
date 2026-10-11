@@ -41,6 +41,7 @@ vm.runInContext(`${html.slice(start, end)};
   this.workerPresentation = workerPresentation;
   this.statusPresentation = statusPresentation;
   this.applyStatusPresentation = applyStatusPresentation;
+  this.showsReprobe = showsReprobe;
   this.applyWorkerPresentation = applyWorkerPresentation;
   this.renderQuota = renderQuota;
   this.formatReset = formatReset;`, context);
@@ -233,3 +234,61 @@ assert.equal(requests.length, 1, 'valid changed input sends one request');
 assert.equal(requests[0].url, '/_gateway/pool/auto/concurrency');
 assert.equal(requests[0].body.concurrency, 3);
 assert.equal(banners.length, 3, 'invalid input shows an error');
+
+// "Reset & re-probe" (issue #350): shown on every out-of-rotation member,
+// hidden on serving, idle and disabled ones.
+for (const [member, want] of [
+  [{ status: 'exhausted', parked: false, disabled: false }, true],
+  [{ status: 'exhausted', parked: true, disabled: false }, true],
+  [{ status: 'idle', parked: true, disabled: false }, true],
+  [{ status: 'serving', parked: false, disabled: false }, false],
+  [{ status: 'idle', parked: false, disabled: false }, false],
+  [{ status: 'disabled', parked: false, disabled: true }, false],
+  [{ status: 'disabled', parked: true, disabled: true }, false],
+]) {
+  assert.equal(context.showsReprobe(member), want, `reprobe visibility for ${JSON.stringify(member)}`);
+}
+
+const reprobeStart = html.indexOf('  function reprobeMember(');
+const reprobeEnd = html.indexOf('\n  function addSubscription(', reprobeStart);
+assert.ok(reprobeStart >= 0 && reprobeEnd > reprobeStart, 'reprobe handler exists');
+vm.runInContext(`${html.slice(reprobeStart, reprobeEnd)}; this.reprobeMember = reprobeMember;`, context);
+
+(async () => {
+  // Let the earlier handlers' pending postJSON().then(refreshAfter) chains
+  // settle before the stubs below are swapped in.
+  await new Promise((resolve) => setImmediate(resolve));
+  const reprobeRequests = [];
+  const refreshes = [];
+  let reprobeReply = { ok: true, status: 200, body: { healthy: true } };
+  context.postJSON = (url, body) => {
+    reprobeRequests.push({ url, body });
+    return Promise.resolve(reprobeReply);
+  };
+  context.refreshAfter = (resp, msg) => { refreshes.push({ resp, msg }); return Promise.resolve(); };
+  banners.length = 0;
+
+  context.window.confirm = () => false;
+  await context.reprobeMember('auto', 'ccxe');
+  assert.equal(reprobeRequests.length, 0, 'Cancel sends no reprobe');
+  assert.equal(refreshes.length, 0, 'Cancel does not refresh');
+
+  context.window.confirm = () => true;
+  await context.reprobeMember('auto', 'ccxe');
+  assert.equal(reprobeRequests.length, 1, 'confirm sends one reprobe');
+  assert.equal(reprobeRequests[0].url, '/_gateway/pool/auto/member/ccxe/reprobe');
+  assert.equal(reprobeRequests[0].body, null);
+  assert.equal(refreshes.length, 1, 'reprobe refreshes the view');
+  assert.equal(banners.length, 0, 'healthy reprobe shows no banner');
+
+  reprobeReply = { ok: true, status: 200, body: { healthy: false } };
+  await context.reprobeMember('auto', 'ccxe');
+  assert.equal(refreshes.length, 2, 'still-exhausted reprobe refreshes the view');
+  assert.equal(banners.length, 1, 'still-exhausted reprobe reports it');
+  assert.match(banners[0], /still reports "ccxe" exhausted/);
+
+  reprobeReply = { ok: false, status: 502, body: { error: 'credential rejected' } };
+  await context.reprobeMember('auto', 'ccxe');
+  assert.equal(refreshes.at(-1).resp, reprobeReply, 'a failed reprobe is reported through refreshAfter');
+  assert.equal(refreshes.at(-1).msg, 'Re-probe failed');
+})().catch((err) => { console.error(err); process.exitCode = 1; });

@@ -202,21 +202,32 @@ func (s *Service) claim(key string, reset time.Time) bool {
 	return true
 }
 
-func (s *Service) send(parent context.Context, b backend.Backend) {
+// NewRequest builds the fixed gateway-created hello request for b: one
+// minimal POST {base}/responses carrying b's credential. The operator reprobe
+// (issue #350) sends the identical request to refresh a Codex member's
+// x-codex-* quota windows on demand.
+func NewRequest(ctx context.Context, b backend.Backend) (*http.Request, error) {
 	endpoint, err := responsesURL(b.BaseURL)
 	if err != nil {
-		s.logFailure(b, "invalid upstream URL")
-		return
+		return nil, fmt.Errorf("invalid upstream URL")
 	}
-	ctx, cancel := context.WithTimeout(parent, s.timeout)
-	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(requestBody))
 	if err != nil {
-		s.logFailure(b, "request construction failed")
-		return
+		return nil, fmt.Errorf("request construction failed")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	proxy.StampAuth(req.Header, b.Credential)
+	return req, nil
+}
+
+func (s *Service) send(parent context.Context, b backend.Backend) {
+	ctx, cancel := context.WithTimeout(parent, s.timeout)
+	defer cancel()
+	req, err := NewRequest(ctx, b)
+	if err != nil {
+		s.logFailure(b, err.Error())
+		return
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

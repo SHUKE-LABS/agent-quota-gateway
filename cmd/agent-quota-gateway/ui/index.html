@@ -405,9 +405,10 @@
     font-size: 12px;
   }
   button.move:hover { border-color: var(--accent); color: var(--accent); }
-  /* Per-member "Clear park" escape hatch (issue #147). Hidden by default; shown
-     by applyLiveStatus() only when the member reports parked:true. */
-  button.clear-park {
+  /* Per-member "Clear park" escape hatch (issue #147) and "Reset & re-probe"
+     (issue #350). Hidden by default; applyLiveStatus() reveals them — clear on
+     parked:true, re-probe on any out-of-rotation member. */
+  button.clear-park, button.reprobe {
     border: 1px solid var(--border);
     background: var(--panel);
     color: var(--accent);
@@ -416,7 +417,7 @@
     cursor: pointer;
     font-size: 12px;
   }
-  button.clear-park:hover { border-color: var(--accent); background: rgba(0, 0, 0, 0.04); }
+  button.clear-park:hover, button.reprobe:hover { border-color: var(--accent); background: rgba(0, 0, 0, 0.04); }
   /* "Delete pool" — header control shown only for an empty pool (issue #233).
      margin-left:auto floats it to the header's right edge; for an empty pool the
      .updated span carries no text and collapses, so this owns the free space. */
@@ -1020,6 +1021,21 @@
       });
       actions.appendChild(clr);
 
+      // "Reset & re-probe" — re-query upstream quota for this member (issue
+      // #350). Created hidden; applyLiveStatus() reveals it on every
+      // out-of-rotation member: parked, or exhausted by a stored snapshot
+      // that "Clear park" cannot move.
+      var rp = document.createElement('button');
+      rp.type = 'button';
+      rp.className = 'reprobe';
+      rp.setAttribute('data-role', 'reprobe');
+      rp.textContent = 'Reset & re-probe';
+      rp.style.display = 'none';
+      rp.addEventListener('click', function () {
+        reprobeMember(view.pool, m.nick);
+      });
+      actions.appendChild(rp);
+
       var mv = document.createElement('button');
       mv.type = 'button';
       mv.className = 'move';
@@ -1091,6 +1107,13 @@
 
   function statusPresentation(member) {
     return member.status || 'idle';
+  }
+
+  // showsReprobe gates the "Reset & re-probe" control (issue #350): every
+  // out-of-rotation member — a live park, or a store-sourced exhaustion that
+  // "Clear park" cannot move — but never a disabled one.
+  function showsReprobe(member) {
+    return !member.disabled && (!!member.parked || member.status === 'exhausted');
   }
 
   function applyStatusPresentation(badge, member) {
@@ -1506,6 +1529,11 @@
         if (clr) {
           clr.style.display = match.parked ? '' : 'none';
         }
+        // "Reset & re-probe" (issue #350): see showsReprobe.
+        var rp = tr.querySelector('[data-role="reprobe"]');
+        if (rp) {
+          rp.style.display = showsReprobe(match) ? '' : 'none';
+        }
         var snap = match.snapshot || null;
         // Pull each window's reset ISO once so the quota cell and its
         // adjacent reset cell share one parse and apply the same freshness
@@ -1611,6 +1639,24 @@
     if (!ok) { return; }
     postJSON('/_gateway/clear?pool=' + encodeURIComponent(pool) + '&nick=' + encodeURIComponent(nick), null)
       .then(function (r) { return refreshAfter(r, 'Failed to clear park'); });
+  }
+
+  function reprobeMember(pool, nick) {
+    // Spends one minimal upstream request against this member's quota, so
+    // confirm. A still-exhausted upstream leaves the member exhausted.
+    var ok = window.confirm(
+      'Re-query upstream quota now and rewrite the snapshot for "' + nick +
+      '" in pool "' + pool + '"?\n\n' +
+      'If upstream reports capacity the member returns to rotation; if it is ' +
+      'still exhausted it stays out with the upstream\'s reset.');
+    if (!ok) { return Promise.resolve(); }
+    return postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick) + '/reprobe', null)
+      .then(function (r) {
+        if (r && r.ok && r.body && r.body.healthy === false) {
+          showBanner('Re-probe: upstream still reports "' + nick + '" exhausted; it stays out of rotation');
+        }
+        return refreshAfter(r, 'Re-probe failed');
+      });
   }
 
   function addSubscription(fields) {

@@ -219,7 +219,7 @@ snapshot), `/_gateway/pool[?pool=<name>]` (per-member health),
 in-memory, `internal/activity`), `/_gateway/config` (effective config,
 credentials redacted), `/_gateway/ui`,
 plus runtime mutations under `POST|DELETE /_gateway/pool/{name}/...`
-(priority, member add/remove/move, disable/enable) and
+(priority, member add/remove/move, disable/enable, reprobe) and
 `POST /_gateway/clear` (drop live-429 parks). Non-GET probes on the
 read endpoints return 405 with an `Allow` header. See README "Runtime pool
 configuration" for the full table.
