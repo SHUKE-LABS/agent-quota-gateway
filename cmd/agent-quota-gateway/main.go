@@ -285,6 +285,8 @@ func run(configFlag string) error {
 	// pool handler can attach per-pool poller liveness to its response
 	// (issue #247); Run is started below.
 	qp := poller.NewDynamic(pools.PoolNames, pools.Current, pools.MarkLocalSnapshot, store, nil, 0, nil, nil)
+	// Its per-pool liveness gates the z.ai 429 absorb (issue #249).
+	pools.SetPoller(qp)
 	// Codex weekly-reset hello is a separate background path from proprietary
 	// quota polling. Its member view is rebuilt from the current copy-on-write
 	// registry each tick so runtime additions, disables, and removals take

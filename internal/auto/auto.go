@@ -138,6 +138,19 @@ type Pools struct {
 	// the registry's build-time default is used — env is never consulted again
 	// there (issue #198). Read under p.mu.
 	defaultBaseURL func() string
+
+	// poller is the out-of-band quota poller whose per-pool liveness (issue
+	// #247) gates the z.ai 429 absorb (issue #249). main sets it once via
+	// SetPoller after constructing the poller (which itself needs p); nil
+	// until then and in tests that never set it, where the absorb holds as
+	// before. Atomic so the proxy path reads it without p.mu.
+	poller atomic.Pointer[poller.Poller]
+}
+
+// SetPoller attaches the quota poller whose per-pool liveness decides whether
+// a z.ai 429 may be absorbed as a throttle (issue #249).
+func (p *Pools) SetPoller(pl *poller.Poller) {
+	p.poller.Store(pl)
 }
 
 // NewPools builds one Controller per pool in reg. Each controller starts
@@ -472,11 +485,14 @@ func (p *Pools) AllPoolStatuses(store *quota.Store, pl *poller.Poller) []PoolSta
 // (issue #254 AC7, #332). WindowFact mirrors credentialParkEntry.windowFact;
 // AuthRejected distinguishes 401/403 parks from quota fallback parks, which
 // may have the same WindowFact value. Its zero value keeps legacy entries on
-// the non-auth route.
+// the non-auth route. Since mirrors credentialParkEntry.since (issue #249);
+// absent on every park kind except the z.ai stale-poller park, and absent
+// in legacy files, both of which restore to the zero value.
 type CredentialParkPersist struct {
 	Reset        time.Time `json:"reset"`
 	WindowFact   bool      `json:"window_fact,omitempty"`
 	AuthRejected bool      `json:"auth_rejected,omitempty"`
+	Since        time.Time `json:"since,omitzero"`
 }
 
 // PoolPersistState is the serializable routing state for one pool.
@@ -1416,8 +1432,12 @@ func nickNotResolvableError(nick string, reg *backend.Registry) error {
 // reset wins, because propagation can be delayed behind a sibling's own
 // observation and overwriting it would shorten the active park. Equal resets
 // retain the existing entry so its windowFact/authRejected
-// classifications are preserved (issues #275, #332).
-func (p *Pools) propagateCredentialPark(originPool, nick string, reset time.Time, windowFact, authRejected bool) {
+// classifications are preserved (issues #275, #332). A retained windowFact
+// entry still adopts a later incoming since (issue #249): the new park is
+// fresh evidence the nick is refused now, so a store snapshot predating it —
+// the triggering response's own, in the shared store — must not retire the
+// sibling's longer park either. The reset is never shortened.
+func (p *Pools) propagateCredentialPark(originPool, nick string, entry credentialParkEntry) {
 	reg := p.CurrentRegistry()
 	for _, name := range reg.PoolNames() {
 		if name == originPool {
@@ -1432,8 +1452,12 @@ func (p *Pools) propagateCredentialPark(originPool, nick string, reset time.Time
 		}
 		c.mu.Lock()
 		changed := false
-		if existing, ok := c.credentialPark[nick]; !ok || reset.After(existing.reset) {
-			c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact, authRejected: authRejected}
+		if existing, ok := c.credentialPark[nick]; !ok || entry.reset.After(existing.reset) {
+			c.credentialPark[nick] = entry
+			changed = true
+		} else if existing.windowFact && entry.since.After(existing.since) {
+			existing.since = entry.since
+			c.credentialPark[nick] = existing
 			changed = true
 		}
 		if changed {
@@ -1520,14 +1544,18 @@ func (p *Pools) propagateCredentialParkClear(originPool, nick string) []string {
 // pool-name string, so a later rename (RenamePool) is picked up via c.name()
 // at call time instead of propagating under a stale name.
 func (p *Pools) wireCredentialParkPropagation(c *Controller) {
-	c.propagatePark = func(nick string, reset time.Time, windowFact, authRejected bool) {
-		p.propagateCredentialPark(c.name(), nick, reset, windowFact, authRejected)
+	c.propagatePark = func(nick string, entry credentialParkEntry) {
+		p.propagateCredentialPark(c.name(), nick, entry)
 	}
 	c.propagateParkClear = func(nick string) []string {
 		return p.propagateCredentialParkClear(c.name(), nick)
 	}
 	c.propagateAuthParkClear = func(nick string) {
 		p.propagateCredentialParkAuthClear(c.name(), nick)
+	}
+	c.pollerStale = func(b backend.Backend) bool {
+		st, tracked := p.poller.Load().StatusForPool(c.name(), b.BaseURL)
+		return tracked && st.Stale
 	}
 }
 
@@ -1549,10 +1577,20 @@ func (p *Pools) wireCredentialParkPropagation(c *Controller) {
 //     Quota fallback parks can have either windowFact value: authRejected is
 //     the request-routing discriminator, while windowFact controls store
 //     reconciliation. A missing persisted authRejected bit stays false.
+//
+// since, when non-zero, is when the park was recorded, and narrows store
+// reconciliation of a windowFact entry to snapshots observed strictly after
+// it (issue #249). The z.ai stale-poller park sets it: the quota observer
+// runs before ModifyResponse and admits the triggering 429's own top-level
+// unified-status at AsOf≈now, so without the gate that very response's
+// snapshot reads "fresh, non-blocking" and retires the park in the same call
+// that records it. Every other park kind leaves it zero and keeps its
+// existing reconciliation.
 type credentialParkEntry struct {
 	reset        time.Time
 	windowFact   bool
 	authRejected bool
+	since        time.Time
 }
 
 // Controller is the sticky selector for one pool. The zero value is not
@@ -1706,7 +1744,18 @@ type Controller struct {
 	// test via NewController, where there is no sibling to reach. Always
 	// called with c.mu NOT held — see record429WithSource's doc for why
 	// holding it here would risk a lock-order inversion.
-	propagatePark func(nick string, reset time.Time, windowFact, authRejected bool)
+	propagatePark func(nick string, entry credentialParkEntry)
+
+	// pollerStale, when set, reports whether this pool's poller liveness
+	// (issue #247) is stale for a member on b's provider: the pool is
+	// poller-tracked and has had no successful poll within the poller's
+	// staleness threshold, or none yet. Keyed by pool, not member — the
+	// poller polls only the pool's current member, so a non-current
+	// worker-assigned member is judged by the pool's freshness rather than
+	// parked on every throttle for never having been polled itself. Gates
+	// the z.ai 429 absorb (issue #249). Wired by Pools alongside
+	// propagatePark; nil for a bare Controller, which keeps the absorb.
+	pollerStale func(b backend.Backend) bool
 
 	// propagateParkClear, when set, releases nick's propagated credential
 	// park in every sibling pool holding it (issue #254 AC5/AC12), returning
@@ -2650,6 +2699,7 @@ func (c *Controller) loadCredentialPark(credentialPark map[string]CredentialPark
 			reset:        persisted.Reset,
 			windowFact:   persisted.WindowFact,
 			authRejected: persisted.AuthRejected,
+			since:        persisted.Since,
 		}
 	}
 }
@@ -2706,7 +2756,7 @@ func (c *Controller) persistState() PoolPersistState {
 	if len(c.credentialPark) > 0 {
 		cp := make(map[string]CredentialParkPersist, len(c.credentialPark))
 		for k, v := range c.credentialPark {
-			cp[k] = CredentialParkPersist{Reset: v.reset, WindowFact: v.windowFact, AuthRejected: v.authRejected}
+			cp[k] = CredentialParkPersist{Reset: v.reset, WindowFact: v.windowFact, AuthRejected: v.authRejected, Since: v.since}
 		}
 		ps.CredentialPark = cp
 	}
@@ -2825,16 +2875,36 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 		rewriteTo503AnthropicOverload(resp)
 		return nil
 	case resp.StatusCode == http.StatusTooManyRequests:
-		// A z.ai/Zhipu proxy-path 429 is always a transient concurrency
-		// throttle (the 1302 "Rate limit reached for requests"), never a
-		// genuine-exhaustion signal — for z.ai that is detected out-of-band
-		// by the poller, never by a proxy 429. Absorb it as the gateway's
-		// clean transient 503 + a short backoff so the client retries
-		// transparently; never park the member, and never let the upstream
-		// 1302 body reach the agent (issue #153). Keyed before the
-		// exhaustion classifier so a momentarily at-cap store snapshot can't
-		// misclassify the 1302 as genuine exhaustion and over-park.
+		// A z.ai/Zhipu proxy-path 429 does not say whether it is the 1302
+		// concurrency throttle or a quota wall; the poller's dashboard read
+		// is what tells them apart. A fresh full 5h window already parked
+		// above (statuslessFailureBound, issue #316). Otherwise:
+		//
+		//   - Poller live for this pool: it vouches the member is below
+		//     cap, so the 429 is the throttle. Absorb it as the gateway's
+		//     clean transient 503 + a short backoff so the client retries
+		//     transparently; never park the member, and never let the
+		//     upstream 1302 body reach the agent (issue #153).
+		//   - Poller stale or never succeeded: nothing vouches, and
+		//     absorbing would ride a quota-walled member forever on a 3s
+		//     Retry-After (issue #249). Park for the conservative default
+		//     window and fail over; a dry pool gets #203's long Retry-After.
+		//     The park is store-unrepresentable (siblings sharing the nick
+		//     get it) and windowFact, but stamped with since so the
+		//     triggering response's own snapshot — the observer admits
+		//     z.ai's top-level unified-status at AsOf≈now — cannot retire
+		//     it in this same call; later store evidence, a recovery probe,
+		//     a clear, or the bound can.
+		//
+		// Keyed before the generic exhaustion classifier, whose header
+		// reads do not apply to z.ai.
 		if isZaiBackend(b) {
+			if c.pollerStale != nil && c.pollerStale(b) {
+				fmt.Fprintf(c.logOut, "auto[%s]: %s z.ai 429 with stale poller signal — parking and failing over\n", c.name(), b.Nick)
+				now := c.now()
+				return c.parkAndFailoverEntry(resp, b.Nick, "z.ai 429, poller stale", true,
+					credentialParkEntry{reset: now.Add(defaultExhaustionWindow), windowFact: true, since: now})
+			}
 			fmt.Fprintf(c.logOut, "auto[%s]: %s z.ai 429 concurrency throttle — absorbing as transient, not parking\n", c.name(), b.Nick)
 			rewriteTo503Throttle(resp, zaiThrottleRetryAfterSeconds)
 			return nil
@@ -3034,13 +3104,12 @@ func isNativeAnthropicBackend(b backend.Backend) bool {
 }
 
 // isZaiBackend reports whether b is a z.ai/Zhipu backend. For these
-// backends a proxy-path 429 is always a transient concurrency/QPS throttle
-// (the 1302 "Rate limit reached for requests"): genuine quota exhaustion is
-// detected out-of-band by the poller (5h / monthly windows via the quota
-// endpoint), never by a proxy 429. So a z.ai proxy 429 is never a
-// park-worthy exhaustion signal (issue #153). Detection reuses the same
-// URL-keyed provider registry; ProviderFor is a pure match with no network
-// call.
+// backends a proxy-path 429 carries no exhaustion signal of its own: the
+// 1302 concurrency throttle and a quota wall look alike on the wire, so
+// the poller's dashboard read (5h / monthly windows via the quota endpoint)
+// decides. The 429 is absorbed as a throttle only while that read is fresh
+// (issues #153, #249). Detection reuses the same URL-keyed provider
+// registry; ProviderFor is a pure match with no network call.
 func isZaiBackend(b backend.Backend) bool {
 	prov, ok := poller.ProviderFor(b.BaseURL)
 	return ok && prov.Name() == "z.ai/zhipu"
@@ -3142,7 +3211,13 @@ func (c *Controller) parkAndFailoverCredentialRejected(resp *http.Response, nick
 }
 
 func (c *Controller) parkAndFailoverWithCause(resp *http.Response, nick string, reset time.Time, reason string, storeUnrepresentable, windowFact, authRejected bool) error {
-	res := c.record429WithCause(nick, reset, storeUnrepresentable, windowFact, authRejected)
+	return c.parkAndFailoverEntry(resp, nick, reason, storeUnrepresentable, credentialParkEntry{reset: reset, windowFact: windowFact, authRejected: authRejected})
+}
+
+// parkAndFailoverEntry is parkAndFailoverWithCause with the full
+// credentialPark entry, so a caller can stamp since (issue #249).
+func (c *Controller) parkAndFailoverEntry(resp *http.Response, nick string, reason string, storeUnrepresentable bool, entry credentialParkEntry) error {
+	res := c.record429Entry(nick, storeUnrepresentable, entry)
 
 	if res.allExhausted {
 		if recovered := c.tryRecoverParked(); recovered != "" {
@@ -3321,11 +3396,19 @@ func (c *Controller) record429WithSource(nick string, reset time.Time, storeUnre
 // (*Pools).propagateCredentialPark also honours by locking one sibling at a
 // time). See that function's doc for the full argument.
 func (c *Controller) record429WithCause(nick string, reset time.Time, storeUnrepresentable, windowFact, authRejected bool) record429Result {
+	return c.record429Entry(nick, storeUnrepresentable, credentialParkEntry{reset: reset, windowFact: windowFact, authRejected: authRejected})
+}
+
+// record429Entry is record429WithCause with the full credentialPark entry,
+// so a caller can stamp since (issue #249). entry.reset is the park bound
+// for c.exhausted as well.
+func (c *Controller) record429Entry(nick string, storeUnrepresentable bool, entry credentialParkEntry) record429Result {
+	reset := entry.reset
 	c.mu.Lock()
 
 	c.exhausted[nick] = reset
 	if storeUnrepresentable {
-		c.credentialPark[nick] = credentialParkEntry{reset: reset, windowFact: windowFact, authRejected: authRejected}
+		c.credentialPark[nick] = entry
 	}
 	c.clearExpiredLocked() // housekeeping; never clears the future reset just set
 
@@ -3347,7 +3430,7 @@ func (c *Controller) record429WithCause(nick string, reset time.Time, storeUnrep
 	c.mu.Unlock()
 
 	if storeUnrepresentable && c.propagatePark != nil {
-		c.propagatePark(nick, reset, windowFact, authRejected)
+		c.propagatePark(nick, entry)
 	}
 	return result
 }
@@ -3592,12 +3675,12 @@ func (c *Controller) isExhaustedLocked(nick string) bool {
 // cannot move it.
 // A credentialPark entry with windowFact true (the header-less-429 residue) is
 // still subject to storeReconcilesParkLocked, same as c.exhausted — it is a
-// quota-window fact the store can retire early. windowFact false (401/403) is
-// never reconciled by the store: it only ages out by wall-clock or an explicit
-// clear. Caller holds c.mu.
+// quota-window fact the store can retire early (credentialParkRetiredLocked).
+// windowFact false (401/403) is never reconciled by the store: it only ages
+// out by wall-clock or an explicit clear. Caller holds c.mu.
 func (c *Controller) liveParkActiveLocked(nick string) bool {
 	if entry, ok := c.credentialPark[nick]; ok && c.now().Before(entry.reset) {
-		if !entry.windowFact || !c.storeReconcilesParkLocked(nick) {
+		if !c.credentialParkRetiredLocked(nick, entry) {
 			return true
 		}
 	}
@@ -3646,7 +3729,7 @@ func (c *Controller) exhaustedUntilLocked(nick string) (time.Time, bool) {
 	// store — it is not a fact about a quota window at all — so it only ages
 	// out by wall-clock or an explicit clear (issue #254).
 	if cp, cpOK := c.credentialPark[nick]; cpOK && now.Before(cp.reset) {
-		retired := cp.windowFact && c.storeReconcilesParkLocked(nick)
+		retired := c.credentialParkRetiredLocked(nick, cp)
 		if !retired && (!ok || cp.reset.After(reset)) {
 			reset, ok = cp.reset, true
 		}
@@ -3665,23 +3748,48 @@ func (c *Controller) exhaustedUntilLocked(nick string) (time.Time, bool) {
 // Empty or stale snapshots never clear a park. Caller holds c.mu; the store
 // has its own lock and never calls back into the controller.
 func (c *Controller) storeReconcilesParkLocked(nick string) bool {
+	_, ok := c.storeReconcilingAsOfLocked(nick)
+	return ok
+}
+
+// storeReconcilingAsOfLocked is storeReconcilesParkLocked that also returns
+// the reconciling snapshot's AsOf, so credentialParkRetiredLocked can require
+// the evidence to post-date a park (issue #249). Caller holds c.mu.
+func (c *Controller) storeReconcilingAsOfLocked(nick string) (time.Time, bool) {
 	if c.store == nil {
-		return false
+		return time.Time{}, false
 	}
 	idx := c.indexOf(nick)
 	if idx < 0 {
-		return false
+		return time.Time{}, false
 	}
 	b := c.backendAt(idx)
 	snap := c.store.Get(b.QuotaKey())
 	if !snap.HasData() {
-		return false
+		return time.Time{}, false
 	}
 	now := c.now()
 	if now.Sub(snap.AsOf) > storeSnapshotFreshness {
-		return false // frozen / stale snapshot — do not second-guess the park
+		return time.Time{}, false // frozen / stale snapshot — do not second-guess the park
 	}
-	return !snapRejects(snap, now, poller.LongWindowBlocksExhaustion(b.BaseURL))
+	if snapRejects(snap, now, poller.LongWindowBlocksExhaustion(b.BaseURL)) {
+		return time.Time{}, false
+	}
+	return snap.AsOf, true
+}
+
+// credentialParkRetiredLocked reports whether the store has retired a
+// credentialPark entry early. Only a windowFact entry is retirable (a 401/403
+// is not a quota-window fact, issue #254); it retires on a fresh non-blocking
+// snapshot (#145), and an entry stamped with since (issue #249) only on one
+// observed strictly after the park — the triggering response's own snapshot
+// predates it. Caller holds c.mu.
+func (c *Controller) credentialParkRetiredLocked(nick string, entry credentialParkEntry) bool {
+	if !entry.windowFact {
+		return false
+	}
+	asOf, ok := c.storeReconcilingAsOfLocked(nick)
+	return ok && (entry.since.IsZero() || asOf.After(entry.since))
 }
 
 // storeBlockBoundLocked returns the bound for a status-bearing rejected
