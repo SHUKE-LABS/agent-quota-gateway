@@ -737,7 +737,7 @@ func newReqResp(b backend.Backend, status int, reset time.Time) *http.Response {
 	h.Set("Content-Type", "application/json")
 	ctx := backend.WithBackend(context.Background(), b)
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}")).WithContext(ctx)
-	_ = reset // park time is provided by the caller; reset header is informational here
+	_ = reset        // park time is provided by the caller; reset header is informational here
 	_ = json.Marshal // keep the json import quiet for non-marshal callers
 	return &http.Response{
 		StatusCode: status,
