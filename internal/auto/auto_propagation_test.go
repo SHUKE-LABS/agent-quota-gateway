@@ -495,9 +495,9 @@ func TestCredentialPark_propagationRetainsLatestReset(t *testing.T) {
 	// the delayed sibling update is delivered.
 	originalAPropagation := ca.propagatePark
 	var delayedAPropagation func()
-	ca.propagatePark = func(nick string, reset time.Time, windowFact, authRejected bool) {
+	ca.propagatePark = func(nick string, entry credentialParkEntry) {
 		delayedAPropagation = func() {
-			originalAPropagation(nick, reset, windowFact, authRejected)
+			originalAPropagation(nick, entry)
 		}
 	}
 	ca.record429WithSource("ccz", olderReset, true, true)
@@ -513,7 +513,7 @@ func TestCredentialPark_propagationRetainsLatestReset(t *testing.T) {
 	cb.propagatePark = nil
 	cb.record429WithCause("ccz", newerReset, true, false, true)
 	cb.propagatePark = originalBPropagation
-	p.propagateCredentialPark("b", "ccz", newerReset, false, true)
+	p.propagateCredentialPark("b", "ccz", credentialParkEntry{reset: newerReset, authRejected: true})
 	delayedAPropagation()
 
 	for _, pool := range []string{"a", "b", "c"} {

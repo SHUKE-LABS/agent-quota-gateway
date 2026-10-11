@@ -630,7 +630,7 @@ distinct where the response paths take different actions (issue #245).
 |---|---|---|---|
 | **Switch** — a member is still available, the sticky pointer has already advanced | `{"error":"backend switching; retry"}` | `1` (fixed) | another member |
 | **Pool dry** — every member is exhausted; the sticky pointer is pre-pointed at the soonest-resetting member | `{"error":"all backends rate-limited"}` | precise wait until the soonest member resets (or a conservative 5-hour window) | the soonest-resetting member |
-| **Z.ai/Zhipu throttle absorbed** (issue #153 / #316) — proxy `429` is a transient `1302` concurrency throttle when no fresh full eligible window is present | `{"error":"backend throttled; same member"}` | `3` (fixed; longer than the switch hint so a single-member z.ai pool's retry lets the concurrency window free up) | the same member |
+| **Z.ai/Zhipu throttle absorbed** (issue #153 / #316 / #249) — proxy `429` is a transient `1302` concurrency throttle when no fresh full eligible window is present and the pool's poller is not stale | `{"error":"backend throttled; same member"}` | `3` (fixed; longer than the switch hint so a single-member z.ai pool's retry lets the concurrency window free up) | the same member |
 | **Anthropic per-minute rate-limit back-off** (issue #191) — transient RPM/ITPM/OTPM throttle, clears in seconds | `{"error":"backend throttled; same member"}` | upstream `retry-after` clamped to `[1, 3]` s, defaulting to `3` | the same member |
 | **Native Anthropic overload** (issue #258) — upstream `529` capacity wobble, not quota exhaustion | `{"error":"backend throttled; same member"}` | `60` (fixed) | the same member |
 | **Codex capacity overload** (issue #345) — `chatgpt.com` answers `200` and the stream fails with `server_is_overloaded` ("Selected model is at capacity") before any output | `{"error":"backend throttled; same member"}` | `30` (fixed) | the same member |
@@ -706,6 +706,18 @@ and never lets the upstream `1302` message reach the client. With a fresh full
 5h window, the same failed response confirms exhaustion and triggers failover.
 Claude Code retries the transient `503` transparently instead of stopping on
 the passed-through `429`.
+
+The absorb holds only while the poller vouches for the member: a z.ai `429`
+looks the same on the wire whether it is the throttle or a spent quota, and
+the poller's dashboard read is what tells them apart. When the pool's poller
+liveness reads stale (the same `stale` verdict `/_gateway/pool` reports — no
+successful poll within three intervals, or none yet), the `429` instead parks
+the member for the conservative 5-hour window and fails over; a pool with no
+other member returns the **pool dry** `503` with its long `Retry-After`
+(issue #249). The park is shared with every pool holding the same nick. The
+triggering response's own quota headers cannot release it; a fresh non-blocking
+snapshot observed afterwards (the poller recovering), a healthy recovery probe,
+`POST /_gateway/clear`, or the 5-hour bound does.
 
 The **Anthropic rate-limit back-off** flavour: a transient per-minute
 throttle (`rate_limit_error` for the RPM/ITPM/OTPM throughput limit,
