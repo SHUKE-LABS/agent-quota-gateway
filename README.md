@@ -723,6 +723,13 @@ triggering response's own quota headers cannot release it; a fresh non-blocking
 snapshot observed afterwards (the poller recovering), a healthy recovery probe,
 `POST /_gateway/clear`, or the 5-hour bound does.
 
+Temporarily (issue #351), every z.ai upstream `429` also writes one
+`z.ai 429 capture (issue #351)` line to stderr before it is classified: the
+upstream status, the z.ai error `code`, and only the `Retry-After`,
+`x-ratelimit-*`, `x-request-id`, and `anthropic-ratelimit-unified-status`
+headers. It exists to tell a quota-wall `429` from the `1302` throttle on the
+wire and is removed once #351's verdict is recorded.
+
 The **Anthropic rate-limit back-off** flavour: a transient per-minute
 throttle (`rate_limit_error` for the RPM/ITPM/OTPM throughput limit,
 distinct from the 5h/7d quota window) clears in seconds and the *same*
