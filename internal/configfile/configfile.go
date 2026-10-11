@@ -90,6 +90,7 @@ func LoadFile(path string) (config.Config, *backend.Registry, error) {
 		AnthropicBaseURL: dto.BaseURL,
 		ListenAddr:       dto.ListenAddr,
 		SharedListenAddr: dto.SharedListenAddr,
+		SharedWriteAllow: dto.SharedWriteAllow,
 		StateFile:        dto.StateFile,
 		DebugLogRequests: dto.Debug != nil && dto.Debug.LogRequests,
 	}
@@ -181,6 +182,9 @@ func Marshal(cfg config.Config, reg *backend.Registry) ([]byte, error) {
 		dto.SharedListenAddr = cfg.ListenAddr
 	} else {
 		dto.ListenAddr = cfg.ListenAddr
+	}
+	for _, prefix := range cfg.SharedWriteAllow {
+		dto.SharedWriteAllow = append(dto.SharedWriteAllow, config.FormatWriteAllowEntry(prefix))
 	}
 
 	spec := reg.Spec()
@@ -454,6 +458,11 @@ type fileDTO struct {
 
 	// SharedListenAddr opts into shared mode (non-loopback overlay/IP binding).
 	SharedListenAddr string `json:"shared_listen_addr"`
+
+	// SharedWriteAllow restricts /_gateway writes to these IP literals or
+	// CIDRs plus loopback (issue #349). Omitted when empty so a file that
+	// never set it stays byte-identical across Marshal.
+	SharedWriteAllow []string `json:"shared_write_allow,omitempty"`
 
 	// StateFile is the path for the persistent state file. Empty disables it.
 	StateFile string `json:"state_file"`

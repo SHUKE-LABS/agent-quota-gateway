@@ -69,6 +69,9 @@ Listen/behavior vars: `ANTHROPIC_BASE_URL` (upstream, default
 api.anthropic.com), `LISTEN_ADDR` (loopback, default 127.0.0.1:8080),
 `SHARED_LISTEN_ADDR` (non-loopback overlay/IP address, e.g. Tailscale or
 OpenVPN — opt into shared mode; mutually exclusive with `LISTEN_ADDR`),
+`SHARED_WRITE_ALLOW` (IP/CIDR list allowed to send non-GET `/_gateway/*`
+writes, plus loopback; peer address only, never forwarded headers — issue
+#349),
 `AQG_STATE_FILE` / `$STATE_DIRECTORY`
 (persistence). `AQG_DEBUG_LOG_REQUESTS=1` seeds the inbound/outbound request
 dump (`internal/reqlog`, credentials redacted) on first bootstrap only; the

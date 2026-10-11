@@ -338,8 +338,11 @@ func run(configFlag string) error {
 	// proxy's flusher still reach the real writer and SSE keeps streaming.
 	// Strip the reserved worker namespace before ServeMux path cleaning and
 	// before request logs capture the API path. The worker name is carried only
-	// in request context into the selector middleware.
-	handler := backend.WorkerNamespaceMiddleware(reqlog.Middleware(logging.Middleware(activity.Middleware(activityStore, mux))))
+	// in request context into the selector middleware. The SHARED_WRITE_ALLOW
+	// guard (issue #349) wraps the mux directly: inside the namespace strip so
+	// a namespaced /_gateway write is still caught, and inside logging so a
+	// denied write is logged with its 403.
+	handler := backend.WorkerNamespaceMiddleware(reqlog.Middleware(logging.Middleware(activity.Middleware(activityStore, writeAllowMiddleware(cfg.SharedWriteAllow, mux)))))
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -424,6 +427,7 @@ func run(configFlag string) error {
 		// so make the exposure loud rather than let it pass as a normal
 		// start.
 		fmt.Fprintf(os.Stderr, "agent-quota-gateway: SHARED MODE — bound to overlay/IP address %s, reachable by any client that can route to it. An appropriate network ACL/firewall restricting this port is REQUIRED; the gateway adds no authentication of its own.\n", cfg.ListenAddr)
+		fmt.Fprintf(os.Stderr, "agent-quota-gateway: SHARED MODE — %s\n", sharedWriteAllowSummary(cfg.SharedWriteAllow))
 	}
 	fmt.Fprintf(os.Stderr, "agent-quota-gateway %s listening on %s; default upstream %s; pools %s\n", version, cfg.ListenAddr, cfg.AnthropicBaseURL, strings.Join(registry.PoolNames(), ", "))
 
