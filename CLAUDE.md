@@ -20,10 +20,11 @@ go test -race ./...                                                 # full suite
 go test -race ./internal/auto -run TestResolveAuto_stickyWhileHealthy   # one test
 ```
 
-CI (`.github/workflows/ci.yml`) runs `go build ./... && go vet ./... &&
-go test -race ./...` on PRs and pushes to `main`; the suite is
-race-clean by design. A release tag is auto-generated on every push to
-main (`scripts/release-tag`, `lib/release.sh`).
+CI (`.github/workflows/ci.yml`) runs `gofmt -l .` (fails if non-empty),
+then `go build ./... && go vet ./... && go test -race ./...` on PRs and
+pushes to `main`; the suite is race-clean by design. A release tag is
+auto-generated on every push to main (`scripts/release-tag`,
+`lib/release.sh`).
 
 Run locally (env path keeps zero credentials on disk):
 

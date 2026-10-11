@@ -364,7 +364,7 @@ func TestAdd_resolvesAcrossRestartFromEnv(t *testing.T) {
 	clock := newMoveClock()
 	env := map[string]string{
 		backend.EnvPrefix + "A_BACKEND_CCZ":   "cred-ccz",
-		backend.EnvPrefix + "A_BASE_URL":     "https://a.example",
+		backend.EnvPrefix + "A_BASE_URL":      "https://a.example",
 		backend.EnvPrefix + "B_BACKEND_OTHER": "cred-other",
 	}
 	p := loadMovePools(t, clock, env)
@@ -400,7 +400,7 @@ func TestAdd_resolvesAcrossRestartFromRuntimeMutation(t *testing.T) {
 	clock := newMoveClock()
 	env := map[string]string{
 		backend.EnvPrefix + "A_BACKEND_CCZ":   "cred-ccz",
-		backend.EnvPrefix + "A_BASE_URL":     "https://a.example",
+		backend.EnvPrefix + "A_BASE_URL":      "https://a.example",
 		backend.EnvPrefix + "B_BACKEND_OTHER": "cred-other",
 		backend.EnvPrefix + "C_BACKEND_D":     "cred-d",
 	}
@@ -494,9 +494,9 @@ func TestAdd_sameCredentialAcrossPoolsNotAmbiguous(t *testing.T) {
 	clock := newMoveClock()
 	env := map[string]string{
 		backend.EnvPrefix + "A_BACKEND_CCZ": "cred-ccz",
-		backend.EnvPrefix + "A_BASE_URL":   "https://z.example",
-		backend.EnvPrefix + "B_BACKEND_X":  "cred-x",
-		backend.EnvPrefix + "C_BACKEND_D":  "cred-d",
+		backend.EnvPrefix + "A_BASE_URL":    "https://z.example",
+		backend.EnvPrefix + "B_BACKEND_X":   "cred-x",
+		backend.EnvPrefix + "C_BACKEND_D":   "cred-d",
 	}
 	p := loadMovePools(t, clock, env)
 
@@ -532,10 +532,10 @@ func TestAdd_differentBaseURLAcrossPoolsIsAmbiguous(t *testing.T) {
 	clock := newMoveClock()
 	env := map[string]string{
 		backend.EnvPrefix + "A_BACKEND_CCZ": "cred-ccz",
-		backend.EnvPrefix + "A_BASE_URL":   "https://z.example",
+		backend.EnvPrefix + "A_BASE_URL":    "https://z.example",
 		backend.EnvPrefix + "C_BACKEND_CCZ": "cred-ccz", // same nick, same cred, DIFFERENT url override
-		backend.EnvPrefix + "C_BASE_URL":   "https://c.example",
-		backend.EnvPrefix + "B_BACKEND_X":  "cred-x",
+		backend.EnvPrefix + "C_BASE_URL":    "https://c.example",
+		backend.EnvPrefix + "B_BACKEND_X":   "cred-x",
 	}
 	// Note: declaring ccz in both a and c with the same credential but
 	// different pool-level base_urls is exactly the bijection-allowed shape
