@@ -2865,6 +2865,11 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 			return c.parkAndFailoverWithSource(resp, b.Nick, reset, "hit 429", true, precise)
 		}
 	}
+	// TEMPORARY (issue #351): capture the z.ai 429 wire shape before any leg
+	// below rewrites it. Remove with zai_capture.go.
+	if resp.StatusCode == http.StatusTooManyRequests && isZaiBackend(b) {
+		c.logZai429Capture(resp, b)
+	}
 	// Classify the original upstream status before any branch rewrites it to a
 	// gateway 503. A statusless full window is only exhaustion evidence when
 	// this same request failed upstream. Credential rejection and native
