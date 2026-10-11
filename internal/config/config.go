@@ -37,6 +37,16 @@ const (
 	// auth of its own. See the README "Shared mode" section.
 	EnvSharedListenAddr = "SHARED_LISTEN_ADDR"
 
+	// EnvSharedWriteAllow is a comma list of IP literals or CIDRs whose
+	// peers may send state-changing (non-GET/HEAD) requests under
+	// /_gateway (issue #349). Loopback is always allowed. Unset leaves every
+	// reachable client able to write — the pre-#349 behavior. A network ACL
+	// cannot express this split: it filters by port, and fleet clients need
+	// the proxy paths and GET /_gateway/quota on the same port as the admin
+	// writes. Like every other setting, env seeds the first bootstrap and
+	// aqg.json's shared_write_allow owns it afterwards.
+	EnvSharedWriteAllow = "SHARED_WRITE_ALLOW"
+
 	// EnvStateFile sets the path for the persistent state file. When unset,
 	// the gateway checks $STATE_DIRECTORY (set automatically by systemd when
 	// StateDirectory= is configured) and uses $STATE_DIRECTORY/state.json if
@@ -76,6 +86,12 @@ type Config struct {
 	// validator and drives the loud startup warning in main.
 	Shared bool
 
+	// SharedWriteAllow lists the peer prefixes allowed to send non-GET/HEAD
+	// requests under /_gateway, in addition to loopback (issue #349). Nil
+	// means no restriction. Meaningful only in shared mode — a loopback
+	// listener only ever sees loopback peers.
+	SharedWriteAllow []netip.Prefix
+
 	// StateFile is the path for the persistent state file. Empty string
 	// disables persistence (the gateway runs as before, all state in memory).
 	StateFile string
@@ -100,6 +116,10 @@ type Inputs struct {
 	// SharedListenAddr is the overlay/IP bind address for shared mode.
 	// Empty string means shared mode is off.
 	SharedListenAddr string
+
+	// SharedWriteAllow is the write allowlist (issue #349): IP literals or
+	// CIDRs. Nil or empty means no restriction.
+	SharedWriteAllow []string
 
 	// StateFile is the path for the persistent state file. Empty string
 	// means disabled; no $STATE_DIRECTORY consultation (that fallback
@@ -127,10 +147,29 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("%s and %s are mutually exclusive: set exactly one (loopback by default, or an overlay/IP address for shared mode)", EnvListenAddr, EnvSharedListenAddr)
 	}
 
+	var writeAllow []string
+	// Presence-aware, unlike lookupEnv: an exported-but-empty
+	// SHARED_WRITE_ALLOW= is an operator who meant to restrict writes, so it
+	// fails closed below rather than reading as "unset" and leaving them open.
+	if raw, ok := os.LookupEnv(EnvSharedWriteAllow); ok {
+		for _, entry := range strings.Split(raw, ",") {
+			if entry = strings.TrimSpace(entry); entry != "" {
+				writeAllow = append(writeAllow, entry)
+			}
+		}
+		// A set-but-blank list ("", ",", " , ") would otherwise read as "no
+		// restriction" — the opposite of what an operator setting the knob
+		// meant. Fail closed.
+		if len(writeAllow) == 0 {
+			return Config{}, fmt.Errorf("%s is set but lists no addresses; unset it to allow writes from every reachable client", EnvSharedWriteAllow)
+		}
+	}
+
 	inputs := Inputs{
 		AnthropicBaseURL: getEnv(EnvAnthropicBaseURL, DefaultBaseURL),
 		ListenAddr:       getEnv(EnvListenAddr, DefaultListenAddr),
 		SharedListenAddr: shared,
+		SharedWriteAllow: writeAllow,
 		StateFile:        resolveStateFile(),
 		DebugLogRequests: os.Getenv(EnvDebugLogRequests) == "1",
 	}
@@ -171,10 +210,70 @@ func Build(in Inputs) (Config, error) {
 		}
 	}
 
+	for _, entry := range in.SharedWriteAllow {
+		prefix, err := ParseWriteAllowEntry(entry)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.SharedWriteAllow = append(cfg.SharedWriteAllow, prefix)
+	}
+
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// ParseWriteAllowEntry parses one SHARED_WRITE_ALLOW entry: an IP literal
+// (a single-address prefix) or a CIDR (masked to its network). Names are
+// rejected for the same reason SHARED_LISTEN_ADDR rejects them — the check
+// runs against the TCP peer address, and a name cannot be matched against
+// that without a resolution step the gateway deliberately does not take.
+// IPv4-mapped IPv6 forms are unmapped so they match the peer addresses
+// MatchesWriteAllow compares them with.
+func ParseWriteAllowEntry(entry string) (netip.Prefix, error) {
+	if strings.Contains(entry, "/") {
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			return netip.Prefix{}, fmt.Errorf("SHARED_WRITE_ALLOW entry %q is not a valid CIDR: %w", entry, err)
+		}
+		if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		return prefix.Masked(), nil
+	}
+	addr, err := netip.ParseAddr(entry)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("SHARED_WRITE_ALLOW entry %q must be an IP literal or CIDR, not a name", entry)
+	}
+	addr = addr.Unmap()
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
+}
+
+// FormatWriteAllowEntry is ParseWriteAllowEntry's inverse for the config
+// file: a single-address prefix is written as the bare address, anything
+// wider as a CIDR.
+func FormatWriteAllowEntry(prefix netip.Prefix) string {
+	if prefix.IsSingleIP() {
+		return prefix.Addr().String()
+	}
+	return prefix.String()
+}
+
+// MatchesWriteAllow reports whether a peer address may send a write under
+// an allowlist: loopback always may, otherwise the address must fall in
+// one of the prefixes.
+func MatchesWriteAllow(allow []netip.Prefix, peer netip.Addr) bool {
+	peer = peer.Unmap()
+	if peer.IsLoopback() {
+		return true
+	}
+	for _, prefix := range allow {
+		if prefix.Contains(peer) {
+			return true
+		}
+	}
+	return false
 }
 
 // validate enforces the contract: an upstream URL with a scheme and

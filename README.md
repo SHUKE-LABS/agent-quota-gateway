@@ -361,6 +361,7 @@ classes and configure each pool's `BASE_URL` and members accordingly.
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Default upstream inherited by any pool without its own `BASE_URL`; scheme and host are required. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Loopback address only (`127.0.0.1`, `::1`, `localhost`); the build refuses anything else. Mutually exclusive with `SHARED_LISTEN_ADDR`. |
 | `SHARED_LISTEN_ADDR` | _(unset)_ | Opt into [shared mode](#shared-mode-over-tailscale): bind a single non-loopback overlay/IP address (e.g. a Tailscale address, `100.64.0.0/10` / `fd7a:115c:a1e0::/48`; or any other overlay/LAN address the deployment trusts, such as an OpenVPN `10.8.0.0/24`) instead of loopback, so other machines that can reach it share one authoritative gateway. Must be an IP literal; loopback, `0.0.0.0`/`::`, and names are rejected at startup. Mutually exclusive with `LISTEN_ADDR`. |
+| `SHARED_WRITE_ALLOW` | _(unset)_ | Comma list of IP literals or CIDRs (e.g. `100.64.1.2,fd7a:115c:a1e0::/48`) allowed to change gateway state. When set, any non-`GET`/`HEAD` request under `/_gateway` from a peer outside the list gets `403`; loopback is always allowed, and reads plus proxy paths are untouched. Unset leaves writes open to every reachable client. See [Restricting admin writes](#restricting-admin-writes). Names, a malformed entry, or a set-but-empty value (including `SHARED_WRITE_ALLOW=`) fail startup. Like `AQG_POOL_*`, a first-start bootstrap seed: once `aqg.json` exists, set `shared_write_allow` there instead. |
 | `VOLC_ACCESSKEY` | _(unset)_ | Volcengine IAM Access Key ID. Required when any pool backend has a base URL containing `volces.com` — the background poller needs these account-level credentials to call `GetCodingPlanUsage`. Unrelated to the inference key stored in `AQG_POOL_*_BACKEND_*`. Deliberately env-only (issue #301): account-level signing credentials are not pool-member intent, so they stay out of `aqg.json`; a missing pair surfaces as the member's `last_err` in pool status. |
 | `VOLC_SECRETKEY` | _(unset)_ | Volcengine IAM Secret Access Key. Required alongside `VOLC_ACCESSKEY` for Volcengine Ark quota polling. If either var is absent at poll time, the poll is skipped and the prior snapshot is preserved. Env-only by design — see `VOLC_ACCESSKEY`. |
 | `AQG_STATE_FILE` | see notes | Path for the persistent state file. When unset the gateway falls back to `$STATE_DIRECTORY/state.json` (set automatically by systemd when `StateDirectory=agent-quota-gateway` is in the unit — the default install already sets this). An empty resolved path disables persistence: all runtime state is in-memory only and lost on restart. When a config file declares an empty `state_file`, startup warns with the config path; set `state_file` in that file and restart. The file stores **runtime observation only** — sticky pointers, per-worker affinities and their first-use cursor, exhausted maps, quota snapshots, and per-pool local-snapshot nicks. **Operator intent (pools, members, credentials, priority, disabled) lives in the config file, not here** (issue #198). Writes are atomic (temp-file + rename) at mode 0600 and coalesced via a 200 ms debounce. A missing or unparseable file at startup is silently ignored and a fresh state begins. A pre-#198 state file may also contain legacy `config` / `added_pools` keys. First-deploy bootstrap reads the full overlay once; an existing-file start reconciles legacy `priority_override` and `disabled` (issues #241, #259) and **reports only** legacy `removed_members` / `added_members` (the credential-bearing keys are never silently applied), as described in [Config file](#config-file). When `aqg.json` declares an empty `state_file`, that migration may discover the old file through `AQG_STATE_FILE` or `$STATE_DIRECTORY` without enabling persistence or saving the discovered path. |
@@ -371,8 +372,9 @@ on a pool with no members, a malformed upstream URL, an unrecognized
 `AQG_POOL_*` shape, two keys colliding on the same pool/member, a
 `PRIORITY` that is empty, repeats a nick, names a nick that is not a member
 of the pool, both `LISTEN_ADDR` and
-`SHARED_LISTEN_ADDR` set at once, or a `SHARED_LISTEN_ADDR` that is
-loopback, the wildcard address, or not an IP literal. A `|` in a
+`SHARED_LISTEN_ADDR` set at once, a `SHARED_LISTEN_ADDR` that is
+loopback, the wildcard address, or not an IP literal, or a
+`SHARED_WRITE_ALLOW` entry that is not an IP literal or CIDR. A `|` in a
 credential is rejected because the tail must parse as a URL — tokens do
 not contain `|`.
 
@@ -483,6 +485,7 @@ permissions causes startup to fail closed — no silent fallback to env.
   "base_url": "https://api.anthropic.com",
   "listen_addr": "127.0.0.1:8080",
   "shared_listen_addr": "",
+  "shared_write_allow": [],
   "state_file": "",
   "debug": { "log_requests": false },
   "pools": {
@@ -518,6 +521,7 @@ pool name.
 | `ANTHROPIC_BASE_URL` | `base_url` | Gateway default upstream. |
 | `LISTEN_ADDR` | `listen_addr` | Loopback-only bind address. |
 | `SHARED_LISTEN_ADDR` | `shared_listen_addr` | Overlay/IP bind address for shared mode (e.g. Tailscale). |
+| `SHARED_WRITE_ALLOW` | `shared_write_allow` | Array of IP literals / CIDRs allowed to send `/_gateway` writes (issue #349). Omit the key for no restriction. |
 | `AQG_STATE_FILE` | `state_file` | Path to persistent state file. |
 | `AQG_DEBUG_LOG_REQUESTS` | `debug.log_requests` | Request dump toggle (issue #301). Env seeds the first bootstrap only; afterwards the JSON key is the source of truth and `POST /_gateway/debug` flips it live. The section is written only when on — an absent `debug` key and `false` mean the same thing. |
 
@@ -1340,6 +1344,10 @@ that section for the changed model.) The guarantees that follow:
   non-loopback, non-wildcard IP literal — Tailscale is the reference
   deployment, but any overlay/LAN address the operator's network trusts
   works the same way.
+- In shared mode, `SHARED_WRITE_ALLOW` optionally restricts state-changing
+  `/_gateway` requests to listed peer addresses plus loopback (see
+  [Restricting admin writes](#restricting-admin-writes)). It is an address
+  check on the TCP peer, not authentication.
 
 ## Shared mode over Tailscale
 
@@ -1442,6 +1450,36 @@ allow only the client tag to the port:
 Apply the gateway tag to the host running the binary
 (`tailscale up --advertise-tags=tag:aqg-gateway`) and the client tag to the
 consuming machines.
+
+### Restricting admin writes
+
+A port ACL decides who reaches the gateway at all, but every client that
+reaches it can also reorder, disable, add, or remove pool members. The ACL
+cannot narrow that: fleet clients need `/v1/*`, `/_aqg/w/<nick>/*`, and
+`GET /_gateway/quota` on the same port as the admin writes.
+
+`SHARED_WRITE_ALLOW` (file: `shared_write_allow`) closes that gap (issue
+#349). List the admin machines' addresses or ranges:
+
+```bash
+SHARED_WRITE_ALLOW=100.64.1.2,100.64.1.3
+```
+
+On a gateway that already has an `aqg.json`, env is no longer read: add
+`"shared_write_allow": ["100.64.1.2", "100.64.1.3"]` to the file and restart.
+
+With it set, any non-`GET`/`HEAD` request under `/_gateway` — pool and member
+mutations, `/_gateway/clear`, `/_gateway/debug`, including the same paths
+under a `/_aqg/w/<nick>` prefix — from a peer outside the list returns `403`
+with `{"error": ...}`, and the state is unchanged. Loopback is always
+allowed. All `GET`s and every proxy request still work from anywhere the
+ACL admits. The UI still loads for everyone; its write actions show the
+`403` message in the error banner.
+
+The check uses the TCP peer address only. `X-Forwarded-For`, `Forwarded`,
+and similar headers are ignored: the gateway sits behind no proxy, so those
+headers are whatever the client chose to send. In shared mode the startup
+log states whether writes are restricted and to which addresses.
 
 ### Blast radius
 
