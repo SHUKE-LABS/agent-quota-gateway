@@ -300,6 +300,51 @@ func TestIssue249_stalePollerParkPropagates(t *testing.T) {
 	}
 }
 
+// AC3 (review v1 of #352): a sibling already holding a later-reset windowFact
+// park keeps its reset but adopts the stale park's since, so the shared
+// store's fresh non-blocking snapshot — the triggering 429's own — cannot
+// retire it there while the origin stays parked.
+func TestIssue249_stalePollerParkMergesSinceIntoLongerSiblingPark(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	env := propagationEnv()
+	for _, pool := range []string{"A", "B", "C"} {
+		env[backend.EnvPrefix+pool+"_BASE_URL"] = issue249ZaiURL
+	}
+	scrubPoolEnv(t)
+	for k, v := range env {
+		t.Setenv(k, v)
+	}
+	reg, err := backend.Load(testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	store := quota.NewStore()
+	p := NewPools(reg, store, clock.now, io.Discard)
+	for _, c := range p.byPool {
+		c.SetProbeHTTPClient(issue249FailingClient())
+	}
+	later := clock.now().Add(defaultExhaustionWindow + time.Hour)
+	p.byPool["b"].mu.Lock()
+	p.byPool["b"].credentialPark["ccz"] = credentialParkEntry{reset: later, windowFact: true}
+	p.byPool["b"].mu.Unlock()
+	issue249SetStale(p.byPool["a"], true)
+	store.Put("ccz", quota.Snapshot{UnifiedStatus: "rejected", AsOf: clock.now()})
+
+	b, _ := p.CurrentRegistry().ResolveIn("a", "ccz")
+	req, _ := http.NewRequestWithContext(backend.WithBackend(context.Background(), b), http.MethodPost, "/v1/messages", nil)
+	resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Request: req, Body: io.NopCloser(strings.NewReader("1302"))}
+	if err := p.ModifyResponse(resp); err != nil {
+		t.Fatalf("ModifyResponse: %v", err)
+	}
+	e, ok := issue249CredPark(p.byPool["b"], "ccz")
+	if !ok || !e.reset.Equal(later) || !e.windowFact || !e.since.Equal(clock.now()) {
+		t.Fatalf("pool b credentialPark[ccz] = %+v,%v; want reset kept at %v, since=now", e, ok, later)
+	}
+	if got, _, _, exhausted := p.Route("b"); exhausted || got.Nick != "b2" {
+		t.Fatalf("pool b routed %q exhausted=%v; want b2 (ccz still parked)", got.Nick, exhausted)
+	}
+}
+
 // AC4: a live poller, or no poller at all, keeps #153's absorb.
 func TestIssue249_livePollerOrNoPollerAbsorbs(t *testing.T) {
 	for _, tc := range []struct {

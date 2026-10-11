@@ -1432,7 +1432,11 @@ func nickNotResolvableError(nick string, reg *backend.Registry) error {
 // reset wins, because propagation can be delayed behind a sibling's own
 // observation and overwriting it would shorten the active park. Equal resets
 // retain the existing entry so its windowFact/authRejected
-// classifications are preserved (issues #275, #332).
+// classifications are preserved (issues #275, #332). A retained windowFact
+// entry still adopts a later incoming since (issue #249): the new park is
+// fresh evidence the nick is refused now, so a store snapshot predating it —
+// the triggering response's own, in the shared store — must not retire the
+// sibling's longer park either. The reset is never shortened.
 func (p *Pools) propagateCredentialPark(originPool, nick string, entry credentialParkEntry) {
 	reg := p.CurrentRegistry()
 	for _, name := range reg.PoolNames() {
@@ -1450,6 +1454,10 @@ func (p *Pools) propagateCredentialPark(originPool, nick string, entry credentia
 		changed := false
 		if existing, ok := c.credentialPark[nick]; !ok || entry.reset.After(existing.reset) {
 			c.credentialPark[nick] = entry
+			changed = true
+		} else if existing.windowFact && entry.since.After(existing.since) {
+			existing.since = entry.since
+			c.credentialPark[nick] = existing
 			changed = true
 		}
 		if changed {
