@@ -220,10 +220,10 @@ func TestReprobe_credentialRejected(t *testing.T) {
 	}
 }
 
-// staleCodexFull is a stranded Codex snapshot: x-codex-* windows carry no
-// status, so a full weekly window (utilization 1.0, reset days out) is the
-// exhaustion signal.
-func staleCodexFull(now time.Time) quota.Snapshot {
+// staleFullWindow is a stranded statusless snapshot (Codex x-codex-* and
+// poller windows carry no status): a full weekly window (utilization 1.0,
+// reset days out) is the exhaustion signal.
+func staleFullWindow(now time.Time) quota.Snapshot {
 	util, reset := 1.0, now.Add(72*time.Hour)
 	return quota.Snapshot{Unified7dUtilization: &util, Unified7dReset: &reset, AsOf: now.Add(-time.Minute)}
 }
@@ -243,7 +243,7 @@ func TestReprobe_codex(t *testing.T) {
 	client := &http.Client{Transport: redirectTransport{target: target}}
 
 	store := quota.NewStore()
-	store.Put("a", staleCodexFull(now))
+	store.Put("a", staleFullWindow(now))
 	gw, _ := reprobeServer(t, store, "https://chatgpt.com/backend-api/codex", "codex-token", client)
 
 	status, body := postReprobe(t, gw, "auto", "a")
@@ -257,7 +257,7 @@ func TestReprobe_codex(t *testing.T) {
 	empty, _ := fakeUpstream(t, http.StatusOK, nil)
 	emptyTarget, _ := url.Parse(empty.URL)
 	store2 := quota.NewStore()
-	store2.Put("a", staleCodexFull(now))
+	store2.Put("a", staleFullWindow(now))
 	before := store2.Get("a")
 	gw2, _ := reprobeServer(t, store2, "https://chatgpt.com/backend-api/codex", "codex-token",
 		&http.Client{Transport: redirectTransport{target: emptyTarget}})
@@ -294,6 +294,33 @@ func TestReprobe_pollerProvider(t *testing.T) {
 	defer mu.Unlock()
 	if len(paths) != 1 || paths[0] != "/api/monitor/usage/quota/limit" {
 		t.Errorf("upstream paths = %v, want one quota-endpoint request", paths)
+	}
+}
+
+// TestReprobe_pollerCredentialRejected: a poller quota endpoint answering
+// 401/403 surfaces as poller.StatusError and maps to 502 "credential
+// rejected", leaving the prior snapshot untouched.
+func TestReprobe_pollerCredentialRejected(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(code)
+			}))
+			t.Cleanup(upstream.Close)
+			poller.WithTestProviderForTest(t, upstream.URL, poller.HostURLForTest("/api/monitor/usage/quota/limit"), poller.RawAuthForTest, poller.ParseZhipuForTest)
+
+			store := quota.NewStore()
+			store.Put("a", staleFullWindow(time.Now().UTC()))
+			before := store.Get("a")
+			gw, _ := reprobeServer(t, store, upstream.URL, "zai-key", nil)
+			status, body := postReprobe(t, gw, "auto", "a")
+			if status != http.StatusBadGateway || body["error"] != "credential rejected" {
+				t.Errorf("status = %d body=%v, want 502 credential rejected", status, body)
+			}
+			if after := store.Get("a"); !reflect.DeepEqual(before, after) {
+				t.Errorf("snapshot changed on poller credential rejection")
+			}
+		})
 	}
 }
 

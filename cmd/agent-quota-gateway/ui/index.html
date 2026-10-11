@@ -1109,6 +1109,13 @@
     return member.status || 'idle';
   }
 
+  // showsReprobe gates the "Reset & re-probe" control (issue #350): every
+  // out-of-rotation member — a live park, or a store-sourced exhaustion that
+  // "Clear park" cannot move — but never a disabled one.
+  function showsReprobe(member) {
+    return !member.disabled && (!!member.parked || member.status === 'exhausted');
+  }
+
   function applyStatusPresentation(badge, member) {
     var status = statusPresentation(member);
     badge.setAttribute('data-status', status);
@@ -1522,13 +1529,10 @@
         if (clr) {
           clr.style.display = match.parked ? '' : 'none';
         }
-        // "Reset & re-probe" (issue #350) covers both out-of-rotation shapes:
-        // a live park and a store-sourced exhaustion. Hidden on serving, idle
-        // and disabled members.
+        // "Reset & re-probe" (issue #350): see showsReprobe.
         var rp = tr.querySelector('[data-role="reprobe"]');
         if (rp) {
-          var out = !match.disabled && (match.parked || match.status === 'exhausted');
-          rp.style.display = out ? '' : 'none';
+          rp.style.display = showsReprobe(match) ? '' : 'none';
         }
         var snap = match.snapshot || null;
         // Pull each window's reset ISO once so the quota cell and its
@@ -1645,8 +1649,8 @@
       '" in pool "' + pool + '"?\n\n' +
       'If upstream reports capacity the member returns to rotation; if it is ' +
       'still exhausted it stays out with the upstream\'s reset.');
-    if (!ok) { return; }
-    postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick) + '/reprobe', null)
+    if (!ok) { return Promise.resolve(); }
+    return postJSON('/_gateway/pool/' + encodeURIComponent(pool) + '/member/' + encodeURIComponent(nick) + '/reprobe', null)
       .then(function (r) {
         if (r && r.ok && r.body && r.body.healthy === false) {
           showBanner('Re-probe: upstream still reports "' + nick + '" exhausted; it stays out of rotation');
