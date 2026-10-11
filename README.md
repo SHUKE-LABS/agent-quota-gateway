@@ -1611,6 +1611,10 @@ ssh <host> agent-quota-gateway -version
 ssh <host> journalctl -u agent-quota-gateway -f
 ```
 
+The binary accepts only `-version`, `-config <path>`, and `-h`/`-help`
+(single or double dash). Any other argument, including a bare word like
+`version`, exits 2 with usage before binding a port (issue #358).
+
 The unit runs under `DynamicUser=yes` with a strict hardening profile
 (`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, no new privileges,
 IP sockets only). The env file is read by the systemd manager and the

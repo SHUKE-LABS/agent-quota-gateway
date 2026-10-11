@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -127,17 +128,42 @@ func quotaObserver(store *quota.Store, pools *auto.Pools) func(*http.Response) {
 var version = "dev"
 
 func main() {
-	showVersion := flag.Bool("version", false, "print version and exit")
-	configPath := flag.String("config", "", "path to a JSON config file (overrides AQG_CONFIG and ./aqg.json)")
-	flag.Parse()
+	os.Exit(cli(os.Args[1:], os.Stdout, os.Stderr, run))
+}
+
+// cli owns the whole entry flow and returns the process exit code. start
+// (run in production) is the only path to a bound listener, so every
+// non-start outcome below is guaranteed to bind no port. Any argument
+// other than the declared flags exits 2 with usage before start (issue
+// #358): a positional word like `version` or `help` used to be ignored
+// silently, launching a second, unconfigured gateway on the default
+// address next to the real one.
+func cli(args []string, stdout, stderr io.Writer, start func(configPath string) error) int {
+	fs := flag.NewFlagSet("agent-quota-gateway", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	showVersion := fs.Bool("version", false, "print version and exit")
+	configPath := fs.String("config", "", "path to a JSON config file (overrides AQG_CONFIG and ./aqg.json)")
+	if err := fs.Parse(args); err != nil {
+		// Parse has already printed the error and usage to stderr.
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "unexpected argument %q\n", fs.Arg(0))
+		fs.Usage()
+		return 2
+	}
 	if *showVersion {
-		fmt.Println(version)
-		return
+		fmt.Fprintln(stdout, version)
+		return 0
 	}
-	if err := run(*configPath); err != nil {
-		fmt.Fprintf(os.Stderr, "agent-quota-gateway: %v\n", err)
-		os.Exit(1)
+	if err := start(*configPath); err != nil {
+		fmt.Fprintf(stderr, "agent-quota-gateway: %v\n", err)
+		return 1
 	}
+	return 0
 }
 
 func run(configFlag string) error {
