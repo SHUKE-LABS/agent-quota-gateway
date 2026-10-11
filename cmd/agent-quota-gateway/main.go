@@ -328,6 +328,9 @@ func run(configFlag string) error {
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/disable", disableMemberHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/enable", enableMemberHandler(pools, persistence))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/move", moveMemberHandler(pools, persistence))
+	// Operator reprobe (issue #350): method checked in the handler so a
+	// non-POST is a 405, not a fall-through to the proxy catch-all.
+	mux.HandleFunc("/_gateway/pool/{name}/member/{nick}/reprobe", reprobeHandler(pools, reprobeQuery(store, newReprobeClient(), time.Now)))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools, persistence))
 	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools, persistence))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))

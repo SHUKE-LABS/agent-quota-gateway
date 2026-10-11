@@ -856,7 +856,9 @@ is currently holding the member out of rotation (present, reset not yet elapsed,
 and not reconciled away by a fresh healthy store snapshot). It is the precise gate for the per-nick
 "clear park" escape hatch — distinct from `status: "exhausted"`, which also
 covers a status-bearing rejected store window that clearing a recorded park cannot move. The UI
-shows the "Clear park" button only on a member with `parked: true`.
+shows the "Clear park" button only on a member with `parked: true`, and the
+"Reset & re-probe" button on every enabled member that is `parked: true` or
+`status: "exhausted"` (see [Re-probing a member](#re-probing-a-member)).
 
 **`disabled`** is `true` when the member has been taken out of selection and
 failover by the runtime disable toggle (`POST
@@ -949,6 +951,7 @@ restarting is the wrong tool.
 | `GET /_gateway/pool` | Live member status. Each member includes `in_window` (whether it is in the current worker window; always `false` at concurrency `1`) and sorted `workers` (recorded worker affinities targeting it, omitted when empty). Affinities remain listed when outside the window until that worker makes its next request. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
+| `POST /_gateway/pool/{name}/member/{nick}/reprobe` | Re-query upstream quota for one member now, merge the fresh snapshot, and reconcile its park; see [Re-probing a member](#re-probing-a-member). Non-POST → `405`. |
 | `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "...", "placement": [...]}`. `credential` and `base_url` are each optional when the nick is already a known subscription in another pool (resolved independently; ambiguous → `400`). `placement` is a JSON array of nicks (highest ranked first, must include the added nick) and is **required** when the target has an explicit order and no existing slot for that nick; rejected (`400`) for targets using the sorted default. Persisted with its credential. |
 | `POST /_gateway/pool/{name}/member/{nick}/move` | Move a subscription to another pool; body `{"to": "<pool>", "placement": [...], "force": false}`. |
 | `DELETE /_gateway/pool/{name}/member/{nick}` | Remove a member (static or runtime-added) from selection |
@@ -1195,6 +1198,53 @@ it was freed in (a whole-pool clear can release several nicks at once):
 {"pool":"auto","nick":"ccz","cleared":true,"released_in":["chn","minimax"]}
 {"pool":"auto","cleared":["ccz"],"released_in":{"ccz":["chn","minimax"]}}
 ```
+
+#### Re-probing a member
+
+A member can be held out of rotation by a stored quota snapshot rather than a
+recorded park: a `429` that wrote `unified_7d_status: "rejected"` with a reset
+days out reports `status: "exhausted"`, `parked: false`. If the upstream
+subscription is reset early, nothing refreshes that snapshot — sticky follows
+the pool's other members, so the stranded one is never forwarded to again —
+and "Clear park" cannot move it (issue #350).
+`POST /_gateway/pool/{name}/member/{nick}/reprobe` (the UI's
+"Reset & re-probe" button) queries upstream once for that member:
+
+| Backend | Query |
+|---------|-------|
+| Poller-tracked (z.ai/Zhipu, MiniMaxi, Volcengine Ark) | The provider's quota endpoint, as the [recovery probe](#recovery-probing-for-parked-members) uses |
+| ChatGPT-Codex (`chatgpt.com`) | The Codex weekly-reset hello request (`POST {base}/responses`), reading `x-codex-*` |
+| Anthropic and any other provider | One `max_tokens: 1` `POST {base}/v1/messages` (Haiku), reading the unified rate-limit headers |
+
+The Anthropic and Codex queries are real model calls and count, minimally,
+against the member's quota — unified headers only arrive on real responses.
+The fresh snapshot is merged into the store (absent windows carry forward).
+If it no longer rejects, the member's recorded park is dropped too, including
+a propagated credential park in sibling pools, and the member rejoins rotation
+through ordinary selection; the sticky pointer is not moved. If upstream still
+rejects — a fresh `429` included — the new window and its reset are merged
+honestly and the member stays exhausted until that reset.
+
+```bash
+curl -X POST 'http://127.0.0.1:8080/_gateway/pool/auto/member/a/reprobe'
+```
+
+```json
+{"pool":"auto","nick":"a","healthy":true,"unified_status":"allowed","unified_5h_utilization":0.01,"unified_7d_utilization":0,"unified_5h_reset":"2026-10-11T23:00:00Z","unified_7d_reset":"2026-10-18T10:00:00Z"}
+```
+
+`healthy:false` is a successful re-probe that confirmed exhaustion. Errors:
+unknown pool `404`, unknown nick `400`, disabled member `409`; a failed query
+returns `502` with `"credential rejected"` (`401`/`403`), `"no quota signal"`
+(a response without quota headers), or `"upstream unreachable"`, and leaves the
+stored snapshot and every park untouched — a re-probe never records a park.
+Concurrent re-probes of the same nick, from any pool sharing it, share one
+upstream query; the recovery probe's 30-second cooldown does not apply to a
+manual click.
+
+Re-probe and clear both stay: clear drops the recorded park without asking
+upstream (use it when you know the member is fine); re-probe asks upstream and
+lets the answer decide both the stored snapshot and the park.
 
 A single-file management page is served at `GET /_gateway/ui`. Open it in a
 browser to view every pool, its priority order, the global sticky target, and

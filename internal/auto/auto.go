@@ -145,6 +145,12 @@ type Pools struct {
 	// until then and in tests that never set it, where the absorb holds as
 	// before. Atomic so the proxy path reads it without p.mu.
 	poller atomic.Pointer[poller.Poller]
+
+	// reprobeMu guards reprobeCalls, the in-flight operator reprobes keyed by
+	// QuotaKey (issue #350). A dedicated lock, not mu: a reprobe waits on a
+	// network round-trip and must never stall registry mutations or routing.
+	reprobeMu    sync.Mutex
+	reprobeCalls map[string]*reprobeCall
 }
 
 // SetPoller attaches the quota poller whose per-pool liveness decides whether
@@ -1661,11 +1667,16 @@ type Controller struct {
 	// under c.mu.
 	lastProbeAttempt map[string]time.Time
 
-	// probeInFlight marks a quota key whose recovery probe is currently
-	// running on another goroutine; concurrent "all exhausted" requests
-	// see the flag and skip the probe for that member, coalescing to one
-	// probe per parked member. Accessed only under c.mu.
-	probeInFlight map[string]bool
+	// probeInFlight counts the upstream probes currently running for a quota
+	// key on another goroutine — the automatic recovery probe (issue #124)
+	// and the operator's manual reprobe (issue #350) both hold a reference.
+	// Concurrent "all exhausted" requests and the background recovery loop
+	// see a positive count and skip the probe for that member, coalescing to
+	// one probe per parked member. A refcount rather than a flag so one path
+	// finishing can never clear the signal the other still holds; only
+	// beginProbeLocked / endProbeLocked touch it, and clears leave it alone
+	// for the same reason. Accessed only under c.mu.
+	probeInFlight map[string]int
 
 	// probeHTTPClient is the HTTP client used for recovery probes. Defaults
 	// to http.DefaultClient; tests inject a client backed by httptest to
@@ -1825,7 +1836,7 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		credentialPark:     make(map[string]credentialParkEntry),
 		workerAffinity:     make(map[string]string),
 		lastProbeAttempt:   make(map[string]time.Time),
-		probeInFlight:      make(map[string]bool),
+		probeInFlight:      make(map[string]int),
 		probeHTTPClient:    http.DefaultClient,
 		now:                now,
 		logOut:             logOut,
@@ -2385,7 +2396,6 @@ func (c *Controller) ClearExhausted() (cleared []string, releasedElsewhere map[s
 	c.exhausted = make(map[string]time.Time)
 	c.credentialPark = make(map[string]credentialParkEntry)
 	c.lastProbeAttempt = make(map[string]time.Time)
-	c.probeInFlight = make(map[string]bool)
 	c.notifyMutate()
 	c.mu.Unlock()
 
@@ -2423,7 +2433,6 @@ func (c *Controller) ClearExhaustedNick(nick string) (cleared bool, releasedElse
 	delete(c.exhausted, nick)
 	delete(c.credentialPark, nick)
 	delete(c.lastProbeAttempt, nick)
-	delete(c.probeInFlight, nick)
 	c.notifyMutate()
 	c.mu.Unlock()
 
@@ -3548,7 +3557,7 @@ func (c *Controller) recoverParked(skipActive bool) string {
 			continue
 		}
 		quotaKey := b.QuotaKey()
-		if c.probeInFlight[quotaKey] {
+		if c.probeInFlight[quotaKey] > 0 {
 			continue
 		}
 		if last, ok := c.lastProbeAttempt[quotaKey]; ok && now.Sub(last) < probeCooldown {
@@ -3556,7 +3565,7 @@ func (c *Controller) recoverParked(skipActive bool) string {
 		}
 		// Mark in-flight under the lock so concurrent all-exhausted paths
 		// skip this member until the probe returns.
-		c.probeInFlight[quotaKey] = true
+		c.beginProbeLocked(quotaKey)
 		c.lastProbeAttempt[quotaKey] = now
 		targets = append(targets, probeTarget{nick: nick, quotaKey: quotaKey})
 	}
@@ -3620,7 +3629,7 @@ func (c *Controller) recoverParked(skipActive bool) string {
 		} else {
 			fmt.Fprintf(c.logOut, "auto[%s]: recovery probe for %s still exhausted; park retained\n", c.name(), t.nick)
 		}
-		c.probeInFlight[t.quotaKey] = false
+		c.endProbeLocked(t.quotaKey)
 		c.mu.Unlock()
 
 		if hadCredPark && c.propagateParkClear != nil {
@@ -3630,13 +3639,29 @@ func (c *Controller) recoverParked(skipActive bool) string {
 	return recovered
 }
 
-// clearProbeInFlight clears the in-flight flag for quotaKey under c.mu.
-// Used by the error path of recoverParked (shared by tryRecoverParked
-// and tryRecoverParkedNonActive).
+// clearProbeInFlight drops this probe's in-flight reference for quotaKey
+// under c.mu. Used by the error path of recoverParked (shared by
+// tryRecoverParked and tryRecoverParkedNonActive).
 func (c *Controller) clearProbeInFlight(quotaKey string) {
 	c.mu.Lock()
-	c.probeInFlight[quotaKey] = false
+	c.endProbeLocked(quotaKey)
 	c.mu.Unlock()
+}
+
+// beginProbeLocked takes one in-flight reference on quotaKey. Every call is
+// paired with exactly one endProbeLocked. Caller holds c.mu.
+func (c *Controller) beginProbeLocked(quotaKey string) {
+	c.probeInFlight[quotaKey]++
+}
+
+// endProbeLocked releases one in-flight reference on quotaKey, deleting the
+// entry at zero. Caller holds c.mu.
+func (c *Controller) endProbeLocked(quotaKey string) {
+	if n := c.probeInFlight[quotaKey]; n > 1 {
+		c.probeInFlight[quotaKey] = n - 1
+	} else {
+		delete(c.probeInFlight, quotaKey)
+	}
 }
 
 // clearExpiredLocked drops parks whose reset has passed, so a recovered
