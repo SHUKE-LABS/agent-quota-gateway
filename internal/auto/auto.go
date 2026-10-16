@@ -42,6 +42,11 @@ import (
 // available. The five-hour bound is anchored to the quota snapshot's AsOf.
 const defaultExhaustionWindow = 5 * time.Hour
 
+// workerIdleTTL is the fixed liveness window for namespaced workers. A worker
+// that has not sent a request for longer than this is no longer considered
+// live for dashboard display or worker balancing.
+const workerIdleTTL = time.Hour
+
 // exhaustionUtilizationThreshold is the full-window utilization value used
 // with a failed upstream response to identify statusless quota exhaustion.
 const exhaustionUtilizationThreshold = 1.0
@@ -390,8 +395,9 @@ type MemberStatus struct {
 	// InWindow is true only at concurrency >1 when this member is in the
 	// current available worker window.
 	InWindow bool `json:"in_window"`
-	// Workers lists sorted worker affinities targeting this member, including
-	// stale assignments that will be rechecked on the worker's next request.
+	// Workers lists sorted live worker observations targeting this member. Above
+	// concurrency 1, assignments outside the current window remain visible
+	// until the worker's next request; observations idle for one hour expire.
 	Workers []string `json:"workers,omitempty"`
 
 	// Disabled mirrors c.disabled[nick] — the same source the "disabled"
@@ -1740,6 +1746,14 @@ type Controller struct {
 	// Stale targets are rechecked on that worker's next request. Accessed only
 	// under c.mu.
 	workerAffinity map[string]string
+	// workerLastSeen records the last namespaced request time for each valid
+	// worker. It is deliberately not persisted; restored affinities are stamped
+	// at load time instead. Accessed only under c.mu.
+	workerLastSeen map[string]time.Time
+	// workerMember records the latest resolved member for concurrency-1 workers.
+	// It is display-only and is not persisted or used for selection. Accessed
+	// only under c.mu.
+	workerMember map[string]string
 	// workerCursor names the next member in the current window for a new
 	// assignment. It is persisted by member nick so order changes can
 	// reconcile it safely.
@@ -1835,6 +1849,8 @@ func NewController(reg *backend.Registry, poolName string, start int, store *quo
 		exhausted:          make(map[string]time.Time),
 		credentialPark:     make(map[string]credentialParkEntry),
 		workerAffinity:     make(map[string]string),
+		workerLastSeen:     make(map[string]time.Time),
+		workerMember:       make(map[string]string),
 		lastProbeAttempt:   make(map[string]time.Time),
 		probeInFlight:      make(map[string]int),
 		probeHTTPClient:    http.DefaultClient,
@@ -1909,7 +1925,13 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	c.disabled = disabled
 	c.declaredPriority = reg.PoolPriority(c.name())
 	c.order = effectiveOrder(c.declaredPriority, nicks)
+	previousConcurrency := c.workerConcurrency
 	c.workerConcurrency = reg.PoolConcurrency(c.name())
+	if previousConcurrency != c.workerConcurrency {
+		// Concurrency-1 attribution is presentation-only and has no meaningful
+		// continuity across a window-mode change.
+		clear(c.workerMember)
+	}
 
 	// Prune runtime observation for members that left the pool.
 	for nick := range c.exhausted {
@@ -1930,6 +1952,11 @@ func (c *Controller) reconcileLocked(reg *backend.Registry) {
 	for nick := range c.topStatusLogged {
 		if !present[nick] {
 			delete(c.topStatusLogged, nick)
+		}
+	}
+	for worker, nick := range c.workerMember {
+		if !present[nick] {
+			delete(c.workerMember, worker)
 		}
 	}
 	c.reconcileWorkerAffinityLocked()
@@ -2119,8 +2146,8 @@ func (c *Controller) nextWorkerReassignmentLocked() (nick, nextCursor string, ok
 
 // reconcileWorkerAffinityLocked clears all assignments at concurrency 1.
 // Above 1, it leaves stale member references for ResolveWorker to reassign on
-// that worker's next request, and repairs the round-robin cursor. A worker that
-// never returns can therefore leave a stale runtime entry in the state file.
+// that worker's next request, and repairs the round-robin cursor. Idle worker
+// entries are pruned lazily by pruneWorkerObservationsLocked.
 // Caller holds c.mu.
 func (c *Controller) reconcileWorkerAffinityLocked() bool {
 	changed := false
@@ -2148,6 +2175,40 @@ func (c *Controller) reconcileWorkerAffinityLocked() bool {
 		c.notifyMutate()
 	}
 	return changed
+}
+
+// pruneWorkerObservationsLocked drops worker observations older than the fixed
+// idle TTL. At concurrency above 1, deleting an affinity changes persisted
+// routing state; the caller decides whether that deletion should notify the
+// persister. At concurrency 1, only display attribution is removed. Caller
+// holds c.mu.
+func (c *Controller) pruneWorkerObservationsLocked(now time.Time, notify bool) bool {
+	affinityChanged := false
+	for worker, seen := range c.workerLastSeen {
+		if now.Sub(seen) <= workerIdleTTL {
+			continue
+		}
+		delete(c.workerLastSeen, worker)
+		delete(c.workerMember, worker)
+		if c.workerConcurrency > 1 {
+			if _, ok := c.workerAffinity[worker]; ok {
+				delete(c.workerAffinity, worker)
+				affinityChanged = true
+			}
+		}
+	}
+	if notify && affinityChanged {
+		c.notifyMutate()
+	}
+	return affinityChanged
+}
+
+// markWorkerSeenLocked records a valid namespaced request. Caller holds c.mu.
+func (c *Controller) markWorkerSeenLocked(worker string, seen time.Time) {
+	if c.workerLastSeen == nil {
+		c.workerLastSeen = make(map[string]time.Time)
+	}
+	c.workerLastSeen[worker] = seen
 }
 
 // indexOf returns the index of nick in c.members, or -1 if absent. Pools are
@@ -2255,24 +2316,41 @@ func (c *Controller) ResolveAuto() (backend.Backend, time.Duration, bool) {
 	return backend.Backend{}, 0, true
 }
 
-// ResolveWorker routes worker through global sticky behavior when concurrency
-// is 1. Above 1, workers keep affinity within the first N available members in
-// effective order, rebalancing only when their member has at least two more
-// assignments than the least-used window member. When no member is available,
-// it reports the same pool-dry wait without assigning an unavailable nick.
+// ResolveWorker routes workers through global sticky behavior when concurrency
+// is 1 while recording a display-only member observation. Above 1, workers
+// keep affinity within the first N available members in effective order,
+// rebalancing only when their member has at least two more assignments than
+// the least-used window member. When no member is available, it reports the
+// same pool-dry wait without assigning an unavailable nick.
 func (c *Controller) ResolveWorker(worker string) (backend.Backend, time.Duration, bool) {
 	if !backend.IsValidWorkerNickname(worker) {
 		return backend.Backend{}, 0, true
 	}
 	c.mu.Lock()
 	if c.workerConcurrency <= 1 {
+		now := c.now()
+		c.pruneWorkerObservationsLocked(now, false)
+		c.markWorkerSeenLocked(worker, now)
 		c.mu.Unlock()
-		return c.ResolveAuto()
+		b, retryAfter, exhausted := c.ResolveAuto()
+		if !exhausted && b.Nick != "" {
+			c.mu.Lock()
+			if c.workerConcurrency <= 1 {
+				if _, ok := c.backendByNickLocked(b.Nick); ok {
+					c.workerMember[worker] = b.Nick
+				}
+			}
+			c.mu.Unlock()
+		}
+		return b, retryAfter, exhausted
 	}
 	defer c.mu.Unlock()
 
 	c.clearExpiredLocked()
-	mutated := c.normalizeWorkerCursorLocked()
+	now := c.now()
+	mutated := c.pruneWorkerObservationsLocked(now, false)
+	c.markWorkerSeenLocked(worker, now)
+	mutated = c.normalizeWorkerCursorLocked() || mutated
 	window := c.workerWindowLocked()
 	inWindow := make(map[string]bool, len(window))
 	for _, nick := range window {
@@ -2559,6 +2637,7 @@ func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller, pollerMap
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.clearExpiredLocked()
+	c.pruneWorkerObservationsLocked(c.now(), true)
 
 	// Build from the effective member set (all members − removed), matching
 	// EffectiveConfig and the selection path, so removed members never surface
@@ -2569,6 +2648,10 @@ func (c *Controller) poolStatus(store *quota.Store, pl *poller.Poller, pollerMap
 	workersByNick := make(map[string][]string)
 	if c.workerConcurrency > 1 {
 		for worker, nick := range c.workerAffinity {
+			workersByNick[nick] = append(workersByNick[nick], worker)
+		}
+	} else {
+		for worker, nick := range c.workerMember {
 			workersByNick[nick] = append(workersByNick[nick], worker)
 		}
 	}
@@ -2720,15 +2803,19 @@ func (c *Controller) loadWorkerAffinity(affinity map[string]string, cursor strin
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.workerAffinity = make(map[string]string, len(affinity))
+	c.workerLastSeen = make(map[string]time.Time, len(affinity))
 	if c.workerConcurrency <= 1 {
 		c.workerCursor = ""
+		clear(c.workerMember)
 		return
 	}
+	loadedAt := c.now()
 	for worker, nick := range affinity {
 		if !backend.IsValidWorkerNickname(worker) || nick == "" {
 			continue
 		}
 		c.workerAffinity[worker] = nick
+		c.workerLastSeen[worker] = loadedAt
 	}
 	c.workerCursor = cursor
 	c.normalizeWorkerCursorLocked()
@@ -2738,6 +2825,7 @@ func (c *Controller) loadWorkerAffinity(affinity map[string]string, cursor strin
 func (c *Controller) persistState() PoolPersistState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.pruneWorkerObservationsLocked(c.now(), false)
 	ex := make(map[string]time.Time, len(c.exhausted))
 	for k, v := range c.exhausted {
 		ex[k] = v

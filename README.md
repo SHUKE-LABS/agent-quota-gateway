@@ -85,7 +85,10 @@ namespace. No worker field is added to `backends.json`.
 
 Each pool's `concurrency` setting controls worker routing (default `1`). At
 `1`, a namespaced request uses the same global sticky, failover, and
-preempt behavior as an ordinary request, and no worker assignment is stored.
+preempt behavior as an ordinary request, while the gateway records the last
+member it resolved to for the live pool view. A pool-dry request records that
+the worker is alive but leaves its previous display attribution unchanged; a
+worker that has only received pool-dry responses is not listed.
 At values above `1`, the first N available members in effective order form the
 worker window: declared `PRIORITY` order when present, otherwise sorted member
 nick order. New workers are assigned to a least-used member, with ties broken
@@ -103,15 +106,23 @@ unavailable in every pool that shares the nick; each mapped worker is
 reassigned within its pool window on its next request.
 
 The dashboard shows each pool's concurrency in its header and lets you edit
-it when the pool has at least two members. When concurrency is above `1`, the
-members table shows worker counts and marks the current window; workers still
-recorded on a member outside that window are shown as pending reassignment.
+it when the pool has at least two members. At concurrency `1`, the members
+table shows the live workers column when any worker has a resolved member;
+workers on a member whose status is not `serving` are shown as pending until
+their next request. When concurrency is above `1`, the members table shows
+worker counts and marks the current window; workers still recorded on a member
+outside that window are shown as pending reassignment.
 
 Worker assignments and the next first-use cursor are runtime routing
-observations in the configured state file. At concurrency above `1`, a stale
-assignment is checked against the current window and reassigned on that
-worker's next request. At concurrency `1`, any saved worker assignments and
-cursor are discarded on load and reconcile. Without
+observations in the configured state file; the concurrency-`1` display
+attribution is in-memory only. A worker observation expires after
+one hour without a namespaced request in both concurrency modes; above `1`,
+the expired affinity is removed from balancing and state, while at `1` the
+display attribution disappears. Last-seen times are not persisted. At
+concurrency above `1`, affinities loaded from state receive a fresh one-hour
+window, a stale assignment is checked against the current window and
+reassigned on that worker's next request. At concurrency `1`, any saved worker
+assignments and cursor are discarded on load and reconcile. Without
 `/_aqg/w/<worker-nickname>`, requests keep the existing global-sticky
 behavior. The quota poller still tracks the global sticky member; a worker
 assigned to another poller-tracked member may not get a
@@ -981,7 +992,7 @@ restarting is the wrong tool.
 | `POST /_gateway/pool/{name}/rename` | Rename a pool in place; body `{"name": "<new>"}` (required, normalized server-side). Carries the pool's members, disabled flags, and declared priority over to the new key. Sticky pointer, exhausted marks, and local-snapshot observations follow member nicks; worker affinities and their first-use cursor follow the controller and persist under the renamed pool key. Returns `200` `{"pool": "<new>"}`. Empty / identical-after-normalize new name → `400`; unknown old pool → `404`; new name collides with a different existing pool → `409`. Persisted: the next config-roundtrip restart restores the rename under the new key. **Caveat for env-only mode** (`AQG_CONFIG` unset, no `aqg.json`): the config writer is a no-op, so the rename is runtime-only and reverts to the env-declared name on restart — same constraint `AddPool`/`AddMember` already carry. |
 | `POST /_gateway/pool/{name}/priority` | Set the declared member order; body is a JSON array of nicks, highest ranked first. Partial lists append unlisted members in sorted order. Posting `[]` clears the declaration and restores sorted nick order. |
 | `POST /_gateway/pool/{name}/concurrency` | Set worker concurrency at runtime; body `{"concurrency": N}` with integer `N >= 1`. Values above the member count are accepted, as in config. Unknown pool → `404`; invalid value → `400`. A changed window reassigns affected workers on their next namespaced request and is written to `aqg.json` when config-file persistence is enabled. |
-| `GET /_gateway/pool` | Live member status. Each member includes `in_window` (whether it is in the current worker window; always `false` at concurrency `1`) and sorted `workers` (recorded worker affinities targeting it, omitted when empty). Affinities remain listed when outside the window until that worker makes its next request. |
+| `GET /_gateway/pool` | Live member status. Each member includes `in_window` (whether it is in the current worker window; always `false` at concurrency `1`) and sorted `workers` (live worker observations targeting it, omitted when empty). Observations expire after one hour idle in both modes; at concurrency `1` the column lists resolved workers, while above `1` affinities outside the window remain listed until the worker's next request. Last-seen times are not persisted; loaded affinities receive a fresh hour. |
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
 | `POST /_gateway/pool/{name}/member/{nick}/reprobe` | Re-query upstream quota for one member now, merge the fresh snapshot, and reconcile its park; see [Re-probing a member](#re-probing-a-member). Non-POST → `405`. |
@@ -1299,13 +1310,15 @@ contains no auth and no build step — it inherits the gateway's trust boundary.
 write controls to any client that can reach the port; the network
 ACL/firewall restricting the port is the only gate.
 
-At concurrency 1, the available global sticky member reports `serving` without
-a worker assignment. At concurrency above 1, additional available members
-report `serving` only when they have an assigned worker inside the current
-window. The dashboard displays that API status directly in the Status badge;
-it keeps worker counts and shows out-of-window assignments as pending. A
-member inside the window without an assignment stays `idle`, and `disabled` or
-`exhausted` takes precedence. `serving` describes a routing target, not an
+At concurrency 1, the available global sticky member reports `serving`; the
+dashboard shows the Workers column only when the live pool response contains
+a worker, and a worker on a non-`serving` member is pending with the title
+"moves on next request". At concurrency above 1, additional available
+members report `serving` only when they have an assigned worker inside the
+current window. The dashboard displays that API status directly in the Status
+badge; it keeps worker counts and shows out-of-window assignments as pending.
+A member inside the window without an assignment stays `idle`, and `disabled`
+or `exhausted` takes precedence. `serving` describes a routing target, not an
 in-flight request.
 
 A rolling-window utilization cell (5h or long) renders `-` once its reset has

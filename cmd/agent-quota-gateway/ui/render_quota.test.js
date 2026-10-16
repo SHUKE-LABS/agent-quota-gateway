@@ -72,7 +72,8 @@ assert.equal(context.formatReset('2026-01-01T01:30:00Z', '5h'), '1h 30m');
 
 assert.equal(context.showConcurrencyControl(1), false, 'single-member pool has no concurrency control');
 assert.equal(context.showConcurrencyControl(2), true, 'multi-member pool has concurrency control');
-assert.equal(context.showsWorkerColumn(1), false, 'concurrency 1 hides worker column');
+assert.equal(context.showsWorkerColumn(1, [{ workers: ['worker-a'] }]), true, 'concurrency 1 with workers shows worker column');
+assert.equal(context.showsWorkerColumn(1, [{ workers: [] }]), false, 'concurrency 1 without workers hides worker column');
 assert.equal(context.showsWorkerColumn(2), true, 'concurrency above 1 shows worker column');
 
 for (const raw of ['0', '4', 'abc']) {
@@ -97,10 +98,17 @@ context.applyWorkerPresentation(pendingCell, { in_window: false, workers: ['work
 assert.equal(pendingCell.textContent, '1');
 assert.equal(pendingCell.title, 'worker-a (moves on next request)');
 assert.equal(pendingCell.classList.contains('pending'), true, 'pending worker count is dimmed');
-const single = context.workerPresentation(1, { in_window: true, workers: ['worker-a'] });
-assert.equal(single.enabled, false);
-assert.equal(single.serving, false);
-assert.equal(single.count, 0);
+const single = context.workerPresentation(1, { status: 'serving', in_window: false, workers: ['worker-a'] });
+assert.equal(single.enabled, true);
+assert.equal(single.pending, false);
+assert.equal(single.count, 1);
+const singlePending = context.workerPresentation(1, { status: 'idle', in_window: false, workers: ['worker-a'] });
+assert.equal(singlePending.pending, true, 'concurrency 1 non-serving worker is pending');
+assert.equal(singlePending.title, 'worker-a (moves on next request)');
+const singleEmpty = context.workerPresentation(1, { status: 'serving', workers: [] });
+assert.equal(singleEmpty.enabled, false);
+assert.equal(single.serving, true);
+assert.equal(singleEmpty.count, 0);
 
 const poolMembers = [
   { nick: 'sticky', status: 'serving', in_window: true, workers: [] },

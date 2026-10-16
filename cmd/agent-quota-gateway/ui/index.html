@@ -847,7 +847,7 @@
 
   function renderMembers(view) {
     var table = document.createElement('table');
-    var showWorkers = showsWorkerColumn(view.concurrency);
+    var showWorkers = showsWorkerColumn(view.concurrency, view.members);
     table.className = showWorkers ? 'members with-workers' : 'members';
 
     // Provider-agnostic column headers (issue #154): the long-window
@@ -1085,14 +1085,20 @@
     return memberCount >= 2;
   }
 
-  function showsWorkerColumn(concurrency) {
-    return Number(concurrency) > 1;
+  function showsWorkerColumn(concurrency, members) {
+    if (Number(concurrency) > 1) return true;
+    if (Number(concurrency) !== 1 || !Array.isArray(members)) return false;
+    return members.some(function (member) {
+      return member && Array.isArray(member.workers) && member.workers.length > 0;
+    });
   }
 
   function workerPresentation(concurrency, member) {
-    var enabled = showsWorkerColumn(concurrency);
-    var workers = enabled && Array.isArray(member.workers) ? member.workers.slice().sort() : [];
-    var serving = enabled && member.in_window === true;
+    var workers = Array.isArray(member.workers) ? member.workers.slice().sort() : [];
+    var enabled = Number(concurrency) > 1 || workers.length > 0;
+    var serving = Number(concurrency) > 1
+      ? member.in_window === true
+      : Number(concurrency) === 1 && member.status === 'serving';
     var pending = workers.length > 0 && !serving;
     var names = workers.join(', ');
     return {
@@ -1458,18 +1464,50 @@
   // stack a second renderAll on top, double-rebuilding the tree and
   // clobbering whatever restoreInputState had just put back. The flag is
   // set when scheduling, cleared in the same chain after renderAll and
-  // restoreInputState have both run, so a divergence detected while a
-  // reconcile is in flight is dropped — the next tick's poll will catch
-  // it. That's the right tradeoff: an in-flight reconcile already
-  // re-fetched config, so any further server-side change in the same
-  // ~3s window will resurface on the next poll.
+  // restoreInputState have both run. The latest live status is retained
+  // for the in-flight render so a concurrency-1 worker column is not lost.
   var reconcileInFlight = false;
-  function scheduleReconcile() {
+  var pendingLiveStatuses = null;
+
+  function mergeLiveStatus(views, statuses) {
+    if (!Array.isArray(statuses)) return views;
+    var byPool = {};
+    statuses.forEach(function (s) { byPool[s.pool] = s; });
+    return (views || []).map(function (view) {
+      var status = byPool[view.pool];
+      if (!status) return view;
+      var byNick = {};
+      (status.members || []).forEach(function (member) {
+        if (member && member.nick) byNick[member.nick] = member;
+      });
+      var members = (view.members || []).map(function (member) {
+        var live = byNick[member.nick];
+        if (!live) return member;
+        var merged = {};
+        Object.keys(member).forEach(function (key) { merged[key] = member[key]; });
+        if (Array.isArray(live.workers)) merged.workers = live.workers.slice();
+        if (typeof live.status === 'string') merged.status = live.status;
+        if (Object.prototype.hasOwnProperty.call(live, 'disabled')) {
+          merged.disabled = !!live.disabled;
+        }
+        return merged;
+      });
+      var mergedView = {};
+      Object.keys(view).forEach(function (key) { mergedView[key] = view[key]; });
+      mergedView.members = members;
+      return mergedView;
+    });
+  }
+
+  function scheduleReconcile(statuses) {
+    if (Array.isArray(statuses)) pendingLiveStatuses = statuses;
     if (reconcileInFlight) return;
     reconcileInFlight = true;
     var captured = captureInputState();
     loadConfig().then(function (views) {
-      renderAll(views);
+      var live = pendingLiveStatuses;
+      pendingLiveStatuses = null;
+      renderAll(mergeLiveStatus(views, live));
       restoreInputState(captured);
     }).then(function () {
       reconcileInFlight = false;
@@ -1578,8 +1616,19 @@
       var section = root.querySelector('section.pool[data-pool="' + cssEscape(s.pool) + '"]');
       return section && section.getAttribute('data-concurrency') !== String(s.concurrency);
     });
-    if (concurrencyChanged || !rosterEqual(liveRoster(statuses), renderedRoster())) {
-      scheduleReconcile();
+    var workerColumnChanged = (statuses || []).some(function (s) {
+      var section = root.querySelector('section.pool[data-pool="' + cssEscape(s.pool) + '"]');
+      if (!section) return false;
+      var wantsWorkers = Number(s.concurrency) > 1 ||
+        (Number(s.concurrency) === 1 && (s.members || []).some(function (member) {
+          return member && Array.isArray(member.workers) && member.workers.length > 0;
+        }));
+      var table = section.querySelector('table.members');
+      var hasWorkers = !!(table && table.classList.contains('with-workers'));
+      return wantsWorkers !== hasWorkers;
+    });
+    if (concurrencyChanged || workerColumnChanged || !rosterEqual(liveRoster(statuses), renderedRoster())) {
+      scheduleReconcile(statuses);
     }
   }
 
