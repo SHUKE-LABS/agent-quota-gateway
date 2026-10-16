@@ -1,114 +1,39 @@
 # agent-quota-gateway
 
+A credential-holding gateway for fleets of coding-agent workers: each worker addresses a pool by name, and the gateway spreads workers across subscriptions and rotates accounts as quotas run out.
+
 Loopback-only reverse proxy for opaque HTTP/SSE APIs, sized for local
 Anthropic Messages and OpenAI-compatible Responses workflows.
 
-## What it is
+## Who it's for
 
-A single-binary Go server that listens on `127.0.0.1` and forwards any
-method and path to the selected upstream (Anthropic clients use
-`/v1/messages`; OpenAI-compatible clients use `/responses` or
-`/v1/responses`), preserving streaming and headers. Request and response
-payloads are opaque to the gateway: it performs no body inspection,
-translation, or provider detection. The one exception is the event type
-(and a failure's error code) at the head of a ChatGPT-Codex `/responses`
-stream, peeked before any header is sent to absorb an in-stream capacity
-failure (issue #345). For multiple machines that share one set of pool
-credentials, an opt-in
-[shared mode](#shared-mode-over-tailscale) binds a non-loopback overlay/IP
-address (Tailscale, an OpenVPN overlay, or any address a fleet's own
-network trusts) so they ride one authoritative instance.
+Operators who run many concurrent, autonomously driven coding-agent workers—Claude Code, Codex, and similar—on one or more machines, across several subscriptions or API keys, without giving any worker a real token.
+Interactive TUI sessions and non-interactive workers are both in scope; a single person routing a few interactive agents is supported, but it is not the main use case.
 
-The gateway owns one or more named **pools**. A pool is a set of
-*interchangeable* backends — one client-facing application contract and the
-same quota semantics — each holding a real upstream credential. A client
-never sends a real token: it
-sends a **pool name** (via `ANTHROPIC_AUTH_TOKEN`, which Claude Code puts
-on the `Authorization` header), and the gateway picks a backend from that
-pool and swaps in its credential before forwarding. The gateway
-auto-rotates within the pool, switching members on a real `429` so one
-local user can ride several authorized accounts from a single endpoint
-without any client ever seeing a credential.
+## Why use it
 
-Everything is a pool. There is no non-pool mode: even a single account is
-declared inside a pool. The client-facing pool selector is the application
-boundary: Anthropic Messages clients and OpenAI-compatible Responses clients
-must use different pool names, and operators must not place members from
-different application/protocol classes in one pool. AQG does not infer that
-contract from nick, token prefix, hostname, or request body.
+- **Agent fleets first:** Per-worker affinity and spreading via `/_aqg/w/<worker-nickname>` ([per-worker affinity](#per-worker-affinity)).
+- **Credentials stay at the gateway:** Clients send a pool name; the gateway swaps in the credential and never logs credentials or bodies ([security model](#security-model)).
+- **Sticky quota-aware routing:** A worker stays on one account until a real `429` or blocking quota window, then fails over in declared or sorted order; a revoked `401`/`403` credential is parked ([pools and selectors](#pools-and-selectors)).
+- **Wait and resume when a pool is empty:** An exhausted pool returns `503` with `Retry-After` up to the soonest reset, so Claude Code can wait and resume instead of ending the turn ([429/529 handling](#what-the-client-sees-on-an-upstream-429-native-anthropic-529-or-codex-capacity-overload)).
+- **Opaque provider passthrough:** Anthropic Messages and OpenAI-compatible Responses pass through without translation, so new endpoints and beta headers work without gateway changes ([scope](#scope)).
+- **Quota and health at a glance:** `/_gateway/quota`, `/_gateway/pool`, `/_gateway/ui`, and Z.ai / MiniMaxi / Volcengine Ark pollers expose the current view ([reading a pool's quota](#reading-a-pools-quota), [inspecting pool health](#inspecting-pool-health), [proprietary quota polling](#proprietary-quota-polling)).
+- **Small deployment footprint:** One stdlib-only Go binary, a systemd deploy script, and optional shared mode over Tailscale/OpenVPN ([deploying as a systemd service](#deploying-as-a-systemd-service), [shared mode](#shared-mode-over-tailscale)).
 
-## Scope
+## Not for
 
-- Opaque HTTP/SSE passthrough for Anthropic Messages and OpenAI-compatible
-  Responses. AQG does not translate or validate provider-specific schemas;
-  any additional protocol support is an upstream/client contract.
-- Full method + path passthrough. Any method on any path is forwarded to
-  the upstream — the upstream is the authority on what it serves, so new
-  or compatible-API endpoints (e.g. `GET /v1/models`, batch polling, the
-  Files API) pass through instead of hitting a gateway 404 or 405. What
-  gates a request is the selector/auth boundary, not its method: an
-  unknown or missing selector still fails closed with `403` for every
-  method.
-- Streaming (SSE) is forwarded without buffering — the first event
-  reaches the client as soon as the upstream writes it.
-- Error responses from upstream propagate to the client with the original
-  status code, except those response paths handle specially: a `429` (quota),
-  and a `401`/`403` (the backend's credential was rejected — revoked, expired,
-  or the account pulled), which fail the pool over to a healthy member rather
-  than stick to a dead account. If every enabled member is parked only for
-  `401`/`403`, later client requests retry the first parked member in effective
-  order; concurrent requests may all reach that upstream. A recovered
-  credential is released by its next non-`401`/`403` response. A native
-  Anthropic `529` overload becomes a same-member `503` with `Retry-After: 60`;
-  a ChatGPT-Codex stream that fails with `server_is_overloaded` before any
-  output becomes a same-member `503` with `Retry-After: 30`.
-  See [Pools and selectors](#pools-and-selectors).
-- One log line per request (method, path, status, duration, request ID).
-  Request bodies, response bodies, and credential headers are never
-  logged.
-- Pool-based routing. The inbound `ANTHROPIC_AUTH_TOKEN` is a local pool
-  name, never forwarded upstream. Unknown or missing selectors fail
-  closed with `403` — there is no silent fallback.
-- Quota snapshots are captured from upstream rate-limit headers and
-  exposed at `GET /_gateway/quota`, keyed per account. Header-derived
-  freshness usually follows real client traffic. After a stored weekly
-  reset, a `chatgpt.com` Codex member gets one fixed background hello to
-  start its next session; it does not inspect client bodies or affect
-  routing. Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark use the background
-  poller for their proprietary quota endpoints (see
-  [Proprietary quota polling](#proprietary-quota-polling)).
+- Protocol translation between providers.
+- Usage metering or billing history.
+- A desktop multi-agent switcher for one person.
 
-Out of scope:
+## License
 
-- Protocol detection, request/response body inspection, and protocol
-  translation.
-- Quota-watermark or concurrency-aware load spreading. A pool fails off a
-  member on a real `429`, or once the quota store reports its window
-  **blocking** — a `rejected` status for an Anthropic backend, or (for a
-  poller-tracked backend, which reports no status) utilization `1.0`; see
-  [Proprietary quota polling](#proprietary-quota-polling). It never pre-empts
-  a member the upstream still serves (an Anthropic window at `1.0` with
-  `allowed_warning` keeps serving, to maximize prompt-cache retention) and
-  never spreads concurrent requests across accounts.
-- **Cross-pool fallback / manual pool switching** — e.g. "all
-  subscription pools are exhausted, borrow the `api` pool for 30 minutes".
-  Pools are independent here; choosing between them is the client's job
-  (it picks the pool name). A scheduler that moves traffic between pools
-  is deliberately not built yet.
-- TLS termination (front it with a reverse proxy or `stunnel` if needed).
-- Request/response body modification, caching, retries.
-- Quota history or per-request metering — only the latest snapshot per
-  backend is kept. Snapshots are merged field-by-field, so a window absent
-  from one response/poll no longer clears a reset already learned.
-- Authentication on `/_gateway/*` — loopback is the trust boundary (in
-  [shared mode](#shared-mode-over-tailscale) the deployment's own network
-  ACL/firewall is, and the `/_gateway/quota` view becomes readable by
-  every client that can reach the bound address).
-- Docker image or other packaging — `go build` is the deliverable.
+Source-available under [BSL 1.1](#license).
 
 ## Quickstart
 
 ```bash
+git clone https://github.com/SHUKE-LABS/agent-quota-gateway && cd agent-quota-gateway
 go build -o agent-quota-gateway ./cmd/agent-quota-gateway
 
 # Declare a pool "auto" with two subscription accounts. The upstream
@@ -264,6 +189,109 @@ Metering quota on subscription (`sk-ant-oat…`) tokens is the primary use —
 those carry the depletable 5h/7d limits worth watching. API keys and
 non-native vendors generally do not report quota headers (see
 [Quota snapshots](#quota-snapshots)).
+
+## What it is
+
+A single-binary Go server that listens on `127.0.0.1` and forwards any
+method and path to the selected upstream (Anthropic clients use
+`/v1/messages`; OpenAI-compatible clients use `/responses` or
+`/v1/responses`), preserving streaming and headers. Request and response
+payloads are opaque to the gateway: it performs no body inspection,
+translation, or provider detection. The one exception is the event type
+(and a failure's error code) at the head of a ChatGPT-Codex `/responses`
+stream, peeked before any header is sent to absorb an in-stream capacity
+failure (issue #345). For multiple machines that share one set of pool
+credentials, an opt-in
+[shared mode](#shared-mode-over-tailscale) binds a non-loopback overlay/IP
+address (Tailscale, an OpenVPN overlay, or any address a fleet's own
+network trusts) so they ride one authoritative instance.
+
+The gateway owns one or more named **pools**. A pool is a set of
+*interchangeable* backends — one client-facing application contract and the
+same quota semantics — each holding a real upstream credential. A client
+never sends a real token: it
+sends a **pool name** (via `ANTHROPIC_AUTH_TOKEN`, which Claude Code puts
+on the `Authorization` header), and the gateway picks a backend from that
+pool and swaps in its credential before forwarding. The gateway
+auto-rotates within the pool, switching members on a real `429` so one
+local user can ride several authorized accounts from a single endpoint
+without any client ever seeing a credential.
+
+Everything is a pool. There is no non-pool mode: even a single account is
+declared inside a pool. The client-facing pool selector is the application
+boundary: Anthropic Messages clients and OpenAI-compatible Responses clients
+must use different pool names, and operators must not place members from
+different application/protocol classes in one pool. AQG does not infer that
+contract from nick, token prefix, hostname, or request body.
+
+## Scope
+
+- Opaque HTTP/SSE passthrough for Anthropic Messages and OpenAI-compatible
+  Responses. AQG does not translate or validate provider-specific schemas;
+  any additional protocol support is an upstream/client contract.
+- Full method + path passthrough. Any method on any path is forwarded to
+  the upstream — the upstream is the authority on what it serves, so new
+  or compatible-API endpoints (e.g. `GET /v1/models`, batch polling, the
+  Files API) pass through instead of hitting a gateway 404 or 405. What
+  gates a request is the selector/auth boundary, not its method: an
+  unknown or missing selector still fails closed with `403` for every
+  method.
+- Streaming (SSE) is forwarded without buffering — the first event
+  reaches the client as soon as the upstream writes it.
+- Error responses from upstream propagate to the client with the original
+  status code, except those response paths handle specially: a `429` (quota),
+  and a `401`/`403` (the backend's credential was rejected — revoked, expired,
+  or the account pulled), which fail the pool over to a healthy member rather
+  than stick to a dead account. If every enabled member is parked only for
+  `401`/`403`, later client requests retry the first parked member in effective
+  order; concurrent requests may all reach that upstream. A recovered
+  credential is released by its next non-`401`/`403` response. A native
+  Anthropic `529` overload becomes a same-member `503` with `Retry-After: 60`;
+  a ChatGPT-Codex stream that fails with `server_is_overloaded` before any
+  output becomes a same-member `503` with `Retry-After: 30`.
+  See [Pools and selectors](#pools-and-selectors).
+- One log line per request (method, path, status, duration, request ID).
+  Request bodies, response bodies, and credential headers are never
+  logged.
+- Pool-based routing. The inbound `ANTHROPIC_AUTH_TOKEN` is a local pool
+  name, never forwarded upstream. Unknown or missing selectors fail
+  closed with `403` — there is no silent fallback.
+- Quota snapshots are captured from upstream rate-limit headers and
+  exposed at `GET /_gateway/quota`, keyed per account. Header-derived
+  freshness usually follows real client traffic. After a stored weekly
+  reset, a `chatgpt.com` Codex member gets one fixed background hello to
+  start its next session; it does not inspect client bodies or affect
+  routing. Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark use the background
+  poller for their proprietary quota endpoints (see
+  [Proprietary quota polling](#proprietary-quota-polling)).
+
+Out of scope:
+
+- Protocol detection, request/response body inspection, and protocol
+  translation.
+- Quota-watermark or concurrency-aware load spreading. A pool fails off a
+  member on a real `429`, or once the quota store reports its window
+  **blocking** — a `rejected` status for an Anthropic backend, or (for a
+  poller-tracked backend, which reports no status) utilization `1.0`; see
+  [Proprietary quota polling](#proprietary-quota-polling). It never pre-empts
+  a member the upstream still serves (an Anthropic window at `1.0` with
+  `allowed_warning` keeps serving, to maximize prompt-cache retention) and
+  never spreads concurrent requests across accounts.
+- **Cross-pool fallback / manual pool switching** — e.g. "all
+  subscription pools are exhausted, borrow the `api` pool for 30 minutes".
+  Pools are independent here; choosing between them is the client's job
+  (it picks the pool name). A scheduler that moves traffic between pools
+  is deliberately not built yet.
+- TLS termination (front it with a reverse proxy or `stunnel` if needed).
+- Request/response body modification, caching, retries.
+- Quota history or per-request metering — only the latest snapshot per
+  backend is kept. Snapshots are merged field-by-field, so a window absent
+  from one response/poll no longer clears a reset already learned.
+- Authentication on `/_gateway/*` — loopback is the trust boundary (in
+  [shared mode](#shared-mode-over-tailscale) the deployment's own network
+  ACL/firewall is, and the `/_gateway/quota` view becomes readable by
+  every client that can reach the bound address).
+- Docker image or other packaging — `go build` is the deliverable.
 
 ## Pools by kind
 
@@ -1160,6 +1188,8 @@ All error bodies are credential-free.
 > new upstream of their choosing. This is a sharper exposure than the read-only
 > quota view. The network ACL/firewall restricting this port is the only gate;
 > the gateway adds no auth of its own.
+
+#### Clearing recorded parks
 
 **Clearing recorded parks.** `POST /_gateway/clear` drops recorded parks so
 an over-parked member becomes selectable again without waiting out the park or
