@@ -2,9 +2,6 @@
 
 A credential-holding gateway for fleets of coding-agent workers: each worker addresses a pool by name, and the gateway spreads workers across subscriptions and rotates accounts as quotas run out.
 
-Loopback-only reverse proxy for opaque HTTP/SSE APIs, sized for local
-Anthropic Messages and OpenAI-compatible Responses workflows.
-
 ## Who it's for
 
 Operators who run many concurrent, autonomously driven coding-agent workers—Claude Code, Codex, and similar—on one or more machines, across several subscriptions or API keys, without giving any worker a real token.
@@ -26,9 +23,7 @@ Interactive TUI sessions and non-interactive workers are both in scope; a single
 - Usage metering or billing history.
 - A desktop multi-agent switcher for one person.
 
-## License
-
-Source-available under [BSL 1.1](#license).
+**License:** Source-available under [BSL 1.1](#license).
 
 ## Quickstart
 
@@ -189,6 +184,9 @@ Metering quota on subscription (`sk-ant-oat…`) tokens is the primary use —
 those carry the depletable 5h/7d limits worth watching. API keys and
 non-native vendors generally do not report quota headers (see
 [Quota snapshots](#quota-snapshots)).
+
+Loopback-only reverse proxy for opaque HTTP/SSE APIs, sized for local
+Anthropic Messages and OpenAI-compatible Responses workflows.
 
 ## What it is
 
