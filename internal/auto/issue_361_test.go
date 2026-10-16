@@ -126,6 +126,63 @@ func TestIssue361_idleExpiryAppliesToBothConcurrencyModes(t *testing.T) {
 	}
 }
 
+func TestIssue361_returningWorkerAfterExpiryGetsFreshAssignment(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	p := NewPools(workerRegistryWithConcurrency(t, 2, "a", "b"), nil, clock.now, io.Discard)
+
+	for _, tc := range []struct {
+		worker string
+		want   string
+	}{
+		{worker: "worker-returning", want: "a"},
+		{worker: "worker-anchor", want: "b"},
+		{worker: "worker-live", want: "a"},
+	} {
+		if got, _, _, exhausted := p.RouteWorker("auto", tc.worker); exhausted || got.Nick != tc.want {
+			t.Fatalf("initial %s route=%q exhausted=%v, want %s/false", tc.worker, got.Nick, exhausted, tc.want)
+		}
+	}
+
+	// Keep a different worker on the returning worker's original member while
+	// the returning worker and the anchor age past the idle window.
+	clock.advance(59 * time.Minute)
+	if got, _, _, exhausted := p.RouteWorker("auto", "worker-live"); exhausted || got.Nick != "a" {
+		t.Fatalf("live worker refresh route=%q exhausted=%v, want a/false", got.Nick, exhausted)
+	}
+	clock.advance(2 * time.Minute)
+	returningAt := clock.now()
+	if got, _, _, exhausted := p.RouteWorker("auto", "worker-returning"); exhausted || got.Nick != "b" {
+		t.Fatalf("returning worker route=%q exhausted=%v, want fresh b/false", got.Nick, exhausted)
+	}
+
+	c := p.byPool["auto"]
+	c.mu.Lock()
+	seen, seenOK := c.workerLastSeen["worker-returning"]
+	affinity, affinityOK := c.workerAffinity["worker-returning"]
+	c.mu.Unlock()
+	if !seenOK || !seen.Equal(returningAt) {
+		t.Fatalf("returning worker last_seen=%v (present=%v), want %v", seen, seenOK, returningAt)
+	}
+	if !affinityOK || affinity != "b" {
+		t.Fatalf("returning worker affinity=%q (present=%v), want fresh b", affinity, affinityOK)
+	}
+
+	status, _ := p.PoolStatus("auto", quota.NewStore(), nil)
+	if got := strings.Join(issue361Workers(status, "b"), ","); got != "worker-returning" {
+		t.Fatalf("fresh attribution immediately after return=%q, want worker-returning", got)
+	}
+	clock.advance(59 * time.Minute)
+	status, _ = p.PoolStatus("auto", quota.NewStore(), nil)
+	if got := strings.Join(issue361Workers(status, "b"), ","); got != "worker-returning" {
+		t.Fatalf("fresh attribution before new TTL=%q, want worker-returning", got)
+	}
+	clock.advance(2 * time.Minute)
+	status, _ = p.PoolStatus("auto", quota.NewStore(), nil)
+	if got := issue361Workers(status, "b"); len(got) != 0 {
+		t.Fatalf("fresh attribution after new TTL=%v, want none", got)
+	}
+}
+
 func TestIssue361_expiredAffinitiesStopBalancingAndPersisting(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	c := NewController(workerPriorityRegistry(t, 2, "a,b", "a", "b"), "auto", 0, nil, clock.now, io.Discard)
