@@ -13,6 +13,8 @@ jobs:
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,3 +38,163 @@ jobs:
             git commit -m "docs: regenerate changelog [skip ci]" CHANGELOG.md
       - name: Push changelog
         run: git push origin HEAD:main
+
+  build:
+    needs: tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            goos: linux
+            goarch: amd64
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+          - target: darwin-x64
+            goos: darwin
+            goarch: amd64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: Build static binary archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          staging="$(mktemp -d)"
+          trap 'rm -rf "${staging}"' EXIT
+          CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" go build \
+            -trimpath -ldflags "-s -w -X main.version=${version}" \
+            -o "${staging}/agent-quota-gateway" ./cmd/agent-quota-gateway
+          tar -C "${staging}" -czf \
+            "agent-quota-gateway-${version}-${TARGET}.tar.gz" agent-quota-gateway
+      - name: Upload target archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: aqg-${{ matrix.target }}
+          path: agent-quota-gateway-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - name: Download target archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aqg-*
+          path: dist
+          merge-multiple: true
+      - name: Stage and preflight npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          source lib/release.sh
+          version="${RELEASE_TAG#v}"
+          release_npm_stage_packages "${version}" dist npm-packages
+
+          mkdir -p npm-tarballs
+          pack_destination="${PWD}/npm-tarballs"
+          while IFS= read -r package_dir; do
+            (
+              cd "npm-packages/${package_dir}"
+              npm pack --ignore-scripts --pack-destination "${pack_destination}" >/dev/null
+            )
+          done < <(release_npm_package_directories)
+
+          release_npm_validate_package_set "${version}" npm-packages
+          release_npm_verify_tarballs "${version}" npm-tarballs
+          release_npm_write_checksums npm-tarballs npm-SHA256SUMS "${version}"
+          (
+            cd npm-tarballs
+            sha256sum --check ../npm-SHA256SUMS
+          )
+      - name: Publish npm packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${NODE_AUTH_TOKEN:-}" || {
+            echo '::error::NPM_TOKEN release secret is required to publish npm packages'
+            exit 1
+          }
+          source lib/release.sh
+          release_npm_publish "${RELEASE_TAG#v}" npm-tarballs
+
+  smoke:
+    needs: [tag, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
+    steps:
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - name: Verify published packages and Linux x64 install
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          packages=(
+            '@shukelabs/agent-quota-gateway'
+            '@shukelabs/agent-quota-gateway-linux-x64'
+            '@shukelabs/agent-quota-gateway-linux-arm64'
+            '@shukelabs/agent-quota-gateway-darwin-arm64'
+            '@shukelabs/agent-quota-gateway-darwin-x64'
+          )
+          for package in "${packages[@]}"; do
+            test "$(npm view "${package}@${version}" version)" = "${version}"
+          done
+
+          tmp="$(mktemp -d)"
+          npm view "@shukelabs/agent-quota-gateway@${version}" os --json >"${tmp}/os.json"
+          npm view "@shukelabs/agent-quota-gateway@${version}" cpu --json >"${tmp}/cpu.json"
+          node - "${tmp}/os.json" "${tmp}/cpu.json" <<'NODE'
+          const fs = require('node:fs');
+          const [osPath, cpuPath] = process.argv.slice(2);
+          const os = JSON.parse(fs.readFileSync(osPath, 'utf8'));
+          const cpu = JSON.parse(fs.readFileSync(cpuPath, 'utf8'));
+          if (JSON.stringify(os) !== JSON.stringify(['darwin', 'linux'])) {
+            throw new Error(`unexpected npm os constraint: ${JSON.stringify(os)}`);
+          }
+          if (JSON.stringify(cpu) !== JSON.stringify(['x64', 'arm64'])) {
+            throw new Error(`unexpected npm cpu constraint: ${JSON.stringify(cpu)}`);
+          }
+          NODE
+          npm install -g --prefix "${tmp}" "@shukelabs/agent-quota-gateway@${version}"
+          test "$("${tmp}/bin/agent-quota-gateway" --version)" = "${version}"

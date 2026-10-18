@@ -48,5 +48,8 @@ jobs:
       - name: Dashboard quota rendering
         run: node cmd/agent-quota-gateway/ui/render_quota.test.js
 
+      - name: npm launcher
+        run: node packaging/npm/agent-quota-gateway.test.js
+
       - name: Release scripts
         run: bash scripts/test-release.sh

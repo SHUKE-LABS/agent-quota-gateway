@@ -54,6 +54,127 @@ assert_eq "$(release_bump_kind_for_subject "feat!: break api")" "minor" "feat! c
 assert_eq "$(release_bump_kind_for_subject "fix(proxy): repair")" "patch" "fix classifies as patch"
 assert_eq "$(release_bump_kind_for_subject "random text")" "patch" "non-conventional classifies as patch"
 
+assert_eq "$(release_npm_platform_rows)" $'linux-x64|linux-x64|linux|x64|tar.gz|agent-quota-gateway\nlinux-arm64|linux-arm64|linux|arm64|tar.gz|agent-quota-gateway\ndarwin-arm64|darwin-arm64|darwin|arm64|tar.gz|agent-quota-gateway\ndarwin-x64|darwin-x64|darwin|x64|tar.gz|agent-quota-gateway' \
+    "npm platform matrix is complete and ordered"
+
+manifest_dir="$(mktemp -d)"
+release_npm_write_root_manifest 1.2.3 >"${manifest_dir}/package.json"
+if release_npm_validate_manifest "${manifest_dir}/package.json" \
+    '@shukelabs/agent-quota-gateway' 1.2.3 root; then
+    printf 'ok   - root npm manifest validates\n'
+else
+    printf 'FAIL - root npm manifest validates\n'
+    failures=$((failures + 1))
+fi
+assert_fails "npm staging rejects missing target archive" \
+    release_npm_stage_packages 1.2.3 "${manifest_dir}" "${manifest_dir}/staged"
+
+unsupported_package_dir="$(mktemp -d)"
+unsupported_prefix="$(mktemp -d)"
+release_npm_write_root_manifest 1.2.3 >"${unsupported_package_dir}/package.json"
+node - "${unsupported_package_dir}/package.json" <<'NODE'
+const fs = require('node:fs');
+const manifestPath = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+manifest.os = ['freebsd'];
+fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+NODE
+unsupported_log="${unsupported_prefix}/npm.log"
+if npm install --offline --ignore-scripts --prefix "${unsupported_prefix}" \
+    "${unsupported_package_dir}" >"${unsupported_log}" 2>&1; then
+    printf 'FAIL - npm rejects unsupported platform metadata\n'
+    failures=$((failures + 1))
+elif grep -Eiq 'freebsd|EBADPLATFORM|not compatible' "${unsupported_log}"; then
+    printf 'ok   - npm rejects unsupported platform metadata\n'
+else
+    printf 'FAIL - npm rejects unsupported platform metadata without naming platform\n'
+    failures=$((failures + 1))
+fi
+
+publish_dir="$(mktemp -d)"
+publish_log="${publish_dir}/publish.log"
+PUBLISH_STUB_LOG="${publish_log}"
+PUBLISH_STUB_FAIL_ON=""
+
+publish_stub() {
+    local tarball="${5:-}"
+    printf '%s\n' "$(basename -- "${tarball}")" >>"${PUBLISH_STUB_LOG}"
+    [[ -n "${PUBLISH_STUB_FAIL_ON}" && "$(basename -- "${tarball}")" == "${PUBLISH_STUB_FAIL_ON}" ]] && return 1
+    return 0
+}
+
+make_publish_tarballs() {
+    local package_dir="" package_key="" tarball=""
+    while IFS= read -r package_dir; do
+        package_key="${package_dir#agent-quota-gateway-}"
+        if [[ "${package_dir}" == agent-quota-gateway ]]; then
+            tarball="$(release_npm_tarball_name 1.2.3 root)"
+        else
+            tarball="$(release_npm_tarball_name 1.2.3 "${package_key}")"
+        fi
+        mkdir -p "${publish_dir}/package"
+        printf '{}\n' >"${publish_dir}/package/package.json"
+        printf 'binary\n' >"${publish_dir}/package/LICENSE"
+        if [[ "${package_dir}" == agent-quota-gateway ]]; then
+            mkdir -p "${publish_dir}/package/bin" "${publish_dir}/package/deploy"
+            printf '#!/usr/bin/env node\n' >"${publish_dir}/package/bin/agent-quota-gateway.js"
+            printf 'unit\n' >"${publish_dir}/package/deploy/agent-quota-gateway.service"
+            printf 'env\n' >"${publish_dir}/package/deploy/aqg.env.example"
+        else
+            mkdir -p "${publish_dir}/package/bin"
+            printf 'binary\n' >"${publish_dir}/package/bin/agent-quota-gateway"
+        fi
+        tar -czf "${publish_dir}/${tarball}" -C "${publish_dir}" package
+        rm -rf "${publish_dir}/package"
+    done < <(release_npm_package_directories)
+}
+
+make_publish_tarballs
+
+checksum_path="${publish_dir}/SHA256SUMS"
+if release_npm_write_checksums "${publish_dir}" "${checksum_path}" 1.2.3 && \
+    (cd "${publish_dir}" && sha256sum --check "${checksum_path}"); then
+    printf 'ok   - npm tarball checksums validate\n'
+else
+    printf 'FAIL - npm tarball checksums validate\n'
+    failures=$((failures + 1))
+fi
+
+rm -f "${publish_dir}/$(release_npm_tarball_name 1.2.3 darwin-x64)"
+: >"${publish_log}"
+assert_fails "npm publish preflight makes no calls with a missing tarball" \
+    release_npm_publish 1.2.3 "${publish_dir}" publish_stub
+assert_eq "$(wc -c <"${publish_log}" | tr -d ' ')" "0" \
+    "npm publish preflight has zero calls"
+
+make_publish_tarballs
+PUBLISH_STUB_FAIL_ON="$(release_npm_tarball_name 1.2.3 linux-x64)"
+: >"${publish_log}"
+assert_fails "linux-x64 publish failure stops immediately" \
+    release_npm_publish 1.2.3 "${publish_dir}" publish_stub
+assert_eq "$(wc -l <"${publish_log}" | tr -d ' ')" "1" \
+    "linux-x64 is the first publish call"
+
+PUBLISH_STUB_FAIL_ON="$(release_npm_tarball_name 1.2.3 darwin-arm64)"
+: >"${publish_log}"
+assert_fails "later npm publish failure reports partial order" \
+    release_npm_publish 1.2.3 "${publish_dir}" publish_stub
+assert_eq "$(sed -n '1p' "${publish_log}")" \
+    "$(release_npm_tarball_name 1.2.3 linux-x64)" "publish order starts with linux-x64"
+assert_eq "$(sed -n '3p' "${publish_log}")" \
+    "$(release_npm_tarball_name 1.2.3 darwin-arm64)" "later failure is the third publish call"
+
+PUBLISH_STUB_FAIL_ON=""
+: >"${publish_log}"
+if release_npm_publish 1.2.3 "${publish_dir}" publish_stub; then
+    printf 'ok   - all npm packages publish in matrix order\n'
+else
+    printf 'FAIL - all npm packages publish in matrix order\n'
+    failures=$((failures + 1))
+fi
+
+rm -rf "${manifest_dir}" "${unsupported_package_dir}" "${unsupported_prefix}" "${publish_dir}"
+
 if (( failures > 0 )); then
     printf '%d assertion(s) failed\n' "${failures}" >&2
     exit 1

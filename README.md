@@ -1630,7 +1630,70 @@ For an always-on shared-mode instance, run it under systemd on a host that
 stays up. The target needs **no Go toolchain** — the binary is a static
 `linux/amd64` build shipped over ssh.
 
-From a checkout on a machine that *does* have Go:
+For a tagged release, the npm package is the no-checkout install path. It
+supports Linux x64/arm64 and macOS x64/arm64; npm rejects other OS/CPU
+combinations before installation:
+
+```bash
+npm install -g @shukelabs/agent-quota-gateway@<version>
+agent-quota-gateway --version
+```
+
+The package includes `deploy/agent-quota-gateway.service` and
+`deploy/aqg.env.example` for a systemd setup. After a global install, the
+templates are under
+`$(npm root -g)/@shukelabs/agent-quota-gateway/deploy`; configure the
+environment file before starting the service. The global
+`agent-quota-gateway` command is a Node launcher, so do not use that command
+as the unit's `ExecStart`: the included unit enables
+`MemoryDenyWriteExecute=yes`, which is incompatible with Node/V8. Install the
+native Linux package binary at the path expected by the unit instead:
+
+```bash
+case "$(uname -m)" in
+  x86_64) native_package='agent-quota-gateway-linux-x64' ;;
+  aarch64|arm64) native_package='agent-quota-gateway-linux-arm64' ;;
+  *) echo "unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+npm_root="$(npm root -g)"
+root_package="${npm_root}/@shukelabs/agent-quota-gateway"
+native_binary="$(
+  ROOT_PACKAGE="${root_package}" NATIVE_PACKAGE="${native_package}" node -e '
+    const target = `@shukelabs/${process.env.NATIVE_PACKAGE}/bin/agent-quota-gateway`;
+    try {
+      process.stdout.write(require.resolve(target, { paths: [process.env.ROOT_PACKAGE] }));
+    } catch {
+      console.error(`native package binary not found: ${target}`);
+      process.exit(1);
+    }
+  '
+)"
+test -x "${native_binary}" || {
+  echo "native package binary is not executable: ${native_binary}" >&2
+  exit 1
+}
+sudo install -m 0755 \
+  "${native_binary}" \
+  /usr/local/bin/agent-quota-gateway
+sudo install -m 0644 \
+  "${root_package}/deploy/agent-quota-gateway.service" \
+  /etc/systemd/system/agent-quota-gateway.service
+sudo install -d -m 0750 /etc/agent-quota-gateway
+if ! sudo test -e /etc/agent-quota-gateway/aqg.env; then
+  sudo install -m 0600 \
+    "${root_package}/deploy/aqg.env.example" \
+    /etc/agent-quota-gateway/aqg.env
+fi
+sudo systemctl daemon-reload
+sudo systemctl enable agent-quota-gateway
+```
+
+Edit `/etc/agent-quota-gateway/aqg.env` and then enable/restart the service as
+described below; `ExecStart=/usr/local/bin/agent-quota-gateway` now points to
+the native Go binary, not the npm launcher.
+
+For a checkout-based install or an upgrade built from source, run this from a
+checkout on a machine that *does* have Go:
 
 ```bash
 scripts/deploy.sh <ssh-host>        # e.g. scripts/deploy.sh e6420
