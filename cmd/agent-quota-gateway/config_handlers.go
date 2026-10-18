@@ -360,11 +360,14 @@ type addMemberRequest struct {
 	Credential string   `json:"credential"` // optional; resolved from a known nick when omitted
 	BaseURL    string   `json:"base_url"`   // optional; resolved (known nick) or pool default (new nick) when omitted
 	Placement  []string `json:"placement"`  // required for an explicitly ordered target with no existing slot
+	Upsert     bool     `json:"upsert"`     // explicit atomic add/replace semantics for CLI management
 }
 
 // addMemberHandler serves POST /_gateway/pool/{name}/member/{nick} —
 // adds a runtime member to a pool. Credential and base_url are optional for a
-// known subscription; an explicitly ordered target requires a placement.
+// known subscription; an explicitly ordered target requires a placement. The
+// management CLI sets upsert=true to request atomic idempotence/rotation while
+// preserving the legacy duplicate-409 behavior when it is absent.
 func addMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		poolName := backend.NormalizeName(r.PathValue("name"))
@@ -393,7 +396,13 @@ func addMemberHandler(pools *auto.Pools, persistence configfile.PersistenceState
 			return
 		}
 
-		status, err := pools.AddMember(poolName, nick, req.Credential, req.BaseURL, req.Placement)
+		var status int
+		var err error
+		if req.Upsert {
+			status, err = pools.UpsertMember(poolName, nick, req.Credential, req.BaseURL, req.Placement)
+		} else {
+			status, err = pools.AddMember(poolName, nick, req.Credential, req.BaseURL, req.Placement)
+		}
 		if err != nil {
 			w.WriteHeader(status)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
