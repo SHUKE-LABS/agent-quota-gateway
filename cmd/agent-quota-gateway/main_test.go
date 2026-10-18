@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -442,6 +443,137 @@ func TestQuotaHandler_poolViewAddsActiveBackend(t *testing.T) {
 	}
 	if gotUpper["active_backend"] != "acct-one" {
 		t.Errorf("?backend=AUTO active_backend=%v, want acct-one (case-insensitive)", gotUpper["active_backend"])
+	}
+}
+
+// TestQuotaHandler_workerViewUsesRecordedAffinity proves the worker query
+// reads the existing routing observation without turning the display endpoint
+// into a routing operation. It covers the sticky, assigned-worker, unknown,
+// invalid, concurrency-one, and unknown-pool fallbacks in one HTTP surface.
+func TestQuotaHandler_workerViewUsesRecordedAffinity(t *testing.T) {
+	concurrencyTwo := 2
+	concurrencyOne := 1
+	registry, err := backend.BuildFromSpec(backend.Spec{Pools: map[string]backend.PoolSpec{
+		"auto": {
+			Members: map[string]backend.MemberSpec{
+				"a": {Credential: "cred-a"},
+				"b": {Credential: "cred-b"},
+			},
+			Concurrency: &concurrencyTwo,
+		},
+		"single": {
+			Members:     map[string]backend.MemberSpec{"single-a": {Credential: "cred-single"}},
+			Concurrency: &concurrencyOne,
+		},
+	}}, "https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("backend.BuildFromSpec: %v", err)
+	}
+	pools := auto.NewPools(registry, nil, nil, io.Discard)
+	if got, _, ok, exhausted := pools.RouteWorker("auto", "worker-a"); !ok || exhausted || got.Nick != "a" {
+		t.Fatalf("worker-a route = %+v ok=%v exhausted=%v, want a/true/false", got, ok, exhausted)
+	}
+	if got, _, ok, exhausted := pools.RouteWorker("auto", "worker-w"); !ok || exhausted || got.Nick != "b" {
+		t.Fatalf("worker-w route = %+v ok=%v exhausted=%v, want b/true/false", got, ok, exhausted)
+	}
+
+	store := quota.NewStore()
+	aUtil, bUtil := 0.1, 0.8
+	store.Put("a", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &aUtil})
+	store.Put("b", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &bUtil})
+	store.Put("single-a", quota.Snapshot{UnifiedStatus: "allowed", Unified5hUtilization: &aUtil})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_gateway/quota", quotaHandler(store, pools, nil))
+	mux.HandleFunc("/_gateway/pool", poolHandler(store, pools, nil))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	stateBeforeReads := pools.PersistState()["auto"].WorkerAffinity
+	getView := func(query string) poolView {
+		t.Helper()
+		resp, err := http.Get(srv.URL + "/_gateway/quota?" + query)
+		if err != nil {
+			t.Fatalf("quota GET %q: %v", query, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("quota GET %q status=%d, want 200", query, resp.StatusCode)
+		}
+		var view poolView
+		if err := json.NewDecoder(resp.Body).Decode(&view); err != nil {
+			t.Fatalf("decode quota %q: %v", query, err)
+		}
+		return view
+	}
+
+	sticky := getView("backend=auto")
+	if sticky.ActiveBackend != "a" || sticky.Backend != "a" {
+		t.Fatalf("sticky view = %+v, want member a", sticky)
+	}
+	if sticky.Unified5hUtilization == nil || *sticky.Unified5hUtilization != aUtil {
+		t.Errorf("sticky utilization = %v, want %v", sticky.Unified5hUtilization, aUtil)
+	}
+
+	worker := getView("backend=auto&worker=worker-w")
+	if worker.ActiveBackend != "b" || worker.Backend != "b" {
+		t.Fatalf("worker view = %+v, want member b", worker)
+	}
+	if worker.Unified5hUtilization == nil || *worker.Unified5hUtilization != bUtil {
+		t.Errorf("worker utilization = %v, want %v", worker.Unified5hUtilization, bUtil)
+	}
+
+	unknown := getView("backend=auto&worker=never-seen-w")
+	if unknown.ActiveBackend != "a" || unknown.Backend != "a" {
+		t.Errorf("unknown-worker view = %+v, want sticky member a", unknown)
+	}
+	invalid := getView("backend=auto&worker=%2F")
+	if invalid.ActiveBackend != "a" || invalid.Backend != "a" {
+		t.Errorf("invalid-worker view = %+v, want sticky member a", invalid)
+	}
+	single := getView("backend=single&worker=worker-single")
+	if single.ActiveBackend != "single-a" || single.Backend != "single-a" {
+		t.Errorf("concurrency-one view = %+v, want sticky member single-a", single)
+	}
+
+	unknownPoolResp, err := http.Get(srv.URL + "/_gateway/quota?backend=missing&worker=worker-w")
+	if err != nil {
+		t.Fatalf("unknown-pool quota GET: %v", err)
+	}
+	var unknownPool map[string]any
+	if err := json.NewDecoder(unknownPoolResp.Body).Decode(&unknownPool); err != nil {
+		t.Fatalf("decode unknown-pool quota: %v", err)
+	}
+	unknownPoolResp.Body.Close()
+	if unknownPoolResp.StatusCode != http.StatusOK {
+		t.Errorf("unknown-pool status=%d, want 200", unknownPoolResp.StatusCode)
+	}
+	if _, ok := unknownPool["active_backend"]; ok {
+		t.Errorf("unknown-pool view has active_backend: %v", unknownPool)
+	}
+
+	stateAfterReads := pools.PersistState()["auto"].WorkerAffinity
+	if !reflect.DeepEqual(stateAfterReads, stateBeforeReads) {
+		t.Errorf("quota reads changed persisted affinity: before=%v after=%v", stateBeforeReads, stateAfterReads)
+	}
+	poolResp, err := http.Get(srv.URL + "/_gateway/pool?pool=auto")
+	if err != nil {
+		t.Fatalf("pool status GET: %v", err)
+	}
+	defer poolResp.Body.Close()
+	if poolResp.StatusCode != http.StatusOK {
+		t.Fatalf("pool status GET status=%d, want 200", poolResp.StatusCode)
+	}
+	var status auto.PoolStatus
+	if err := json.NewDecoder(poolResp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode pool status: %v", err)
+	}
+	for _, member := range status.Members {
+		for _, worker := range member.Workers {
+			if worker == "never-seen-w" {
+				t.Errorf("unknown worker appeared in pool status: %+v", status)
+			}
+		}
 	}
 }
 

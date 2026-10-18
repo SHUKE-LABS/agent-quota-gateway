@@ -331,6 +331,19 @@ func (p *Pools) Current(poolName string) (backend.Backend, bool) {
 	return c.CurrentBackend(), true
 }
 
+// CurrentForWorker returns the backend already recorded for workerNickname,
+// falling back to the pool's sticky backend when the worker has no recorded
+// affinity or the recorded member no longer exists. This is a read-only view:
+// it never assigns the worker or changes controller state. ok is false for an
+// unknown pool.
+func (p *Pools) CurrentForWorker(poolName, workerNickname string) (backend.Backend, bool) {
+	c, ok := p.controller(poolName)
+	if !ok {
+		return backend.Backend{}, false
+	}
+	return c.CurrentBackendForWorker(workerNickname), true
+}
+
 // ClearExhausted drops the named pool's recorded parks (see
 // Controller.ClearExhausted). ok is false for an unknown pool.
 // releasedElsewhere names, per nick, the sibling pools a propagated
@@ -2649,6 +2662,29 @@ func (c *Controller) Current() string {
 func (c *Controller) CurrentBackend() backend.Backend {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.currentBackendLocked()
+}
+
+// CurrentBackendForWorker returns a worker's already-recorded member for the
+// quota view. It deliberately does not call ResolveWorker: quota reads must
+// not assign workers, advance the worker cursor, prune observations, notify a
+// persister, or otherwise influence routing. Concurrency-one pools have no
+// affinity view and always use the sticky backend.
+func (c *Controller) CurrentBackendForWorker(worker string) backend.Backend {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.workerConcurrency > 1 && backend.IsValidWorkerNickname(worker) {
+		if nick, ok := c.workerAffinity[worker]; ok {
+			if b, ok := c.backendByNickLocked(nick); ok {
+				return b
+			}
+		}
+	}
+	return c.currentBackendLocked()
+}
+
+// currentBackendLocked returns the active sticky backend. Caller holds c.mu.
+func (c *Controller) currentBackendLocked() backend.Backend {
 	if b, ok := c.backendByNickLocked(c.curNick); ok {
 		return b
 	}

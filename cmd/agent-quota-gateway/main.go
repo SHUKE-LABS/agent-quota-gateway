@@ -692,12 +692,14 @@ func encodeViewWithoutAsOf(w http.ResponseWriter, view poolQuotaView) error {
 }
 
 // poolQuotaView is the /_gateway/quota?backend=<pool> response: the
-// pool's active sticky member's snapshot with an added active_backend
-// field naming the member nick. The embedded Snapshot promotes its
-// fields into the same JSON object, so a consumer that asks for a pool
-// gets the active member's snapshot plus the member's name — it needs
-// zero knowledge of pool membership, and the 99%->5% jump on a switch is
-// self-explained because active_backend changes alongside it.
+// pool's active member's snapshot with an added active_backend field naming
+// the member nick. With a valid worker query parameter, the member is that
+// worker's already-recorded affinity; otherwise it is the pool's sticky
+// member. The embedded Snapshot promotes its fields into the same JSON
+// object, so a consumer that asks for a pool gets the selected member's
+// snapshot plus the member's name — it needs zero knowledge of pool
+// membership, and the 99%->5% jump on a switch is self-explained because
+// active_backend changes alongside it.
 //
 // Polled (issue #247) reports whether this pool has ever been polled
 // successfully. It is omitted entirely (key absent) for pools the
@@ -718,12 +720,14 @@ type poolQuotaView struct {
 // Method is GET only — POSTing here would suggest the endpoint mutates
 // state, which it does not. The pool name comes from the `?backend=`
 // query param. A known pool resolves to its active sticky member and adds
-// active_backend; the embedded Snapshot's AsOf is suppressed when this
-// is a tracked never-polled pool (Store.Get's read-time stamp is not
-// data for that case — issue #247). An unknown pool (or a missing
-// param) returns 200 with a bare quota.Snapshot; that branch is left
-// untouched on purpose (AC5 targets known pools with no snapshot, not
-// unknown pool names — see plan review).
+// active_backend, or to an already-recorded worker affinity when the valid
+// optional `worker` parameter is present. The embedded Snapshot's AsOf is
+// suppressed when this is a tracked never-polled pool (Store.Get's
+// read-time stamp is not data for that case — issue #247). An unknown pool
+// (or a missing param) returns 200 with a bare quota.Snapshot; that branch is
+// left untouched on purpose (AC5 targets known pools with no snapshot, not
+// unknown pool names — see plan review). The worker lookup is read-only and
+// falls back to the sticky member when no affinity is recorded.
 func quotaHandler(store *quota.Store, pools *auto.Pools, pl *poller.Poller) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -736,7 +740,15 @@ func quotaHandler(store *quota.Store, pools *auto.Pools, pl *poller.Poller) http
 		key := backend.NormalizeName(r.URL.Query().Get("backend"))
 		w.Header().Set("Content-Type", "application/json")
 		if pools != nil {
-			if b, ok := pools.Current(key); ok {
+			worker := r.URL.Query().Get("worker")
+			var b backend.Backend
+			var ok bool
+			if backend.IsValidWorkerNickname(worker) {
+				b, ok = pools.CurrentForWorker(key, worker)
+			} else {
+				b, ok = pools.Current(key)
+			}
+			if ok {
 				snap := store.Get(b.QuotaKey())
 				view := poolQuotaView{
 					Snapshot:      snap,
