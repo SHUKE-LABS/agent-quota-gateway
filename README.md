@@ -1618,7 +1618,38 @@ The package includes `deploy/agent-quota-gateway.service` and
 `deploy/aqg.env.example` for a systemd setup. After a global install, the
 templates are under
 `$(npm root -g)/@shukelabs/agent-quota-gateway/deploy`; configure the
-environment file before starting the service.
+environment file before starting the service. The global
+`agent-quota-gateway` command is a Node launcher, so do not use that command
+as the unit's `ExecStart`: the included unit enables
+`MemoryDenyWriteExecute=yes`, which is incompatible with Node/V8. Install the
+native Linux package binary at the path expected by the unit instead:
+
+```bash
+case "$(uname -m)" in
+  x86_64) native_package='agent-quota-gateway-linux-x64' ;;
+  aarch64|arm64) native_package='agent-quota-gateway-linux-arm64' ;;
+  *) echo "unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+npm_root="$(npm root -g)"
+sudo install -m 0755 \
+  "${npm_root}/@shukelabs/${native_package}/bin/agent-quota-gateway" \
+  /usr/local/bin/agent-quota-gateway
+sudo install -m 0644 \
+  "${npm_root}/@shukelabs/agent-quota-gateway/deploy/agent-quota-gateway.service" \
+  /etc/systemd/system/agent-quota-gateway.service
+sudo install -d -m 0750 /etc/agent-quota-gateway
+if [[ ! -e /etc/agent-quota-gateway/aqg.env ]]; then
+  sudo install -m 0600 \
+    "${npm_root}/@shukelabs/agent-quota-gateway/deploy/aqg.env.example" \
+    /etc/agent-quota-gateway/aqg.env
+fi
+sudo systemctl daemon-reload
+sudo systemctl enable agent-quota-gateway
+```
+
+Edit `/etc/agent-quota-gateway/aqg.env` and then enable/restart the service as
+described below; `ExecStart=/usr/local/bin/agent-quota-gateway` now points to
+the native Go binary, not the npm launcher.
 
 For a checkout-based install or an upgrade built from source, run this from a
 checkout on a machine that *does* have Go:
