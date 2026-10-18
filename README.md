@@ -1631,16 +1631,32 @@ case "$(uname -m)" in
   *) echo "unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 npm_root="$(npm root -g)"
+root_package="${npm_root}/@shukelabs/agent-quota-gateway"
+native_binary="$(
+  ROOT_PACKAGE="${root_package}" NATIVE_PACKAGE="${native_package}" node -e '
+    const target = `@shukelabs/${process.env.NATIVE_PACKAGE}/bin/agent-quota-gateway`;
+    try {
+      process.stdout.write(require.resolve(target, { paths: [process.env.ROOT_PACKAGE] }));
+    } catch {
+      console.error(`native package binary not found: ${target}`);
+      process.exit(1);
+    }
+  '
+)"
+test -x "${native_binary}" || {
+  echo "native package binary is not executable: ${native_binary}" >&2
+  exit 1
+}
 sudo install -m 0755 \
-  "${npm_root}/@shukelabs/${native_package}/bin/agent-quota-gateway" \
+  "${native_binary}" \
   /usr/local/bin/agent-quota-gateway
 sudo install -m 0644 \
-  "${npm_root}/@shukelabs/agent-quota-gateway/deploy/agent-quota-gateway.service" \
+  "${root_package}/deploy/agent-quota-gateway.service" \
   /etc/systemd/system/agent-quota-gateway.service
 sudo install -d -m 0750 /etc/agent-quota-gateway
-if [[ ! -e /etc/agent-quota-gateway/aqg.env ]]; then
+if ! sudo test -e /etc/agent-quota-gateway/aqg.env; then
   sudo install -m 0600 \
-    "${npm_root}/@shukelabs/agent-quota-gateway/deploy/aqg.env.example" \
+    "${root_package}/deploy/aqg.env.example" \
     /etc/agent-quota-gateway/aqg.env
 fi
 sudo systemctl daemon-reload
