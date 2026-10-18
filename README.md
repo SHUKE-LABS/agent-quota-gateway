@@ -1605,7 +1605,23 @@ For an always-on shared-mode instance, run it under systemd on a host that
 stays up. The target needs **no Go toolchain** — the binary is a static
 `linux/amd64` build shipped over ssh.
 
-From a checkout on a machine that *does* have Go:
+For a tagged release, the npm package is the no-checkout install path. It
+supports Linux x64/arm64 and macOS x64/arm64; npm rejects other OS/CPU
+combinations before installation:
+
+```bash
+npm install -g @shukelabs/agent-quota-gateway@<version>
+agent-quota-gateway --version
+```
+
+The package includes `deploy/agent-quota-gateway.service` and
+`deploy/aqg.env.example` for a systemd setup. After a global install, the
+templates are under
+`$(npm root -g)/@shukelabs/agent-quota-gateway/deploy`; configure the
+environment file before starting the service.
+
+For a checkout-based install or an upgrade built from source, run this from a
+checkout on a machine that *does* have Go:
 
 ```bash
 scripts/deploy.sh <ssh-host>        # e.g. scripts/deploy.sh e6420
