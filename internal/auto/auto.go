@@ -687,14 +687,22 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 	if normalized == "" {
 		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
 	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.addMemberLocked(name, normalized, credential, baseURL, placement)
+}
+
+// addMemberLocked is the legacy add path shared by AddMember and the atomic
+// upsert path. Caller holds p.mu. It intentionally keeps the duplicate check
+// and all legacy credential/base_url resolution semantics unchanged.
+func (p *Pools) addMemberLocked(name, normalized, credential, baseURL string, placement []string) (int, error) {
 	if baseURL != "" {
 		if _, err := backend.ValidateBaseURL(baseURL); err != nil {
 			return http.StatusBadRequest, fmt.Errorf("invalid base_url: %w", err)
 		}
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	c, ok := p.byPool[name]
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("pool not found")
@@ -804,6 +812,89 @@ func (p *Pools) AddMember(poolName, nick, credential, baseURL string, placement 
 	p.applyRegistryLocked(next, name)
 	p.markConfigDirtyLocked()
 	fmt.Fprintf(c.logOut, "auto[%s]: added member %s\n", name, normalized)
+	return http.StatusOK, nil
+}
+
+// UpsertMember atomically adds or updates a runtime member for the CLI
+// management surface. The request must carry a credential: unlike AddMember,
+// this operation never resolves one from another pool because the client is
+// explicitly asking for idempotence or credential rotation.
+//
+// An existing member with the same credential is a true no-op. A different
+// credential may replace the member only when the nick is not shared by any
+// other pool; the declaration's base URL, priority, and disabled state are
+// retained by changing only its credential in a copy-on-write Spec. A new
+// member follows AddMember's existing base_url, placement, and bijection
+// validation. Every failure occurs before the registry/controller swap.
+func (p *Pools) UpsertMember(poolName, nick, credential, baseURL string, placement []string) (int, error) {
+	name := backend.NormalizeName(poolName)
+	normalized := backend.NormalizeName(nick)
+	if normalized == "" {
+		return http.StatusBadRequest, fmt.Errorf("nick is empty after normalization")
+	}
+	if credential == "" {
+		return http.StatusBadRequest, fmt.Errorf("credential is required for upsert")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, ok := p.byPool[name]; !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+
+	current, exists := p.reg.ResolveIn(name, normalized)
+	if !exists {
+		return p.addMemberLocked(name, normalized, credential, baseURL, placement)
+	}
+
+	// A repeat with the same credential must not even mark the config dirty.
+	// In particular, baseURL and placement are intentionally ignored here:
+	// GET /_gateway/config is redacted/effective and cannot safely reconstruct
+	// declaration-level values for an existing member.
+	if current.Credential == credential {
+		return http.StatusOK, nil
+	}
+
+	// A nick shared by another pool represents one physical subscription and
+	// therefore cannot be rotated in only one pool. Refuse before constructing
+	// any replacement registry so the old member remains live and persisted.
+	for _, otherPool := range p.reg.PoolNames() {
+		if otherPool == name {
+			continue
+		}
+		if _, ok := p.reg.ResolveIn(otherPool, normalized); ok {
+			return http.StatusConflict, fmt.Errorf("nick %s is shared by another pool; rotate it only after removing the shared declaration", normalized)
+		}
+	}
+
+	// Preserve every declaration field except the credential. Mutating the
+	// Spec copy and rebuilding it through the normal validator gives the
+	// credential bijection a single atomic decision point.
+	spec := p.reg.Spec()
+	poolSpec, ok := spec.Pools[name]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("pool not found")
+	}
+	member, ok := poolSpec.Members[normalized]
+	if !ok {
+		// The registry is authoritative, so this should be unreachable; fail
+		// closed rather than replacing a member without its declaration.
+		return http.StatusBadRequest, fmt.Errorf("member %s has no declaration", normalized)
+	}
+	member.Credential = credential
+	poolSpec.Members[normalized] = member
+	spec.Pools[name] = poolSpec
+
+	next, err := backend.BuildFromSpec(spec, p.reg.DefaultBaseURL())
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+	p.applyRegistryLocked(next, name)
+	p.markConfigDirtyLocked()
+	if c, ok := p.byPool[name]; ok {
+		fmt.Fprintf(c.logOut, "auto[%s]: updated member %s\n", name, normalized)
+	}
 	return http.StatusOK, nil
 }
 

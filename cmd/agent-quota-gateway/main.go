@@ -139,6 +139,17 @@ func main() {
 // silently, launching a second, unconfigured gateway on the default
 // address next to the real one.
 func cli(args []string, stdout, stderr io.Writer, start func(configPath string) error) int {
+	return cliWithInput(args, os.Stdin, stdout, stderr, start)
+}
+
+// cliWithInput is the testable entry flow. Management commands receive an
+// injected stdin so credential hygiene can be tested without changing the
+// production path, while the existing server CLI keeps its original start
+// callback contract.
+func cliWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer, start func(configPath string) error) int {
+	if looksLikeManagement(args) {
+		return runManagement(args, stdin, stdout, stderr)
+	}
 	fs := flag.NewFlagSet("agent-quota-gateway", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	showVersion := fs.Bool("version", false, "print version and exit")

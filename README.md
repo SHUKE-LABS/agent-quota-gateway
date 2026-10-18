@@ -996,7 +996,7 @@ restarting is the wrong tool.
 | `POST /_gateway/pool/{name}/member/{nick}/disable` | Take a member (static or runtime-added) out of selection and failover |
 | `POST /_gateway/pool/{name}/member/{nick}/enable` | Return a disabled member (static or runtime-added) to rotation |
 | `POST /_gateway/pool/{name}/member/{nick}/reprobe` | Re-query upstream quota for one member now, merge the fresh snapshot, and reconcile its park; see [Re-probing a member](#re-probing-a-member). Non-POST → `405`. |
-| `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "...", "placement": [...]}`. `credential` and `base_url` are each optional when the nick is already a known subscription in another pool (resolved independently; ambiguous → `400`). `placement` is a JSON array of nicks (highest ranked first, must include the added nick) and is **required** when the target has an explicit order and no existing slot for that nick; rejected (`400`) for targets using the sorted default. Persisted with its credential. |
+| `POST /_gateway/pool/{name}/member/{nick}` | Add a runtime member; body `{"credential": "...", "base_url": "...", "placement": [...]}`. `credential` and `base_url` are each optional when the nick is already a known subscription in another pool (resolved independently; ambiguous → `400`). `placement` is a JSON array of nicks (highest ranked first, must include the added nick) and is **required** when the target has an explicit order and no existing slot for that nick; rejected (`400`) for targets using the sorted default. Persisted with its credential. Add `"upsert": true` to request the CLI-safe atomic add/replace contract: credential is required; an identical existing credential is a no-op, a different credential may replace only an unshared nick, and the existing base URL, priority, and disabled declaration are retained. Without `upsert`, an existing nick remains a `409`. |
 | `POST /_gateway/pool/{name}/member/{nick}/move` | Move a subscription to another pool; body `{"to": "<pool>", "placement": [...], "force": false}`. |
 | `DELETE /_gateway/pool/{name}/member/{nick}` | Remove a member (static or runtime-added) from selection |
 
@@ -1022,6 +1022,31 @@ curl -X POST http://127.0.0.1:8080/_gateway/pool/auto/rename -d '{"name":"primar
 # hot-toggle the request dump on a running gateway — no restart (issue #301)
 curl -X POST http://127.0.0.1:8080/_gateway/debug -d '{"log_requests": true}'
 ```
+
+**CLI management.** The same runtime operations are available without putting a
+credential in argv, the process list, or shell history:
+
+```bash
+agent-quota-gateway pool add byok
+agent-quota-gateway pool ls
+agent-quota-gateway pool ls --json
+printf %s "$KEY" | agent-quota-gateway member add byok zai \
+  --base-url https://api.z.ai/api/anthropic --credential-stdin
+agent-quota-gateway member rm byok zai
+```
+
+Commands target `LISTEN_ADDR` (or `127.0.0.1:8080` when it is unset); use
+`--gateway http://host:port` to select another running gateway. `pool ls` is
+credential-free, including its JSON form. `member add` always sends the
+credential through stdin and uses the atomic `upsert` contract: repeating the
+same credential is a no-op, while rotation is accepted only for a nick that is
+not shared by another pool. Existing base URL, priority, and disabled state are
+preserved; a supplied `--base-url` is used only for a new nick. For a new nick
+in an explicitly ordered pool, the CLI reads the redacted effective priority
+order and appends the nick at the end. A missing member removal is a successful
+no-op. Exit codes are `0` for success/no change, `1` for a gateway refusal,
+`2` for usage errors (including empty stdin), and `3` when the gateway cannot
+be reached. Management commands never start a server.
 
 `GET /_gateway/config` returns one object per pool — the expanded declared
 order in `priority` when one exists, and per-member `nick` / `base_url` /
