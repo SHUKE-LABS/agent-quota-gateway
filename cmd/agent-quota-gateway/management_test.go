@@ -202,6 +202,68 @@ func TestManagementCLI_missingMemberIsNoOp(t *testing.T) {
 	}
 }
 
+func TestManagementCLI_memberRemoveAlreadyRemovedRaceIsNoOp(t *testing.T) {
+	var deleted bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_gateway/config":
+			// The member is present during preflight; the delete races with
+			// another actor and reports the real already-removed response.
+			writeManagementJSON(t, w, managementTestViews())
+		case "/_gateway/pool/dst/member/a":
+			deleted = true
+			http.Error(w, `{"error":"nick a not found in pool"}`, http.StatusBadRequest)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	var stdout, stderr strings.Builder
+	code := cliWithInput([]string{"member", "rm", "dst", "a", "--gateway", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) error {
+		t.Fatal("server start called")
+		return nil
+	})
+	if code != 0 || !deleted || stderr.Len() != 0 {
+		t.Fatalf("already-removed race exit=%d deleted=%v stdout=%q stderr=%q", code, deleted, stdout.String(), stderr.String())
+	}
+}
+
+func TestManagementCLI_memberRemoveRefusalsRemainErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		views   []auto.PoolConfigView
+		status  int
+		message string
+	}{
+		{name: "unknown pool", views: nil, status: http.StatusNotFound, message: "pool not found"},
+		{name: "other refusal", views: managementTestViews(), status: http.StatusConflict, message: "member is protected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/_gateway/config":
+					writeManagementJSON(t, w, tc.views)
+				case "/_gateway/pool/dst/member/a":
+					http.Error(w, `{"error":"`+tc.message+`"}`, tc.status)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			var stdout, stderr strings.Builder
+			code := cliWithInput([]string{"member", "rm", "dst", "a", "--gateway", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) error {
+				t.Fatal("server start called")
+				return nil
+			})
+			if code != 1 || !strings.Contains(stderr.String(), tc.message) {
+				t.Fatalf("refusal exit=%d stdout=%q stderr=%q, want exit 1 with %q", code, stdout.String(), stderr.String(), tc.message)
+			}
+		})
+	}
+}
+
 func TestManagementCLI_poolAndMemberMutationsMapMethodsAndRefusals(t *testing.T) {
 	var poolAdded, memberDeleted bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
