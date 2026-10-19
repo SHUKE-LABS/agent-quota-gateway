@@ -708,6 +708,12 @@ release_npm_publish() {
     # Validate every input before the first registry call. This keeps a
     # missing package from turning a preflight mistake into a partial publish.
     release_npm_verify_tarballs "${version}" "${tarball_dir}" || return 1
+    # npm reads a bare `dir/file.tgz` as a GitHub `owner/repo` spec and runs
+    # `git ls-remote` over ssh; an explicit ./ or absolute path stays a tarball.
+    case "${tarball_dir}" in
+        /* | ./* | ../*) ;;
+        *) tarball_dir="./${tarball_dir}" ;;
+    esac
 
     while IFS= read -r package_key; do
         if [[ "${package_key}" == agent-quota-gateway ]]; then
