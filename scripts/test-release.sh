@@ -173,6 +173,17 @@ else
     failures=$((failures + 1))
 fi
 
+# The release workflow passes a relative dir; npm must still see a file path.
+publish_path_log="${publish_dir}/publish-paths.log"
+path_stub() {
+    printf '%s\n' "${5:-}" >>"${publish_path_log}"
+}
+mkdir -p "${publish_dir}/rel/npm-tarballs"
+mv "${publish_dir}"/*.tgz "${publish_dir}/rel/npm-tarballs/"
+(cd "${publish_dir}/rel" && release_npm_publish 1.2.3 npm-tarballs path_stub)
+assert_eq "$(grep -cv '^\./npm-tarballs/' "${publish_path_log}")" "0" \
+    "relative tarball dir reaches npm as ./npm-tarballs/<file>"
+
 rm -rf "${manifest_dir}" "${unsupported_package_dir}" "${unsupported_prefix}" "${publish_dir}"
 
 if (( failures > 0 )); then
