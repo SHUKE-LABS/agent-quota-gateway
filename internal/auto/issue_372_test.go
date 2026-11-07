@@ -136,6 +136,17 @@ func TestCredentialProbeAcceptedDoesNotEmptyTwoMemberPool(t *testing.T) {
 			t.Errorf("%s status=%d, want 403", nick, resp.StatusCode)
 		}
 	}
+	c := p.byPool["auto"]
+	c.mu.Lock()
+	for _, nick := range []string{"a", "b"} {
+		if _, parked := c.exhausted[nick]; parked {
+			t.Errorf("%s unexpectedly exhausted after client rejection", nick)
+		}
+		if _, parked := c.credentialPark[nick]; parked {
+			t.Errorf("%s unexpectedly credential-parked after client rejection", nick)
+		}
+	}
+	c.mu.Unlock()
 	if b, _, ok, exhausted := p.Route("auto"); !ok || exhausted || b.Nick != "a" {
 		t.Fatalf("route after client rejections=%q ok=%v exhausted=%v, want serving a", b.Nick, ok, exhausted)
 	}
