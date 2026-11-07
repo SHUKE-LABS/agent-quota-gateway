@@ -1399,6 +1399,9 @@ func TestClearHandler_crossPoolRelease(t *testing.T) {
 		t.Fatalf("backend.Load: %v", err)
 	}
 	pools := auto.NewPools(registry, nil, nil, io.Discard)
+	pools.SetCredentialProbe(func(context.Context, backend.Backend) auto.CredentialVerdict {
+		return auto.CredentialRejected
+	})
 
 	bCCZinA, ok := registry.ResolveIn("a", "ccz")
 	if !ok {

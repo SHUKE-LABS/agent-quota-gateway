@@ -42,10 +42,13 @@ func (s *stubRouter) Route(pool string) (Backend, time.Duration, bool, bool) {
 func TestMiddleware_resolvesAndInjects(t *testing.T) {
 	want := Backend{Pool: "auto", Nick: "claude-a", Credential: "cred-a", BaseURL: testDefaultBaseURL}
 	var seen Backend
+	var inboundMethod, inboundPath string
+	var inboundOK bool
 	var called bool
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		seen, _ = FromContext(r.Context())
+		inboundMethod, inboundPath, inboundOK = InboundRequestFromContext(r.Context())
 		w.WriteHeader(http.StatusOK)
 	})
 	router := &stubRouter{b: want, ok: true}
@@ -64,6 +67,9 @@ func TestMiddleware_resolvesAndInjects(t *testing.T) {
 	}
 	if seen != want {
 		t.Errorf("injected backend = %+v, want %+v", seen, want)
+	}
+	if !inboundOK || inboundMethod != http.MethodPost || inboundPath != "/v1/messages" {
+		t.Errorf("inbound request metadata=(%q,%q,ok=%v), want POST /v1/messages", inboundMethod, inboundPath, inboundOK)
 	}
 	if router.gotPool != "auto" {
 		t.Errorf("router saw pool %q, want normalized %q", router.gotPool, "auto")

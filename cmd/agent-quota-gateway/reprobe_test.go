@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -321,6 +323,66 @@ func TestReprobe_pollerCredentialRejected(t *testing.T) {
 				t.Errorf("snapshot changed on poller credential rejection")
 			}
 		})
+	}
+}
+
+func TestCredentialProbe_usesStatusOnlyClassDispatch(t *testing.T) {
+	t.Run("messages", func(t *testing.T) {
+		upstream, rec := fakeUpstream(t, http.StatusForbidden, nil)
+		b := backend.Backend{Pool: "auto", Nick: "a", Credential: "sk-ant-api-test", BaseURL: upstream.URL}
+		verdict := credentialProbe(upstream.Client())(context.Background(), b)
+		if verdict != auto.CredentialRejected {
+			t.Fatalf("verdict=%s, want rejected", verdict)
+		}
+		got := rec.snapshot()
+		if got.method != http.MethodPost || got.path != "/v1/messages" {
+			t.Errorf("upstream got %s %s, want POST /v1/messages", got.method, got.path)
+		}
+	})
+
+	t.Run("codex", func(t *testing.T) {
+		upstream, rec := fakeUpstream(t, http.StatusTooManyRequests, nil)
+		target, _ := url.Parse(upstream.URL)
+		client := &http.Client{Transport: redirectTransport{target: target}}
+		b := backend.Backend{Pool: "auto", Nick: "a", Credential: "codex-token", BaseURL: "https://chatgpt.com/backend-api/codex"}
+		verdict := credentialProbe(client)(context.Background(), b)
+		if verdict != auto.CredentialAccepted {
+			t.Fatalf("verdict=%s, want accepted for non-auth status", verdict)
+		}
+		got := rec.snapshot()
+		if got.method != http.MethodPost || got.path != "/backend-api/codex/responses" {
+			t.Errorf("upstream got %s %s, want POST /backend-api/codex/responses", got.method, got.path)
+		}
+	})
+
+	t.Run("poller provider", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/monitor/usage/quota/limit" {
+				t.Errorf("path=%q, want quota endpoint", r.URL.Path)
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		t.Cleanup(upstream.Close)
+		poller.WithTestProviderForTest(t, upstream.URL, poller.HostURLForTest("/api/monitor/usage/quota/limit"), poller.RawAuthForTest, poller.ParseZhipuForTest)
+		b := backend.Backend{Pool: "auto", Nick: "a", Credential: "zai-key", BaseURL: upstream.URL}
+		verdict := credentialProbe(upstream.Client())(context.Background(), b)
+		if verdict != auto.CredentialRejected {
+			t.Fatalf("verdict=%s, want rejected", verdict)
+		}
+	})
+}
+
+type credentialProbeErrorTransport struct{}
+
+func (credentialProbeErrorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("synthetic transport failure")
+}
+
+func TestCredentialProbe_transportErrorIsInconclusive(t *testing.T) {
+	b := backend.Backend{Pool: "auto", Nick: "a", Credential: "credential", BaseURL: "https://api.anthropic.com"}
+	client := &http.Client{Transport: credentialProbeErrorTransport{}}
+	if got := credentialProbe(client)(context.Background(), b); got != auto.CredentialInconclusive {
+		t.Fatalf("verdict=%s, want inconclusive", got)
 	}
 }
 

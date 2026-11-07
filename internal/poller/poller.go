@@ -600,6 +600,51 @@ func ParseZhipuForTest(body []byte, now time.Time) (quota.Snapshot, error) {
 	return parseZhipu(body, now)
 }
 
+func providerRequest(ctx context.Context, b backend.Backend) (*http.Request, provider, error) {
+	prov, ok := providerFor(b.BaseURL)
+	if !ok {
+		return nil, provider{}, ErrNoProvider
+	}
+	target, err := prov.quotaURL(b.BaseURL)
+	if err != nil {
+		return nil, provider{}, err
+	}
+	method := prov.method
+	if method == "" {
+		method = http.MethodGet
+	}
+	var bodyReader io.Reader
+	if prov.body != nil {
+		bodyReader = bytes.NewReader(prov.body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, bodyReader)
+	if err != nil {
+		return nil, provider{}, err
+	}
+	if err := prov.sign(req, b.Credential); err != nil {
+		return nil, provider{}, err
+	}
+	return req, prov, nil
+}
+
+// ProbeStatus performs the same provider-specific request as Probe but only
+// returns the HTTP status. It is used by the request-path credential verifier:
+// any received status other than 401/403 confirms that the credential can
+// reach the server, even when the response has no quota payload.
+func ProbeStatus(ctx context.Context, b backend.Backend, client *http.Client) (int, error) {
+	req, _, err := providerRequest(ctx, b)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
+	return resp.StatusCode, nil
+}
+
 // Probe fetches one quota snapshot for backend b via the registered
 // proprietary endpoint (if any) and returns the parsed Snapshot. It mirrors
 // (*Poller).pollOne so callers outside the poller's goroutine lifecycle
@@ -615,27 +660,8 @@ func ParseZhipuForTest(body []byte, now time.Time) (quota.Snapshot, error) {
 // As in pollOne, the parsed Snapshot is returned on a non-200 response only
 // when parsing succeeds; on error the caller receives an empty Snapshot.
 func Probe(ctx context.Context, b backend.Backend, client *http.Client, now func() time.Time) (quota.Snapshot, error) {
-	prov, ok := providerFor(b.BaseURL)
-	if !ok {
-		return quota.Snapshot{}, ErrNoProvider
-	}
-	target, err := prov.quotaURL(b.BaseURL)
+	req, prov, err := providerRequest(ctx, b)
 	if err != nil {
-		return quota.Snapshot{}, err
-	}
-	method := prov.method
-	if method == "" {
-		method = http.MethodGet
-	}
-	var bodyReader io.Reader
-	if prov.body != nil {
-		bodyReader = bytes.NewReader(prov.body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, target, bodyReader)
-	if err != nil {
-		return quota.Snapshot{}, err
-	}
-	if err := prov.sign(req, b.Credential); err != nil {
 		return quota.Snapshot{}, err
 	}
 	resp, err := client.Do(req)

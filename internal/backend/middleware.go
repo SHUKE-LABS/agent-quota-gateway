@@ -199,7 +199,9 @@ func Middleware(router PoolRouter, next http.Handler) http.Handler {
 			writeRateLimited(w, retryAfter)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(WithBackend(r.Context(), b)))
+		ctx := WithBackend(r.Context(), b)
+		ctx = WithInboundRequest(ctx, r.Method, r.URL.Path)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

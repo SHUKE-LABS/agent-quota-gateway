@@ -19,6 +19,7 @@ package auto
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -108,6 +109,45 @@ const (
 	rateLimitBackoffMaxSeconds = 3
 )
 
+const credentialProbeCooldown = time.Minute
+
+// CredentialVerdict is the result of an independent server-owned credential
+// probe. A rejected result is the only verdict allowed to park a member;
+// accepted and inconclusive both leave it serving.
+type CredentialVerdict uint8
+
+const (
+	CredentialInconclusive CredentialVerdict = iota
+	CredentialAccepted
+	CredentialRejected
+)
+
+func (v CredentialVerdict) String() string {
+	switch v {
+	case CredentialAccepted:
+		return "accepted"
+	case CredentialRejected:
+		return "rejected"
+	default:
+		return "inconclusive"
+	}
+}
+
+// CredentialProbe performs one independent credential check for b. Transport
+// errors and timeouts are represented by CredentialInconclusive so the caller
+// can preserve the member and return a diagnostic instead of parking it.
+type CredentialProbe func(context.Context, backend.Backend) CredentialVerdict
+
+type credentialProbeCall struct {
+	done    chan struct{}
+	verdict CredentialVerdict
+}
+
+type credentialProbeCacheEntry struct {
+	verdict CredentialVerdict
+	until   time.Time
+}
+
 // Pools fronts each configured pool with its own Controller and routes a
 // request to the right one. It implements backend.PoolRouter.
 //
@@ -156,12 +196,31 @@ type Pools struct {
 	// network round-trip and must never stall registry mutations or routing.
 	reprobeMu    sync.Mutex
 	reprobeCalls map[string]*reprobeCall
+
+	// credentialProbeMu guards the request-path credential checks keyed by
+	// QuotaKey. They are separate from operator reprobes: this path returns a
+	// verdict only and never writes the quota store.
+	credentialProbeMu    sync.Mutex
+	credentialProbe      CredentialProbe
+	credentialProbeCalls map[string]*credentialProbeCall
+	credentialProbeCache map[string]credentialProbeCacheEntry
 }
 
 // SetPoller attaches the quota poller whose per-pool liveness decides whether
 // a z.ai 429 may be absorbed as a throttle (issue #249).
 func (p *Pools) SetPoller(pl *poller.Poller) {
 	p.poller.Store(pl)
+}
+
+// SetCredentialProbe installs the independent credential check used before a
+// request-level 401/403 may park a member. The callback is normally wired
+// once during startup; resetting it also drops verdict cooldowns so a new
+// implementation or test callback cannot inherit stale results.
+func (p *Pools) SetCredentialProbe(probe CredentialProbe) {
+	p.credentialProbeMu.Lock()
+	p.credentialProbe = probe
+	p.credentialProbeCache = make(map[string]credentialProbeCacheEntry)
+	p.credentialProbeMu.Unlock()
 }
 
 // NewPools builds one Controller per pool in reg. Each controller starts
@@ -181,14 +240,17 @@ func NewPools(reg *backend.Registry, store *quota.Store, now func() time.Time, l
 		byPool[name] = NewController(reg, name, -1, store, now, logOut)
 	}
 	p := &Pools{
-		byPool: byPool,
-		reg:    reg,
-		store:  store,
-		now:    now,
-		logOut: logOut,
+		byPool:               byPool,
+		reg:                  reg,
+		store:                store,
+		now:                  now,
+		logOut:               logOut,
+		credentialProbeCalls: make(map[string]*credentialProbeCall),
+		credentialProbeCache: make(map[string]credentialProbeCacheEntry),
 	}
 	for _, c := range byPool {
 		p.wireCredentialParkPropagation(c)
+		p.wireCredentialProbe(c)
 	}
 	return p
 }
@@ -1215,6 +1277,7 @@ func (p *Pools) CreatePoolWithMember(name, mode, nick, credential, baseURL strin
 	c := NewController(next, normalized, -1, p.store, p.now, p.logOut)
 	c.onMutate = p.onMutate
 	p.wireCredentialParkPropagation(c)
+	p.wireCredentialProbe(c)
 	p.byPool[normalized] = c
 	p.markConfigDirtyLocked()
 	return http.StatusCreated, nil
@@ -1253,6 +1316,7 @@ func (p *Pools) AddPool(name, mode string) (int, error) {
 	c := NewController(next, normalized, -1, p.store, p.now, p.logOut)
 	c.onMutate = p.onMutate
 	p.wireCredentialParkPropagation(c)
+	p.wireCredentialProbe(c)
 	p.byPool[normalized] = c
 	p.markConfigDirtyLocked()
 	fmt.Fprintf(p.logOut, "auto: created runtime pool %s\n", normalized)
@@ -1675,6 +1739,75 @@ func (p *Pools) wireCredentialParkPropagation(c *Controller) {
 	}
 }
 
+// wireCredentialProbe gives every controller the same Pools-owned verifier,
+// including controllers created by runtime pool mutations. The closure keeps
+// the shared QuotaKey coalescing in Pools rather than creating one probe cache
+// per pool.
+func (p *Pools) wireCredentialProbe(c *Controller) {
+	c.credentialProbe = p.credentialVerdict
+}
+
+func (p *Pools) credentialNow() time.Time {
+	if p.now != nil {
+		return p.now()
+	}
+	return time.Now()
+}
+
+// credentialVerdict coalesces concurrent checks for one physical member and
+// reuses only verdicts that leave the member serving. The probe callback runs
+// without any Pools or Controller lock held; a follower may stop waiting when
+// its own request is cancelled without affecting the leader.
+func (p *Pools) credentialVerdict(ctx context.Context, b backend.Backend) CredentialVerdict {
+	key := b.QuotaKey()
+	now := p.credentialNow()
+
+	p.credentialProbeMu.Lock()
+	if cached, ok := p.credentialProbeCache[key]; ok && now.Before(cached.until) {
+		p.credentialProbeMu.Unlock()
+		return cached.verdict
+	}
+	if call, ok := p.credentialProbeCalls[key]; ok {
+		p.credentialProbeMu.Unlock()
+		select {
+		case <-call.done:
+			return call.verdict
+		case <-ctx.Done():
+			return CredentialInconclusive
+		}
+	}
+	probe := p.credentialProbe
+	if probe == nil {
+		p.credentialProbeCache[key] = credentialProbeCacheEntry{
+			verdict: CredentialInconclusive,
+			until:   now.Add(credentialProbeCooldown),
+		}
+		p.credentialProbeMu.Unlock()
+		return CredentialInconclusive
+	}
+	call := &credentialProbeCall{done: make(chan struct{})}
+	p.credentialProbeCalls[key] = call
+	p.credentialProbeMu.Unlock()
+
+	verdict := probe(ctx, b)
+	if verdict != CredentialAccepted && verdict != CredentialRejected {
+		verdict = CredentialInconclusive
+	}
+
+	p.credentialProbeMu.Lock()
+	delete(p.credentialProbeCalls, key)
+	call.verdict = verdict
+	if verdict != CredentialRejected {
+		p.credentialProbeCache[key] = credentialProbeCacheEntry{
+			verdict: verdict,
+			until:   p.credentialNow().Add(credentialProbeCooldown),
+		}
+	}
+	close(call.done)
+	p.credentialProbeMu.Unlock()
+	return verdict
+}
+
 // credentialParkEntry is one Controller.credentialPark value (issue #254):
 // reset is the wall-clock time the park ages out. windowFact distinguishes
 // the two store-unrepresentable subclasses the map holds, because they
@@ -1897,6 +2030,11 @@ type Controller struct {
 	// Request-path recovery uses this narrower callback so an independent quota
 	// park for the same nick remains intact.
 	propagateAuthParkClear func(nick string)
+
+	// credentialProbe is wired by Pools so every controller shares one
+	// QuotaKey-coalesced verifier. A bare Controller has no probe and therefore
+	// treats a request-level auth response as inconclusive rather than parking.
+	credentialProbe CredentialProbe
 }
 
 // NewController builds the sticky selector over the members of poolName
@@ -3047,13 +3185,12 @@ func (c *Controller) reanchorLocked() {
 //     transient throttle, and one with no metered signature at all stays on
 //     the policy path (issues #304, #314); see codexExhaustion429 for the
 //     bound and retirement rules.
-//   - 401 Unauthorized / 403 Forbidden: the backend's own credential was
-//     rejected — revoked, expired, or the account pulled. The gateway stamps
-//     the credential itself (the client never supplies one), so the rejection
-//     is always about the backend. The member is parked and the pool fails
-//     over, rather than sticking to a dead account and returning the auth
-//     error to every client. A pulled account never emits a 429, so without
-//     this the pool would never migrate off it (the reported bug).
+//   - 401 Unauthorized / 403 Forbidden: the gateway runs the independent
+//     credential probe when one is wired. Only a probe that also returns
+//     401/403 parks the backend and fails over; an accepted or inconclusive
+//     probe leaves the member serving and returns a credential-free diagnostic
+//     with the original status. A bare Controller has no probe and therefore
+//     takes the safe inconclusive path.
 //   - ChatGPT-Codex in-stream overload: a 2xx Responses SSE stream whose
 //     first decisive event is response.failed with server_is_overloaded
 //     ("Selected model is at capacity") becomes a synthetic same-member 503
@@ -3067,6 +3204,14 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 	if !ok {
 		return nil
 	}
+	verdict := CredentialInconclusive
+	if isCredentialRejected(resp.StatusCode) && c.credentialProbe != nil {
+		verdict = c.credentialProbe(resp.Request.Context(), b)
+	}
+	return c.modifyResponse(resp, b, verdict)
+}
+
+func (c *Controller) modifyResponse(resp *http.Response, b backend.Backend, verdict CredentialVerdict) error {
 	// Any response except another credential rejection retires the auth park
 	// before normal handling; in particular, a following 429 establishes its
 	// ordinary quota park.
@@ -3189,6 +3334,13 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 		reset, storeUnrepresentable := c.resetFrom(resp)
 		return c.parkAndFailoverWithSource(resp, b.Nick, reset, "hit 429", storeUnrepresentable, storeUnrepresentable)
 	case isCredentialRejected(resp.StatusCode):
+		method, path := inboundRequestDetails(resp.Request)
+		fmt.Fprintf(c.logOut, "auto[%s]: credential decision pool=%q nick=%q method=%q path=%q upstream_status=%d verdict=%s\n",
+			c.name(), c.name(), b.Nick, method, path, resp.StatusCode, verdict)
+		if verdict != CredentialRejected {
+			rewriteCredentialDiagnostic(resp, verdict, method, path)
+			return nil
+		}
 		// An auth rejection has no reset — the credential is simply dead — so
 		// park for the conservative default window: long enough to keep the
 		// pool off the dead account, short enough that a restored account is
@@ -3214,6 +3366,19 @@ func (c *Controller) ModifyResponse(resp *http.Response) error {
 	default:
 		return nil
 	}
+}
+
+func inboundRequestDetails(req *http.Request) (method, path string) {
+	method, path = req.Method, req.URL.Path
+	if inboundMethod, inboundPath, ok := backend.InboundRequestFromContext(req.Context()); ok {
+		if inboundMethod != "" {
+			method = inboundMethod
+		}
+		if inboundPath != "" {
+			path = inboundPath
+		}
+	}
+	return method, path
 }
 
 // statuslessFailureBound combines the latest measured windows with fields on
@@ -4364,6 +4529,62 @@ func (c *Controller) resetFrom(resp *http.Response) (reset time.Time, storeUnrep
 	return now.Add(defaultExhaustionWindow), true
 }
 
+func stripSyntheticQuotaHeaders(h http.Header) {
+	for k := range h {
+		lk := strings.ToLower(k)
+		// anthropic-ratelimit-* and x-codex-* are both the rejected member's
+		// metered quota state — pool-boundary hygiene says a synthetic
+		// response must never carry either out the pool channel.
+		if strings.HasPrefix(lk, "anthropic-ratelimit-") || strings.HasPrefix(lk, "x-codex-") {
+			h.Del(k)
+		}
+	}
+}
+
+func replaceResponseBody(resp *http.Response, body []byte) {
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if resp.Header == nil {
+		resp.Header = make(http.Header)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	resp.Header.Del("Content-Encoding")
+}
+
+func rewriteCredentialDiagnostic(resp *http.Response, verdict CredentialVerdict, method, path string) {
+	message := "upstream request rejected; credential could not be verified; check the client's base URL or endpoint"
+	verified := false
+	if verdict == CredentialAccepted {
+		message = "upstream request rejected; member credential verified; check the client's base URL or endpoint"
+		verified = true
+	}
+	body, err := json.Marshal(struct {
+		Error              string `json:"error"`
+		Method             string `json:"method"`
+		Path               string `json:"path"`
+		UpstreamStatus     int    `json:"upstream_status"`
+		CredentialVerified bool   `json:"credential_verified"`
+		CredentialVerdict  string `json:"credential_verdict"`
+	}{
+		Error:              message,
+		Method:             method,
+		Path:               path,
+		UpstreamStatus:     resp.StatusCode,
+		CredentialVerified: verified,
+		CredentialVerdict:  verdict.String(),
+	})
+	if err != nil {
+		body = []byte(`{"error":"upstream request rejected; credential could not be verified"}`)
+	}
+	stripSyntheticQuotaHeaders(resp.Header)
+	replaceResponseBody(resp, body)
+	resp.Status = strconv.Itoa(resp.StatusCode) + " " + http.StatusText(resp.StatusCode)
+}
+
 // rewriteTo503Response applies the shared synthetic-503 response shape. When
 // replaceBody is false, the upstream body, content type, content length, and
 // content encoding remain untouched for policy responses that expose the
@@ -4382,22 +4603,9 @@ func rewriteTo503Response(resp *http.Response, body []byte, replaceBody bool, re
 	resp.Status = strconv.Itoa(http.StatusServiceUnavailable) + " " + http.StatusText(http.StatusServiceUnavailable)
 
 	h := resp.Header
-	for k := range h {
-		lk := strings.ToLower(k)
-		// anthropic-ratelimit-* and x-codex-* are both the rejected member's
-		// metered quota state — pool-boundary hygiene says a synthetic
-		// response must never carry either out the pool channel (the codex
-		// family joined the strip with issue #304).
-		if strings.HasPrefix(lk, "anthropic-ratelimit-") || strings.HasPrefix(lk, "x-codex-") {
-			h.Del(k)
-		}
-	}
+	stripSyntheticQuotaHeaders(h)
 	if replaceBody {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		resp.ContentLength = int64(len(body))
-		h.Set("Content-Type", "application/json")
-		h.Set("Content-Length", strconv.Itoa(len(body)))
-		h.Del("Content-Encoding")
+		replaceResponseBody(resp, body)
 	}
 	setRetryAfter(h, retryAfter)
 }

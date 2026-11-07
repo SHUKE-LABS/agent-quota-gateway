@@ -26,6 +26,11 @@ const (
 	// call for Anthropic and Codex, not a sub-second quota endpoint.
 	reprobeTimeout = 30 * time.Second
 
+	// credentialProbeTimeout bounds the request-path credential check. It must
+	// not hold an inbound proxy response open as long as the operator's full
+	// quota reprobe, because this path only needs an HTTP status.
+	credentialProbeTimeout = 10 * time.Second
+
 	// reprobeMessagesBody is the minimal Anthropic Messages request a reprobe
 	// sends. Unified rate-limit headers arrive only on real responses — there
 	// is no Anthropic quota endpoint — so one max_tokens:1 Haiku call is the
@@ -89,13 +94,7 @@ func reprobeQuery(store *quota.Store, client *http.Client, now func() time.Time)
 		}
 
 		codex := auto.IsCodexBackend(b)
-		var req *http.Request
-		var err error
-		if codex {
-			req, err = codexhello.NewRequest(ctx, b)
-		} else {
-			req, err = messagesRequest(ctx, b)
-		}
+		req, err := reprobeRequest(ctx, b)
 		if err != nil {
 			return quota.Snapshot{}, fmt.Errorf("%w: %v", errReprobeUnreachable, err)
 		}
@@ -128,6 +127,48 @@ func reprobeQuery(store *quota.Store, client *http.Client, now func() time.Time)
 		}
 		return snap, nil
 	}
+}
+
+func reprobeRequest(ctx context.Context, b backend.Backend) (*http.Request, error) {
+	if auto.IsCodexBackend(b) {
+		return codexhello.NewRequest(ctx, b)
+	}
+	return messagesRequest(ctx, b)
+}
+
+// credentialProbe returns a status-only verifier for request-level auth
+// failures. It shares the operator reprobe's provider/Codex/Messages dispatch
+// and HTTP client policy, but never parses or stores quota data.
+func credentialProbe(client *http.Client) auto.CredentialProbe {
+	return func(parent context.Context, b backend.Backend) auto.CredentialVerdict {
+		ctx, cancel := context.WithTimeout(parent, credentialProbeTimeout)
+		defer cancel()
+		status, err := credentialProbeStatus(ctx, b, client)
+		if err != nil {
+			return auto.CredentialInconclusive
+		}
+		if rejectsCredential(status) {
+			return auto.CredentialRejected
+		}
+		return auto.CredentialAccepted
+	}
+}
+
+func credentialProbeStatus(ctx context.Context, b backend.Backend, client *http.Client) (int, error) {
+	if _, ok := poller.ProviderFor(b.BaseURL); ok {
+		return poller.ProbeStatus(ctx, b, client)
+	}
+	req, err := reprobeRequest(ctx, b)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	return resp.StatusCode, nil
 }
 
 func rejectsCredential(status int) bool {

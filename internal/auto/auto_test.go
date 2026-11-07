@@ -22,6 +22,10 @@ import (
 
 const testDefaultBaseURL = "https://api.anthropic.com"
 
+func rejectingCredentialProbeForTest(context.Context, backend.Backend) CredentialVerdict {
+	return CredentialRejected
+}
+
 // fixedClock is a manually-advanced clock so reset-window logic is
 // deterministic and free of real sleeps.
 type fixedClock struct {
@@ -237,7 +241,9 @@ func respAuth(b backend.Backend, code int) *http.Response {
 
 func newController(t *testing.T, start int, clock *fixedClock, logOut io.Writer, nicks ...string) *Controller {
 	t.Helper()
-	return NewController(testRegistry(t, nicks...), "auto", start, nil, clock.now, logOut)
+	c := NewController(testRegistry(t, nicks...), "auto", start, nil, clock.now, logOut)
+	c.credentialProbe = rejectingCredentialProbeForTest
+	return c
 }
 
 // zaiController builds a single-pool controller whose pool default upstream
