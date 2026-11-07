@@ -29,7 +29,9 @@ func codexController(t *testing.T, clock *fixedClock, logOut io.Writer, store *q
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	return NewController(reg, "auto", 0, store, clock.now, logOut)
+	c := NewController(reg, "auto", 0, store, clock.now, logOut)
+	c.credentialProbe = rejectingCredentialProbeForTest
+	return c
 }
 
 // codexWin describes one x-codex-* window on a synthetic response. The zero

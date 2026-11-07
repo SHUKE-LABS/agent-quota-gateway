@@ -11,7 +11,7 @@ Interactive TUI sessions and non-interactive workers are both in scope; a single
 
 - **Agent fleets first:** Per-worker affinity and spreading via `/_aqg/w/<worker-nickname>` ([per-worker affinity](#per-worker-affinity)).
 - **Credentials stay at the gateway:** Clients send a pool name; the gateway swaps in the credential and never logs credentials or bodies ([security model](#security-model)).
-- **Sticky quota-aware routing:** A worker stays on one account until a real `429` or blocking quota window, then fails over in declared or sorted order; a revoked `401`/`403` credential is parked ([pools and selectors](#pools-and-selectors)).
+- **Sticky quota-aware routing:** A worker stays on one account until a real `429` or blocking quota window, then fails over in declared or sorted order; a request-level `401`/`403` parks a member only after an independent gateway-owned probe confirms the credential is rejected ([pools and selectors](#pools-and-selectors)).
 - **Wait and resume when a pool is empty:** An exhausted pool returns `503` with `Retry-After` up to the soonest reset, so Claude Code can wait and resume instead of ending the turn ([429/529 handling](#what-the-client-sees-on-an-upstream-429-native-anthropic-529-or-codex-capacity-overload)).
 - **Opaque provider passthrough:** Anthropic Messages and OpenAI-compatible Responses pass through without translation, so new endpoints and beta headers work without gateway changes ([scope](#scope)).
 - **Quota and health at a glance:** `/_gateway/quota`, `/_gateway/pool`, `/_gateway/ui`, and Z.ai / MiniMaxi / Volcengine Ark pollers expose the current view ([reading a pool's quota](#reading-a-pools-quota), [inspecting pool health](#inspecting-pool-health), [proprietary quota polling](#proprietary-quota-polling)).
@@ -101,7 +101,7 @@ recovers, only workers needed to balance the window move back. A transient
 same-member throttle, 529, or Codex capacity overload keeps the member
 available and does not move its workers.
 
-A real upstream quota rejection or credential failure makes the member
+A real upstream quota rejection or confirmed credential failure makes the member
 unavailable in every pool that shares the nick; each mapped worker is
 reassigned within its pool window on its next request.
 
@@ -140,7 +140,7 @@ pool's "fresh-looking" copy gets picked after the other has already exhausted
 it.
 
 A park the quota store cannot represent follows the same rule (issue #254). A
-`401`/`403` credential rejection, or a `429` with no usable reset, is a fact
+confirmed `401`/`403` credential rejection, or a `429` with no usable reset, is a fact
 about the credential itself — no quota-window field can carry it, so no
 sibling pool could ever re-derive it from the shared store the way a
 window-backed park is derived. The gateway copies that park directly into
@@ -249,11 +249,15 @@ contract from nick, token prefix, hostname, or request body.
   reaches the client as soon as the upstream writes it.
 - Error responses from upstream propagate to the client with the original
   status code, except those response paths handle specially: a `429` (quota),
-  and a `401`/`403` (the backend's credential was rejected — revoked, expired,
-  or the account pulled), which fail the pool over to a healthy member rather
-  than stick to a dead account. If every enabled member is parked only for
-  `401`/`403`, later client requests retry the first parked member in effective
-  order; concurrent requests may all reach that upstream. A recovered
+  and a request-level `401`/`403`, which first gets an independent,
+  gateway-owned credential probe. A probe returning `401`/`403` confirms the
+  backend credential was rejected (revoked, expired, or pulled), so the pool
+  fails over to a healthy member rather than sticking to a dead account. An
+  accepted or inconclusive probe keeps the member serving and returns the
+  original status with a credential-free diagnostic telling the client to
+  check its base URL or endpoint. If every enabled member is parked only for
+  confirmed `401`/`403`, later client requests retry the first parked member
+  in effective order; concurrent requests may all reach that upstream. A recovered
   credential is released by its next non-`401`/`403` response. A native
   Anthropic `529` overload becomes a same-member `503` with `Retry-After: 60`;
   a ChatGPT-Codex stream that fails with `server_is_overloaded` before any
@@ -629,11 +633,11 @@ Codex weekly hello below is independent of member selection:
   member instead of parking it). Separately, any original upstream non-2xx
   response can park it when a fresh eligible statusless window is full; the
   snapshot alone keeps the member eligible.
-- **Dead-credential switch.** A member that returns `401`/`403` (its
-  credential was revoked, expired, or the account pulled) is parked for the
-  conservative default window and the pool fails over — a dead account never
-  emits a `429`, so without this the pool would stick to it and return the
-  auth error to every client. If the same nick is a member of other pools,
+- **Dead-credential switch.** A member is parked for the conservative default
+  window only when its request-level `401`/`403` is confirmed by an independent
+  gateway-owned probe; the pool then fails over. A dead account never emits a
+  `429`, so without this the pool would stick to it and return the auth error
+  to every client. If the same nick is a member of other pools,
   the park is copied into every one of them immediately (issue #254) — the
   credential is equally dead there, and no sibling pool would otherwise learn
   that fact until its own next `401`. The park is cleared, everywhere it was
@@ -644,12 +648,15 @@ Codex weekly hello below is independent of member selection:
   A repeated `401`/`403` is returned with `Retry-After`; any other upstream
   status releases that auth park across sibling pools before normal response
   handling (so a `429` still applies its quota park). Concurrent client
-  requests can all reach the parked member; the gateway does not add a probe.
-  Quota parks, including fallback parks, continue to produce the pool's
+  requests can all reach the parked member. Accepted or inconclusive probes
+  leave the member in rotation and return the original status with a short
+  JSON diagnostic; verdicts are coalesced per credential and cooled down for
+  60 seconds. Quota parks, including fallback parks, continue to produce the pool's
   synthetic `503` with the quota `Retry-After`.
-- **No routing probe.** The starting member is the first available one in
+- **No quota-routing probe.** The starting member is the first available one in
   effective order (or a valid persisted sticky member), and the gateway never
-  contacts a member just to measure quota. The Codex hello starts the upstream weekly
+  contacts a member just to measure quota. A request-level auth failure may
+  cause the separate status-only credential check described above. The Codex hello starts the upstream weekly
   session after its stored reset; its quota headers update the shared
   snapshot, but it never moves the sticky pointer or changes exhaustion
   state. Rolling 5-hour windows remain anchored to real use.
@@ -911,10 +918,12 @@ the `status: "disabled"` string derives from, so the two can never disagree.
 The UI's per-member toggle reads this on every poll to stay in sync with an
 out-of-band disable (another tab, the API, another operator).
 
-**Caveat for Anthropic/Claude members:** the gateway never probes — quota
-state is learned only from real proxied responses. An idle or never-active
-member will have `snapshot: null` or a stale value. This is intentional:
-probing would start a new session and consume quota.
+**Caveat for Anthropic/Claude members:** quota state is learned only from real
+proxied responses. A request-level `401`/`403` can additionally trigger one
+bounded credential check, but that status-only result is not merged into the
+quota store. An idle or never-active member will have `snapshot: null` or a
+stale value; quota-refresh probing would start a new session and consume
+quota.
 
 **`poller`** is the per-pool liveness observation (issue #247) for pools
 the background poller tracks (Z.ai / ZhipuAI, MiniMaxi, Volcengine Ark).
@@ -1453,14 +1462,16 @@ that section for the changed model.) The guarantees that follow:
   so state survives a restart. The file contains quota snapshots, routing
   identities, and timing — no credentials — and is `0600` so only the service account can
   read it. There is no telemetry egress.
-- The proxy does not issue probe traffic against the Messages API: each
-  header-derived snapshot there comes from a real client request. Background
-  upstream requests are the poller's reads of Z.ai / ZhipuAI, MiniMaxi, and
-  Volcengine Ark quota endpoints, plus the Codex weekly hello to an eligible
-  member's own `chatgpt.com` upstream. Each uses that member's credential
-  (or Volcengine's IAM key pair). The hello carries only its fixed
-  gateway-created JSON body; client request and response bodies remain
-  opaque.
+- The proxy does not issue quota-refresh probes against the Messages API:
+  each header-derived snapshot there comes from a real client request. A
+  request-level `401`/`403` may still trigger one bounded, status-only
+  credential check using the same member credential; its response is not
+  merged into the quota store. Other background upstream requests are the
+  poller's reads of Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark quota
+  endpoints, plus the Codex weekly hello to an eligible member's own
+  `chatgpt.com` upstream. Each uses that member's credential (or Volcengine's
+  IAM key pair). The hello carries only its fixed gateway-created JSON body;
+  client request and response bodies remain opaque.
 - The listen address is loopback-only by default. `config.validate`
   rejects `0.0.0.0`, and unresolvable names so a misconfigured deployment
   fails closed at startup. The one sanctioned way off loopback is
@@ -1852,10 +1863,12 @@ local read-only view, gated by the loopback boundary like
 ### Freshness model
 
 For Anthropic and other header-reporting backends, snapshots only update
-when real traffic flows. The gateway issues no synthetic probe requests
-against the Messages API — if no client has hit the pool recently, the
-snapshot is stale by exactly that gap. Codex weekly resets use the separate
-hello described below; it does not probe Anthropic or affect routing.
+when real traffic flows. The gateway issues no synthetic quota-refresh
+requests against the Messages API — if no client has hit the pool recently,
+the snapshot is stale by exactly that gap. A request-level auth failure may
+trigger the separate bounded, status-only credential check; it does not
+update quota state or affect routing unless it confirms `401`/`403`.
+Codex weekly resets use the separate hello described below.
 
 Z.ai / ZhipuAI, MiniMaxi, and Volcengine Ark backends are kept fresh
 independently of traffic by the background poller (see
@@ -1989,8 +2002,10 @@ poller uses (cheap, non-billable, returns utilization + precise reset). A
 member whose probe no longer satisfies the freshness/exhaustion predicate
 is unparked; the request is then routed to it (response rewritten to
 503 — the normal switch shape) instead of being forwarded as the
-upstream 429. Anthropic is intentionally not probed — its 429s already
-carry precise resets and organic traffic refreshes the store.
+upstream 429. Anthropic is intentionally not quota-probed here — its 429s
+already carry precise resets and organic traffic refreshes the store. The
+separate request-path credential check runs only after a client-facing
+`401`/`403`.
 
 Probes are rate-limited (≤ 1 per parked member per 30s) and coalesce
 across concurrent all-exhausted requests so a stalled upstream does not
@@ -2010,8 +2025,9 @@ probe-eligible member (issue #242):
   registered proprietary provider (z.ai / MiniMaxi / Ark). The active
   sticky member is skipped — probing it would duplicate the request-path
   all-exhausted recovery and race its in-flight bookkeeping. Anthropic is
-  skipped for the same reason as the request-path probe: its `429`s
-  carry precise resets and organic traffic refreshes the store.
+  skipped because its `429`s carry precise resets and organic traffic refresh
+  the store; the request-path credential check is a separate auth-failure
+  safeguard, not this quota-recovery loop.
 - **Cadence.** The loop ticks every 5 minutes, matching the preemptor's
   idle fallback interval. The per-member `30s` probe cooldown still
   bounds concurrent overlaps with request-path probes (the two paths

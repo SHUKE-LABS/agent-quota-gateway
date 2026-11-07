@@ -233,6 +233,11 @@ func run(configFlag string) error {
 	// without a live 429 — the only exhaustion signal poller-tracked
 	// backends (z.ai / MiniMaxi) ever produce.
 	pools := auto.NewPools(registry, store, nil, nil)
+	reprobeClient := newReprobeClient()
+	// Request-level 401/403 responses must be confirmed by an independent
+	// server-owned probe before a member is parked. The same client and class
+	// dispatch serve the operator reprobe endpoint below.
+	pools.SetCredentialProbe(credentialProbe(reprobeClient))
 
 	// Gateway-default-upstream resolver for the add-member base_url fallback
 	// (issue #302). Kept as a named helper so tests exercise the exact wiring
@@ -367,7 +372,7 @@ func run(configFlag string) error {
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}/move", moveMemberHandler(pools, persistence))
 	// Operator reprobe (issue #350): method checked in the handler so a
 	// non-POST is a 405, not a fall-through to the proxy catch-all.
-	mux.HandleFunc("/_gateway/pool/{name}/member/{nick}/reprobe", reprobeHandler(pools, reprobeQuery(store, newReprobeClient(), time.Now)))
+	mux.HandleFunc("/_gateway/pool/{name}/member/{nick}/reprobe", reprobeHandler(pools, reprobeQuery(store, reprobeClient, time.Now)))
 	mux.HandleFunc("POST /_gateway/pool/{name}/member/{nick}", addMemberHandler(pools, persistence))
 	mux.HandleFunc("DELETE /_gateway/pool/{name}/member/{nick}", removeMemberHandler(pools, persistence))
 	mux.Handle("/", backend.Middleware(pools, proxyHandler))

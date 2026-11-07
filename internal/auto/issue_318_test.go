@@ -185,6 +185,7 @@ func TestWorkerAffinity_realFailureInvalidatesAllMappingsToNick(t *testing.T) {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 			p := NewPools(workerRegistryWithConcurrency(t, 2, "a", "b"), nil, clock.now, io.Discard)
+			p.SetCredentialProbe(rejectingCredentialProbeForTest)
 			for _, worker := range []string{"agent-one", "agent-two", "agent-three"} {
 				if _, _, ok, exhausted := p.RouteWorker("auto", worker); !ok || exhausted {
 					t.Fatalf("initial assignment for %s failed", worker)
@@ -228,6 +229,7 @@ func TestWorkerAffinity_sharedCredentialFailureInvalidatesSiblingPool(t *testing
 			}
 			store := quota.NewStore()
 			p := NewPools(reg, store, clock.now, io.Discard)
+			p.SetCredentialProbe(rejectingCredentialProbeForTest)
 			if got, _, _, _ := p.RouteWorker("one", "agent-shared"); got.Nick != "a" {
 				t.Fatalf("pool one assignment=%q, want a", got.Nick)
 			}

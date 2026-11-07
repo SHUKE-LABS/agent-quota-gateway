@@ -18,6 +18,7 @@ import (
 func TestCredentialDryPoolForwardsRepeatedAuthFailure(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	p := NewPools(testRegistry(t, "solo"), nil, clock.now, io.Discard)
+	p.SetCredentialProbe(rejectingCredentialProbeForTest)
 	upstreamCalls := 0
 	upstreamBody := `{"error":"invalid_api_key"}`
 	gateway := backend.Middleware(p, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +79,7 @@ func TestCredentialDryPoolForwardsRepeatedAuthFailure(t *testing.T) {
 func TestCredentialRejectionStillFailsOverToHealthyMember(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	p := NewPools(workerPriorityRegistry(t, 1, "a,b", "a", "b"), nil, clock.now, io.Discard)
+	p.SetCredentialProbe(rejectingCredentialProbeForTest)
 	var upstreamNicks []string
 	gateway := backend.Middleware(p, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, ok := backend.FromContext(r.Context())
@@ -207,6 +209,7 @@ func TestCredentialAuthRecoveryReanchorsUnavailableStickyAcrossPools(t *testing.
 		t.Fatalf("BuildFromSpec: %v", err)
 	}
 	p := NewPools(reg, nil, clock.now, io.Discard)
+	p.SetCredentialProbe(rejectingCredentialProbeForTest)
 	reset := clock.now().Add(time.Hour)
 	for pool, parkedNick := range map[string]string{"a": "aonly", "b": "bonly"} {
 		c := p.byPool[pool]
@@ -411,6 +414,7 @@ func TestCredentialDryPoolKeepsPreciseQuota503AlongsideAuthPark(t *testing.T) {
 func TestCredentialDryPoolAuthCausePersistsAndLegacyDoesNotRetry(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	p := NewPools(testRegistry(t, "solo"), nil, clock.now, io.Discard)
+	p.SetCredentialProbe(rejectingCredentialProbeForTest)
 	b, _ := p.CurrentRegistry().ResolveIn("auto", "solo")
 	if err := p.ModifyResponse(respAuth(b, http.StatusUnauthorized)); err != nil {
 		t.Fatalf("ModifyResponse 401: %v", err)
@@ -421,6 +425,7 @@ func TestCredentialDryPoolAuthCausePersistsAndLegacyDoesNotRetry(t *testing.T) {
 	}
 
 	reloaded := NewPools(testRegistry(t, "solo"), nil, clock.now, io.Discard)
+	reloaded.SetCredentialProbe(rejectingCredentialProbeForTest)
 	reloaded.LoadPersistState(saved)
 	if got, _, ok, exhausted := reloaded.Route("auto"); !ok || exhausted || got.Nick != "solo" {
 		t.Fatalf("restored auth route=%q ok=%v exhausted=%v, want solo/true/false", got.Nick, ok, exhausted)
@@ -439,6 +444,7 @@ func TestCredentialDryPoolAuthCausePersistsAndLegacyDoesNotRetry(t *testing.T) {
 		t.Fatal("legacy entry without auth_rejected decoded as an auth park")
 	}
 	legacyPool := NewPools(testRegistry(t, "solo"), nil, clock.now, io.Discard)
+	legacyPool.SetCredentialProbe(rejectingCredentialProbeForTest)
 	legacyPool.LoadPersistState(map[string]PoolPersistState{"auto": {
 		Exhausted:      map[string]time.Time{"solo": reset},
 		CredentialPark: map[string]CredentialParkPersist{"solo": legacy},
@@ -453,6 +459,7 @@ func TestCredentialDryPoolWorkerRoutesUseSameAuthOnlyRule(t *testing.T) {
 		t.Run(fmt.Sprintf("concurrency-%d", concurrency), func(t *testing.T) {
 			clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 			p := NewPools(workerRegistryWithConcurrency(t, concurrency, "a", "b"), nil, clock.now, io.Discard)
+			p.SetCredentialProbe(rejectingCredentialProbeForTest)
 			reg := p.CurrentRegistry()
 			for _, nick := range []string{"a", "b"} {
 				b, _ := reg.ResolveIn("auto", nick)
@@ -507,6 +514,7 @@ func TestCredentialDryPoolWorkerRecoveryRoutesNormally(t *testing.T) {
 		t.Run(fmt.Sprintf("concurrency-%d", concurrency), func(t *testing.T) {
 			clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 			p := NewPools(workerPriorityRegistry(t, concurrency, "a,b", "a", "b"), nil, clock.now, io.Discard)
+			p.SetCredentialProbe(rejectingCredentialProbeForTest)
 			reg := p.CurrentRegistry()
 			for _, nick := range []string{"a", "b"} {
 				b, _ := reg.ResolveIn("auto", nick)
@@ -589,6 +597,7 @@ func TestCredentialDryPoolWorkerRecoveryRoutesNormally(t *testing.T) {
 func TestCredentialDryPoolUsesPriorityBeforeSortedNicks(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	p := NewPools(workerPriorityRegistry(t, 2, "b,a", "a", "b"), nil, clock.now, io.Discard)
+	p.SetCredentialProbe(rejectingCredentialProbeForTest)
 	reg := p.CurrentRegistry()
 	for _, nick := range []string{"a", "b"} {
 		b, _ := reg.ResolveIn("auto", nick)

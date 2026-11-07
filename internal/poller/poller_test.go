@@ -354,6 +354,30 @@ func TestProviderFor(t *testing.T) {
 	}
 }
 
+func TestProbeStatusReturnsHTTPStatusWithoutParsing(t *testing.T) {
+	var gotPath, gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, "not quota JSON")
+	}))
+	t.Cleanup(upstream.Close)
+	WithTestProviderForTest(t, upstream.URL, HostURLForTest("/quota"), RawAuthForTest, ParseZhipuForTest)
+
+	b := backend.Backend{Pool: "auto", Nick: "a", Credential: "zai-key", BaseURL: upstream.URL}
+	status, err := ProbeStatus(context.Background(), b, upstream.Client())
+	if err != nil {
+		t.Fatalf("ProbeStatus: %v", err)
+	}
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want %d", status, http.StatusTooManyRequests)
+	}
+	if gotPath != "/quota" || gotAuth != "zai-key" {
+		t.Errorf("request path=%q auth=%q, want /quota and raw credential", gotPath, gotAuth)
+	}
+}
+
 func TestHostURL_keepsHostReplacesPath(t *testing.T) {
 	build := hostURL("/api/monitor/usage/quota/limit")
 	got, err := build("https://api.z.ai/api/anthropic/v1/messages")

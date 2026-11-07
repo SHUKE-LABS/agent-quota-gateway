@@ -21,7 +21,9 @@ func loadMovePools(t *testing.T, clock *fixedClock, env map[string]string) *Pool
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	return NewPools(reg, nil, clock.now, io.Discard)
+	p := NewPools(reg, nil, clock.now, io.Discard)
+	p.SetCredentialProbe(rejectingCredentialProbeForTest)
+	return p
 }
 
 // poolMembers returns the effective-config member nicks for a pool as a set.

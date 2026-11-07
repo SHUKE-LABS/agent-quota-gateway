@@ -38,7 +38,9 @@ func reprobePools(t *testing.T, clock *fixedClock, store *quota.Store, baseURL s
 	if err != nil {
 		t.Fatalf("backend.Load: %v", err)
 	}
-	return NewPools(reg, store, clock.now, io.Discard)
+	p := NewPools(reg, store, clock.now, io.Discard)
+	p.SetCredentialProbe(rejectingCredentialProbeForTest)
+	return p
 }
 
 // windowSnap is a status-bearing snapshot for one window ("5h" or "7d"), the
