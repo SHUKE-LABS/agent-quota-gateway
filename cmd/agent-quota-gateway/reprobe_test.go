@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -383,6 +384,68 @@ func TestCredentialProbe_transportErrorIsInconclusive(t *testing.T) {
 	client := &http.Client{Transport: credentialProbeErrorTransport{}}
 	if got := credentialProbe(client)(context.Background(), b); got != auto.CredentialInconclusive {
 		t.Fatalf("verdict=%s, want inconclusive", got)
+	}
+}
+
+func TestCredentialProbe_timeoutPreservesResponseAndMember(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	}))
+	defer close(release)
+	t.Cleanup(upstream.Close)
+
+	client := &http.Client{Timeout: 25 * time.Millisecond}
+	pools := func() *auto.Pools {
+		_, pools := reprobeServer(t, quota.NewStore(), upstream.URL, "credential", client)
+		pools.SetCredentialProbe(credentialProbe(client))
+		return pools
+	}()
+	b, ok := pools.CurrentRegistry().ResolveIn("auto", "a")
+	if !ok {
+		t.Fatal("backend a missing")
+	}
+	ctx := backend.WithBackend(context.Background(), b)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
+	ctx = backend.WithInboundRequest(req.Context(), req.Method, req.URL.Path)
+	req = req.WithContext(ctx)
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader("upstream body")),
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- pools.ModifyResponse(resp) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("credential probe did not reach the controlled upstream")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ModifyResponse: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("credential probe timeout was not bounded")
+	}
+
+	var body struct {
+		Error   string `json:"error"`
+		Verdict string `json:"credential_verdict"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("diagnostic JSON: %v", err)
+	}
+	if resp.StatusCode != http.StatusForbidden || body.Verdict != "inconclusive" || !strings.Contains(body.Error, "could not be verified") {
+		t.Fatalf("timeout response=%d body=%+v, want original 403 inconclusive diagnostic", resp.StatusCode, body)
+	}
+	if got, _, ok, exhausted := pools.Route("auto"); !ok || exhausted || got.Nick != "a" {
+		t.Fatalf("route after timeout=%q ok=%v exhausted=%v, want a serving", got.Nick, ok, exhausted)
 	}
 }
 

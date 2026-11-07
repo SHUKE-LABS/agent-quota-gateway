@@ -139,6 +139,24 @@ func TestCredentialProbeAcceptedDoesNotEmptyTwoMemberPool(t *testing.T) {
 	if b, _, ok, exhausted := p.Route("auto"); !ok || exhausted || b.Nick != "a" {
 		t.Fatalf("route after client rejections=%q ok=%v exhausted=%v, want serving a", b.Nick, ok, exhausted)
 	}
+
+	// Exercise the actual resolver boundary after the two bad client paths:
+	// a valid follow-up request must still reach the selected fake upstream.
+	gateway := backend.Middleware(p, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, ok := backend.FromContext(r.Context())
+		if !ok || b.Nick != "a" {
+			t.Errorf("follow-up upstream backend=(%q, ok=%v), want a", b.Nick, ok)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("healthy"))
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer auto")
+	rec := httptest.NewRecorder()
+	gateway.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "healthy" {
+		t.Fatalf("valid follow-up response=%d %q, want 200 healthy", rec.Code, rec.Body.String())
+	}
 }
 
 func TestCredentialProbeRejectedPreservesFailover(t *testing.T) {
@@ -214,7 +232,9 @@ func TestCredentialProbeInconclusiveDoesNotParkOrWriteStore(t *testing.T) {
 	before := quota.Snapshot{Backend: "a", Unified5hStatus: "allowed", AsOf: clock.now()}
 	store.Put("a", before)
 	p := NewPools(testRegistry(t, "a"), store, clock.now, io.Discard)
+	calls := 0
 	p.SetCredentialProbe(func(context.Context, backend.Backend) CredentialVerdict {
+		calls++
 		return CredentialInconclusive
 	})
 	b, _ := p.CurrentRegistry().ResolveIn("auto", "a")
@@ -225,6 +245,26 @@ func TestCredentialProbeInconclusiveDoesNotParkOrWriteStore(t *testing.T) {
 	body := readBody(t, resp)
 	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(body, "could not be verified") {
 		t.Fatalf("response status/body=%d/%q, want original status and inconclusive diagnostic", resp.StatusCode, body)
+	}
+	if calls != 1 {
+		t.Fatalf("initial inconclusive probe calls=%d, want 1", calls)
+	}
+	resp = authResponse(b, http.StatusUnauthorized)
+	if err := p.ModifyResponse(resp); err != nil {
+		t.Fatalf("cached ModifyResponse: %v", err)
+	}
+	_ = readBody(t, resp)
+	if calls != 1 {
+		t.Fatalf("inconclusive probe calls within cooldown=%d, want 1", calls)
+	}
+	clock.advance(credentialProbeCooldown)
+	resp = authResponse(b, http.StatusUnauthorized)
+	if err := p.ModifyResponse(resp); err != nil {
+		t.Fatalf("expired ModifyResponse: %v", err)
+	}
+	_ = readBody(t, resp)
+	if calls != 2 {
+		t.Fatalf("inconclusive probe calls after cooldown=%d, want 2", calls)
 	}
 	if after := store.Get("a"); after != before {
 		t.Errorf("store changed on credential probe: before=%+v after=%+v", before, after)
