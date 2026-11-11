@@ -13,6 +13,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/poller"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
@@ -57,9 +58,10 @@ type Preemptor struct {
 // NewPreemptor builds a Preemptor over the pools in p. It reads p's current
 // controller set fresh on every tick (via p.sortedControllers, under Pools'
 // lock), so runtime-created pools are picked up automatically; tick() itself
-// skips empty pools. store supplies the precise unified_5h_reset; interval
-// defaults to 5 minutes, now to time.Now, and logOut to os.Stderr when their
-// zero value is passed.
+// skips empty pools. store supplies the precise unified_5h_reset and the
+// statusless long-window snapshot used to refine an existing live park;
+// interval defaults to 5 minutes, now to time.Now, and logOut to os.Stderr
+// when their zero value is passed.
 func NewPreemptor(p *Pools, store *quota.Store, interval time.Duration, now func() time.Time, logOut io.Writer) *Preemptor {
 	return newPreemptorFunc(p.sortedControllers, store, interval, now, logOut)
 }
@@ -114,13 +116,13 @@ func (p *Preemptor) Run(ctx context.Context) {
 // tick performs one preempt-back evaluation across every nonempty pool and
 // returns how long to sleep before the next one. For each pool it walks the
 // members ranked strictly above the active one, in effective order, and
-// either switches now (the member has recovered) or records when it will,
-// scheduling the loop to wake at the soonest such reset. The returned wait is
-// capped at the interval: a reset within the interval is slept to exactly,
-// while a farther one is re-evaluated at each interval mark — so a member
-// that parks or recovers mid-sleep on any pool is seen within one interval,
-// not at some far reset another pool scheduled (issue #288). With nothing to
-// wait for it returns the idle interval.
+// either switches now (the member has recovered) or records its binding
+// recovery reset, scheduling the loop to wake at the soonest such reset. The
+// returned wait is capped at the interval: a reset within the interval is
+// slept to exactly, while a farther one is re-evaluated at each interval mark
+// — so a member that parks or recovers mid-sleep on any pool is seen within
+// one interval, not at some far reset another pool scheduled (issue #288).
+// With nothing to wait for it returns the idle interval.
 func (p *Preemptor) tick() time.Duration {
 	now := p.now()
 
@@ -149,7 +151,8 @@ func (p *Preemptor) tick() time.Duration {
 			// The precise window reset from the quota store (populated for
 			// Anthropic via headers, for z-ai/MiniMaxi via the poller) is
 			// preferred over the controller's conservative park.
-			qReset := p.store.Get(m.quotaKey).Unified5hReset
+			snap := p.store.Get(m.quotaKey)
+			qReset := snap.Unified5hReset
 			// m.exhausted already incorporates store-driven exhaustion via
 			// exhaustedUntilLocked → storeExhaustedUntilLocked → windowBlocks,
 			// which is the only predicate that correctly handles Anthropic's
@@ -173,14 +176,37 @@ func (p *Preemptor) tick() time.Duration {
 				break
 			}
 
-			// Member is exhausted (by park, store, or both). Check if it has recovered.
-			if qReset != nil && !now.Before(*qReset) {
+			// Member is exhausted (by park, store, or both). Compute the
+			// binding recovery reset. The precise 5h reset still supersedes a
+			// conservative park, but an eligible statusless long window may
+			// extend an existing live failed-response park. A statusless
+			// snapshot without that live park never reaches this branch because
+			// exhaustedUntilLocked deliberately does not create store-only
+			// exhaustion from it.
+			next := m.reset
+			if qReset != nil && (next.IsZero() || qReset.Before(next)) &&
+				!m.longWindowBound {
+				next = *qReset
+			}
+			if longReset, ok := m.statuslessLongReset(snap, now); ok &&
+				(next.IsZero() || longReset.After(next)) {
+				next = longReset
+			}
+
+			if !next.IsZero() && !now.Before(next) {
 				// The precise window has reset. Act once per distinct reset so a
 				// member that resets but is immediately re-limited does not flap
 				// on its stale frozen value.
-				if !p.lastActed[m.quotaKey].Equal(*qReset) {
+				actedReset := next
+				if qReset != nil {
+					// Keep the historical dedup anchor on the precise 5h
+					// reset when one exists. A later long-window bound must
+					// not make the same frozen 5h value flap on re-limit.
+					actedReset = *qReset
+				}
+				if !p.lastActed[m.quotaKey].Equal(actedReset) {
 					c.noteRecovered(m.nick)
-					p.lastActed[m.quotaKey] = *qReset
+					p.lastActed[m.quotaKey] = actedReset
 					target = m.nick
 					break
 				}
@@ -188,15 +214,7 @@ func (p *Preemptor) tick() time.Duration {
 				// the controller's fresh park instead.
 			}
 
-			// Still exhausted: wake at the soonest of the park reset or the
-			// precise store reset (when known and still ahead).
-			// When park reset is zero (member not parked), use the store reset.
-			next := m.reset
-			if next.IsZero() && qReset != nil && qReset.After(now) {
-				next = *qReset
-			} else if qReset != nil && qReset.After(now) && qReset.Before(next) {
-				next = *qReset
-			}
+			// Still exhausted: wake at the binding reset computed above.
 			if !next.IsZero() {
 				schedule(next)
 			}
@@ -223,9 +241,10 @@ func (p *Preemptor) tick() time.Duration {
 	return p.interval
 }
 
-// preemptView is a read-only snapshot of a controller's state the preemptor
-// needs to schedule and decide a preempt-back. hasOrder is false only for an
-// empty pool, which has no routing target to preempt.
+// preemptView is the controller snapshot the preemptor needs to schedule and
+// decide a preempt-back. It may extend an existing live park before taking the
+// snapshot; hasOrder is false only for an empty pool, which has no routing
+// target to preempt.
 type preemptView struct {
 	hasOrder bool
 	current  string
@@ -236,22 +255,44 @@ type preemptView struct {
 
 // memberState describes one higher-ranked member at snapshot time.
 type memberState struct {
-	nick      string
-	quotaKey  string    // the quota.Store key, for the precise reset lookup
-	exhausted bool      // whether the controller currently parks it
-	reset     time.Time // park reset; valid only when exhausted
+	nick             string
+	quotaKey         string    // the quota.Store key, for precise reset lookups
+	exhausted        bool      // whether the controller currently parks it
+	reset            time.Time // union recovery reset; valid only when exhausted
+	livePark         bool      // a failed-response park, not store-only exhaustion
+	longWindowBlocks bool      // provider's long window is chat-blocking
+	longWindowBound  bool      // live park reset already incorporates that window
 }
 
-// preemptView snapshots the members ranked above the active one. It clears
-// expired marks first so a member whose park already elapsed reads as
-// healthy. Returns the zero view for an empty pool.
+// preemptView snapshots the members ranked above the active one. Before
+// clearing expired marks it lets an existing live failed-response park absorb
+// a future statusless long-window reset, so a short-window tick cannot discard
+// the later binding bound. A statusless snapshot alone never creates a park.
+// Returns the zero view for an empty pool.
 func (c *Controller) preemptView() preemptView {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	order := c.effectiveOrderLocked()
 	if len(order) == 0 {
+		c.mu.Unlock()
 		return preemptView{}
+	}
+	var propagated []struct {
+		nick  string
+		entry credentialParkEntry
+	}
+	longBound := make(map[string]bool)
+	for _, nick := range order {
+		if entry, propagate, extended := c.extendStatuslessLongParkLocked(nick); extended {
+			longBound[nick] = true
+			if !propagate {
+				continue
+			}
+			propagated = append(propagated, struct {
+				nick  string
+				entry credentialParkEntry
+			}{nick: nick, entry: entry})
+		}
 	}
 	c.clearExpiredLocked()
 
@@ -275,14 +316,122 @@ func (c *Controller) preemptView() preemptView {
 		if c.disabled[nick] {
 			continue
 		}
-		ms := memberState{nick: nick, quotaKey: c.backendAt(idx).QuotaKey()}
+		b := c.backendAt(idx)
+		ms := memberState{
+			nick:             nick,
+			quotaKey:         b.QuotaKey(),
+			longWindowBlocks: poller.LongWindowBlocksExhaustion(b.BaseURL),
+		}
 		if r, ok := c.exhaustedUntilLocked(nick); ok {
 			ms.exhausted = true
 			ms.reset = r
 		}
+		if entry, ok := c.credentialPark[nick]; ok {
+			ms.longWindowBound = entry.longWindowBound
+		}
+		if longBound[nick] {
+			ms.longWindowBound = true
+		}
+		ms.livePark = c.liveParkActiveLocked(nick)
+		if entry, ok := c.credentialPark[nick]; ok && entry.authRejected {
+			// A credential-rejection park is not quota evidence; a stored
+			// statusless long window must not extend it.
+			ms.livePark = false
+			ms.longWindowBound = false
+		}
 		v.higher = append(v.higher, ms)
 	}
+	c.mu.Unlock()
+	if c.propagatePark != nil {
+		for _, extension := range propagated {
+			c.propagatePark(extension.nick, extension.entry)
+		}
+	}
 	return v
+}
+
+// statuslessLongWindowReset returns a future 7d reset only when the snapshot
+// is a fresh, full, statusless, chat-blocking window. The caller must supply
+// the independent live-park evidence; this helper never creates a park from a
+// store snapshot alone. Z.AI's monthly long window is excluded by
+// longWindowBlocks.
+func statuslessLongWindowReset(snap quota.Snapshot, now time.Time, longWindowBlocks bool) (time.Time, bool) {
+	if !longWindowBlocks || snap.Unified7dStatus != "" ||
+		!windowBlocks(snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset, snap.AsOf, now) ||
+		snap.Unified7dReset == nil || !snap.Unified7dReset.After(now) {
+		return time.Time{}, false
+	}
+	return *snap.Unified7dReset, true
+}
+
+// statuslessLongReset returns a future 7d reset only when the member already
+// has a live failed-response park and its provider treats the long window as
+// chat-blocking. The live park supplies the failure evidence; the statusless
+// snapshot only refines its bound, so it never becomes an independent park.
+func (m memberState) statuslessLongReset(snap quota.Snapshot, now time.Time) (time.Time, bool) {
+	if !m.livePark {
+		return time.Time{}, false
+	}
+	return statuslessLongWindowReset(snap, now, m.longWindowBlocks)
+}
+
+// extendStatuslessLongParkLocked preserves the live-park evidence while a
+// statusless full long window remains ahead. Without this extension,
+// clearExpiredLocked would remove a short live park at its 5h reset before
+// tick can observe that the weekly window is still binding. The store snapshot
+// cannot create an entry here: c.exhausted must already contain the failed-
+// response park. The returned credential park, when present, is propagated by
+// preemptView after c.mu is released. The final bool reports that the live
+// park now carries the long-window bound, even when no credential park exists
+// to propagate. Caller holds c.mu.
+func (c *Controller) extendStatuslessLongParkLocked(nick string) (credentialParkEntry, bool, bool) {
+	reset, parked := c.exhausted[nick]
+	now := c.now()
+	if !parked || !now.Before(reset) {
+		return credentialParkEntry{}, false, false
+	}
+	if entry, ok := c.credentialPark[nick]; ok && entry.authRejected {
+		return credentialParkEntry{}, false, false
+	}
+	if c.store == nil {
+		return credentialParkEntry{}, false, false
+	}
+	idx := c.indexOf(nick)
+	if idx < 0 {
+		return credentialParkEntry{}, false, false
+	}
+	b := c.backendAt(idx)
+	snap := c.store.Get(b.QuotaKey())
+	longReset, ok := statuslessLongWindowReset(snap, now, poller.LongWindowBlocksExhaustion(b.BaseURL))
+	if !ok || reset.After(longReset) {
+		return credentialParkEntry{}, false, false
+	}
+	changed := false
+	if reset.Before(longReset) {
+		c.exhausted[nick] = longReset
+		changed = true
+	}
+	var propagated credentialParkEntry
+	propagate := false
+	if entry, ok := c.credentialPark[nick]; ok {
+		if entry.reset.Before(longReset) {
+			entry.reset = longReset
+			c.credentialPark[nick] = entry
+			changed = true
+		}
+		if !entry.longWindowBound {
+			entry.longWindowBound = true
+			c.credentialPark[nick] = entry
+			changed = true
+		}
+		if changed {
+			propagated, propagate = entry, true
+		}
+	}
+	if changed {
+		c.notifyMutate()
+	}
+	return propagated, propagate, true
 }
 
 // PreemptTo switches the pool's sticky pointer back to nick. It is the

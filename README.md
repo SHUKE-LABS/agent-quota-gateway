@@ -374,12 +374,15 @@ namespaced requests.
 Preempt-back uses this same order, including the sorted default. When a
 higher-ranked member recovers while a lower-ranked member is active, the
 background preemptor returns the ordinary route on its existing reset-driven
-cadence. A reset within the five-minute cadence is handled at its reset time;
-a farther reset is rechecked at each cadence mark. Recovery does not force a
-synchronous switch or add an upstream probe. A member that resets but is
-immediately rate-limited again is not selected repeatedly; reactive `429`
-failover keeps precedence. Worker affinities outside the window return on
-their own next request.
+cadence. Recovery waits for the latest eligible blocking quota-window reset
+when a live failed-response park spans more than one window; a statusless full
+snapshot can extend that existing park but can never create a store-only park.
+Z.AI's monthly long window remains excluded from chat recovery. A reset within
+the five-minute cadence is handled at its reset time; a farther reset is
+rechecked at each cadence mark. Recovery does not force a synchronous switch
+or add an upstream probe. A member that resets but is immediately rate-limited
+again is not selected repeatedly; reactive `429` failover keeps precedence.
+Worker affinities outside the window return on their own next request.
 
 An explicit order can be set or cleared through
 `POST /_gateway/pool/{name}/priority`; posting `[]` returns routing to sorted
