@@ -184,7 +184,8 @@ func (p *Preemptor) tick() time.Duration {
 			// exhaustedUntilLocked deliberately does not create store-only
 			// exhaustion from it.
 			next := m.reset
-			if qReset != nil && (next.IsZero() || qReset.Before(next)) {
+			if qReset != nil && (next.IsZero() || qReset.Before(next)) &&
+				!m.longWindowBound {
 				next = *qReset
 			}
 			if longReset, ok := m.statuslessLongReset(snap, now); ok &&
@@ -260,6 +261,7 @@ type memberState struct {
 	reset            time.Time // union recovery reset; valid only when exhausted
 	livePark         bool      // a failed-response park, not store-only exhaustion
 	longWindowBlocks bool      // provider's long window is chat-blocking
+	longWindowBound  bool      // live park reset already incorporates that window
 }
 
 // preemptView snapshots the members ranked above the active one. Before
@@ -269,14 +271,28 @@ type memberState struct {
 // Returns the zero view for an empty pool.
 func (c *Controller) preemptView() preemptView {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	order := c.effectiveOrderLocked()
 	if len(order) == 0 {
+		c.mu.Unlock()
 		return preemptView{}
 	}
+	var propagated []struct {
+		nick  string
+		entry credentialParkEntry
+	}
+	longBound := make(map[string]bool)
 	for _, nick := range order {
-		c.extendStatuslessLongParkLocked(nick)
+		if entry, propagate, extended := c.extendStatuslessLongParkLocked(nick); extended {
+			longBound[nick] = true
+			if !propagate {
+				continue
+			}
+			propagated = append(propagated, struct {
+				nick  string
+				entry credentialParkEntry
+			}{nick: nick, entry: entry})
+		}
 	}
 	c.clearExpiredLocked()
 
@@ -310,31 +326,53 @@ func (c *Controller) preemptView() preemptView {
 			ms.exhausted = true
 			ms.reset = r
 		}
+		if entry, ok := c.credentialPark[nick]; ok {
+			ms.longWindowBound = entry.longWindowBound
+		}
+		if longBound[nick] {
+			ms.longWindowBound = true
+		}
 		ms.livePark = c.liveParkActiveLocked(nick)
 		if entry, ok := c.credentialPark[nick]; ok && entry.authRejected {
 			// A credential-rejection park is not quota evidence; a stored
 			// statusless long window must not extend it.
 			ms.livePark = false
+			ms.longWindowBound = false
 		}
 		v.higher = append(v.higher, ms)
 	}
+	c.mu.Unlock()
+	if c.propagatePark != nil {
+		for _, extension := range propagated {
+			c.propagatePark(extension.nick, extension.entry)
+		}
+	}
 	return v
+}
+
+// statuslessLongWindowReset returns a future 7d reset only when the snapshot
+// is a fresh, full, statusless, chat-blocking window. The caller must supply
+// the independent live-park evidence; this helper never creates a park from a
+// store snapshot alone. Z.AI's monthly long window is excluded by
+// longWindowBlocks.
+func statuslessLongWindowReset(snap quota.Snapshot, now time.Time, longWindowBlocks bool) (time.Time, bool) {
+	if !longWindowBlocks || snap.Unified7dStatus != "" ||
+		!windowBlocks(snap.Unified7dUtilization, snap.Unified7dStatus, snap.Unified7dReset, snap.AsOf, now) ||
+		snap.Unified7dReset == nil || !snap.Unified7dReset.After(now) {
+		return time.Time{}, false
+	}
+	return *snap.Unified7dReset, true
 }
 
 // statuslessLongReset returns a future 7d reset only when the member already
 // has a live failed-response park and its provider treats the long window as
 // chat-blocking. The live park supplies the failure evidence; the statusless
-// snapshot only refines its bound, so the store-only freshness rule must not
-// turn this into an independent park. Z.AI's monthly long window is excluded
-// by longWindowBlocks.
+// snapshot only refines its bound, so it never becomes an independent park.
 func (m memberState) statuslessLongReset(snap quota.Snapshot, now time.Time) (time.Time, bool) {
-	if !m.livePark || !m.longWindowBlocks || snap.Unified7dStatus != "" ||
-		snap.Unified7dUtilization == nil ||
-		*snap.Unified7dUtilization < exhaustionUtilizationThreshold ||
-		snap.Unified7dReset == nil || !snap.Unified7dReset.After(now) {
+	if !m.livePark {
 		return time.Time{}, false
 	}
-	return *snap.Unified7dReset, true
+	return statuslessLongWindowReset(snap, now, m.longWindowBlocks)
 }
 
 // extendStatuslessLongParkLocked preserves the live-park evidence while a
@@ -342,35 +380,58 @@ func (m memberState) statuslessLongReset(snap quota.Snapshot, now time.Time) (ti
 // clearExpiredLocked would remove a short live park at its 5h reset before
 // tick can observe that the weekly window is still binding. The store snapshot
 // cannot create an entry here: c.exhausted must already contain the failed-
-// response park. Caller holds c.mu.
-func (c *Controller) extendStatuslessLongParkLocked(nick string) {
+// response park. The returned credential park, when present, is propagated by
+// preemptView after c.mu is released. The final bool reports that the live
+// park now carries the long-window bound, even when no credential park exists
+// to propagate. Caller holds c.mu.
+func (c *Controller) extendStatuslessLongParkLocked(nick string) (credentialParkEntry, bool, bool) {
 	reset, parked := c.exhausted[nick]
-	if !parked {
-		return
+	now := c.now()
+	if !parked || !now.Before(reset) {
+		return credentialParkEntry{}, false, false
 	}
 	if entry, ok := c.credentialPark[nick]; ok && entry.authRejected {
-		return
+		return credentialParkEntry{}, false, false
 	}
 	if c.store == nil {
-		return
+		return credentialParkEntry{}, false, false
 	}
 	idx := c.indexOf(nick)
 	if idx < 0 {
-		return
+		return credentialParkEntry{}, false, false
 	}
 	b := c.backendAt(idx)
-	if !poller.LongWindowBlocksExhaustion(b.BaseURL) {
-		return
-	}
 	snap := c.store.Get(b.QuotaKey())
-	if snap.Unified7dStatus != "" || snap.Unified7dUtilization == nil ||
-		*snap.Unified7dUtilization < exhaustionUtilizationThreshold ||
-		snap.Unified7dReset == nil || !snap.Unified7dReset.After(c.now()) ||
-		!reset.Before(*snap.Unified7dReset) {
-		return
+	longReset, ok := statuslessLongWindowReset(snap, now, poller.LongWindowBlocksExhaustion(b.BaseURL))
+	if !ok || reset.After(longReset) {
+		return credentialParkEntry{}, false, false
 	}
-	c.exhausted[nick] = *snap.Unified7dReset
-	c.notifyMutate()
+	changed := false
+	if reset.Before(longReset) {
+		c.exhausted[nick] = longReset
+		changed = true
+	}
+	var propagated credentialParkEntry
+	propagate := false
+	if entry, ok := c.credentialPark[nick]; ok {
+		if entry.reset.Before(longReset) {
+			entry.reset = longReset
+			c.credentialPark[nick] = entry
+			changed = true
+		}
+		if !entry.longWindowBound {
+			entry.longWindowBound = true
+			c.credentialPark[nick] = entry
+			changed = true
+		}
+		if changed {
+			propagated, propagate = entry, true
+		}
+	}
+	if changed {
+		c.notifyMutate()
+	}
+	return propagated, propagate, true
 }
 
 // PreemptTo switches the pool's sticky pointer back to nick. It is the

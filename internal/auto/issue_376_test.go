@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shukebeta/agent-quota-gateway/internal/backend"
 	"github.com/shukebeta/agent-quota-gateway/internal/quota"
 )
 
@@ -42,7 +43,7 @@ func TestPreempt_codexLaterWeeklyResetKeepsFallbackUntilWeeklyReset(t *testing.T
 	fiveReset := clock.now().Add(2 * time.Hour)
 	weeklyReset := clock.now().Add(6 * time.Hour)
 	putTwoWindowSnapshot(t, store, c, fiveReset, weeklyReset, clock.now())
-	c.park("a", fiveReset)
+	c.record429WithSource("a", fiveReset, true, true)
 
 	p := newPreemptor([]*Controller{c}, store, 0, clock.now, io.Discard)
 	if wait := p.tick(); wait != defaultPreemptInterval {
@@ -97,6 +98,57 @@ func TestPreempt_codexFiveHourOnlyStillPreemptsAtFiveHourReset(t *testing.T) {
 	}
 }
 
+func TestPreempt_statuslessLongWindowRequiresFreshLivePark(t *testing.T) {
+	t.Run("stale snapshot does not extend live park", func(t *testing.T) {
+		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+		store := quota.NewStore()
+		c := issue316Controller(t, "https://chatgpt.com/backend-api/codex", clock, store)
+		c.setCur("b")
+		fiveReset := clock.now().Add(2 * time.Hour)
+		weeklyReset := clock.now().Add(6 * time.Hour)
+		putTwoWindowSnapshot(t, store, c, fiveReset, weeklyReset,
+			clock.now().Add(-storeSnapshotFreshness-time.Minute))
+		c.park("a", fiveReset)
+
+		p := newPreemptor([]*Controller{c}, store, 0, clock.now, io.Discard)
+		p.tick()
+		c.mu.Lock()
+		got := c.exhausted["a"]
+		c.mu.Unlock()
+		if !got.Equal(fiveReset) {
+			t.Fatalf("stale snapshot extended park to %v, want original 5h reset %v", got, fiveReset)
+		}
+
+		clock.advance(2 * time.Hour)
+		p.tick()
+		if got := c.Current(); got != "a" {
+			t.Fatalf("Current()=%q after stale snapshot's 5h reset, want a", got)
+		}
+	})
+
+	t.Run("expired park is not revived", func(t *testing.T) {
+		clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+		store := quota.NewStore()
+		c := issue316Controller(t, "https://chatgpt.com/backend-api/codex", clock, store)
+		c.setCur("b")
+		weeklyReset := clock.now().Add(time.Hour)
+		putTwoWindowSnapshot(t, store, c, clock.now().Add(time.Hour), weeklyReset, clock.now())
+		c.park("a", clock.now().Add(-time.Minute))
+
+		p := newPreemptor([]*Controller{c}, store, 0, clock.now, io.Discard)
+		p.tick()
+		if got := c.Current(); got != "a" {
+			t.Fatalf("Current()=%q with expired park, want a; stale park must not be revived", got)
+		}
+		c.mu.Lock()
+		_, parked := c.exhausted["a"]
+		c.mu.Unlock()
+		if parked {
+			t.Fatal("expired park revived from statusless weekly snapshot")
+		}
+	})
+}
+
 func TestPreempt_statuslessWeeklySnapshotAloneRemainsSelectable(t *testing.T) {
 	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	store := quota.NewStore()
@@ -138,5 +190,72 @@ func TestPreempt_zaiMonthlyLongWindowDoesNotExtendPark(t *testing.T) {
 	p.tick()
 	if got := c.Current(); got != "a" {
 		t.Fatalf("Current()=%q after 5h reset, want a (Z.AI monthly window is not chat-blocking)", got)
+	}
+}
+
+func TestPreempt_codexQuotaParkExtensionPropagatesToSiblingPools(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	scrubPoolEnv(t)
+	env := propagationEnv()
+	env[backend.EnvPrefix+"A_BASE_URL"] = "https://chatgpt.com/backend-api/codex"
+	env[backend.EnvPrefix+"B_BASE_URL"] = "https://chatgpt.com/backend-api/codex"
+	for key, value := range env {
+		t.Setenv(key, value)
+	}
+	reg, err := backend.Load(testDefaultBaseURL)
+	if err != nil {
+		t.Fatalf("backend.Load: %v", err)
+	}
+	pools := NewPools(reg, store, clock.now, io.Discard)
+
+	ca, cb := pools.byPool["a"], pools.byPool["b"]
+	cb.setCur("b2")
+	fiveReset := clock.now().Add(2 * time.Hour)
+	weeklyReset := clock.now().Add(6 * time.Hour)
+	full := 1.0
+	ccz := ca.resolve(t, "ccz")
+	store.Put(ccz.QuotaKey(), quota.Snapshot{
+		Unified5hUtilization: &full,
+		Unified5hReset:       &fiveReset,
+		Unified7dUtilization: &full,
+		Unified7dReset:       &weeklyReset,
+		AsOf:                 clock.now(),
+	})
+	ca.record429WithSource("ccz", fiveReset, true, true)
+
+	p := newPreemptor([]*Controller{ca, cb}, store, 0, clock.now, io.Discard)
+	p.tick()
+	for _, c := range []*Controller{ca, cb} {
+		c.mu.Lock()
+		entry, ok := c.credentialPark["ccz"]
+		c.mu.Unlock()
+		if !ok || !entry.reset.Equal(weeklyReset) {
+			t.Fatalf("pool %s credentialPark[ccz]=%+v,%v, want propagated weekly reset %v", c.name(), entry, ok, weeklyReset)
+		}
+		if got := c.Current(); got == "ccz" {
+			t.Fatalf("pool %s preempted to ccz before weekly reset", c.name())
+		}
+	}
+
+	// The shared snapshot is now stale, but the already-extended live quota
+	// park must remain binding in both pools through the earlier 5h reset.
+	clock.advance(2 * time.Hour)
+	p.tick()
+	for _, c := range []*Controller{ca, cb} {
+		if got := c.Current(); got == "ccz" {
+			t.Fatalf("pool %s preempted to ccz at the 5h reset", c.name())
+		}
+		if !memberParked(c.poolStatus(store, nil, nil), "ccz") {
+			t.Fatalf("pool %s lost ccz park before weekly reset", c.name())
+		}
+	}
+
+	clock.advance(4 * time.Hour)
+	p.tick()
+	for _, c := range []*Controller{ca, cb} {
+		if got := c.Current(); got != "ccz" {
+			t.Fatalf("pool %s Current()=%q after weekly reset, want ccz", c.name(), got)
+		}
 	}
 }

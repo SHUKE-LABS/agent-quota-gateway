@@ -571,15 +571,18 @@ func (p *Pools) AllPoolStatuses(store *quota.Store, pl *poller.Poller) []PoolSta
 // CredentialParkPersist is the persisted shape of one credentialPark entry
 // (issue #254 AC7, #332). WindowFact mirrors credentialParkEntry.windowFact;
 // AuthRejected distinguishes 401/403 parks from quota fallback parks, which
-// may have the same WindowFact value. Its zero value keeps legacy entries on
-// the non-auth route. Since mirrors credentialParkEntry.since (issue #249);
+// may have the same WindowFact value. LongWindowBound records that a quota
+// park's reset already incorporates a blocking long-window reset, so a later
+// precise 5h snapshot cannot shorten it. Its zero value keeps legacy entries
+// on the old route. Since mirrors credentialParkEntry.since (issue #249);
 // absent on every park kind except the z.ai stale-poller park, and absent
 // in legacy files, both of which restore to the zero value.
 type CredentialParkPersist struct {
-	Reset        time.Time `json:"reset"`
-	WindowFact   bool      `json:"window_fact,omitempty"`
-	AuthRejected bool      `json:"auth_rejected,omitempty"`
-	Since        time.Time `json:"since,omitzero"`
+	Reset           time.Time `json:"reset"`
+	WindowFact      bool      `json:"window_fact,omitempty"`
+	AuthRejected    bool      `json:"auth_rejected,omitempty"`
+	LongWindowBound bool      `json:"long_window_bound,omitempty"`
+	Since           time.Time `json:"since,omitzero"`
 }
 
 // PoolPersistState is the serializable routing state for one pool.
@@ -1612,7 +1615,8 @@ func nickNotResolvableError(nick string, reg *backend.Registry) error {
 // reset wins, because propagation can be delayed behind a sibling's own
 // observation and overwriting it would shorten the active park. Equal resets
 // retain the existing entry so its windowFact/authRejected
-// classifications are preserved (issues #275, #332). A retained windowFact
+// classifications are preserved (issues #275, #332), while an incoming
+// long-window bound may still be added to a non-auth entry. A retained windowFact
 // entry still adopts a later incoming since (issue #249): the new park is
 // fresh evidence the nick is refused now, so a store snapshot predating it —
 // the triggering response's own, in the shared store — must not retire the
@@ -1634,6 +1638,10 @@ func (p *Pools) propagateCredentialPark(originPool, nick string, entry credentia
 		changed := false
 		if existing, ok := c.credentialPark[nick]; !ok || entry.reset.After(existing.reset) {
 			c.credentialPark[nick] = entry
+			changed = true
+		} else if !existing.authRejected && entry.longWindowBound && !existing.longWindowBound {
+			existing.longWindowBound = true
+			c.credentialPark[nick] = existing
 			changed = true
 		} else if existing.windowFact && entry.since.After(existing.since) {
 			existing.since = entry.since
@@ -1827,6 +1835,11 @@ func (p *Pools) credentialVerdict(ctx context.Context, b backend.Backend) Creden
 //     the request-routing discriminator, while windowFact controls store
 //     reconciliation. A missing persisted authRejected bit stays false.
 //
+// longWindowBound is set when a fresh statusless long-window snapshot has
+// already been folded into reset. It is propagated and persisted with quota
+// parks so a later stale snapshot cannot make a sibling shorten that bound to
+// the precise 5h reset. It is never set for authRejected parks.
+//
 // since, when non-zero, is when the park was recorded, and narrows store
 // reconciliation of a windowFact entry to snapshots observed strictly after
 // it (issue #249). The z.ai stale-poller park sets it: the quota observer
@@ -1836,10 +1849,11 @@ func (p *Pools) credentialVerdict(ctx context.Context, b backend.Backend) Creden
 // that records it. Every other park kind leaves it zero and keeps its
 // existing reconciliation.
 type credentialParkEntry struct {
-	reset        time.Time
-	windowFact   bool
-	authRejected bool
-	since        time.Time
+	reset           time.Time
+	windowFact      bool
+	authRejected    bool
+	longWindowBound bool
+	since           time.Time
 }
 
 // Controller is the sticky selector for one pool. The zero value is not
@@ -3053,10 +3067,11 @@ func (c *Controller) loadCredentialPark(credentialPark map[string]CredentialPark
 			continue
 		}
 		c.credentialPark[nick] = credentialParkEntry{
-			reset:        persisted.Reset,
-			windowFact:   persisted.WindowFact,
-			authRejected: persisted.AuthRejected,
-			since:        persisted.Since,
+			reset:           persisted.Reset,
+			windowFact:      persisted.WindowFact,
+			authRejected:    persisted.AuthRejected,
+			longWindowBound: persisted.LongWindowBound,
+			since:           persisted.Since,
 		}
 	}
 }
@@ -3118,7 +3133,13 @@ func (c *Controller) persistState() PoolPersistState {
 	if len(c.credentialPark) > 0 {
 		cp := make(map[string]CredentialParkPersist, len(c.credentialPark))
 		for k, v := range c.credentialPark {
-			cp[k] = CredentialParkPersist{Reset: v.reset, WindowFact: v.windowFact, AuthRejected: v.authRejected, Since: v.since}
+			cp[k] = CredentialParkPersist{
+				Reset:           v.reset,
+				WindowFact:      v.windowFact,
+				AuthRejected:    v.authRejected,
+				LongWindowBound: v.longWindowBound,
+				Since:           v.since,
+			}
 		}
 		ps.CredentialPark = cp
 	}
