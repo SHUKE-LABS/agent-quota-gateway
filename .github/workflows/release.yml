@@ -98,6 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     env:
       RELEASE_TAG: ${{ needs.tag.outputs.tag }}
     steps:
@@ -109,6 +110,11 @@ jobs:
         with:
           node-version: "22"
           registry-url: https://registry.npmjs.org
+      - name: Upgrade npm for trusted publishing (OIDC)
+        # npm >= 11.5.1 exchanges the job's GitHub OIDC token for a short-lived
+        # publish credential when a trusted publisher is configured on npmjs.com,
+        # and falls back to NODE_AUTH_TOKEN otherwise.
+        run: npm install -g npm@11
       - name: Download target archives
         uses: actions/download-artifact@v4
         with:
