@@ -259,3 +259,43 @@ func TestPreempt_codexQuotaParkExtensionPropagatesToSiblingPools(t *testing.T) {
 		}
 	}
 }
+
+func TestPreempt_persistedLongWindowBoundSurvivesRestart(t *testing.T) {
+	clock := &fixedClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	store := quota.NewStore()
+	c := issue316Controller(t, "https://chatgpt.com/backend-api/codex", clock, store)
+	c.setCur("b")
+	fiveReset := clock.now().Add(2 * time.Hour)
+	weeklyReset := clock.now().Add(6 * time.Hour)
+	putTwoWindowSnapshot(t, store, c, fiveReset, weeklyReset, clock.now())
+	c.record429WithSource("a", fiveReset, true, true)
+
+	pre := newPreemptor([]*Controller{c}, store, 0, clock.now, io.Discard)
+	pre.tick() // folds the fresh weekly reset into the persisted quota park
+	saved := c.persistState()
+	entry, ok := saved.CredentialPark["a"]
+	if !ok || !entry.LongWindowBound || !entry.Reset.Equal(weeklyReset) {
+		t.Fatalf("saved Codex park=%+v,%v, want weekly reset with long_window_bound", entry, ok)
+	}
+
+	// Rebuild the controller from persisted routing state, then let the
+	// shared snapshot age past the freshness window before the 5h reset.
+	restarted := issue316Controller(t, "https://chatgpt.com/backend-api/codex", clock, store)
+	restarted.loadState(saved.Sticky, saved.Exhausted, saved.LocalSnapshotNicks)
+	restarted.loadCredentialPark(saved.CredentialPark)
+	clock.advance(2 * time.Hour)
+	post := newPreemptor([]*Controller{restarted}, store, 0, clock.now, io.Discard)
+	post.tick()
+	if got := restarted.Current(); got != "b" {
+		t.Fatalf("Current()=%q after restart at 5h reset, want fallback b", got)
+	}
+	if !memberParked(restarted.poolStatus(store, nil, nil), "a") {
+		t.Fatal("restarted Codex member a lost its weekly park at the stale 5h tick")
+	}
+
+	clock.advance(4 * time.Hour)
+	post.tick()
+	if got := restarted.Current(); got != "a" {
+		t.Fatalf("Current()=%q at weekly reset after restart, want a", got)
+	}
+}
