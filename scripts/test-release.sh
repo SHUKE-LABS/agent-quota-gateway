@@ -66,6 +66,93 @@ else
     printf 'FAIL - root npm manifest validates\n'
     failures=$((failures + 1))
 fi
+
+invalid_repository_manifest="${manifest_dir}/invalid-repository.json"
+node - "${manifest_dir}/package.json" "${invalid_repository_manifest}" <<'NODE'
+const fs = require('node:fs');
+const [sourcePath, destinationPath] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
+manifest.repository.url = 'https://github.com/SHUKE-LABS/agent-quota-gateway.git';
+fs.writeFileSync(destinationPath, `${JSON.stringify(manifest)}\n`);
+NODE
+assert_fails "npm manifest rejects a mismatched repository URL" \
+    release_npm_validate_manifest "${invalid_repository_manifest}" \
+    '@shukelabs/agent-quota-gateway' 1.2.3 root
+
+repository_url='git+https://github.com/SHUKE-LABS/agent-quota-gateway.git'
+release_archive_dir="$(mktemp -d)"
+release_archive_source_dir="$(mktemp -d)"
+release_stage_parent="$(mktemp -d)"
+release_stage_dir="${release_stage_parent}/npm-packages"
+release_pack_dir="$(mktemp -d)"
+release_pack_manifest_dir="$(mktemp -d)"
+
+while IFS='|' read -r _package_key target _npm_os _npm_cpu archive binary; do
+    printf 'binary for %s\n' "${target}" >"${release_archive_source_dir}/${binary}"
+    tar -czf "${release_archive_dir}/agent-quota-gateway-1.2.3-${target}.${archive}" \
+        -C "${release_archive_source_dir}" "${binary}"
+done < <(release_npm_platform_rows)
+
+staging_pack_status=0
+if release_npm_stage_packages 1.2.3 "${release_archive_dir}" "${release_stage_dir}"; then
+    printf 'ok   - all staged npm manifests validate\n'
+else
+    printf 'FAIL - all staged npm manifests validate\n'
+    failures=$((failures + 1))
+    staging_pack_status=1
+fi
+
+if (( staging_pack_status == 0 )); then
+    while IFS= read -r package_dir; do
+        if ! (
+            cd "${release_stage_dir}/${package_dir}" &&
+            npm pack --ignore-scripts --pack-destination "${release_pack_dir}" >/dev/null
+        ); then
+            printf 'FAIL - npm pack succeeds for %s\n' "${package_dir}"
+            failures=$((failures + 1))
+            staging_pack_status=1
+        fi
+    done < <(release_npm_package_directories)
+fi
+
+if (( staging_pack_status == 0 )); then
+    if release_npm_verify_tarballs 1.2.3 "${release_pack_dir}"; then
+        printf 'ok   - npm pack creates the complete staged package set\n'
+    else
+        printf 'FAIL - npm pack creates the complete staged package set\n'
+        failures=$((failures + 1))
+        staging_pack_status=1
+    fi
+fi
+
+if (( staging_pack_status == 0 )); then
+    while IFS= read -r package_dir; do
+        if [[ "${package_dir}" == agent-quota-gateway ]]; then
+            tarball="$(release_npm_tarball_name 1.2.3 root)"
+        else
+            tarball="$(release_npm_tarball_name 1.2.3 "${package_dir#agent-quota-gateway-}")"
+        fi
+        packed_manifest="${release_pack_manifest_dir}/${package_dir}.json"
+        if tar -xOzf "${release_pack_dir}/${tarball}" package/package.json >"${packed_manifest}" && \
+            node - "${packed_manifest}" "${repository_url}" <<'NODE'
+const fs = require('node:fs');
+
+const [, , manifestPath, expectedRepositoryUrl] = process.argv;
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+if (manifest.repository?.url !== expectedRepositoryUrl) {
+  console.error(`${manifestPath}: repository.url does not match the expected GitHub repository`);
+  process.exit(1);
+}
+NODE
+        then
+            printf 'ok   - packed %s manifest has the repository URL\n' "${package_dir}"
+        else
+            printf 'FAIL - packed %s manifest has the repository URL\n' "${package_dir}"
+            failures=$((failures + 1))
+        fi
+    done < <(release_npm_package_directories)
+fi
+
 assert_fails "npm staging rejects missing target archive" \
     release_npm_stage_packages 1.2.3 "${manifest_dir}" "${manifest_dir}/staged"
 
@@ -184,7 +271,9 @@ mv "${publish_dir}"/*.tgz "${publish_dir}/rel/npm-tarballs/"
 assert_eq "$(grep -cv '^\./npm-tarballs/' "${publish_path_log}")" "0" \
     "relative tarball dir reaches npm as ./npm-tarballs/<file>"
 
-rm -rf "${manifest_dir}" "${unsupported_package_dir}" "${unsupported_prefix}" "${publish_dir}"
+rm -rf "${manifest_dir}" "${unsupported_package_dir}" "${unsupported_prefix}" "${publish_dir}" \
+    "${release_archive_dir}" "${release_archive_source_dir}" "${release_stage_parent}" \
+    "${release_pack_dir}" "${release_pack_manifest_dir}"
 
 if (( failures > 0 )); then
     printf '%d assertion(s) failed\n' "${failures}" >&2
