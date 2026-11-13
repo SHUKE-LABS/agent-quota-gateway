@@ -316,6 +316,11 @@ release_npm_shim_path() {
 }
 
 
+release_npm_repository_url() {
+    printf '%s\n' 'git+https://github.com/SHUKE-LABS/agent-quota-gateway.git'
+}
+
+
 release_npm_write_root_manifest() {
     local version="${1:-}"
 
@@ -326,6 +331,10 @@ release_npm_write_root_manifest() {
   "version": "${version}",
   "description": "Static Agent Quota Gateway launcher and systemd deployment templates.",
   "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "$(release_npm_repository_url)"
+  },
   "bin": {
     "agent-quota-gateway": "bin/agent-quota-gateway.js"
   },
@@ -370,6 +379,10 @@ release_npm_write_platform_manifest() {
   "version": "${version}",
   "description": "Native Agent Quota Gateway binary for ${npm_os}/${npm_cpu}.",
   "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "$(release_npm_repository_url)"
+  },
   "files": [
     "bin",
     "LICENSE"
@@ -390,7 +403,7 @@ EOF
 
 release_npm_validate_manifest() {
     local manifest_path="${1:-}" expected_name="${2:-}" version="${3:-}"
-    local kind="${4:-}" npm_os="${5:-}" npm_cpu="${6:-}"
+    local kind="${4:-}" npm_os="${5:-}" npm_cpu="${6:-}" repository_url=""
 
     [[ -f "${manifest_path}" ]] || {
         printf "release: npm manifest not found '%s'\n" "${manifest_path}" >&2
@@ -400,12 +413,13 @@ release_npm_validate_manifest() {
         printf 'release: node is required to validate npm manifests\n' >&2
         return 1
     }
+    repository_url="$(release_npm_repository_url)"
 
     node - "${manifest_path}" "${expected_name}" "${version}" "${kind}" \
-        "${npm_os}" "${npm_cpu}" <<'NODE'
+        "${npm_os}" "${npm_cpu}" "${repository_url}" <<'NODE'
 const fs = require('node:fs');
 
-const [, , manifestPath, expectedName, expectedVersion, kind, expectedOs, expectedCpu] = process.argv;
+const [, , manifestPath, expectedName, expectedVersion, kind, expectedOs, expectedCpu, expectedRepositoryUrl] = process.argv;
 let manifest;
 try {
   manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
@@ -422,6 +436,11 @@ function fail(message) {
 if (manifest.name !== expectedName) fail(`name '${manifest.name}' does not match '${expectedName}'`);
 if (manifest.version !== expectedVersion) fail(`version '${manifest.version}' does not match '${expectedVersion}'`);
 if (manifest.license !== 'SEE LICENSE IN LICENSE') fail('license must point to LICENSE');
+const repository = manifest.repository;
+if (!repository || typeof repository !== 'object' || Array.isArray(repository) ||
+    repository.type !== 'git' || repository.url !== expectedRepositoryUrl) {
+  fail(`repository.url must be '${expectedRepositoryUrl}'`);
+}
 if (manifest.publishConfig?.access !== 'public') fail('publishConfig.access must be public');
 function sameObject(actual, expected) {
   if (!actual || typeof actual !== 'object' || Array.isArray(actual)) return false;
