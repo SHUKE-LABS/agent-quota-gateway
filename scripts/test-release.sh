@@ -16,6 +16,15 @@ source "${ROOT}/lib/release.sh"
 
 failures=0
 
+publish_workflow="$(sed -n '/^  publish:/,/^  smoke:/p' \
+    "${ROOT}/.github/workflows/release.yml")"
+if grep -Eq 'registry-url:|NPM_TOKEN|NODE_AUTH_TOKEN|_authToken' <<<"${publish_workflow}"; then
+    printf 'FAIL - npm OIDC publish job avoids token authentication configuration\n'
+    failures=$((failures + 1))
+else
+    printf 'ok   - npm OIDC publish job avoids token authentication configuration\n'
+fi
+
 assert_eq() {
     local actual="${1}" expected="${2}" label="${3}"
     if [[ "${actual}" == "${expected}" ]]; then
