@@ -25,6 +25,27 @@ else
     printf 'ok   - npm OIDC publish job avoids token authentication configuration\n'
 fi
 
+smoke_workflow="$(sed -n '/^  smoke:/,$p' "${ROOT}/.github/workflows/release.yml")"
+smoke_checkout_line="$(grep -nF 'uses: actions/checkout@v4' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_ref_line="$(grep -nF 'ref: ${{ needs.tag.outputs.tag }}' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_source_line="$(grep -nF 'source lib/release.sh' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_wait_line="$(grep -nF 'release_npm_wait_for_versions "${version}" 300 10' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_metadata_line="$(grep -nF 'npm view "@shukelabs/agent-quota-gateway@${version}" os --json' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_install_line="$(grep -nF 'npm install -g --prefix' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+if [[ -n "${smoke_checkout_line}" && -n "${smoke_ref_line}" &&
+    -n "${smoke_source_line}" && -n "${smoke_wait_line}" &&
+    -n "${smoke_metadata_line}" && -n "${smoke_install_line}" ]] &&
+    (( smoke_checkout_line < smoke_source_line &&
+        smoke_ref_line < smoke_source_line &&
+        smoke_source_line < smoke_wait_line &&
+        smoke_wait_line < smoke_metadata_line &&
+        smoke_wait_line < smoke_install_line )); then
+    printf 'ok   - release smoke checks out source before waiting for npm versions\n'
+else
+    printf 'FAIL - release smoke checkout/wait ordering is incomplete\n'
+    failures=$((failures + 1))
+fi
+
 assert_eq() {
     local actual="${1}" expected="${2}" label="${3}"
     if [[ "${actual}" == "${expected}" ]]; then
