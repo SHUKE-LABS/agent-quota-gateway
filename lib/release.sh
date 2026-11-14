@@ -287,6 +287,80 @@ release_npm_package_directories() {
 }
 
 
+release_npm_wait_for_versions() {
+    local version="${1:-}" max_wait_seconds="${2:-300}" poll_interval_seconds="${3:-10}"
+    local package="" output="" status=0 deadline=0 remaining=0 sleep_seconds=0
+    local -a packages=()
+    local -A pending=() last_errors=()
+
+    release_validate_version "${version}" || return 1
+    [[ "${max_wait_seconds}" =~ ^[1-9][0-9]*$ && max_wait_seconds -le 300 ]] || {
+        printf "release: npm version wait limit must be between 1 and 300 seconds, got '%s'\n" \
+            "${max_wait_seconds}" >&2
+        return 1
+    }
+    [[ "${poll_interval_seconds}" =~ ^[0-9]+$ ]] || {
+        printf "release: invalid npm version poll interval '%s'\n" "${poll_interval_seconds}" >&2
+        return 1
+    }
+    command -v timeout >/dev/null 2>&1 || {
+        printf 'release: timeout is required to bound npm version queries\n' >&2
+        return 1
+    }
+
+    while IFS= read -r package; do
+        package="@shukelabs/${package}"
+        packages+=("${package}")
+        pending["${package}"]=1
+        last_errors["${package}"]='npm view has not been attempted'
+    done < <(release_npm_package_directories)
+
+    deadline=$((SECONDS + max_wait_seconds))
+    while (( ${#pending[@]} > 0 )); do
+        for package in "${packages[@]}"; do
+            [[ -n "${pending[${package}]+present}" ]] || continue
+            remaining=$((deadline - SECONDS))
+            (( remaining > 0 )) || break
+
+            # Give each query only the time left in the global budget. This
+            # keeps a hung registry request from outliving the retry window.
+            if output="$(timeout --signal=KILL "${remaining}s" \
+                npm view "${package}@${version}" version 2>&1)"; then
+                if [[ "${output}" == "${version}" ]]; then
+                    unset "pending[${package}]"
+                    unset "last_errors[${package}]"
+                    printf 'verified npm package %s@%s\n' "${package}" "${version}"
+                    continue
+                fi
+                last_errors["${package}"]="expected ${version}, got ${output:-<empty>}"
+            else
+                status=$?
+                output="${output//$'\n'/; }"
+                last_errors["${package}"]="${output:-npm view failed with exit ${status}}"
+            fi
+        done
+
+        (( ${#pending[@]} == 0 )) && return 0
+        remaining=$((deadline - SECONDS))
+        (( remaining > 0 )) || break
+        (( poll_interval_seconds > 0 )) || continue
+        if (( poll_interval_seconds < remaining )); then
+            sleep_seconds="${poll_interval_seconds}"
+        else
+            sleep_seconds="${remaining}"
+        fi
+        sleep "${sleep_seconds}"
+    done
+
+    for package in "${packages[@]}"; do
+        [[ -n "${pending[${package}]+present}" ]] || continue
+        printf '::error::npm package %s@%s was not available within %ss; last npm error: %s\n' \
+            "${package}" "${version}" "${max_wait_seconds}" "${last_errors[${package}]}" >&2
+    done
+    return 1
+}
+
+
 release_npm_tarball_name() {
     local version="${1:-}" package_key="${2:-}"
 
