@@ -25,6 +25,27 @@ else
     printf 'ok   - npm OIDC publish job avoids token authentication configuration\n'
 fi
 
+smoke_workflow="$(sed -n '/^  smoke:/,$p' "${ROOT}/.github/workflows/release.yml")"
+smoke_checkout_line="$(grep -nF 'uses: actions/checkout@v4' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_ref_line="$(grep -nF 'ref: ${{ needs.tag.outputs.tag }}' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_source_line="$(grep -nF 'source lib/release.sh' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_wait_line="$(grep -nF 'release_npm_wait_for_versions "${version}" 300 10' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_metadata_line="$(grep -nF 'npm view "@shukelabs/agent-quota-gateway@${version}" os --json' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+smoke_install_line="$(grep -nF 'npm install -g --prefix' <<<"${smoke_workflow}" | sed -n '1p' | cut -d: -f1)"
+if [[ -n "${smoke_checkout_line}" && -n "${smoke_ref_line}" &&
+    -n "${smoke_source_line}" && -n "${smoke_wait_line}" &&
+    -n "${smoke_metadata_line}" && -n "${smoke_install_line}" ]] &&
+    (( smoke_checkout_line < smoke_source_line &&
+        smoke_ref_line < smoke_source_line &&
+        smoke_source_line < smoke_wait_line &&
+        smoke_wait_line < smoke_metadata_line &&
+        smoke_wait_line < smoke_install_line )); then
+    printf 'ok   - release smoke checks out source before waiting for npm versions\n'
+else
+    printf 'FAIL - release smoke checkout/wait ordering is incomplete\n'
+    failures=$((failures + 1))
+fi
+
 assert_eq() {
     local actual="${1}" expected="${2}" label="${3}"
     if [[ "${actual}" == "${expected}" ]]; then
@@ -65,6 +86,70 @@ assert_eq "$(release_bump_kind_for_subject "random text")" "patch" "non-conventi
 
 assert_eq "$(release_npm_platform_rows)" $'linux-x64|linux-x64|linux|x64|tar.gz|agent-quota-gateway\nlinux-arm64|linux-arm64|linux|arm64|tar.gz|agent-quota-gateway\ndarwin-arm64|darwin-arm64|darwin|arm64|tar.gz|agent-quota-gateway\ndarwin-x64|darwin-x64|darwin|x64|tar.gz|agent-quota-gateway' \
     "npm platform matrix is complete and ordered"
+
+npm_wait_dir="$(mktemp -d)"
+npm_wait_bin="${npm_wait_dir}/npm"
+npm_wait_count="${npm_wait_dir}/count"
+cat >"${npm_wait_bin}" <<'STUB'
+#!/usr/bin/env bash
+set -u
+
+count_file="${NPM_STUB_COUNT_FILE:?}"
+count="$(cat "${count_file}" 2>/dev/null || printf '0')"
+count=$((count + 1))
+printf '%s\n' "${count}" >"${count_file}"
+
+if [[ "${NPM_STUB_MODE:-transient}" == slow ]]; then
+    while :; do :; done
+fi
+if [[ "${NPM_STUB_MODE:-transient}" == always-fail || "${count}" -le 2 ]]; then
+    printf 'npm error code E404\nNo match found for version\n' >&2
+    exit 1
+fi
+printf '%s\n' "${NPM_STUB_VERSION:?}"
+STUB
+chmod +x "${npm_wait_bin}"
+
+: >"${npm_wait_count}"
+if PATH="${npm_wait_dir}:${PATH}" NPM_STUB_COUNT_FILE="${npm_wait_count}" \
+    NPM_STUB_VERSION=1.2.3 release_npm_wait_for_versions 1.2.3 5 0 \
+    >"${npm_wait_dir}/transient.log" 2>&1; then
+    printf 'ok   - npm version wait recovers from transient 404s\n'
+else
+    printf 'FAIL - npm version wait recovers from transient 404s\n'
+    failures=$((failures + 1))
+fi
+
+: >"${npm_wait_count}"
+if PATH="${npm_wait_dir}:${PATH}" NPM_STUB_COUNT_FILE="${npm_wait_count}" \
+    NPM_STUB_MODE=always-fail NPM_STUB_VERSION=1.2.3 \
+    release_npm_wait_for_versions 1.2.3 1 1 \
+    >"${npm_wait_dir}/timeout.log" 2>&1; then
+    printf 'FAIL - npm version wait reports an exhausted deadline\n'
+    failures=$((failures + 1))
+elif grep -Fq '@shukelabs/agent-quota-gateway@1.2.3' "${npm_wait_dir}/timeout.log" && \
+    grep -Fq 'E404' "${npm_wait_dir}/timeout.log"; then
+    printf 'ok   - npm version wait reports an exhausted deadline\n'
+else
+    printf 'FAIL - npm version wait reports package and last npm error\n'
+    failures=$((failures + 1))
+fi
+
+wait_start="${SECONDS}"
+: >"${npm_wait_count}"
+if PATH="${npm_wait_dir}:${PATH}" NPM_STUB_COUNT_FILE="${npm_wait_count}" \
+    NPM_STUB_MODE=slow NPM_STUB_VERSION=1.2.3 \
+    release_npm_wait_for_versions 1.2.3 1 1 \
+    >"${npm_wait_dir}/slow.log" 2>&1; then
+    printf 'FAIL - npm version wait caps an in-flight query\n'
+    failures=$((failures + 1))
+elif (( SECONDS - wait_start <= 3 )) && \
+    grep -Fq '@shukelabs/agent-quota-gateway@1.2.3' "${npm_wait_dir}/slow.log"; then
+    printf 'ok   - npm version wait caps an in-flight query\n'
+else
+    printf 'FAIL - npm version wait exceeds the in-flight deadline\n'
+    failures=$((failures + 1))
+fi
 
 manifest_dir="$(mktemp -d)"
 release_npm_write_root_manifest 1.2.3 >"${manifest_dir}/package.json"
@@ -280,7 +365,7 @@ mv "${publish_dir}"/*.tgz "${publish_dir}/rel/npm-tarballs/"
 assert_eq "$(grep -cv '^\./npm-tarballs/' "${publish_path_log}")" "0" \
     "relative tarball dir reaches npm as ./npm-tarballs/<file>"
 
-rm -rf "${manifest_dir}" "${unsupported_package_dir}" "${unsupported_prefix}" "${publish_dir}" \
+rm -rf "${npm_wait_dir}" "${manifest_dir}" "${unsupported_package_dir}" "${unsupported_prefix}" "${publish_dir}" \
     "${release_archive_dir}" "${release_archive_source_dir}" "${release_stage_parent}" \
     "${release_pack_dir}" "${release_pack_manifest_dir}"
 
